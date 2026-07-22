@@ -1,0 +1,17 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Source planning documents that may contain internal information.
+# Remove these lines if the Word/Excel requirements documents should be published.
+Bind_Edge_AI_*.txt
+*.docx
+*.xlsx
+~$*

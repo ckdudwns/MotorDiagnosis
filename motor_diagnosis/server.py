@@ -16,37 +16,61 @@ from .data import (
     NETWORK_PROFILES,
     PARAMETERS,
     ROLE_POLICIES,
-    SITES,
     ApiError,
     assets_for,
     authenticate,
     copy_payload,
+    create_asset,
+    create_device,
+    create_site,
+    current_user_for_token,
+    deactivate_site,
+    delete_asset,
+    delete_device,
+    delete_site,
     devices_for,
     get_site,
     inject_anomaly,
     install_points_for,
     network_profile,
     network_profiles_for_sites,
+    quarantine_unregistered_device,
+    require_permission,
+    require_site_access,
     review_event,
-    rollout_plans,
     role_policy,
+    rollout_plans,
     telemetry_for,
-    visible_sites_for_role,
+    telemetry_units,
+    update_asset,
+    update_device,
+    update_site,
+    visible_sites_for_user,
 )
 from .web import render_page
 
 
 LOGGER = logging.getLogger("motor_diagnosis")
+MAX_JSON_BODY_BYTES = 64 * 1024
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "MotorDiagnosis/0.1"
+    server_version = "MotorDiagnosis/0.2"
 
     def do_GET(self) -> None:
         self.handle_request("GET")
 
     def do_POST(self) -> None:
         self.handle_request("POST")
+
+    def do_DELETE(self) -> None:
+        self.handle_request("DELETE")
+
+    def do_PUT(self) -> None:
+        self.handle_request("PUT")
+
+    def do_PATCH(self) -> None:
+        self.handle_request("PATCH")
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -57,38 +81,44 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         query = parse_qs(parsed.query)
+        segments = path_segments(path)
         request_started = time.monotonic()
         try:
             if method == "GET":
-                self.route_get(path, query)
+                self.route_get(path, segments, query)
             elif method == "POST":
-                self.route_post(path)
+                self.route_post(segments)
+            elif method == "DELETE":
+                self.route_delete(segments)
             else:
-                raise ApiError(405, "METHOD_NOT_ALLOWED", "지원하지 않는 메서드입니다.")
+                raise ApiError(405, "METHOD_NOT_ALLOWED", "HTTP method is not supported for this API.")
         except ApiError as exc:
             self.send_error_json(exc)
         except json.JSONDecodeError:
-            self.send_error_json(ApiError(400, "INVALID_JSON", "JSON 형식이 올바르지 않습니다."))
+            self.send_error_json(ApiError(400, "INVALID_JSON", "Request body is not valid JSON."))
         except Exception:
             LOGGER.exception("unexpected_error path=%s", path)
-            self.send_error_json(ApiError(500, "INTERNAL_ERROR", "서버 처리 중 오류가 발생했습니다."))
+            self.send_error_json(ApiError(500, "INTERNAL_ERROR", "Server processing failed."))
         finally:
             elapsed_ms = round((time.monotonic() - request_started) * 1000, 2)
             LOGGER.info("%s %s %.2fms", method, path, elapsed_ms)
 
-    def route_get(self, path: str, query: dict[str, list[str]]) -> None:
+    def route_get(self, path: str, segments: list[str], query: dict[str, list[str]]) -> None:
         if path == "/":
             self.send_text(render_page(), "text/html; charset=utf-8")
             return
-        if path == "/api/health":
+        if segments == ["api", "health"]:
             self.send_json({"ok": True, "service": "Bind Edge AI backend", "timestamp": time.time()})
             return
-        if path == "/api/bootstrap":
+
+        user = self.require_user()
+
+        if segments == ["api", "bootstrap"]:
             self.send_json(
                 {
-                    "sites": copy_payload(SITES),
+                    "sites": visible_sites_for_user(user),
                     "networkProfiles": copy_payload(NETWORK_PROFILES),
-                    "events": copy_payload(EVENTS),
+                    "events": authorized_events(user),
                     "parameters": copy_payload(PARAMETERS),
                     "rolePolicies": copy_payload(ROLE_POLICIES),
                     "acousticLabels": copy_payload(ACOUSTIC_LABEL_TAXONOMY),
@@ -96,105 +126,184 @@ class AppHandler(BaseHTTPRequestHandler):
                 }
             )
             return
-        if path == "/api/auth/roles":
+        if segments == ["api", "auth", "roles"]:
             self.send_json(copy_payload(ROLE_POLICIES))
             return
-        if path.startswith("/api/auth/roles/"):
-            role = path.split("/")[4]
-            self.send_json(role_policy(role))
+        if len(segments) == 4 and segments[:3] == ["api", "auth", "roles"]:
+            self.send_json(role_policy(segments[3]))
             return
-        if path == "/api/sites":
-            role = first_query(query, "role", "B")
-            self.send_json(visible_sites_for_role(role))
+        if segments == ["api", "sites"]:
+            self.send_json(visible_sites_for_user(user))
             return
-        if path.startswith("/api/sites/") and path.endswith("/assets"):
-            site_id = path.split("/")[3]
+        if len(segments) == 3 and segments[:2] == ["api", "sites"]:
+            site = get_site(segments[2])
+            require_site_access(user, site["id"])
+            require_permission(user, "site:read")
+            self.send_json(copy_payload(site))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "assets":
+            get_site(segments[2])
+            require_site_access(user, segments[2])
+            require_permission(user, "asset:read")
+            self.send_json(assets_for(segments[2]))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "devices":
+            get_site(segments[2])
+            require_site_access(user, segments[2])
+            require_permission(user, "device:read")
+            self.send_json(devices_for(segments[2]))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "install-points":
+            get_site(segments[2])
+            require_site_access(user, segments[2])
+            self.send_json(install_points_for(segments[2]))
+            return
+        if segments == ["api", "assets"]:
+            site_id = required_query(query, "siteId")
+            get_site(site_id)
+            require_site_access(user, site_id)
+            require_permission(user, "asset:read")
             self.send_json(assets_for(site_id))
             return
-        if path.startswith("/api/sites/") and path.endswith("/devices"):
-            site_id = path.split("/")[3]
+        if segments == ["api", "devices"]:
+            site_id = required_query(query, "siteId")
+            get_site(site_id)
+            require_site_access(user, site_id)
+            require_permission(user, "device:read")
             self.send_json(devices_for(site_id))
             return
-        if path.startswith("/api/sites/") and path.endswith("/install-points"):
-            site_id = path.split("/")[3]
-            self.send_json(install_points_for(site_id))
+        if segments == ["api", "rollout-plans"]:
+            self.send_json(filter_site_rows(user, rollout_plans()))
             return
-        if path.startswith("/api/sites/"):
-            site_id = path.split("/")[3]
-            self.send_json(get_site(site_id))
-            return
-        if path == "/api/assets":
-            site_id = required_query(query, "siteId")
-            self.send_json(assets_for(site_id))
-            return
-        if path == "/api/devices":
-            site_id = required_query(query, "siteId")
-            self.send_json(devices_for(site_id))
-            return
-        if path == "/api/rollout-plans":
-            self.send_json(rollout_plans())
-            return
-        if path == "/api/network-profiles":
+        if segments == ["api", "network-profiles"]:
             self.send_json(copy_payload(NETWORK_PROFILES))
             return
-        if path == "/api/site-network-profiles":
-            self.send_json(network_profiles_for_sites())
+        if len(segments) == 3 and segments[:2] == ["api", "network-profiles"]:
+            self.send_json(network_profile(segments[2]))
             return
-        if path.startswith("/api/network-profiles/"):
-            profile_type = path.split("/")[3]
-            self.send_json(network_profile(profile_type))
+        if segments == ["api", "site-network-profiles"]:
+            self.send_json(filter_site_rows(user, network_profiles_for_sites()))
             return
-        if path == "/api/install-points":
+        if segments == ["api", "install-points"]:
             site_id = required_query(query, "siteId")
+            get_site(site_id)
+            require_site_access(user, site_id)
             self.send_json(install_points_for(site_id))
             return
-        if path == "/api/acoustic-labels":
+        if segments == ["api", "acoustic-labels"]:
             self.send_json(copy_payload(ACOUSTIC_LABEL_TAXONOMY))
             return
-        if path == "/api/data-pipelines":
+        if segments == ["api", "data-pipelines"]:
             self.send_json(copy_payload(DATA_PIPELINES))
             return
-        if path == "/api/events":
-            self.send_json(copy_payload(EVENTS))
+        if segments == ["api", "events"]:
+            self.send_json(authorized_events(user))
             return
-        if path == "/api/telemetry":
+        if segments == ["api", "telemetry"]:
             site_id = required_query(query, "siteId")
             asset_id = required_query(query, "assetId")
-            self.send_json({"siteId": site_id, "assetId": asset_id, "points": telemetry_for(site_id, asset_id)})
+            get_site(site_id)
+            require_site_access(user, site_id)
+            require_permission(user, "telemetry:read")
+            self.send_json(
+                {
+                    "siteId": site_id,
+                    "assetId": asset_id,
+                    "units": telemetry_units(),
+                    "points": telemetry_for(site_id, asset_id),
+                }
+            )
             return
-        if path == "/api/export":
+        if segments == ["api", "export"]:
             site_id = required_query(query, "siteId")
             asset_id = required_query(query, "assetId")
+            get_site(site_id)
+            require_site_access(user, site_id)
+            require_permission(user, "export:read")
             self.send_csv(site_id, asset_id)
             return
-        raise ApiError(404, "NOT_FOUND", "요청한 API를 찾을 수 없습니다.")
+        raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
-    def route_post(self, path: str) -> None:
+    def route_post(self, segments: list[str]) -> None:
         payload = self.read_json()
-        if path == "/api/auth/login":
+        if segments == ["api", "auth", "login"]:
             self.send_json(authenticate(payload))
             return
-        if path == "/api/demo/inject-anomaly":
+
+        user = self.require_user()
+
+        if segments == ["api", "sites"]:
+            self.send_json(create_site(user, payload), status=201)
+            return
+        if len(segments) == 3 and segments[:2] == ["api", "sites"]:
+            self.send_json(update_site(user, segments[2], payload))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "deactivate":
+            self.send_json(deactivate_site(user, segments[2]))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "assets":
+            self.send_json(create_asset(user, segments[2], payload), status=201)
+            return
+        if len(segments) == 5 and segments[:2] == ["api", "sites"] and segments[3] == "assets":
+            self.send_json(update_asset(user, segments[2], segments[4], payload))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "devices":
+            self.send_json(create_device(user, segments[2], payload), status=201)
+            return
+        if len(segments) == 3 and segments[:2] == ["api", "devices"]:
+            self.send_json(update_device(user, segments[2], payload))
+            return
+        if segments == ["api", "devices", "quarantine"]:
+            require_permission(user, "device:write")
+            self.send_json(quarantine_unregistered_device(payload), status=201)
+            return
+        if segments == ["api", "demo", "inject-anomaly"]:
+            require_permission(user, "event:write")
             self.send_json(inject_anomaly(payload), status=201)
             return
-        if path.startswith("/api/events/") and path.endswith("/review"):
-            event_id = path.split("/")[3]
-            self.send_json(review_event(event_id, payload))
+        if len(segments) == 4 and segments[:2] == ["api", "events"] and segments[3] == "review":
+            require_permission(user, "event:review")
+            self.send_json(review_event(segments[2], payload))
             return
-        raise ApiError(404, "NOT_FOUND", "요청한 API를 찾을 수 없습니다.")
+        raise ApiError(404, "NOT_FOUND", "API route was not found.")
+
+    def route_delete(self, segments: list[str]) -> None:
+        user = self.require_user()
+        if len(segments) == 3 and segments[:2] == ["api", "sites"]:
+            self.send_json(delete_site(user, segments[2]))
+            return
+        if len(segments) == 5 and segments[:2] == ["api", "sites"] and segments[3] == "assets":
+            self.send_json(delete_asset(user, segments[2], segments[4]))
+            return
+        if len(segments) == 3 and segments[:2] == ["api", "devices"]:
+            self.send_json(delete_device(user, segments[2]))
+            return
+        raise ApiError(404, "NOT_FOUND", "API route was not found.")
+
+    def require_user(self) -> dict[str, Any]:
+        authorization = self.headers.get("authorization", "")
+        if not authorization.startswith("Bearer "):
+            raise ApiError(401, "AUTH_REQUIRED", "A bearer session token is required.")
+        return current_user_for_token(authorization.removeprefix("Bearer ").strip())
 
     def read_json(self) -> dict[str, Any]:
         length_text = self.headers.get("content-length", "0")
         try:
             length = int(length_text)
         except ValueError as exc:
-            raise ApiError(400, "INVALID_CONTENT_LENGTH", "Content-Length가 올바르지 않습니다.") from exc
+            raise ApiError(400, "INVALID_CONTENT_LENGTH", "Content-Length is invalid.") from exc
+        if length < 0:
+            raise ApiError(400, "INVALID_CONTENT_LENGTH", "Content-Length is invalid.")
+        if length > MAX_JSON_BODY_BYTES:
+            raise ApiError(413, "REQUEST_TOO_LARGE", "Request body must be 64KB or less.")
         if length == 0:
             return {}
-        raw = self.rfile.read(length).decode("utf-8")
-        data = json.loads(raw) if raw else {}
+        content_type = self.headers.get("content-type", "").split(";")[0].lower()
+        if content_type != "application/json":
+            raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "Only application/json requests are supported.")
+        data = json.loads(self.rfile.read(length).decode("utf-8"))
         if not isinstance(data, dict):
-            raise ApiError(400, "INVALID_JSON_BODY", "JSON 본문은 객체여야 합니다.")
+            raise ApiError(400, "INVALID_JSON_BODY", "JSON body must be an object.")
         return data
 
     def send_json(self, payload: Any, status: int = 200) -> None:
@@ -218,17 +327,7 @@ class AppHandler(BaseHTTPRequestHandler):
         points = telemetry_for(site_id, asset_id)
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(
-            [
-                "site_id",
-                "asset_id",
-                "minute",
-                "vibration_rms_mm_s",
-                "acoustic_db",
-                "rpm",
-                "anomaly_score",
-            ]
-        )
+        writer.writerow(["site_id", "asset_id", "minute", "vibration_rms_mm_s", "acoustic_db", "rpm", "anomaly_score"])
         for point in points:
             writer.writerow(
                 [
@@ -248,6 +347,8 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("content-disposition", f'attachment; filename="{filename}"')
         self.send_header("cache-control", "no-store")
         self.send_header("access-control-allow-origin", "*")
+        self.send_header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("access-control-allow-headers", "authorization, content-type")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -256,25 +357,39 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("content-type", content_type)
         self.send_header("cache-control", "no-store")
         self.send_header("access-control-allow-origin", "*")
-        self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
-        self.send_header("access-control-allow-headers", "content-type")
+        self.send_header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("access-control-allow-headers", "authorization, content-type")
         self.send_header("content-length", str(content_length))
 
     def log_message(self, fmt: str, *args: object) -> None:
         LOGGER.info("client=%s %s", self.address_string(), fmt % args)
 
 
-def first_query(query: dict[str, list[str]], key: str, default: str) -> str:
-    return query.get(key, [default])[0]
+def authorized_events(user: dict[str, Any]) -> list[dict[str, Any]]:
+    require_permission(user, "event:read")
+    allowed = user.get("allowedSiteIds", [])
+    if "*" in allowed:
+        return copy_payload(EVENTS)
+    return copy_payload([event for event in EVENTS if event["siteId"] in allowed])
+
+
+def filter_site_rows(user: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    allowed = user.get("allowedSiteIds", [])
+    if "*" in allowed:
+        return copy_payload(rows)
+    return copy_payload([row for row in rows if row.get("siteId") in allowed])
+
+
+def path_segments(path: str) -> list[str]:
+    return [segment for segment in path.split("/") if segment]
 
 
 def required_query(query: dict[str, list[str]], key: str) -> str:
     value = query.get(key, [""])[0].strip()
     if not value:
-        raise ApiError(400, "MISSING_QUERY_PARAMETER", f"{key} 값이 필요합니다.")
+        raise ApiError(400, "MISSING_QUERY_PARAMETER", f"{key} is required.")
     return value
 
 
 def create_server(host: str, port: int) -> ThreadingHTTPServer:
     return ThreadingHTTPServer((host, port), AppHandler)
-

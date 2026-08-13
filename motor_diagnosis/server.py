@@ -250,12 +250,12 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "devices":
             self.send_json(create_device(user, segments[2], payload), status=201)
             return
-        if len(segments) == 3 and segments[:2] == ["api", "devices"]:
-            self.send_json(update_device(user, segments[2], payload))
-            return
         if segments == ["api", "devices", "quarantine"]:
             require_permission(user, "device:write")
             self.send_json(quarantine_unregistered_device(payload), status=201)
+            return
+        if len(segments) == 3 and segments[:2] == ["api", "devices"]:
+            self.send_json(update_device(user, segments[2], payload))
             return
         if segments == ["api", "demo", "inject-anomaly"]:
             require_permission(user, "event:write")

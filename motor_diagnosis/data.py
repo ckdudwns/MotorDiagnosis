@@ -551,6 +551,31 @@ def install_points_for(site_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def parse_int_value(field: str, value: Any, default: int = 0) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ApiError(400, "INVALID_NUMBER", f"{field} must be a valid number.") from exc
+
+
+def parse_float_value(field: str, value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ApiError(400, "INVALID_NUMBER", f"{field} must be a valid number.") from exc
+
+
+def parse_int_field(payload: dict[str, Any], *keys: str, default: int = 0) -> int:
+    for key in keys:
+        if key in payload:
+            return parse_int_value(key, payload[key], default)
+    return default
+
+
 def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     require_permission(user, "site:write")
     site_id = required_text(payload, "id").upper()
@@ -578,9 +603,9 @@ def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]
             "onlineDevices": 0,
             "eventCount": 0,
             "assetCount": 0,
-            "signalQuality": int(payload.get("signalQuality") or 70),
+            "signalQuality": parse_int_field(payload, "signalQuality", default=70),
             "rolloutStage": str(payload.get("rolloutStage") or "planned"),
-            "targetAssetCount": int(payload.get("targetAssetCount") or 0),
+            "targetAssetCount": parse_int_field(payload, "targetAssetCount", default=0),
         }
         SITES.append(site)
         return copy_payload(site)
@@ -606,7 +631,7 @@ def update_site(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> 
             site["network"] = network_type
         for key in ("signalQuality", "targetAssetCount"):
             if key in payload:
-                site[key] = int(payload[key])
+                site[key] = parse_int_value(key, payload[key])
         return copy_payload(site)
 
 
@@ -645,8 +670,8 @@ def create_asset(user: dict[str, Any], site_id: str, payload: dict[str, Any]) ->
             "name": required_text(payload, "name"),
             "type": str(payload.get("assetType") or payload.get("type") or "motor"),
             "assetType": str(payload.get("assetType") or payload.get("type") or "motor"),
-            "ratedRpm": int(payload.get("ratedRpm") or payload.get("rpm") or 0),
-            "rpm": int(payload.get("ratedRpm") or payload.get("rpm") or 0),
+            "ratedRpm": parse_int_field(payload, "ratedRpm", "rpm", default=0),
+            "rpm": parse_int_field(payload, "ratedRpm", "rpm", default=0),
             "operationStatus": str(payload.get("operationStatus") or "active"),
             "installLocation": str(payload.get("installLocation") or ""),
             "baselineStatus": baseline["status"],
@@ -677,7 +702,7 @@ def update_asset(user: dict[str, Any], site_id: str, asset_id: str, payload: dic
             asset["assetType"] = str(payload.get("assetType") or payload.get("type"))
             asset["type"] = asset["assetType"]
         if "ratedRpm" in payload or "rpm" in payload:
-            asset["ratedRpm"] = int(payload.get("ratedRpm") or payload.get("rpm"))
+            asset["ratedRpm"] = parse_int_field(payload, "ratedRpm", "rpm", default=asset["ratedRpm"])
             asset["rpm"] = asset["ratedRpm"]
         if "baseline" in payload or any(key.startswith("baseline") for key in payload):
             asset["baseline"] = baseline_payload(payload, asset.get("baseline"))
@@ -720,7 +745,7 @@ def create_device(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -
             "sensorChannels": payload.get("sensorChannels") or ["vibration", "acoustic", "rpm"],
             "firmware": str(payload.get("firmware") or "edge-0.1.0"),
             "certificateStatus": str(payload.get("certificateStatus") or "registered"),
-            "lastSeenSecAgo": int(payload.get("lastSeenSecAgo") or 0),
+            "lastSeenSecAgo": parse_int_field(payload, "lastSeenSecAgo", default=0),
             "health": str(payload.get("health") or "online"),
             "mappingStatus": mapping_status,
             "mappingHistory": [{"assetId": asset_id, "mappedAt": now_text(), "status": mapping_status}],
@@ -739,14 +764,17 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
     with STORE_LOCK:
         device = get_device(device_id)
         require_site_access(user, device["siteId"])
-        if "assetId" in payload:
-            next_asset_id = str(payload["assetId"]).strip().upper()
-            get_asset(device["siteId"], next_asset_id)
-            if device.get("mappingStatus") == "active" and any(
-                item["id"] != device_id and item["assetId"] == next_asset_id and item["mappingStatus"] == "active"
-                for item in DEVICES
-            ):
-                raise ApiError(400, "DEVICE_ASSET_DUPLICATED", "The asset already has an active device mapping.")
+        previous_health = str(device.get("health") or "")
+        previous_asset_id = str(device["assetId"])
+        next_asset_id = str(payload.get("assetId", previous_asset_id)).strip().upper()
+        next_mapping_status = str(payload.get("mappingStatus", device.get("mappingStatus") or "active"))
+        get_asset(device["siteId"], next_asset_id)
+        if next_mapping_status == "active" and any(
+            item["id"] != device_id and item["assetId"] == next_asset_id and item["mappingStatus"] == "active"
+            for item in DEVICES
+        ):
+            raise ApiError(400, "DEVICE_ASSET_DUPLICATED", "The asset already has an active device mapping.")
+        if next_asset_id != previous_asset_id:
             previous_asset_id = device["assetId"]
             device["assetId"] = next_asset_id
             device.setdefault("mappingHistory", []).append(
@@ -754,16 +782,25 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
                     "fromAssetId": previous_asset_id,
                     "assetId": next_asset_id,
                     "mappedAt": now_text(),
-                    "status": device.get("mappingStatus", "active"),
+                    "status": next_mapping_status,
                 }
             )
-        for key in ("sensorChannels", "firmware", "certificateStatus", "lastSeenSecAgo", "health", "mappingStatus"):
+        for key in ("sensorChannels", "firmware", "certificateStatus", "health", "mappingStatus"):
             if key in payload:
                 device[key] = payload[key]
+        if "lastSeenSecAgo" in payload:
+            device["lastSeenSecAgo"] = parse_int_value("lastSeenSecAgo", payload["lastSeenSecAgo"])
         if "replacementReason" in payload:
             device.setdefault("replacementHistory", []).append(
                 {"reason": str(payload["replacementReason"]), "replacedAt": now_text()}
             )
+        next_health = str(device.get("health") or "")
+        if previous_health != next_health:
+            site = get_site(device["siteId"])
+            if previous_health == "online":
+                site["onlineDevices"] = max(0, int(site["onlineDevices"]) - 1)
+            if next_health == "online":
+                site["onlineDevices"] = int(site["onlineDevices"]) + 1
         return copy_payload(device)
 
 
@@ -893,9 +930,9 @@ def baseline_payload(payload: dict[str, Any], existing: dict[str, Any] | None = 
     return {
         "status": str(source.get("status") or "draft"),
         "capturedAt": str(source.get("capturedAt") or ""),
-        "vibrationRmsMmS": float(source.get("vibrationRmsMmS") or 0),
-        "acousticDb": float(source.get("acousticDb") or 0),
-        "sampleCount": int(source.get("sampleCount") or 0),
+        "vibrationRmsMmS": parse_float_value("baseline.vibrationRmsMmS", source.get("vibrationRmsMmS"), 0.0),
+        "acousticDb": parse_float_value("baseline.acousticDb", source.get("acousticDb"), 0.0),
+        "sampleCount": parse_int_value("baseline.sampleCount", source.get("sampleCount"), 0),
     }
 
 

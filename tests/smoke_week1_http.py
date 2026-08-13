@@ -101,11 +101,29 @@ def main() -> None:
             {"id": "DEV-SMOKE", "assetId": created_asset["id"]},
             token=admin_token,
         )
+        quarantined = request_json(
+            port,
+            "/api/devices/quarantine",
+            {"deviceId": "DEV-SMOKE-UNKNOWN", "payload": {"rssi": -89}},
+            token=admin_token,
+        )
 
         expect_error(port, "/api/sites/SITE-999/assets", 404, token=admin_token)
         expect_error(port, "/api/sites/SITE-05", 403, token=operator_token)
         expect_error(port, "/api/sites/SITE-01/not-a-route", 404, token=admin_token)
         expect_error(port, "/api/sites/SITE-01", 405, payload={"name": "bad method"}, token=admin_token, method="PUT")
+        expect_error(
+            port,
+            "/api/sites",
+            400,
+            payload={
+                "id": "SITE-BAD-NUMBER",
+                "code": "BAD-NUMBER",
+                "name": "Bad Number Plant",
+                "signalQuality": "bad",
+            },
+            token=admin_token,
+        )
         expect_error(
             port,
             "/api/events/EV-241/review",
@@ -128,6 +146,7 @@ def main() -> None:
         assert created_site["id"] == "SITE-SMOKE"
         assert created_asset["baseline"]["sampleCount"] == 120
         assert created_device["assetId"] == created_asset["id"]
+        assert quarantined["deviceId"] == "DEV-SMOKE-UNKNOWN"
         print(
             "HTTP smoke OK:",
             f"sites={len(sites)}",

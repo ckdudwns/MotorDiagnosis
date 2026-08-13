@@ -148,9 +148,37 @@ class Week1BackendTest(unittest.TestCase):
             create_device(admin, site["id"], {"id": "DEV-T02", "assetId": asset["id"]})
         self.assertEqual(duplicated_mapping.exception.code, "DEVICE_ASSET_DUPLICATED")
 
+        second_asset = create_asset(
+            admin,
+            site["id"],
+            {
+                "assetCode": "MOT-100",
+                "name": "Second Test Motor",
+                "assetType": "motor",
+                "ratedRpm": 1450,
+            },
+        )
+        inactive_device = create_device(
+            admin,
+            site["id"],
+            {
+                "id": "DEV-T02",
+                "assetId": second_asset["id"],
+                "mappingStatus": "inactive",
+                "health": "offline",
+            },
+        )
+        with self.assertRaises(ApiError) as duplicated_activation:
+            update_device(admin, inactive_device["id"], {"assetId": asset["id"], "mappingStatus": "active"})
+        self.assertEqual(duplicated_activation.exception.code, "DEVICE_ASSET_DUPLICATED")
+
         updated_device = update_device(admin, device["id"], {"firmware": "edge-0.2.0", "replacementReason": "lab swap"})
         self.assertEqual(updated_device["firmware"], "edge-0.2.0")
         self.assertEqual(updated_device["replacementHistory"][0]["reason"], "lab swap")
+
+        self.assertEqual(get_site(site["id"])["onlineDevices"], 1)
+        update_device(admin, device["id"], {"health": "offline"})
+        self.assertEqual(get_site(site["id"])["onlineDevices"], 0)
 
         quarantined = quarantine_unregistered_device({"deviceId": "DEV-UNKNOWN", "payload": {"rssi": -88}})
         self.assertEqual(quarantined["deviceId"], "DEV-UNKNOWN")
@@ -164,8 +192,40 @@ class Week1BackendTest(unittest.TestCase):
         self.assertEqual(blocked_asset_delete.exception.code, "ASSET_HAS_DEVICE")
 
         self.assertTrue(delete_device(admin, device["id"])["deleted"])
+        self.assertTrue(delete_device(admin, inactive_device["id"])["deleted"])
         self.assertTrue(delete_asset(admin, site["id"], asset["id"])["deleted"])
+        self.assertTrue(delete_asset(admin, site["id"], second_asset["id"])["deleted"])
         self.assertTrue(delete_site(admin, site["id"])["deleted"])
+
+    def test_numeric_crud_fields_return_400_for_invalid_input(self) -> None:
+        admin = self.admin_user()
+
+        with self.assertRaises(ApiError) as invalid_site_number:
+            create_site(
+                admin,
+                {
+                    "id": "SITE-NUM",
+                    "code": "TEST-NUM",
+                    "name": "Bad Number Plant",
+                    "networkType": "D",
+                    "signalQuality": "not-a-number",
+                },
+            )
+        self.assertEqual(invalid_site_number.exception.status, 400)
+        self.assertEqual(invalid_site_number.exception.code, "INVALID_NUMBER")
+
+        with self.assertRaises(ApiError) as invalid_asset_number:
+            create_asset(
+                admin,
+                "SITE-01",
+                {
+                    "assetCode": "BAD-NUM",
+                    "name": "Bad Number Asset",
+                    "ratedRpm": "fast",
+                },
+            )
+        self.assertEqual(invalid_asset_number.exception.status, 400)
+        self.assertEqual(invalid_asset_number.exception.code, "INVALID_NUMBER")
 
     def test_unknown_site_is_not_replaced_by_first_site(self) -> None:
         with self.assertRaises(ApiError) as context:

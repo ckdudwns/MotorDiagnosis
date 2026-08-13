@@ -14,13 +14,17 @@ from motor_diagnosis.data import (
     delete_asset,
     delete_device,
     delete_site,
+    get_asset,
+    get_device,
     get_site,
     quarantine_unregistered_device,
     require_site_access,
     reset_runtime_state,
     telemetry_for,
     telemetry_units,
+    update_asset,
     update_device,
+    update_site,
     visible_sites_for_user,
 )
 from motor_diagnosis.server import AppHandler
@@ -226,6 +230,53 @@ class Week1BackendTest(unittest.TestCase):
             )
         self.assertEqual(invalid_asset_number.exception.status, 400)
         self.assertEqual(invalid_asset_number.exception.code, "INVALID_NUMBER")
+
+    def test_failed_updates_do_not_partially_mutate_state(self) -> None:
+        admin = self.admin_user()
+
+        original_site = get_site("SITE-01").copy()
+        with self.assertRaises(ApiError) as invalid_site_update:
+            update_site(admin, "SITE-01", {"name": "Should Not Persist", "signalQuality": "bad"})
+        self.assertEqual(invalid_site_update.exception.code, "INVALID_NUMBER")
+        self.assertEqual(get_site("SITE-01")["name"], original_site["name"])
+        self.assertEqual(get_site("SITE-01")["signalQuality"], original_site["signalQuality"])
+
+        original_asset = get_asset("SITE-01", "SITE-01-MOT-02").copy()
+        with self.assertRaises(ApiError) as invalid_asset_update:
+            update_asset(
+                admin,
+                "SITE-01",
+                "SITE-01-MOT-02",
+                {"name": "Should Not Persist", "ratedRpm": "fast"},
+            )
+        self.assertEqual(invalid_asset_update.exception.code, "INVALID_NUMBER")
+        self.assertEqual(get_asset("SITE-01", "SITE-01-MOT-02")["name"], original_asset["name"])
+        self.assertEqual(get_asset("SITE-01", "SITE-01-MOT-02")["ratedRpm"], original_asset["ratedRpm"])
+
+        site = create_site(admin, {"id": "SITE-ATOM", "code": "TEST-ATOM", "name": "Atomic Plant"})
+        first_asset = create_asset(admin, site["id"], {"assetCode": "MOT-01", "name": "First Motor"})
+        second_asset = create_asset(admin, site["id"], {"assetCode": "MOT-02", "name": "Second Motor"})
+        device = create_device(admin, site["id"], {"id": "DEV-ATOM", "assetId": first_asset["id"]})
+        original_device = get_device(device["id"]).copy()
+        original_history_count = len(original_device["mappingHistory"])
+        original_online_count = get_site(site["id"])["onlineDevices"]
+
+        with self.assertRaises(ApiError) as invalid_device_update:
+            update_device(
+                admin,
+                device["id"],
+                {
+                    "assetId": second_asset["id"],
+                    "health": "offline",
+                    "lastSeenSecAgo": "late",
+                },
+            )
+        self.assertEqual(invalid_device_update.exception.code, "INVALID_NUMBER")
+        current_device = get_device(device["id"])
+        self.assertEqual(current_device["assetId"], original_device["assetId"])
+        self.assertEqual(current_device["health"], original_device["health"])
+        self.assertEqual(len(current_device["mappingHistory"]), original_history_count)
+        self.assertEqual(get_site(site["id"])["onlineDevices"], original_online_count)
 
     def test_unknown_site_is_not_replaced_by_first_site(self) -> None:
         with self.assertRaises(ApiError) as context:

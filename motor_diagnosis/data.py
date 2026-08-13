@@ -616,22 +616,24 @@ def update_site(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> 
     require_site_access(user, site_id)
     with STORE_LOCK:
         site = get_site(site_id)
+        candidate = copy_payload(site)
         if "code" in payload:
             next_code = str(payload["code"]).strip().upper()
             if any(item["id"] != site_id and item["code"] == next_code for item in SITES):
                 raise ApiError(400, "SITE_CODE_DUPLICATED", "Site code is duplicated.")
-            site["code"] = next_code
+            candidate["code"] = next_code
         for key in ("name", "region", "timezone", "priority", "status", "operationStatus", "rolloutStage"):
             if key in payload:
-                site[key] = str(payload[key])
+                candidate[key] = str(payload[key])
         if "networkType" in payload:
             network_type = str(payload["networkType"]).strip().upper()
             network_profile(network_type)
-            site["networkType"] = network_type
-            site["network"] = network_type
+            candidate["networkType"] = network_type
+            candidate["network"] = network_type
         for key in ("signalQuality", "targetAssetCount"):
             if key in payload:
-                site[key] = parse_int_value(key, payload[key])
+                candidate[key] = parse_int_value(key, payload[key])
+        site.update(candidate)
         return copy_payload(site)
 
 
@@ -687,6 +689,7 @@ def update_asset(user: dict[str, Any], site_id: str, asset_id: str, payload: dic
     require_site_access(user, site_id)
     with STORE_LOCK:
         asset = get_asset(site_id, asset_id)
+        candidate = copy_payload(asset)
         if "assetCode" in payload:
             next_code = str(payload["assetCode"]).strip().upper()
             if any(
@@ -694,19 +697,20 @@ def update_asset(user: dict[str, Any], site_id: str, asset_id: str, payload: dic
                 for item in ASSETS
             ):
                 raise ApiError(400, "ASSET_CODE_DUPLICATED", "Asset code must be unique within a site.")
-            asset["assetCode"] = next_code
+            candidate["assetCode"] = next_code
         for key in ("name", "operationStatus", "installLocation", "baselineStatus"):
             if key in payload:
-                asset[key] = str(payload[key])
+                candidate[key] = str(payload[key])
         if "assetType" in payload or "type" in payload:
-            asset["assetType"] = str(payload.get("assetType") or payload.get("type"))
-            asset["type"] = asset["assetType"]
+            candidate["assetType"] = str(payload.get("assetType") or payload.get("type"))
+            candidate["type"] = candidate["assetType"]
         if "ratedRpm" in payload or "rpm" in payload:
-            asset["ratedRpm"] = parse_int_field(payload, "ratedRpm", "rpm", default=asset["ratedRpm"])
-            asset["rpm"] = asset["ratedRpm"]
+            candidate["ratedRpm"] = parse_int_field(payload, "ratedRpm", "rpm", default=candidate["ratedRpm"])
+            candidate["rpm"] = candidate["ratedRpm"]
         if "baseline" in payload or any(key.startswith("baseline") for key in payload):
-            asset["baseline"] = baseline_payload(payload, asset.get("baseline"))
-            asset["baselineStatus"] = asset["baseline"]["status"]
+            candidate["baseline"] = baseline_payload(payload, candidate.get("baseline"))
+            candidate["baselineStatus"] = candidate["baseline"]["status"]
+        asset.update(candidate)
         return copy_payload(asset)
 
 
@@ -764,6 +768,7 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
     with STORE_LOCK:
         device = get_device(device_id)
         require_site_access(user, device["siteId"])
+        candidate = copy_payload(device)
         previous_health = str(device.get("health") or "")
         previous_asset_id = str(device["assetId"])
         next_asset_id = str(payload.get("assetId", previous_asset_id)).strip().upper()
@@ -776,8 +781,8 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
             raise ApiError(400, "DEVICE_ASSET_DUPLICATED", "The asset already has an active device mapping.")
         if next_asset_id != previous_asset_id:
             previous_asset_id = device["assetId"]
-            device["assetId"] = next_asset_id
-            device.setdefault("mappingHistory", []).append(
+            candidate["assetId"] = next_asset_id
+            candidate.setdefault("mappingHistory", []).append(
                 {
                     "fromAssetId": previous_asset_id,
                     "assetId": next_asset_id,
@@ -787,14 +792,15 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
             )
         for key in ("sensorChannels", "firmware", "certificateStatus", "health", "mappingStatus"):
             if key in payload:
-                device[key] = payload[key]
+                candidate[key] = payload[key]
         if "lastSeenSecAgo" in payload:
-            device["lastSeenSecAgo"] = parse_int_value("lastSeenSecAgo", payload["lastSeenSecAgo"])
+            candidate["lastSeenSecAgo"] = parse_int_value("lastSeenSecAgo", payload["lastSeenSecAgo"])
         if "replacementReason" in payload:
-            device.setdefault("replacementHistory", []).append(
+            candidate.setdefault("replacementHistory", []).append(
                 {"reason": str(payload["replacementReason"]), "replacedAt": now_text()}
             )
-        next_health = str(device.get("health") or "")
+        next_health = str(candidate.get("health") or "")
+        device.update(candidate)
         if previous_health != next_health:
             site = get_site(device["siteId"])
             if previous_health == "online":

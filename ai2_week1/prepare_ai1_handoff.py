@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from telemetry_payload import get_nullable_float, to_external_payload
+
 
 if sys.version_info[:2] != (3, 12):
     raise SystemExit(
@@ -69,13 +71,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_float(value: str, field: str, row_number: int) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"Row {row_number}: {field} must be numeric") from error
-
-
 def read_and_validate_rows(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         raise FileNotFoundError(f"AI-1 handoff file not found: {path}")
@@ -99,19 +94,24 @@ def read_and_validate_rows(path: Path) -> list[dict[str, str]]:
             )
         if row["is_synthetic"].lower() != "true":
             raise ValueError(f"Row {row_number}: is_synthetic must be True")
+        for field in ("vibration_rms_raw", "vibration_peak_hz"):
+            try:
+                value = get_nullable_float(row, field, field)
+            except ValueError as error:
+                raise ValueError(f"Row {row_number}: {error}") from error
+            if value is None:
+                raise ValueError(f"Row {row_number}: {field} is required")
         for field in (
             "rpm",
-            "vibration_rms_raw",
-            "vibration_peak_hz",
             "acoustic_rms_raw",
             "acoustic_peak_hz",
+            "vibration_rms_mm_s",
+            "acoustic_db",
         ):
-            parse_float(row[field], field, row_number)
-        if row.get("vibration_rms_mm_s") or row.get("acoustic_db"):
-            raise ValueError(
-                f"Row {row_number}: calibrated mm/s or dB must not be mixed "
-                "into this synthetic raw-data replay"
-            )
+            try:
+                get_nullable_float(row, field, field)
+            except ValueError as error:
+                raise ValueError(f"Row {row_number}: {error}") from error
     return rows
 
 
@@ -151,25 +151,29 @@ def build_replay_record(
     device_map: dict[str, str],
 ) -> dict[str, Any]:
     """Adapt internal snake_case CSV data to the external camelCase payload boundary."""
-    return {
-        "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
-        "sequence": sequence,
-        "siteId": site_id,
-        "assetId": row["asset_id"],
-        "deviceId": device_map[row["asset_id"]],
-        "rpm": float(row["rpm"]),
-        "vibrationRmsRaw": float(row["vibration_rms_raw"]),
-        "vibrationPeakHz": float(row["vibration_peak_hz"]),
-        "acousticRmsRaw": float(row["acoustic_rms_raw"]),
-        "acousticPeakHz": float(row["acoustic_peak_hz"]),
-        "scenarioLabel": row["scenario_label"],
-        "knownVibrationLabel": row["known_vibration_label"],
-        "knownAcousticLabel": row["known_acoustic_label"],
-        "source": row["source"],
-        "isSynthetic": True,
-        "vibrationUnitNote": row["vibration_unit_note"],
-        "acousticUnitNote": row["acoustic_unit_note"],
-    }
+    return to_external_payload(
+        {
+            "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+            "sequence": sequence,
+            "site_id": site_id,
+            "asset_id": row["asset_id"],
+            "device_id": device_map[row["asset_id"]],
+            "rpm": row["rpm"],
+            "vibration_rms_raw": row["vibration_rms_raw"],
+            "vibration_rms_mm_s": row.get("vibration_rms_mm_s"),
+            "vibration_peak_hz": row["vibration_peak_hz"],
+            "acoustic_rms_raw": row["acoustic_rms_raw"],
+            "acoustic_db": row.get("acoustic_db"),
+            "acoustic_peak_hz": row["acoustic_peak_hz"],
+            "scenario_label": row["scenario_label"],
+            "known_vibration_label": row["known_vibration_label"],
+            "known_acoustic_label": row["known_acoustic_label"],
+            "source": row["source"],
+            "is_synthetic": row["is_synthetic"],
+            "vibration_unit_note": row["vibration_unit_note"],
+            "acoustic_unit_note": row["acoustic_unit_note"],
+        }
+    )
 
 
 def write_csv(path: Path, rows: list[dict[str, str]]) -> None:

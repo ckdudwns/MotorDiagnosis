@@ -25,6 +25,8 @@ if sys.version_info[:2] != (3, 12):
 import numpy as np
 from scipy.io import loadmat
 
+from telemetry_payload import to_external_payload
+
 
 FILE_LABELS = {
     "97": ("normal", "normal"),
@@ -36,6 +38,7 @@ FILE_LABELS = {
 FEATURE_FIELDS = [
     "timestamp",
     "sequence",
+    "site_id",
     "device_id",
     "asset_id",
     "source_file",
@@ -45,6 +48,9 @@ FEATURE_FIELDS = [
     "rpm",
     "known_condition",
     "scenario_label",
+    "is_synthetic",
+    "vibration_unit_note",
+    "acoustic_unit_note",
     "vibration_rms_raw",
     "vibration_std_raw",
     "vibration_kurtosis",
@@ -65,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-seconds", type=float, default=2.0)
     parser.add_argument("--device-id", default="demo-motor-001")
     parser.add_argument("--asset-id", default="demo-pump-001")
+    parser.add_argument("--site-id", default="SYN-SITE-01")
     parser.add_argument("--start-at", default="2026-08-24T09:00:00+09:00")
     return parser.parse_args()
 
@@ -172,6 +179,7 @@ def main() -> None:
                 .isoformat()
                 .replace("+00:00", "Z"),
                 "sequence": sequence,
+                "site_id": args.site_id,
                 "device_id": args.device_id,
                 "asset_id": args.asset_id,
                 "source_file": path.name,
@@ -181,6 +189,9 @@ def main() -> None:
                 "rpm": round(rpm, 3) if rpm is not None else "",
                 "known_condition": condition,
                 "scenario_label": scenario,
+                "is_synthetic": "true",
+                "vibration_unit_note": "raw accelerometer output",
+                "acoustic_unit_note": "",
                 # Audio is deliberately absent until MIMII records are joined.
                 "acoustic_rms_raw": "",
                 "acoustic_peak_hz": "",
@@ -198,7 +209,8 @@ def main() -> None:
     jsonl_path = args.output_dir / "telemetry_replay.jsonl"
     with jsonl_path.open("w", encoding="utf-8") as handle:
         for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            payload = to_external_payload(record)
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
     manifest_path = args.output_dir / "dataset_manifest.json"
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(

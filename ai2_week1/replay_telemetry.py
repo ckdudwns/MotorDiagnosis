@@ -11,6 +11,8 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from telemetry_payload import to_external_payload
+
 if sys.version_info[:2] != (3, 12):
     raise SystemExit(
         "Python 3.12.x is required by the team development standard. "
@@ -54,8 +56,9 @@ def main() -> None:
     if args.limit:
         rows = rows[: args.limit]
     for index, row in enumerate(rows, start=1):
+        payload = to_external_payload(row)
         if args.send:
-            body = json.dumps(row).encode("utf-8")
+            body = json.dumps(payload).encode("utf-8")
             request = Request(
                 args.endpoint,
                 data=body,
@@ -66,14 +69,14 @@ def main() -> None:
                 with urlopen(request, timeout=10) as response:
                     print(
                         f"[{index}/{len(rows)}] {response.status} "
-                        f"seq={row['sequence']} {row['scenario_label']}"
+                        f"seq={payload['sequence']} {payload['scenarioLabel']}"
                     )
             except (HTTPError, URLError) as exc:
                 raise SystemExit(
-                    f"POST failed at sequence {row['sequence']}: {exc}"
+                    f"POST failed at sequence {payload['sequence']}: {exc}"
                 ) from exc
         else:
-            print(json.dumps(row, ensure_ascii=False))
+            print(json.dumps(payload, ensure_ascii=False))
         if index < len(rows) and args.interval_seconds:
             time.sleep(args.interval_seconds)
 

@@ -48,6 +48,7 @@ from motor_diagnosis.mqtt_service import (
     MqttRetryQueue,
     configure_mqtt_callbacks,
     forward_mqtt_message,
+    is_permanent_ingest_error,
     process_mqtt_message,
     report_mqtt_status,
     subscription_is_granted,
@@ -96,11 +97,12 @@ class Week2BackendTest(unittest.TestCase):
         return current_user_for_token(login["session"]["token"])
 
     def test_ingest_is_idempotent_and_query_uses_only_stored_raw_data(self) -> None:
+        payload = telemetry_payload()
         accepted, accepted_status = ingest_telemetry(
-            self.principal, telemetry_payload()
+            self.principal, payload
         )
         duplicate, duplicate_status = ingest_telemetry(
-            self.principal, telemetry_payload()
+            self.principal, payload
         )
 
         self.assertEqual(accepted_status, 201)
@@ -119,8 +121,9 @@ class Week2BackendTest(unittest.TestCase):
             "vibrationRmsMmS", telemetry_units("SITE-01", "SITE-01-GEN-01")
         )
 
+        conflict_payload = {**payload, "rpm": 1801.0}
         with self.assertRaises(ApiError) as conflict:
-            ingest_telemetry(self.principal, telemetry_payload(rpm=1801.0))
+            ingest_telemetry(self.principal, conflict_payload)
         self.assertEqual(conflict.exception.status, 409)
         self.assertEqual(conflict.exception.code, "SEQUENCE_CONFLICT")
         self.assertEqual(len(TELEMETRY_RECORDS), 1)
@@ -385,6 +388,38 @@ class Week2BackendTest(unittest.TestCase):
         self.assertEqual(result, "quarantined")
         self.assertEqual(client.ack_calls, [(7, 1), (9, 2)])
 
+        for status, code in (
+            (401, "AUTH_REQUIRED"),
+            (403, "TELEMETRY_INGEST_FORBIDDEN"),
+            (404, "NOT_FOUND"),
+            (413, "REQUEST_TOO_LARGE"),
+        ):
+            with self.subTest(status=status, code=code):
+                message.mid += 1
+                with patch(
+                    "motor_diagnosis.mqtt_service.forward_mqtt_message",
+                    side_effect=MqttBridgeError(status, code, "not quarantined"),
+                ):
+                    result = process_mqtt_message(
+                        client,
+                        message,
+                        endpoint="http://backend/api/telemetry/ingest",
+                        token="token",
+                    )
+                self.assertEqual(result, "retry")
+                self.assertEqual(client.ack_calls, [(7, 1), (9, 2)])
+
+        for status, code in (
+            (400, "INVALID_TELEMETRY_PAYLOAD"),
+            (404, "DEVICE_NOT_FOUND"),
+            (409, "DEVICE_MAPPING_MISMATCH"),
+            (409, "SEQUENCE_CONFLICT"),
+        ):
+            with self.subTest(quarantined_status=status, quarantined_code=code):
+                self.assertTrue(
+                    is_permanent_ingest_error(MqttBridgeError(status, code, "stored"))
+                )
+
     def test_mqtt_retry_queue_performs_a_second_http_delivery_before_ack(self) -> None:
         class FakeClient:
             def __init__(self) -> None:
@@ -469,9 +504,13 @@ class Week2BackendTest(unittest.TestCase):
             quarantine_endpoint="http://backend/api/telemetry/quarantine",
             ingest_token="token",
         )
-        self.assertTrue(subscription_is_granted([0, 1]))
-        self.assertFalse(subscription_is_granted([128]))
-        self.assertFalse(subscription_is_granted([]))
+        self.assertTrue(subscription_is_granted([1], requested_qos=1))
+        self.assertTrue(subscription_is_granted([2], requested_qos=1))
+        self.assertFalse(subscription_is_granted([0], requested_qos=1))
+        self.assertTrue(subscription_is_granted([2], requested_qos=2))
+        self.assertFalse(subscription_is_granted([1], requested_qos=2))
+        self.assertFalse(subscription_is_granted([128], requested_qos=1))
+        self.assertFalse(subscription_is_granted([], requested_qos=1))
 
         with tempfile.TemporaryDirectory() as directory:
             retry_queue = MqttRetryQueue(
@@ -502,6 +541,17 @@ class Week2BackendTest(unittest.TestCase):
                 self.assertEqual(
                     report.call_args.kwargs["error_code"],
                     "MQTT_SUBSCRIBE_REJECTED",
+                )
+
+                report.reset_mock()
+                client.on_connect(client, None, None, 0, None)
+                self.assertEqual(pending, {33})
+                report.assert_not_called()
+                client.on_subscribe(client, None, 33, [0], None)
+                self.assertEqual(report.call_args.kwargs["status"], "degraded")
+                self.assertEqual(
+                    report.call_args.kwargs["error_code"],
+                    "MQTT_SUBSCRIBE_QOS_DOWNGRADED",
                 )
 
 

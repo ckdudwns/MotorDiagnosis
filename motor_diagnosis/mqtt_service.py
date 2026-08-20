@@ -19,6 +19,18 @@ from urllib.request import Request, urlopen
 
 LOGGER = logging.getLogger("motor_diagnosis.mqtt")
 RETRYABLE_HTTP_STATUSES = {408, 425, 429}
+BACKEND_QUARANTINED_INGEST_ERRORS = frozenset(
+    {
+        (400, "INVALID_TELEMETRY_PAYLOAD"),
+        (400, "INVALID_RAW_ONLY_FIELD"),
+        (404, "SITE_NOT_FOUND"),
+        (404, "ASSET_NOT_FOUND"),
+        (404, "DEVICE_NOT_FOUND"),
+        (409, "DEVICE_MAPPING_MISMATCH"),
+        (409, "DEVICE_CERTIFICATE_NOT_ACTIVE"),
+        (409, "SEQUENCE_CONFLICT"),
+    }
+)
 
 
 @dataclass
@@ -183,10 +195,12 @@ def quarantine_local_mqtt_message(
 
 
 def is_permanent_ingest_error(error: MqttBridgeError) -> bool:
-    return (
-        400 <= error.status < 500
-        and error.status not in RETRYABLE_HTTP_STATUSES
-    )
+    if error.local:
+        return (
+            400 <= error.status < 500
+            and error.status not in RETRYABLE_HTTP_STATUSES
+        )
+    return (error.status, error.code) in BACKEND_QUARANTINED_INGEST_ERRORS
 
 
 def acknowledge_message(client: Any, message: Any) -> bool:
@@ -675,10 +689,30 @@ def mqtt_reason_failed(reason_code: Any) -> bool:
         return True
 
 
-def subscription_is_granted(reason_code_list: Any) -> bool:
+def mqtt_reason_value(reason_code: Any) -> int | None:
+    value = getattr(reason_code, "value", reason_code)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def subscription_reason_meets_qos(reason_code: Any, requested_qos: int) -> bool:
+    granted_qos = mqtt_reason_value(reason_code)
+    if granted_qos is None:
+        return False
+    return (
+        not mqtt_reason_failed(reason_code)
+        and granted_qos in {0, 1, 2}
+        and granted_qos >= requested_qos
+    )
+
+
+def subscription_is_granted(reason_code_list: Any, requested_qos: int) -> bool:
     reason_codes = list(reason_code_list or [])
     return bool(reason_codes) and all(
-        not mqtt_reason_failed(reason_code) for reason_code in reason_codes
+        subscription_reason_meets_qos(reason_code, requested_qos)
+        for reason_code in reason_codes
     )
 
 
@@ -723,23 +757,45 @@ def configure_mqtt_callbacks(
         _client, _userdata, mid, reason_code_list, _properties
     ) -> None:
         pending_subscriptions.discard(int(mid))
-        if not subscription_is_granted(reason_code_list):
-            reasons = ", ".join(str(code) for code in (reason_code_list or []))
-            LOGGER.error(
-                "mqtt_suback_rejected topic=%s mid=%s reasons=%s",
-                args.topic,
-                mid,
-                reasons or "missing",
+        reason_codes = list(reason_code_list or [])
+        if not subscription_is_granted(reason_codes, args.qos):
+            reasons = ", ".join(str(code) for code in reason_codes)
+            broker_rejected = not reason_codes or any(
+                mqtt_reason_failed(code) for code in reason_codes
             )
+            if broker_rejected:
+                error_code = "MQTT_SUBSCRIBE_REJECTED"
+                detail = (
+                    "Broker rejected subscription: "
+                    f"{reasons or 'missing SUBACK code'}"
+                )
+                LOGGER.error(
+                    "mqtt_suback_rejected topic=%s mid=%s reasons=%s",
+                    args.topic,
+                    mid,
+                    reasons or "missing",
+                )
+            else:
+                granted_qos = [mqtt_reason_value(code) for code in reason_codes]
+                error_code = "MQTT_SUBSCRIBE_QOS_DOWNGRADED"
+                detail = (
+                    f"Broker granted QoS {granted_qos} below requested "
+                    f"QoS {args.qos}."
+                )
+                LOGGER.error(
+                    "mqtt_suback_qos_downgraded topic=%s mid=%s "
+                    "requested=%s granted=%s",
+                    args.topic,
+                    mid,
+                    args.qos,
+                    granted_qos,
+                )
             report_mqtt_status_safely(
                 endpoint=args.health_endpoint,
                 token=args.ingest_token,
                 status="degraded",
-                detail=(
-                    "Broker rejected subscription: "
-                    f"{reasons or 'missing SUBACK code'}"
-                ),
-                error_code="MQTT_SUBSCRIBE_REJECTED",
+                detail=detail,
+                error_code=error_code,
             )
             return
         report_mqtt_status_safely(

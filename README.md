@@ -33,9 +33,11 @@ MQTT/TLS 수집기는 별도 프로세스의 메모리에 저장하지 않고 �
 
 QoS 1/2 메시지는 HTTP 처리가 끝난 뒤에만 수동 ACK한다. 일시적인 네트워크·5xx 오류와
 `408`, `425`, `429` 응답은 SQLite 재시도 큐(`output/mqtt_retry.sqlite3`)에 보존하며,
-작업자가 지수 백오프로 실제 HTTP 전송에 성공한 뒤 ACK한다. 잘못된 MQTT JSON·토픽은
+작업자가 지수 백오프로 실제 HTTP 전송에 성공한 뒤 ACK한다. 인증·권한·경로·본문 크기
+오류도 ACK하지 않으며, 백엔드 격리가 보장된 수집 validation 오류만 ACK한다. 잘못된
+MQTT JSON·토픽은
 `POST /api/telemetry/quarantine`에 원문과 오류 사유가 저장된 뒤 ACK된다. 브로커 상태는
-`POST /api/health/dependencies/mqtt`에 보고하되, 구독 요청 직후가 아니라 SUBACK 승인 후에만
+`POST /api/health/dependencies/mqtt`에 보고하되, SUBACK 승인 QoS가 요청 QoS 이상일 때만
 `healthy`로 전환한다.
 
 ```bash

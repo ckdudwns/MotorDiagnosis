@@ -32,15 +32,19 @@ MQTT/TLS 수집기는 별도 프로세스의 메모리에 저장하지 않고 �
 거쳐 `GET /api/telemetry`와 대시보드에서 동일하게 조회된다.
 
 QoS 1/2 메시지는 HTTP 처리가 끝난 뒤에만 수동 ACK한다. 일시적인 네트워크·5xx 오류와
-`408`, `425`, `429` 응답은 ACK하지 않아 브로커 재전송 대상으로 남기고, 백엔드가 이미
-격리한 영구적인 4xx 오류만 ACK하여 반복 수신을 막는다. 브로커 연결·해제 상태는 내부
-`POST /api/health/dependencies/mqtt` 경로로 보고되어 상태 조회 API에 반영된다.
+`408`, `425`, `429` 응답은 SQLite 재시도 큐(`output/mqtt_retry.sqlite3`)에 보존하며,
+작업자가 지수 백오프로 실제 HTTP 전송에 성공한 뒤 ACK한다. 잘못된 MQTT JSON·토픽은
+`POST /api/telemetry/quarantine`에 원문과 오류 사유가 저장된 뒤 ACK된다. 브로커 상태는
+`POST /api/health/dependencies/mqtt`에 보고하되, 구독 요청 직후가 아니라 SUBACK 승인 후에만
+`healthy`로 전환한다.
 
 ```bash
 python -m motor_diagnosis.mqtt_service \
   --host mqtt.example.com \
   --ca-cert ca.pem \
-  --ingest-endpoint http://127.0.0.1:8787/api/telemetry/ingest
+  --ingest-endpoint http://127.0.0.1:8787/api/telemetry/ingest \
+  --quarantine-endpoint http://127.0.0.1:8787/api/telemetry/quarantine \
+  --retry-db output/mqtt_retry.sqlite3
 ```
 
 ## 개발 환경

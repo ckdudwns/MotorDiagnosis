@@ -45,6 +45,7 @@ from .data import (
     logout,
     network_profile,
     network_profiles_for_sites,
+    quarantine_mqtt_message,
     quarantine_unregistered_device,
     report_service_dependency,
     require_permission,
@@ -393,6 +394,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 telemetry_principal_for_token(self.bearer_token()), payload
             )
             self.send_json(result, status=status)
+            return
+        if segments == ["api", "telemetry", "quarantine"]:
+            self.send_json(
+                quarantine_mqtt_message(
+                    telemetry_principal_for_token(self.bearer_token()), payload
+                ),
+                status=201,
+            )
             return
         if segments == ["api", "health", "dependencies", "mqtt"]:
             self.send_json(

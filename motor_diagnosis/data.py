@@ -290,7 +290,11 @@ TELEMETRY_SERVICE_TOKENS = {
     "demo-mqtt-ingest-token": {
         "id": "service-mqtt-collector",
         "type": "service",
-        "permissions": ["telemetry:ingest", "service-health:write"],
+        "permissions": [
+            "telemetry:ingest",
+            "telemetry:quarantine",
+            "service-health:write",
+        ],
         "allowedDeviceIds": ["*"],
         "allowedDependencyIds": ["mqtt"],
     },
@@ -734,6 +738,7 @@ TELEMETRY_METRICS: dict[str, int | float | str | None] = {
     "accepted": 0,
     "duplicates": 0,
     "rejected": 0,
+    "localRejected": 0,
     "conflicts": 0,
     "lastReceivedAt": None,
     "lastLatencyMs": 0.0,
@@ -761,6 +766,7 @@ def reset_runtime_state() -> None:
                 "accepted": 0,
                 "duplicates": 0,
                 "rejected": 0,
+                "localRejected": 0,
                 "conflicts": 0,
                 "lastReceivedAt": None,
                 "lastLatencyMs": 0.0,
@@ -2278,6 +2284,57 @@ def quarantine_telemetry_error(payload: dict[str, Any], error: ApiError) -> None
             "payload": copy_payload(payload),
         }
     )
+
+
+def quarantine_mqtt_message(
+    principal: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    permissions = set(principal.get("permissions", []))
+    if "*" not in permissions and "telemetry:quarantine" not in permissions:
+        raise ApiError(
+            403,
+            "TELEMETRY_QUARANTINE_FORBIDDEN",
+            "The token cannot quarantine MQTT messages.",
+        )
+
+    topic = required_text(payload, "topic")
+    reason = required_text(payload, "reason")
+    message = required_text(payload, "message")
+    raw_payload = payload.get("payload")
+    if not isinstance(raw_payload, str):
+        raise ApiError(
+            400,
+            "INVALID_QUARANTINE_PAYLOAD",
+            "payload must contain the original MQTT message as text.",
+        )
+
+    topic_parts = [part for part in topic.strip("/").split("/") if part]
+    device_id = None
+    if (
+        len(topic_parts) == 3
+        and topic_parts[0] == "devices"
+        and topic_parts[2] == "telemetry"
+    ):
+        device_id = topic_parts[1].strip().upper() or None
+
+    with STORE_LOCK:
+        TELEMETRY_METRICS["requests"] = int(TELEMETRY_METRICS["requests"]) + 1
+        TELEMETRY_METRICS["rejected"] = int(TELEMETRY_METRICS["rejected"]) + 1
+        TELEMETRY_METRICS["localRejected"] = (
+            int(TELEMETRY_METRICS["localRejected"]) + 1
+        )
+        record = {
+            "id": f"Q-MQTT-{len(QUARANTINED_DEVICE_MESSAGES) + 1:04d}",
+            "source": "mqtt_bridge",
+            "deviceId": device_id,
+            "topic": topic,
+            "reason": reason,
+            "message": message,
+            "receivedAt": now_iso(),
+            "payload": raw_payload,
+        }
+        QUARANTINED_DEVICE_MESSAGES.append(record)
+        return copy_payload(record)
 
 
 def update_ingest_dependency(

@@ -98,12 +98,8 @@ class Week2BackendTest(unittest.TestCase):
 
     def test_ingest_is_idempotent_and_query_uses_only_stored_raw_data(self) -> None:
         payload = telemetry_payload()
-        accepted, accepted_status = ingest_telemetry(
-            self.principal, payload
-        )
-        duplicate, duplicate_status = ingest_telemetry(
-            self.principal, payload
-        )
+        accepted, accepted_status = ingest_telemetry(self.principal, payload)
+        duplicate, duplicate_status = ingest_telemetry(self.principal, payload)
 
         self.assertEqual(accepted_status, 201)
         self.assertFalse(accepted["duplicate"])
@@ -286,9 +282,9 @@ class Week2BackendTest(unittest.TestCase):
                 self.assertEqual(context.exception.status, 400)
                 self.assertEqual(context.exception.code, "INVALID_NUMBER")
         self.assertEqual(
-            connectivity_tests_for_device(
-                admin, "DEV-01-GEN-01", page=1, size=10
-            )["total"],
+            connectivity_tests_for_device(admin, "DEV-01-GEN-01", page=1, size=10)[
+                "total"
+            ],
             1,
         )
 
@@ -310,10 +306,7 @@ class Week2BackendTest(unittest.TestCase):
         still_degraded = service_health_dependencies()
         self.assertEqual(still_degraded["status"], "degraded")
         self.assertFalse(
-            any(
-                event["status"] == "recovered"
-                for event in still_degraded["events"]
-            )
+            any(event["status"] == "recovered" for event in still_degraded["events"])
         )
 
         for sequence in range(4, 12):
@@ -781,9 +774,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
 
         client = AckClient()
         endpoint = f"http://127.0.0.1:{self.port}/api/telemetry/ingest"
-        quarantine_endpoint = (
-            f"http://127.0.0.1:{self.port}/api/telemetry/quarantine"
-        )
+        quarantine_endpoint = f"http://127.0.0.1:{self.port}/api/telemetry/quarantine"
         malformed = SimpleNamespace(
             topic="devices/DEV-01-GEN-01/telemetry",
             payload=b"{not-json",
@@ -839,9 +830,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
             },
         )
         self.assertEqual(forbidden_status, 403)
-        self.assertEqual(
-            forbidden["error"]["code"], "TELEMETRY_QUARANTINE_FORBIDDEN"
-        )
+        self.assertEqual(forbidden["error"]["code"], "TELEMETRY_QUARANTINE_FORBIDDEN")
 
     def test_actual_ai2_replay_output_is_accepted_and_queryable(self) -> None:
         source_asset_id = "SYN-ASSET-01"
@@ -901,9 +890,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
         self.assertEqual([point["sequence"] for point in telemetry["points"]], [41])
 
     def test_mqtt_connection_status_is_reflected_in_dependency_health(self) -> None:
-        endpoint = (
-            f"http://127.0.0.1:{self.port}/api/health/dependencies/mqtt"
-        )
+        endpoint = f"http://127.0.0.1:{self.port}/api/health/dependencies/mqtt"
         failed = report_mqtt_status(
             endpoint,
             "demo-mqtt-ingest-token",
@@ -916,9 +903,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
         self.assertEqual(failed["errorRatePct"], 100.0)
 
         system_token = self.login("system", "system123")
-        status, health = self.request(
-            "/api/health/dependencies", token=system_token
-        )
+        status, health = self.request("/api/health/dependencies", token=system_token)
         self.assertEqual(status, 200)
         self.assertEqual(health["status"], "degraded")
         mqtt = next(item for item in health["dependencies"] if item["id"] == "mqtt")
@@ -934,9 +919,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
         self.assertEqual(recovered["status"], "healthy")
         self.assertIsNotNone(recovered["lastRecoveryAt"])
         self.assertEqual(recovered["errorRatePct"], 50.0)
-        status, health = self.request(
-            "/api/health/dependencies", token=system_token
-        )
+        status, health = self.request("/api/health/dependencies", token=system_token)
         self.assertEqual(status, 200)
         self.assertEqual(health["status"], "healthy")
         self.assertEqual(health["events"][-1]["status"], "recovered")
@@ -948,9 +931,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
             payload={"status": "degraded"},
         )
         self.assertEqual(forbidden_status, 403)
-        self.assertEqual(
-            forbidden["error"]["code"], "SERVICE_HEALTH_WRITE_FORBIDDEN"
-        )
+        self.assertEqual(forbidden["error"]["code"], "SERVICE_HEALTH_WRITE_FORBIDDEN")
 
 
 if __name__ == "__main__":

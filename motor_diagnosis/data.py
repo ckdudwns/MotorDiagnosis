@@ -2320,9 +2320,7 @@ def quarantine_mqtt_message(
     with STORE_LOCK:
         TELEMETRY_METRICS["requests"] = int(TELEMETRY_METRICS["requests"]) + 1
         TELEMETRY_METRICS["rejected"] = int(TELEMETRY_METRICS["rejected"]) + 1
-        TELEMETRY_METRICS["localRejected"] = (
-            int(TELEMETRY_METRICS["localRejected"]) + 1
-        )
+        TELEMETRY_METRICS["localRejected"] = int(TELEMETRY_METRICS["localRejected"]) + 1
         record = {
             "id": f"Q-MQTT-{len(QUARANTINED_DEVICE_MESSAGES) + 1:04d}",
             "source": "mqtt_bridge",
@@ -2824,9 +2822,9 @@ def report_service_dependency(
             )
         previous_status = str(dependency["status"])
         checked_at = now_iso()
-        dependency["statusReportCount"] = int(
-            dependency.get("statusReportCount", 0)
-        ) + 1
+        dependency["statusReportCount"] = (
+            int(dependency.get("statusReportCount", 0)) + 1
+        )
         if status == "degraded":
             dependency["failureCount"] = int(dependency.get("failureCount", 0)) + 1
         dependency["errorRatePct"] = round(

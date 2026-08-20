@@ -116,11 +116,7 @@ def post_json(
     except HTTPError as exc:
         try:
             error_body = json.loads(exc.read().decode("utf-8"))
-            error = (
-                error_body.get("error", {})
-                if isinstance(error_body, dict)
-                else {}
-            )
+            error = error_body.get("error", {}) if isinstance(error_body, dict) else {}
             code = str(error.get("code") or "INGEST_REJECTED")
             message_text = str(error.get("message") or exc.reason)
         except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
@@ -196,10 +192,7 @@ def quarantine_local_mqtt_message(
 
 def is_permanent_ingest_error(error: MqttBridgeError) -> bool:
     if error.local:
-        return (
-            400 <= error.status < 500
-            and error.status not in RETRYABLE_HTTP_STATUSES
-        )
+        return 400 <= error.status < 500 and error.status not in RETRYABLE_HTTP_STATUSES
     return (error.status, error.code) in BACKEND_QUARANTINED_INGEST_ERRORS
 
 
@@ -575,9 +568,7 @@ def process_mqtt_message(
                 error.message,
             )
             return "quarantined" if acknowledged else "retry"
-        queued = bool(
-            retry_queue and retry_queue.enqueue(client, message, error)
-        )
+        queued = bool(retry_queue and retry_queue.enqueue(client, message, error))
         LOGGER.warning(
             "mqtt_ingest_retry topic=%s status=%s code=%s message=%s queued=%s",
             message.topic,
@@ -753,9 +744,7 @@ def configure_mqtt_callbacks(
             mid,
         )
 
-    def on_subscribe(
-        _client, _userdata, mid, reason_code_list, _properties
-    ) -> None:
+    def on_subscribe(_client, _userdata, mid, reason_code_list, _properties) -> None:
         pending_subscriptions.discard(int(mid))
         reason_codes = list(reason_code_list or [])
         if not subscription_is_granted(reason_codes, args.qos):

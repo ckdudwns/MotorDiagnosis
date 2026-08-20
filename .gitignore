@@ -3,6 +3,21 @@
 Thumbs.db
 Desktop.ini
 *.swp
+
+# Python local artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local runtime outputs
+*.log
+*.csv
+output/
+tmp/
 *.tar
 *.tar.gz
 *.tgz

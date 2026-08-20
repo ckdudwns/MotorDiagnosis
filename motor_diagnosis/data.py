@@ -8,6 +8,7 @@ import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -16,6 +17,7 @@ LOCK_SECONDS = 15 * 60
 SESSION_SECONDS = 60 * 60
 MAX_REVIEW_NOTE_LENGTH = 2000
 DEVICE_CERTIFICATE_STATUSES = {"pending", "registered", "revoked", "expired"}
+DEVICE_MAPPING_STATUSES = {"active", "inactive"}
 
 NETWORK_PROFILES = [
     {
@@ -348,20 +350,33 @@ def build_devices(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return devices
 
 
+def rollout_configuration_for_profile(network_profile_id: str) -> dict[str, Any]:
+    configurations = {
+        "A": {"configurationType": "direct", "gatewayRequired": False},
+        "B": {"configurationType": "gateway", "gatewayRequired": True},
+        "C": {"configurationType": "store_and_forward", "gatewayRequired": False},
+        "D": {"configurationType": "offline", "gatewayRequired": False},
+    }
+    configuration = configurations.get(network_profile_id)
+    if not configuration:
+        raise ApiError(404, "NETWORK_PROFILE_NOT_FOUND", "Network profile was not found.")
+    return copy_payload(configuration)
+
+
 def build_rollout_plan_records(
     sites: list[dict[str, Any]], assets: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     records = []
     for site in sites:
         target_asset_ids = [asset["id"] for asset in assets if asset["siteId"] == site["id"]]
+        configuration = rollout_configuration_for_profile(site["networkType"])
         records.append(
             {
                 "siteId": site["id"],
                 "networkProfileId": site["networkType"],
                 "targetAssetIds": target_asset_ids,
                 "installPriority": site["priority"],
-                "configurationType": "gateway" if site["networkType"] == "B" else "direct",
-                "gatewayRequired": site["networkType"] == "B",
+                **configuration,
                 "note": "Initial 65-site rollout plan",
                 "updatedAt": "2026-08-11T00:00:00Z",
             }
@@ -654,6 +669,7 @@ def update_rollout_plan(user: dict[str, Any], site_id: str, payload: dict[str, A
     require_site_access(user, site_id)
     network_profile_id = required_text(payload, "networkProfileId").upper()
     network_profile(network_profile_id)
+    configuration = rollout_configuration_for_profile(network_profile_id)
     target_asset_ids = string_list(payload, "targetAssetIds", required=True, uppercase=True)
 
     with STORE_LOCK:
@@ -671,8 +687,7 @@ def update_rollout_plan(user: dict[str, Any], site_id: str, payload: dict[str, A
                 "networkProfileId": network_profile_id,
                 "targetAssetIds": target_asset_ids,
                 "installPriority": required_text(payload, "installPriority"),
-                "configurationType": required_text(payload, "configurationType"),
-                "gatewayRequired": boolean_field(payload, "gatewayRequired"),
+                **configuration,
                 "note": str(payload.get("note") or ""),
                 "updatedAt": now_iso(),
             }
@@ -721,6 +736,20 @@ def sync_site_network_profile(site_id: str, network_profile_id: str) -> None:
             "updatedAt": now_iso(),
         }
     )
+    sync_rollout_network_configuration(site_id, network_profile_id)
+
+
+def sync_rollout_network_configuration(site_id: str, network_profile_id: str) -> None:
+    rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+    if not rollout:
+        raise ApiError(404, "ROLLOUT_PLAN_NOT_FOUND", "The site rollout plan was not found.")
+    rollout.update(
+        {
+            "networkProfileId": network_profile_id,
+            **rollout_configuration_for_profile(network_profile_id),
+            "updatedAt": now_iso(),
+        }
+    )
 
 
 def update_site_network_profile(
@@ -752,10 +781,7 @@ def update_site_network_profile(
         record.update(candidate)
         site["network"] = network_profile_id
         site["networkType"] = network_profile_id
-        rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
-        if rollout:
-            rollout["networkProfileId"] = network_profile_id
-            rollout["updatedAt"] = now_iso()
+        sync_rollout_network_configuration(site_id, network_profile_id)
         return site_network_profile(site_id)
 
 
@@ -851,9 +877,12 @@ def parse_float_value(field: str, value: Any, default: float = 0.0) -> float:
     if value in (None, ""):
         return default
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise ApiError(400, "INVALID_NUMBER", f"{field} must be a valid number.") from exc
+    if not math.isfinite(parsed):
+        raise ApiError(400, "INVALID_NUMBER", f"{field} must be a finite number.")
+    return parsed
 
 
 def parse_int_field(payload: dict[str, Any], *keys: str, default: int = 0) -> int:
@@ -935,8 +964,7 @@ def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]
                 "networkProfileId": network_type,
                 "targetAssetIds": [],
                 "installPriority": site["priority"],
-                "configurationType": "undecided",
-                "gatewayRequired": False,
+                **rollout_configuration_for_profile(network_type),
                 "note": "",
                 "updatedAt": timestamp,
             }
@@ -996,10 +1024,6 @@ def update_site(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> 
         site.update(candidate)
         if "networkType" in payload:
             sync_site_network_profile(site_id, site["networkType"])
-            rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
-            if rollout:
-                rollout["networkProfileId"] = site["networkType"]
-                rollout["updatedAt"] = now_iso()
         return copy_payload(site)
 
 
@@ -1184,6 +1208,42 @@ def certificate_payload(
     return certificate
 
 
+def validate_certificate_for_mapping(certificate: dict[str, Any], mapping_status: str) -> None:
+    if mapping_status != "active":
+        return
+    if certificate["status"] != "registered":
+        raise ApiError(
+            409,
+            "CERTIFICATE_NOT_ACTIVE",
+            "An active device mapping requires a registered certificate.",
+        )
+    expires_at_text = str(certificate.get("expiresAt") or "").strip()
+    if not expires_at_text:
+        return
+    normalized = expires_at_text[:-1] + "+00:00" if expires_at_text.endswith("Z") else expires_at_text
+    try:
+        expires_at = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ApiError(
+            400,
+            "INVALID_CERTIFICATE_EXPIRY",
+            "certificateExpiresAt must be an ISO 8601 timestamp.",
+        ) from exc
+    if expires_at.tzinfo is None:
+        raise ApiError(
+            400,
+            "INVALID_CERTIFICATE_EXPIRY",
+            "certificateExpiresAt must include a timezone.",
+        )
+    if expires_at <= datetime.now(timezone.utc):
+        raise ApiError(409, "CERTIFICATE_EXPIRED", "An active device mapping cannot use an expired certificate.")
+
+
+def validate_mapping_status(mapping_status: str) -> None:
+    if mapping_status not in DEVICE_MAPPING_STATUSES:
+        raise ApiError(400, "INVALID_MAPPING_STATUS", "mappingStatus must be active or inactive.")
+
+
 def apply_certificate_fields(device: dict[str, Any], certificate: dict[str, Any]) -> None:
     device["certificate"] = copy_payload(certificate)
     device["certificateId"] = certificate["id"]
@@ -1225,7 +1285,8 @@ def create_device(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -
 
     with STORE_LOCK:
         validate_asset_device_mapping(site_id, asset_id)
-        mapping_status = str(payload.get("mappingStatus") or "active")
+        mapping_status = str(payload.get("mappingStatus") or "active").strip().lower()
+        validate_mapping_status(mapping_status)
         if any(device["id"] == device_id for device in DEVICES):
             raise ApiError(400, "DEVICE_DUPLICATED", "Device ID is already registered.")
         if mapping_status == "active" and any(
@@ -1239,6 +1300,7 @@ def create_device(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -
         )
         firmware_version = str(payload.get("firmwareVersion") or payload.get("firmware") or "edge-0.1.0")
         certificate = certificate_payload(payload)
+        validate_certificate_for_mapping(certificate, mapping_status)
         timestamp = now_iso()
         device = {
             "id": device_id,
@@ -1274,7 +1336,10 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
         previous_health = str(device.get("health") or "")
         previous_asset_id = str(device["assetId"])
         next_asset_id = str(payload.get("assetId", previous_asset_id)).strip().upper()
-        next_mapping_status = str(payload.get("mappingStatus", device.get("mappingStatus") or "active"))
+        next_mapping_status = str(
+            payload.get("mappingStatus", device.get("mappingStatus") or "active")
+        ).strip().lower()
+        validate_mapping_status(next_mapping_status)
         get_asset(device["siteId"], next_asset_id)
         if next_asset_id != previous_asset_id or (
             next_mapping_status == "active" and device.get("mappingStatus") != "active"
@@ -1311,7 +1376,8 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
             "certificateIssuedAt",
             "certificateExpiresAt",
         }
-        if certificate_keys.intersection(payload):
+        certificate_changed = bool(certificate_keys.intersection(payload))
+        if certificate_changed:
             previous_certificate = copy_payload(device.get("certificate", {}))
             next_certificate = certificate_payload(payload, previous_certificate)
             apply_certificate_fields(candidate, next_certificate)
@@ -1320,7 +1386,12 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
             next_certificate = previous_certificate
         for key in ("health", "mappingStatus"):
             if key in payload:
-                candidate[key] = str(payload[key])
+                candidate[key] = str(payload[key]).strip().lower()
+        if certificate_changed or (
+            next_mapping_status == "active"
+            and (device.get("mappingStatus") != "active" or next_asset_id != previous_asset_id)
+        ):
+            validate_certificate_for_mapping(next_certificate, next_mapping_status)
         if "lastSeenSecAgo" in payload:
             candidate["lastSeenSecAgo"] = parse_int_value("lastSeenSecAgo", payload["lastSeenSecAgo"])
         before = device_replacement_snapshot(device)

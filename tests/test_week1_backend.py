@@ -23,6 +23,7 @@ from motor_diagnosis.data import (
     quarantine_unregistered_device,
     require_site_access,
     reset_runtime_state,
+    rollout_plan_for,
     telemetry_for,
     telemetry_units,
     update_asset,
@@ -233,6 +234,15 @@ class Week1BackendTest(unittest.TestCase):
         self.assertEqual(certificate_updated["certificateHistory"][0]["before"]["id"], "CERT-T01")
         self.assertEqual(certificate_updated["certificateHistory"][0]["after"]["id"], "CERT-T01-ROTATED")
 
+        with self.assertRaises(ApiError) as revoked_active_update:
+            update_device(
+                admin,
+                device["id"],
+                {"certificateStatus": "revoked", "reason": "certificate compromise"},
+            )
+        self.assertEqual(revoked_active_update.exception.code, "CERTIFICATE_NOT_ACTIVE")
+        self.assertEqual(get_device(device["id"])["certificateStatus"], "registered")
+
         self.assertEqual(get_site(site["id"])["onlineDevices"], 1)
         update_device(admin, device["id"], {"health": "offline"})
         self.assertEqual(get_site(site["id"])["onlineDevices"], 0)
@@ -284,6 +294,34 @@ class Week1BackendTest(unittest.TestCase):
         self.assertEqual(invalid_asset_number.exception.status, 400)
         self.assertEqual(invalid_asset_number.exception.code, "INVALID_NUMBER")
 
+        for index, non_finite in enumerate((float("nan"), float("inf"), float("-inf")), 1):
+            with self.subTest(non_finite=non_finite):
+                with self.assertRaises(ApiError) as invalid_coordinate:
+                    create_site(
+                        admin,
+                        {
+                            "id": f"SITE-NON-FINITE-{index}",
+                            "code": f"NON-FINITE-{index}",
+                            "name": "Invalid Coordinate Plant",
+                            "latitude": non_finite,
+                        },
+                    )
+                self.assertEqual(invalid_coordinate.exception.status, 400)
+                self.assertEqual(invalid_coordinate.exception.code, "INVALID_NUMBER")
+
+        with self.assertRaises(ApiError) as invalid_baseline:
+            create_asset(
+                admin,
+                "SITE-01",
+                {
+                    "assetCode": "NON-FINITE",
+                    "name": "Invalid Baseline Asset",
+                    "baselineVibrationRmsMmS": float("nan"),
+                },
+            )
+        self.assertEqual(invalid_baseline.exception.status, 400)
+        self.assertEqual(invalid_baseline.exception.code, "INVALID_NUMBER")
+
     def test_device_mapping_requires_ready_asset_rollout_and_certificate(self) -> None:
         admin = self.admin_user()
         site = create_site(admin, {"id": "SITE-READY", "code": "READY", "name": "Ready Check Plant"})
@@ -303,6 +341,49 @@ class Week1BackendTest(unittest.TestCase):
         with self.assertRaises(ApiError) as missing_certificate:
             create_device(admin, site["id"], {"id": "DEV-READY", "assetId": asset["id"]})
         self.assertEqual(missing_certificate.exception.code, "DEVICE_CERTIFICATE_REQUIRED")
+
+        for certificate_status in ("revoked", "expired", "pending"):
+            with self.subTest(certificate_status=certificate_status):
+                with self.assertRaises(ApiError) as inactive_certificate:
+                    create_device(
+                        admin,
+                        site["id"],
+                        {
+                            "id": f"DEV-{certificate_status.upper()}",
+                            "assetId": asset["id"],
+                            "certificateStatus": certificate_status,
+                            **self.certificate_fields(certificate_status.upper()),
+                        },
+                    )
+                self.assertEqual(inactive_certificate.exception.status, 409)
+                self.assertEqual(inactive_certificate.exception.code, "CERTIFICATE_NOT_ACTIVE")
+
+        with self.assertRaises(ApiError) as expired_certificate:
+            create_device(
+                admin,
+                site["id"],
+                {
+                    "id": "DEV-EXPIRED-DATE",
+                    "assetId": asset["id"],
+                    **self.certificate_fields("EXPIRED-DATE"),
+                    "certificateExpiresAt": "2000-01-01T00:00:00Z",
+                },
+            )
+        self.assertEqual(expired_certificate.exception.status, 409)
+        self.assertEqual(expired_certificate.exception.code, "CERTIFICATE_EXPIRED")
+
+        inactive_device = create_device(
+            admin,
+            site["id"],
+            {
+                "id": "DEV-REVOKED-INACTIVE",
+                "assetId": asset["id"],
+                "mappingStatus": "inactive",
+                "certificateStatus": "revoked",
+                **self.certificate_fields("REVOKED-INACTIVE"),
+            },
+        )
+        self.assertEqual(inactive_device["certificateStatus"], "revoked")
 
     def test_rollout_network_and_install_point_changes_are_persisted_with_history(self) -> None:
         admin = self.admin_user()
@@ -350,6 +431,39 @@ class Week1BackendTest(unittest.TestCase):
         self.assertEqual(updated["changeHistory"][0]["before"]["orientation"], "horizontal X")
         self.assertEqual(updated["changeHistory"][0]["after"]["orientation"], "vertical Z")
         self.assertEqual(len(install_points_for_asset(asset["id"])), 1)
+
+    def test_rollout_configuration_follows_network_profile(self) -> None:
+        admin = self.admin_user()
+
+        initial_c = rollout_plan_for("SITE-03")
+        initial_d = rollout_plan_for("SITE-07")
+        self.assertEqual(initial_c["configurationType"], "store_and_forward")
+        self.assertFalse(initial_c["gatewayRequired"])
+        self.assertEqual(initial_d["configurationType"], "offline")
+        self.assertFalse(initial_d["gatewayRequired"])
+
+        update_site(admin, "SITE-01", {"networkType": "B"})
+        profile_b = rollout_plan_for("SITE-01")
+        self.assertEqual(profile_b["networkProfileId"], "B")
+        self.assertEqual(profile_b["configurationType"], "gateway")
+        self.assertTrue(profile_b["gatewayRequired"])
+
+        update_site_network_profile(
+            admin,
+            "SITE-01",
+            {
+                "networkProfileId": "C",
+                "grade": "C",
+                "directSend": False,
+                "gateway": False,
+                "offlineSync": True,
+                "reason": "Bandwidth-limited field network",
+            },
+        )
+        profile_c = rollout_plan_for("SITE-01")
+        self.assertEqual(profile_c["networkProfileId"], "C")
+        self.assertEqual(profile_c["configurationType"], "store_and_forward")
+        self.assertFalse(profile_c["gatewayRequired"])
 
     def test_failed_updates_do_not_partially_mutate_state(self) -> None:
         admin = self.admin_user()

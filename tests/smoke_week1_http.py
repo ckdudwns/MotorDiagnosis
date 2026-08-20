@@ -147,6 +147,25 @@ def main() -> None:
             token=admin_token,
             method="PUT",
         )
+        network_rollout = request_json(
+            port,
+            "/api/sites/SITE-SMOKE/rollout-plan",
+            token=admin_token,
+        )
+        expect_error(
+            port,
+            "/api/devices",
+            409,
+            payload={
+                "id": "DEV-SMOKE-REVOKED",
+                "siteId": "SITE-SMOKE",
+                "assetId": created_asset["id"],
+                "certificateId": "CERT-SMOKE-REVOKED",
+                "certificateFingerprint": "fingerprint-smoke-revoked",
+                "certificateStatus": "revoked",
+            },
+            token=admin_token,
+        )
         created_device = request_json(
             port,
             "/api/devices",
@@ -225,6 +244,18 @@ def main() -> None:
         )
         expect_error(
             port,
+            "/api/sites",
+            400,
+            payload={
+                "id": "SITE-NON-FINITE",
+                "code": "NON-FINITE",
+                "name": "Non-finite Coordinate Plant",
+                "latitude": float("nan"),
+            },
+            token=admin_token,
+        )
+        expect_error(
+            port,
             "/api/events/EV-241/review",
             413,
             payload={"label": "needs_review", "note": "x" * 70000},
@@ -250,6 +281,8 @@ def main() -> None:
         assert created_asset["baseline"]["sampleCount"] == 120
         assert rollout_saved["targetAssetIds"] == [created_asset["id"]]
         assert network_saved["gateway"] is True
+        assert network_rollout["configurationType"] == "gateway"
+        assert network_rollout["gatewayRequired"] is True
         assert created_device["assetId"] == created_asset["id"]
         assert patched_site["name"] == "Smoke Test Plant Updated"
         assert patched_asset["installLocation"] == "Smoke Bay 2"

@@ -9,6 +9,7 @@ from motor_diagnosis.data import (
     authenticate,
     create_asset,
     create_device,
+    create_install_point,
     create_site,
     current_user_for_token,
     delete_asset,
@@ -17,6 +18,8 @@ from motor_diagnosis.data import (
     get_asset,
     get_device,
     get_site,
+    install_points_for_asset,
+    logout,
     quarantine_unregistered_device,
     require_site_access,
     reset_runtime_state,
@@ -24,7 +27,10 @@ from motor_diagnosis.data import (
     telemetry_units,
     update_asset,
     update_device,
+    update_install_point,
+    update_rollout_plan,
     update_site,
+    update_site_network_profile,
     visible_sites_for_user,
 )
 from motor_diagnosis.server import AppHandler
@@ -54,6 +60,44 @@ class Week1BackendTest(unittest.TestCase):
         login = authenticate({"username": "admin", "password": "admin123"})
         return current_user_for_token(login["session"]["token"])
 
+    def ready_asset_payload(self, asset_code: str, name: str, rated_rpm: int = 1500) -> dict:
+        return {
+            "assetCode": asset_code,
+            "name": name,
+            "assetType": "motor",
+            "ratedRpm": rated_rpm,
+            "installLocation": f"Bay {asset_code}",
+            "baseline": {
+                "status": "ready",
+                "capturedAt": "2026-08-13T10:00:00+09:00",
+                "vibrationRmsMmS": 1.21,
+                "acousticDb": 51.4,
+                "sampleCount": 180,
+            },
+        }
+
+    def configure_rollout(self, admin: dict, site_id: str, asset_ids: list[str]) -> dict:
+        return update_rollout_plan(
+            admin,
+            site_id,
+            {
+                "networkProfileId": "A",
+                "targetAssetIds": asset_ids,
+                "installPriority": "high",
+                "configurationType": "direct",
+                "gatewayRequired": False,
+                "note": "week1 test rollout",
+            },
+        )
+
+    def certificate_fields(self, suffix: str) -> dict:
+        return {
+            "certificateId": f"CERT-{suffix}",
+            "certificateFingerprint": f"fingerprint-{suffix}",
+            "certificateIssuedAt": "2026-08-13T00:00:00Z",
+            "certificateExpiresAt": "2027-08-13T00:00:00Z",
+        }
+
     def test_login_returns_server_side_session_and_role_policy(self) -> None:
         first = authenticate({"username": "admin", "password": "admin123"})
         second = authenticate({"username": "admin", "password": "admin123"})
@@ -63,6 +107,11 @@ class Week1BackendTest(unittest.TestCase):
         self.assertNotEqual(first["session"]["token"], second["session"]["token"])
         self.assertIn("site:write", first["rolePolicy"]["permissions"])
         self.assertEqual(current_user_for_token(first["session"]["token"])["username"], "admin")
+
+        self.assertEqual(logout(first["session"]["token"]), {"loggedOut": True})
+        with self.assertRaises(ApiError) as logged_out_context:
+            current_user_for_token(first["session"]["token"])
+        self.assertEqual(logged_out_context.exception.code, "INVALID_SESSION")
 
     def test_login_locks_account_after_five_failures(self) -> None:
         for _ in range(4):
@@ -113,19 +162,7 @@ class Week1BackendTest(unittest.TestCase):
         asset = create_asset(
             admin,
             site["id"],
-            {
-                "assetCode": "MOT-99",
-                "name": "Test Motor",
-                "assetType": "motor",
-                "ratedRpm": 1500,
-                "baseline": {
-                    "status": "ready",
-                    "capturedAt": "2026-08-13T10:00:00+09:00",
-                    "vibrationRmsMmS": 1.21,
-                    "acousticDb": 51.4,
-                    "sampleCount": 180,
-                },
-            },
+            self.ready_asset_payload("MOT-99", "Test Motor"),
         )
         self.assertEqual(asset["baseline"]["vibrationRmsMmS"], 1.21)
 
@@ -137,6 +174,8 @@ class Week1BackendTest(unittest.TestCase):
             )
         self.assertEqual(duplicated_asset.exception.code, "ASSET_CODE_DUPLICATED")
 
+        self.configure_rollout(admin, site["id"], [asset["id"]])
+
         device = create_device(
             admin,
             site["id"],
@@ -144,6 +183,7 @@ class Week1BackendTest(unittest.TestCase):
                 "id": "DEV-T01",
                 "assetId": asset["id"],
                 "firmware": "edge-0.1.1",
+                **self.certificate_fields("T01"),
             },
         )
         self.assertEqual(device["mappingHistory"][0]["assetId"], asset["id"])
@@ -155,13 +195,9 @@ class Week1BackendTest(unittest.TestCase):
         second_asset = create_asset(
             admin,
             site["id"],
-            {
-                "assetCode": "MOT-100",
-                "name": "Second Test Motor",
-                "assetType": "motor",
-                "ratedRpm": 1450,
-            },
+            self.ready_asset_payload("MOT-100", "Second Test Motor", 1450),
         )
+        self.configure_rollout(admin, site["id"], [asset["id"], second_asset["id"]])
         inactive_device = create_device(
             admin,
             site["id"],
@@ -170,6 +206,7 @@ class Week1BackendTest(unittest.TestCase):
                 "assetId": second_asset["id"],
                 "mappingStatus": "inactive",
                 "health": "offline",
+                **self.certificate_fields("T02"),
             },
         )
         with self.assertRaises(ApiError) as duplicated_activation:
@@ -179,6 +216,22 @@ class Week1BackendTest(unittest.TestCase):
         updated_device = update_device(admin, device["id"], {"firmware": "edge-0.2.0", "replacementReason": "lab swap"})
         self.assertEqual(updated_device["firmware"], "edge-0.2.0")
         self.assertEqual(updated_device["replacementHistory"][0]["reason"], "lab swap")
+        self.assertEqual(updated_device["replacementHistory"][0]["before"]["firmwareVersion"], "edge-0.1.1")
+        self.assertEqual(updated_device["replacementHistory"][0]["after"]["firmwareVersion"], "edge-0.2.0")
+
+        certificate_updated = update_device(
+            admin,
+            device["id"],
+            {
+                "certificateId": "CERT-T01-ROTATED",
+                "certificateFingerprint": "fingerprint-t01-rotated",
+                "certificateStatus": "registered",
+                "reason": "scheduled certificate rotation",
+            },
+        )
+        self.assertEqual(certificate_updated["certificateId"], "CERT-T01-ROTATED")
+        self.assertEqual(certificate_updated["certificateHistory"][0]["before"]["id"], "CERT-T01")
+        self.assertEqual(certificate_updated["certificateHistory"][0]["after"]["id"], "CERT-T01-ROTATED")
 
         self.assertEqual(get_site(site["id"])["onlineDevices"], 1)
         update_device(admin, device["id"], {"health": "offline"})
@@ -231,6 +284,73 @@ class Week1BackendTest(unittest.TestCase):
         self.assertEqual(invalid_asset_number.exception.status, 400)
         self.assertEqual(invalid_asset_number.exception.code, "INVALID_NUMBER")
 
+    def test_device_mapping_requires_ready_asset_rollout_and_certificate(self) -> None:
+        admin = self.admin_user()
+        site = create_site(admin, {"id": "SITE-READY", "code": "READY", "name": "Ready Check Plant"})
+        asset = create_asset(admin, site["id"], {"assetCode": "MOT-01", "name": "Draft Motor"})
+        self.configure_rollout(admin, site["id"], [asset["id"]])
+
+        with self.assertRaises(ApiError) as not_ready:
+            create_device(
+                admin,
+                site["id"],
+                {"id": "DEV-READY", "assetId": asset["id"], **self.certificate_fields("READY")},
+            )
+        self.assertEqual(not_ready.exception.status, 409)
+        self.assertEqual(not_ready.exception.code, "ASSET_NOT_READY_FOR_MAPPING")
+
+        update_asset(admin, site["id"], asset["id"], self.ready_asset_payload("MOT-01", "Ready Motor"))
+        with self.assertRaises(ApiError) as missing_certificate:
+            create_device(admin, site["id"], {"id": "DEV-READY", "assetId": asset["id"]})
+        self.assertEqual(missing_certificate.exception.code, "DEVICE_CERTIFICATE_REQUIRED")
+
+    def test_rollout_network_and_install_point_changes_are_persisted_with_history(self) -> None:
+        admin = self.admin_user()
+        site = create_site(admin, {"id": "SITE-PLAN", "code": "PLAN", "name": "Plan Plant"})
+        asset = create_asset(admin, site["id"], self.ready_asset_payload("MOT-01", "Plan Motor"))
+
+        rollout = self.configure_rollout(admin, site["id"], [asset["id"]])
+        self.assertEqual(rollout["targetAssetIds"], [asset["id"]])
+        self.assertTrue(rollout["installationReady"])
+
+        site_network = update_site_network_profile(
+            admin,
+            site["id"],
+            {
+                "networkProfileId": "B",
+                "grade": "B",
+                "directSend": False,
+                "gateway": True,
+                "offlineSync": True,
+                "reason": "Field survey confirmed gateway relay",
+            },
+        )
+        self.assertEqual(site_network["networkProfileId"], "B")
+        self.assertTrue(site_network["gateway"])
+
+        install_point = create_install_point(
+            admin,
+            asset["id"],
+            {
+                "position": "drive-end bearing housing",
+                "orientation": "horizontal X",
+                "mountingMethod": "bolt fixed bracket",
+                "acousticDirection": "motor cooling fan",
+                "ambientNoiseSources": ["adjacent pump"],
+                "photoRefs": ["survey://SITE-PLAN/MOT-01/front.jpg"],
+            },
+        )
+        updated = update_install_point(
+            admin,
+            asset["id"],
+            install_point["id"],
+            {"orientation": "vertical Z", "reason": "Sensor axis corrected after field verification"},
+        )
+        self.assertEqual(updated["orientation"], "vertical Z")
+        self.assertEqual(updated["changeHistory"][0]["before"]["orientation"], "horizontal X")
+        self.assertEqual(updated["changeHistory"][0]["after"]["orientation"], "vertical Z")
+        self.assertEqual(len(install_points_for_asset(asset["id"])), 1)
+
     def test_failed_updates_do_not_partially_mutate_state(self) -> None:
         admin = self.admin_user()
 
@@ -254,9 +374,14 @@ class Week1BackendTest(unittest.TestCase):
         self.assertEqual(get_asset("SITE-01", "SITE-01-MOT-02")["ratedRpm"], original_asset["ratedRpm"])
 
         site = create_site(admin, {"id": "SITE-ATOM", "code": "TEST-ATOM", "name": "Atomic Plant"})
-        first_asset = create_asset(admin, site["id"], {"assetCode": "MOT-01", "name": "First Motor"})
-        second_asset = create_asset(admin, site["id"], {"assetCode": "MOT-02", "name": "Second Motor"})
-        device = create_device(admin, site["id"], {"id": "DEV-ATOM", "assetId": first_asset["id"]})
+        first_asset = create_asset(admin, site["id"], self.ready_asset_payload("MOT-01", "First Motor"))
+        second_asset = create_asset(admin, site["id"], self.ready_asset_payload("MOT-02", "Second Motor"))
+        self.configure_rollout(admin, site["id"], [first_asset["id"], second_asset["id"]])
+        device = create_device(
+            admin,
+            site["id"],
+            {"id": "DEV-ATOM", "assetId": first_asset["id"], **self.certificate_fields("ATOM")},
+        )
         original_device = get_device(device["id"]).copy()
         original_history_count = len(original_device["mappingHistory"])
         original_online_count = get_site(site["id"])["onlineDevices"]

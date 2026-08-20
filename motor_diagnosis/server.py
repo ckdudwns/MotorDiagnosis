@@ -22,6 +22,7 @@ from .data import (
     copy_payload,
     create_asset,
     create_device,
+    create_install_point,
     create_site,
     current_user_for_token,
     deactivate_site,
@@ -29,9 +30,14 @@ from .data import (
     delete_device,
     delete_site,
     devices_for,
+    get_asset_by_id,
+    get_device,
     get_site,
+    has_permission,
     inject_anomaly,
     install_points_for,
+    install_points_for_asset,
+    logout,
     network_profile,
     network_profiles_for_sites,
     quarantine_unregistered_device,
@@ -40,11 +46,16 @@ from .data import (
     review_event,
     role_policy,
     rollout_plans,
+    rollout_plan_for,
+    site_network_profile,
     telemetry_for,
     telemetry_units,
     update_asset,
     update_device,
+    update_install_point,
+    update_rollout_plan,
     update_site,
+    update_site_network_profile,
     visible_sites_for_user,
 )
 from .web import render_page
@@ -88,6 +99,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.route_get(path, segments, query)
             elif method == "POST":
                 self.route_post(segments)
+            elif method == "PUT":
+                self.route_put(segments)
+            elif method == "PATCH":
+                self.route_patch(segments)
             elif method == "DELETE":
                 self.route_delete(segments)
             else:
@@ -114,22 +129,30 @@ class AppHandler(BaseHTTPRequestHandler):
         user = self.require_user()
 
         if segments == ["api", "bootstrap"]:
-            self.send_json(
-                {
-                    "sites": visible_sites_for_user(user),
-                    "networkProfiles": copy_payload(NETWORK_PROFILES),
-                    "events": authorized_events(user),
-                    "parameters": copy_payload(PARAMETERS),
-                    "rolePolicies": copy_payload(ROLE_POLICIES),
-                    "acousticLabels": copy_payload(ACOUSTIC_LABEL_TAXONOMY),
-                    "dataPipelines": copy_payload(DATA_PIPELINES),
-                }
-            )
+            response: dict[str, Any] = {"sites": visible_sites_for_user(user)}
+            if has_permission(user, "network-profile:read"):
+                response["networkProfiles"] = copy_payload(NETWORK_PROFILES)
+            if has_permission(user, "rollout:read"):
+                response["rolloutPlans"] = filter_site_rows(user, rollout_plans())
+            if has_permission(user, "event:read"):
+                response["events"] = authorized_events(user)
+            if has_permission(user, "configuration:read"):
+                response["parameters"] = copy_payload(PARAMETERS)
+                response["acousticLabels"] = copy_payload(ACOUSTIC_LABEL_TAXONOMY)
+                response["dataPipelines"] = copy_payload(DATA_PIPELINES)
+            if has_permission(user, "role:read"):
+                response["rolePolicies"] = copy_payload(ROLE_POLICIES)
+            self.send_json(response)
+            return
+        if segments == ["api", "me"]:
+            self.send_json({"user": copy_payload(user), "rolePolicy": role_policy(user["role"])})
             return
         if segments == ["api", "auth", "roles"]:
+            require_permission(user, "role:read")
             self.send_json(copy_payload(ROLE_POLICIES))
             return
         if len(segments) == 4 and segments[:3] == ["api", "auth", "roles"]:
+            require_permission(user, "role:read")
             self.send_json(role_policy(segments[3]))
             return
         if segments == ["api", "sites"]:
@@ -156,6 +179,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "install-points":
             get_site(segments[2])
             require_site_access(user, segments[2])
+            require_permission(user, "install-point:read")
             self.send_json(install_points_for(segments[2]))
             return
         if segments == ["api", "assets"]:
@@ -166,34 +190,72 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(assets_for(site_id))
             return
         if segments == ["api", "devices"]:
-            site_id = required_query(query, "siteId")
-            get_site(site_id)
-            require_site_access(user, site_id)
             require_permission(user, "device:read")
-            self.send_json(devices_for(site_id))
+            self.send_json(paginated_devices(user, query))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "devices"] and segments[3] == "health":
+            device = get_device(segments[2])
+            require_site_access(user, device["siteId"])
+            require_permission(user, "device:read")
+            self.send_json(
+                {
+                    "deviceId": device["id"],
+                    "siteId": device["siteId"],
+                    "assetId": device["assetId"],
+                    "health": device["health"],
+                    "lastSeenSecAgo": device["lastSeenSecAgo"],
+                    "firmwareVersion": device.get("firmwareVersion") or device.get("firmware"),
+                    "certificateStatus": device["certificateStatus"],
+                    "mappingStatus": device["mappingStatus"],
+                }
+            )
             return
         if segments == ["api", "rollout-plans"]:
+            require_permission(user, "rollout:read")
             self.send_json(filter_site_rows(user, rollout_plans()))
             return
+        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "rollout-plan":
+            require_site_access(user, segments[2])
+            require_permission(user, "rollout:read")
+            self.send_json(rollout_plan_for(segments[2]))
+            return
         if segments == ["api", "network-profiles"]:
+            require_permission(user, "network-profile:read")
             self.send_json(copy_payload(NETWORK_PROFILES))
             return
         if len(segments) == 3 and segments[:2] == ["api", "network-profiles"]:
+            require_permission(user, "network-profile:read")
             self.send_json(network_profile(segments[2]))
             return
         if segments == ["api", "site-network-profiles"]:
+            require_permission(user, "network-profile:read")
             self.send_json(filter_site_rows(user, network_profiles_for_sites()))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "network-profile":
+            require_site_access(user, segments[2])
+            require_permission(user, "network-profile:read")
+            self.send_json(site_network_profile(segments[2]))
             return
         if segments == ["api", "install-points"]:
             site_id = required_query(query, "siteId")
             get_site(site_id)
             require_site_access(user, site_id)
+            require_permission(user, "install-point:read")
             self.send_json(install_points_for(site_id))
             return
+        if len(segments) == 4 and segments[:2] == ["api", "assets"] and segments[3] == "install-points":
+            asset = get_asset_by_id(segments[2])
+            require_site_access(user, asset["siteId"])
+            require_permission(user, "install-point:read")
+            active = optional_boolean_query(query, "active")
+            self.send_json(install_points_for_asset(asset["id"], active=active))
+            return
         if segments == ["api", "acoustic-labels"]:
+            require_permission(user, "configuration:read")
             self.send_json(copy_payload(ACOUSTIC_LABEL_TAXONOMY))
             return
         if segments == ["api", "data-pipelines"]:
+            require_permission(user, "configuration:read")
             self.send_json(copy_payload(DATA_PIPELINES))
             return
         if segments == ["api", "events"]:
@@ -229,6 +291,11 @@ class AppHandler(BaseHTTPRequestHandler):
         if segments == ["api", "auth", "login"]:
             self.send_json(authenticate(payload))
             return
+        if segments == ["api", "auth", "logout"]:
+            token = self.bearer_token()
+            current_user_for_token(token)
+            self.send_json(logout(token))
+            return
 
         user = self.require_user()
 
@@ -250,12 +317,21 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "devices":
             self.send_json(create_device(user, segments[2], payload), status=201)
             return
+        if segments == ["api", "devices"]:
+            site_id = str(payload.get("siteId") or "").strip().upper()
+            if not site_id:
+                raise ApiError(400, "MISSING_FIELD", "siteId is required.")
+            self.send_json(create_device(user, site_id, payload), status=201)
+            return
         if segments == ["api", "devices", "quarantine"]:
             require_permission(user, "device:write")
             self.send_json(quarantine_unregistered_device(payload), status=201)
             return
         if len(segments) == 3 and segments[:2] == ["api", "devices"]:
             self.send_json(update_device(user, segments[2], payload))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "assets"] and segments[3] == "install-points":
+            self.send_json(create_install_point(user, segments[2], payload), status=201)
             return
         if segments == ["api", "demo", "inject-anomaly"]:
             require_permission(user, "event:write")
@@ -264,6 +340,34 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(segments) == 4 and segments[:2] == ["api", "events"] and segments[3] == "review":
             require_permission(user, "event:review")
             self.send_json(review_event(segments[2], payload))
+            return
+        raise ApiError(404, "NOT_FOUND", "API route was not found.")
+
+    def route_put(self, segments: list[str]) -> None:
+        payload = self.read_json()
+        user = self.require_user()
+        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "rollout-plan":
+            self.send_json(update_rollout_plan(user, segments[2], payload))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "network-profile":
+            self.send_json(update_site_network_profile(user, segments[2], payload))
+            return
+        raise ApiError(404, "NOT_FOUND", "API route was not found.")
+
+    def route_patch(self, segments: list[str]) -> None:
+        payload = self.read_json()
+        user = self.require_user()
+        if len(segments) == 3 and segments[:2] == ["api", "sites"]:
+            self.send_json(update_site(user, segments[2], payload))
+            return
+        if len(segments) == 5 and segments[:2] == ["api", "sites"] and segments[3] == "assets":
+            self.send_json(update_asset(user, segments[2], segments[4], payload))
+            return
+        if len(segments) == 3 and segments[:2] == ["api", "devices"]:
+            self.send_json(update_device(user, segments[2], payload))
+            return
+        if len(segments) == 5 and segments[:2] == ["api", "assets"] and segments[3] == "install-points":
+            self.send_json(update_install_point(user, segments[2], segments[4], payload))
             return
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
@@ -281,10 +385,16 @@ class AppHandler(BaseHTTPRequestHandler):
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
     def require_user(self) -> dict[str, Any]:
+        return current_user_for_token(self.bearer_token())
+
+    def bearer_token(self) -> str:
         authorization = self.headers.get("authorization", "")
         if not authorization.startswith("Bearer "):
             raise ApiError(401, "AUTH_REQUIRED", "A bearer session token is required.")
-        return current_user_for_token(authorization.removeprefix("Bearer ").strip())
+        token = authorization.removeprefix("Bearer ").strip()
+        if not token:
+            raise ApiError(401, "AUTH_REQUIRED", "A bearer session token is required.")
+        return token
 
     def read_json(self) -> dict[str, Any]:
         length_text = self.headers.get("content-length", "0")
@@ -347,7 +457,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("content-disposition", f'attachment; filename="{filename}"')
         self.send_header("cache-control", "no-store")
         self.send_header("access-control-allow-origin", "*")
-        self.send_header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
         self.send_header("access-control-allow-headers", "authorization, content-type")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
@@ -357,7 +467,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("content-type", content_type)
         self.send_header("cache-control", "no-store")
         self.send_header("access-control-allow-origin", "*")
-        self.send_header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
         self.send_header("access-control-allow-headers", "authorization, content-type")
         self.send_header("content-length", str(content_length))
 
@@ -380,6 +490,35 @@ def filter_site_rows(user: dict[str, Any], rows: list[dict[str, Any]]) -> list[d
     return copy_payload([row for row in rows if row.get("siteId") in allowed])
 
 
+def paginated_devices(user: dict[str, Any], query: dict[str, list[str]]) -> dict[str, Any]:
+    site_id = query.get("siteId", [""])[0].strip().upper()
+    if site_id:
+        get_site(site_id)
+        require_site_access(user, site_id)
+        rows = devices_for(site_id)
+    else:
+        rows = []
+        for site in visible_sites_for_user(user):
+            rows.extend(devices_for(site["id"]))
+
+    asset_id = query.get("assetId", [""])[0].strip().upper()
+    status = query.get("status", [""])[0].strip().lower()
+    if asset_id:
+        rows = [row for row in rows if row["assetId"] == asset_id]
+    if status:
+        rows = [
+            row
+            for row in rows
+            if status in {str(row.get("health", "")).lower(), str(row.get("mappingStatus", "")).lower()}
+        ]
+
+    page = positive_query_int(query, "page", 1)
+    size = positive_query_int(query, "size", 50, maximum=200)
+    total = len(rows)
+    start = (page - 1) * size
+    return {"items": copy_payload(rows[start : start + size]), "page": page, "size": size, "total": total}
+
+
 def path_segments(path: str) -> list[str]:
     return [segment for segment in path.split("/") if segment]
 
@@ -389,6 +528,31 @@ def required_query(query: dict[str, list[str]], key: str) -> str:
     if not value:
         raise ApiError(400, "MISSING_QUERY_PARAMETER", f"{key} is required.")
     return value
+
+
+def positive_query_int(
+    query: dict[str, list[str]], key: str, default: int, *, maximum: int | None = None
+) -> int:
+    value = query.get(key, [str(default)])[0].strip()
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ApiError(400, "INVALID_QUERY_PARAMETER", f"{key} must be a positive integer.") from exc
+    if parsed <= 0 or (maximum is not None and parsed > maximum):
+        suffix = f" up to {maximum}" if maximum is not None else ""
+        raise ApiError(400, "INVALID_QUERY_PARAMETER", f"{key} must be a positive integer{suffix}.")
+    return parsed
+
+
+def optional_boolean_query(query: dict[str, list[str]], key: str) -> bool | None:
+    if key not in query:
+        return None
+    value = query[key][0].strip().lower()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ApiError(400, "INVALID_QUERY_PARAMETER", f"{key} must be true or false.")
 
 
 def create_server(host: str, port: int) -> ThreadingHTTPServer:

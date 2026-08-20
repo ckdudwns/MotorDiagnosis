@@ -15,6 +15,7 @@ MAX_LOGIN_FAILURES = 5
 LOCK_SECONDS = 15 * 60
 SESSION_SECONDS = 60 * 60
 MAX_REVIEW_NOTE_LENGTH = 2000
+DEVICE_CERTIFICATE_STATUSES = {"pending", "registered", "revoked", "expired"}
 
 NETWORK_PROFILES = [
     {
@@ -104,7 +105,17 @@ ROLE_POLICIES = [
         "role": "A",
         "name": "Operator",
         "description": "Read-only access to assigned sites, events, telemetry, and exports.",
-        "permissions": ["site:read", "asset:read", "device:read", "event:read", "telemetry:read", "export:read"],
+        "permissions": [
+            "site:read",
+            "asset:read",
+            "device:read",
+            "rollout:read",
+            "network-profile:read",
+            "install-point:read",
+            "event:read",
+            "telemetry:read",
+            "export:read",
+        ],
     },
     {
         "role": "B",
@@ -117,6 +128,14 @@ ROLE_POLICIES = [
             "asset:write",
             "device:read",
             "device:write",
+            "role:read",
+            "rollout:read",
+            "rollout:write",
+            "network-profile:read",
+            "network-profile:write",
+            "install-point:read",
+            "install-point:write",
+            "configuration:read",
             "event:read",
             "event:write",
             "event:review",
@@ -207,6 +226,10 @@ def now_text() -> str:
     return time.strftime("%H:%M:%S")
 
 
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def hash_password(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000).hex()
 
@@ -293,6 +316,13 @@ def build_devices(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     devices: list[dict[str, Any]] = []
     for index, asset in enumerate(assets, 1):
         health = "online" if index % 4 else "warning"
+        certificate = {
+            "id": f"CERT-{index:04d}",
+            "fingerprint": hashlib.sha256(f"device-certificate-{index}".encode("utf-8")).hexdigest(),
+            "status": "registered",
+            "issuedAt": "2026-08-01T00:00:00Z",
+            "expiresAt": "2027-08-01T00:00:00Z",
+        }
         devices.append(
             {
                 "id": f"DEV-{asset['id'].replace('SITE-', '')}",
@@ -300,15 +330,81 @@ def build_devices(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "assetId": asset["id"],
                 "sensorChannels": ["vibration", "acoustic", "rpm"],
                 "firmware": "edge-0.1.0",
-                "certificateStatus": "registered",
+                "firmwareVersion": "edge-0.1.0",
+                "certificate": certificate,
+                "certificateId": certificate["id"],
+                "certificateFingerprint": certificate["fingerprint"],
+                "certificateStatus": certificate["status"],
+                "certificateIssuedAt": certificate["issuedAt"],
+                "certificateExpiresAt": certificate["expiresAt"],
                 "lastSeenSecAgo": 18 + index * 3,
                 "health": health,
                 "mappingStatus": "active",
                 "mappingHistory": [{"assetId": asset["id"], "mappedAt": "initial", "status": "active"}],
                 "replacementHistory": [],
+                "certificateHistory": [],
             }
         )
     return devices
+
+
+def build_rollout_plan_records(
+    sites: list[dict[str, Any]], assets: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    records = []
+    for site in sites:
+        target_asset_ids = [asset["id"] for asset in assets if asset["siteId"] == site["id"]]
+        records.append(
+            {
+                "siteId": site["id"],
+                "networkProfileId": site["networkType"],
+                "targetAssetIds": target_asset_ids,
+                "installPriority": site["priority"],
+                "configurationType": "gateway" if site["networkType"] == "B" else "direct",
+                "gatewayRequired": site["networkType"] == "B",
+                "note": "Initial 65-site rollout plan",
+                "updatedAt": "2026-08-11T00:00:00Z",
+            }
+        )
+    return records
+
+
+def build_site_network_profile_records(sites: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "siteId": site["id"],
+            "networkProfileId": site["networkType"],
+            "grade": site["networkType"],
+            "directSend": site["networkType"] == "A",
+            "gateway": site["networkType"] == "B",
+            "offlineSync": site["networkType"] in {"C", "D"},
+            "reason": "Initial site survey",
+            "lastSurveyedAt": "2026-08-11",
+            "updatedAt": "2026-08-11T00:00:00Z",
+        }
+        for site in sites
+    ]
+
+
+def build_install_point_records(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": f"IP-{asset['id']}",
+            "siteId": asset["siteId"],
+            "assetId": asset["id"],
+            "position": "bearing housing top",
+            "orientation": "horizontal X + vertical Z",
+            "mountingMethod": "bolt fixed bracket",
+            "acousticDirection": "1.5m from cooling side",
+            "ambientNoiseSources": ["nearby rotating equipment"],
+            "photoRefs": [f"survey://{asset['id']}/install-point.jpg"],
+            "active": True,
+            "createdAt": "2026-08-11T00:00:00Z",
+            "updatedAt": "2026-08-11T00:00:00Z",
+            "changeHistory": [],
+        }
+        for asset in assets
+    ]
 
 
 def build_events() -> list[dict[str, Any]]:
@@ -359,11 +455,17 @@ BASE_SITES = build_sites()
 BASE_ASSETS = build_assets(BASE_SITES)
 BASE_DEVICES = build_devices(BASE_ASSETS)
 BASE_EVENTS = build_events()
+BASE_ROLLOUT_PLANS = build_rollout_plan_records(BASE_SITES, BASE_ASSETS)
+BASE_SITE_NETWORK_PROFILES = build_site_network_profile_records(BASE_SITES)
+BASE_INSTALL_POINTS = build_install_point_records(BASE_ASSETS)
 
 SITES = copy_payload(BASE_SITES)
 ASSETS = copy_payload(BASE_ASSETS)
 DEVICES = copy_payload(BASE_DEVICES)
 EVENTS = copy_payload(BASE_EVENTS)
+ROLLOUT_PLAN_RECORDS = copy_payload(BASE_ROLLOUT_PLANS)
+SITE_NETWORK_PROFILE_RECORDS = copy_payload(BASE_SITE_NETWORK_PROFILES)
+INSTALL_POINTS = copy_payload(BASE_INSTALL_POINTS)
 QUARANTINED_DEVICE_MESSAGES: list[dict[str, Any]] = []
 
 
@@ -373,6 +475,9 @@ def reset_runtime_state() -> None:
         ASSETS[:] = copy_payload(BASE_ASSETS)
         DEVICES[:] = copy_payload(BASE_DEVICES)
         EVENTS[:] = copy_payload(BASE_EVENTS)
+        ROLLOUT_PLAN_RECORDS[:] = copy_payload(BASE_ROLLOUT_PLANS)
+        SITE_NETWORK_PROFILE_RECORDS[:] = copy_payload(BASE_SITE_NETWORK_PROFILES)
+        INSTALL_POINTS[:] = copy_payload(BASE_INSTALL_POINTS)
         QUARANTINED_DEVICE_MESSAGES.clear()
         SESSIONS.clear()
         for username in LOGIN_STATE:
@@ -424,6 +529,16 @@ def current_user_for_token(token: str) -> dict[str, Any]:
         return public_user(user)
 
 
+def logout(token: str) -> dict[str, Any]:
+    if not token:
+        raise ApiError(401, "AUTH_REQUIRED", "A bearer session token is required.")
+    with STORE_LOCK:
+        if token not in SESSIONS:
+            raise ApiError(401, "INVALID_SESSION", "The session is expired or invalid.")
+        SESSIONS.pop(token, None)
+    return {"loggedOut": True}
+
+
 def public_user(user: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": user["id"],
@@ -442,9 +557,13 @@ def role_policy(role: str) -> dict[str, Any]:
 
 
 def require_permission(user: dict[str, Any], permission: str) -> None:
-    permissions = set(role_policy(user["role"])["permissions"])
-    if "*" not in permissions and permission not in permissions:
+    if not has_permission(user, permission):
         raise ApiError(403, "FORBIDDEN", "The user does not have permission for this API.")
+
+
+def has_permission(user: dict[str, Any], permission: str) -> bool:
+    permissions = set(role_policy(user["role"])["permissions"])
+    return "*" in permissions or permission in permissions
 
 
 def require_site_access(user: dict[str, Any], site_id: str) -> None:
@@ -469,6 +588,13 @@ def get_site(site_id: str) -> dict[str, Any]:
 
 def get_asset(site_id: str, asset_id: str) -> dict[str, Any]:
     asset = next((item for item in ASSETS if item["siteId"] == site_id and item["id"] == asset_id), None)
+    if not asset:
+        raise ApiError(404, "ASSET_NOT_FOUND", "Asset was not found.")
+    return asset
+
+
+def get_asset_by_id(asset_id: str) -> dict[str, Any]:
+    asset = next((item for item in ASSETS if item["id"] == asset_id), None)
     if not asset:
         raise ApiError(404, "ASSET_NOT_FOUND", "Asset was not found.")
     return asset
@@ -499,56 +625,217 @@ def devices_for(site_id: str) -> list[dict[str, Any]]:
 
 
 def rollout_plans() -> list[dict[str, Any]]:
-    plans = []
-    for site in SITES:
-        profile = network_profile(site["networkType"])
-        plans.append(
+    return [rollout_plan_for(record["siteId"]) for record in ROLLOUT_PLAN_RECORDS]
+
+
+def rollout_plan_for(site_id: str) -> dict[str, Any]:
+    site = get_site(site_id)
+    record = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+    if not record:
+        raise ApiError(404, "ROLLOUT_PLAN_NOT_FOUND", "The site rollout plan was not found.")
+    profile = network_profile(record["networkProfileId"])
+    response = copy_payload(record)
+    response.update(
+        {
+            "siteName": site["name"],
+            "region": site["region"],
+            "stage": site["rolloutStage"],
+            "networkName": profile["name"],
+            "targetAssetCount": len(record["targetAssetIds"]),
+            "recommendedArchitecture": profile["architecture"],
+            "installationReady": bool(record["networkProfileId"] and record["targetAssetIds"]),
+        }
+    )
+    return response
+
+
+def update_rollout_plan(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    require_permission(user, "rollout:write")
+    require_site_access(user, site_id)
+    network_profile_id = required_text(payload, "networkProfileId").upper()
+    network_profile(network_profile_id)
+    target_asset_ids = string_list(payload, "targetAssetIds", required=True, uppercase=True)
+
+    with STORE_LOCK:
+        site = get_site(site_id)
+        site_asset_ids = {asset["id"] for asset in ASSETS if asset["siteId"] == site_id}
+        invalid_asset_ids = [asset_id for asset_id in target_asset_ids if asset_id not in site_asset_ids]
+        if invalid_asset_ids:
+            raise ApiError(400, "ROLLOUT_ASSET_INVALID", "All rollout target assets must belong to the site.")
+        record = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+        if not record:
+            raise ApiError(404, "ROLLOUT_PLAN_NOT_FOUND", "The site rollout plan was not found.")
+        candidate = copy_payload(record)
+        candidate.update(
             {
-                "siteId": site["id"],
-                "siteName": site["name"],
-                "region": site["region"],
-                "priority": site["priority"],
-                "stage": site["rolloutStage"],
-                "networkType": site["networkType"],
-                "networkName": profile["name"],
-                "targetAssetCount": site["targetAssetCount"],
-                "recommendedArchitecture": profile["architecture"],
-                "installationReady": site["rolloutStage"] in {"poc_selected", "phase1_candidate"},
+                "networkProfileId": network_profile_id,
+                "targetAssetIds": target_asset_ids,
+                "installPriority": required_text(payload, "installPriority"),
+                "configurationType": required_text(payload, "configurationType"),
+                "gatewayRequired": boolean_field(payload, "gatewayRequired"),
+                "note": str(payload.get("note") or ""),
+                "updatedAt": now_iso(),
             }
         )
-    return plans
+        record.update(candidate)
+        site["network"] = network_profile_id
+        site["networkType"] = network_profile_id
+        site["priority"] = candidate["installPriority"]
+        site["targetAssetCount"] = len(target_asset_ids)
+        sync_site_network_profile(site_id, network_profile_id)
+        return rollout_plan_for(site_id)
 
 
 def network_profiles_for_sites() -> list[dict[str, Any]]:
-    return [
+    return [site_network_profile(record["siteId"]) for record in SITE_NETWORK_PROFILE_RECORDS]
+
+
+def site_network_profile(site_id: str) -> dict[str, Any]:
+    site = get_site(site_id)
+    record = next((item for item in SITE_NETWORK_PROFILE_RECORDS if item["siteId"] == site_id), None)
+    if not record:
+        raise ApiError(404, "SITE_NETWORK_PROFILE_NOT_FOUND", "The site network profile was not found.")
+    response = copy_payload(record)
+    response.update(
         {
-            "siteId": site["id"],
             "siteName": site["name"],
-            "networkType": site["networkType"],
-            "profile": network_profile(site["networkType"]),
+            "networkType": record["networkProfileId"],
+            "profile": network_profile(record["networkProfileId"]),
             "signalQuality": site["signalQuality"],
-            "lastSurveyedAt": "2026-08-11",
         }
-        for site in SITES
-    ]
+    )
+    return response
+
+
+def sync_site_network_profile(site_id: str, network_profile_id: str) -> None:
+    record = next((item for item in SITE_NETWORK_PROFILE_RECORDS if item["siteId"] == site_id), None)
+    if not record:
+        raise ApiError(404, "SITE_NETWORK_PROFILE_NOT_FOUND", "The site network profile was not found.")
+    record.update(
+        {
+            "networkProfileId": network_profile_id,
+            "grade": network_profile_id,
+            "directSend": network_profile_id == "A",
+            "gateway": network_profile_id == "B",
+            "offlineSync": network_profile_id in {"C", "D"},
+            "updatedAt": now_iso(),
+        }
+    )
+
+
+def update_site_network_profile(
+    user: dict[str, Any], site_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "network-profile:write")
+    require_site_access(user, site_id)
+    network_profile_id = required_text(payload, "networkProfileId").upper()
+    network_profile(network_profile_id)
+    reason = required_text(payload, "reason")
+
+    with STORE_LOCK:
+        site = get_site(site_id)
+        record = next((item for item in SITE_NETWORK_PROFILE_RECORDS if item["siteId"] == site_id), None)
+        if not record:
+            raise ApiError(404, "SITE_NETWORK_PROFILE_NOT_FOUND", "The site network profile was not found.")
+        candidate = copy_payload(record)
+        candidate.update(
+            {
+                "networkProfileId": network_profile_id,
+                "grade": str(payload.get("grade") or network_profile_id),
+                "directSend": boolean_field(payload, "directSend"),
+                "gateway": boolean_field(payload, "gateway"),
+                "offlineSync": boolean_field(payload, "offlineSync"),
+                "reason": reason,
+                "updatedAt": now_iso(),
+            }
+        )
+        record.update(candidate)
+        site["network"] = network_profile_id
+        site["networkType"] = network_profile_id
+        rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+        if rollout:
+            rollout["networkProfileId"] = network_profile_id
+            rollout["updatedAt"] = now_iso()
+        return site_network_profile(site_id)
 
 
 def install_points_for(site_id: str) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": f"IP-{asset['id']}",
-            "siteId": site_id,
-            "assetId": asset["id"],
-            "vibrationMount": "bearing housing top",
-            "vibrationAxis": "horizontal X + vertical Z",
-            "mountingMethod": "bolt fixed bracket",
-            "acousticDirection": "1.5m from cooling side",
-            "noiseSources": ["nearby rotating equipment"],
-            "photoRequired": True,
-            "baselineRequired": True,
+    get_site(site_id)
+    return copy_payload([item for item in INSTALL_POINTS if item["siteId"] == site_id])
+
+
+def install_points_for_asset(asset_id: str, active: bool | None = None) -> list[dict[str, Any]]:
+    get_asset_by_id(asset_id)
+    rows = [item for item in INSTALL_POINTS if item["assetId"] == asset_id]
+    if active is not None:
+        rows = [item for item in rows if bool(item["active"]) is active]
+    return copy_payload(rows)
+
+
+def create_install_point(user: dict[str, Any], asset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    require_permission(user, "install-point:write")
+    asset = get_asset_by_id(asset_id)
+    require_site_access(user, asset["siteId"])
+    ambient_noise_sources = string_list(payload, "ambientNoiseSources")
+    photo_refs = string_list(payload, "photoRefs", required=True)
+
+    with STORE_LOCK:
+        install_point_id = str(payload.get("id") or f"IP-{asset_id}-{len(install_points_for_asset(asset_id)) + 1:02d}").strip().upper()
+        if any(item["id"] == install_point_id for item in INSTALL_POINTS):
+            raise ApiError(400, "INSTALL_POINT_DUPLICATED", "Install point ID is duplicated.")
+        timestamp = now_iso()
+        install_point = {
+            "id": install_point_id,
+            "siteId": asset["siteId"],
+            "assetId": asset_id,
+            "position": required_text(payload, "position"),
+            "orientation": required_text(payload, "orientation"),
+            "mountingMethod": required_text(payload, "mountingMethod"),
+            "acousticDirection": str(payload.get("acousticDirection") or ""),
+            "ambientNoiseSources": ambient_noise_sources,
+            "photoRefs": photo_refs,
+            "active": True,
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+            "changeHistory": [],
         }
-        for asset in assets_for(site_id)
-    ]
+        INSTALL_POINTS.append(install_point)
+        return copy_payload(install_point)
+
+
+def update_install_point(
+    user: dict[str, Any], asset_id: str, install_point_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "install-point:write")
+    asset = get_asset_by_id(asset_id)
+    require_site_access(user, asset["siteId"])
+    reason = required_text(payload, "reason")
+
+    with STORE_LOCK:
+        install_point = next(
+            (item for item in INSTALL_POINTS if item["assetId"] == asset_id and item["id"] == install_point_id),
+            None,
+        )
+        if not install_point:
+            raise ApiError(404, "INSTALL_POINT_NOT_FOUND", "Install point was not found.")
+        candidate = copy_payload(install_point)
+        for key in ("position", "orientation", "mountingMethod", "acousticDirection"):
+            if key in payload:
+                candidate[key] = str(payload[key]).strip()
+        for key in ("ambientNoiseSources", "photoRefs"):
+            if key in payload:
+                candidate[key] = string_list(payload, key, required=key == "photoRefs")
+        if "active" in payload:
+            candidate["active"] = boolean_field(payload, "active")
+        before = install_point_snapshot(install_point)
+        after = install_point_snapshot(candidate)
+        candidate["updatedAt"] = now_iso()
+        if before != after:
+            candidate.setdefault("changeHistory", []).append(
+                {"reason": reason, "changedAt": candidate["updatedAt"], "before": before, "after": after}
+            )
+        install_point.update(candidate)
+        return copy_payload(install_point)
 
 
 def parse_int_value(field: str, value: Any, default: int = 0) -> int:
@@ -576,6 +863,33 @@ def parse_int_field(payload: dict[str, Any], *keys: str, default: int = 0) -> in
     return default
 
 
+def boolean_field(payload: dict[str, Any], key: str, default: bool | None = None) -> bool:
+    if key not in payload:
+        if default is None:
+            raise ApiError(400, "MISSING_FIELD", f"{key} is required.")
+        return default
+    value = payload[key]
+    if isinstance(value, bool):
+        return value
+    raise ApiError(400, "INVALID_BOOLEAN", f"{key} must be a boolean.")
+
+
+def string_list(
+    payload: dict[str, Any], key: str, *, required: bool = False, uppercase: bool = False
+) -> list[str]:
+    value = payload.get(key)
+    if value is None:
+        if required:
+            raise ApiError(400, "MISSING_FIELD", f"{key} is required.")
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise ApiError(400, "INVALID_LIST", f"{key} must be a list of non-empty strings.")
+    result = [item.strip().upper() if uppercase else item.strip() for item in value]
+    if required and not result:
+        raise ApiError(400, "MISSING_FIELD", f"{key} must contain at least one item.")
+    return list(dict.fromkeys(result))
+
+
 def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     require_permission(user, "site:write")
     site_id = required_text(payload, "id").upper()
@@ -588,11 +902,16 @@ def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]
             raise ApiError(400, "SITE_DUPLICATED", "Site ID is duplicated.")
         if any(site["code"] == site_code for site in SITES):
             raise ApiError(400, "SITE_CODE_DUPLICATED", "Site code is duplicated.")
+        timestamp = now_iso()
         site = {
             "id": site_id,
             "code": site_code,
             "name": required_text(payload, "name"),
             "region": str(payload.get("region") or "undecided"),
+            "location": str(payload.get("location") or payload.get("address") or ""),
+            "address": str(payload.get("address") or payload.get("location") or ""),
+            "latitude": parse_float_value("latitude", payload.get("latitude"), 0.0),
+            "longitude": parse_float_value("longitude", payload.get("longitude"), 0.0),
             "timezone": str(payload.get("timezone") or "Asia/Seoul"),
             "network": network_type,
             "networkType": network_type,
@@ -606,8 +925,35 @@ def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]
             "signalQuality": parse_int_field(payload, "signalQuality", default=70),
             "rolloutStage": str(payload.get("rolloutStage") or "planned"),
             "targetAssetCount": parse_int_field(payload, "targetAssetCount", default=0),
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
         }
         SITES.append(site)
+        ROLLOUT_PLAN_RECORDS.append(
+            {
+                "siteId": site_id,
+                "networkProfileId": network_type,
+                "targetAssetIds": [],
+                "installPriority": site["priority"],
+                "configurationType": "undecided",
+                "gatewayRequired": False,
+                "note": "",
+                "updatedAt": timestamp,
+            }
+        )
+        SITE_NETWORK_PROFILE_RECORDS.append(
+            {
+                "siteId": site_id,
+                "networkProfileId": network_type,
+                "grade": network_type,
+                "directSend": network_type == "A",
+                "gateway": network_type == "B",
+                "offlineSync": network_type in {"C", "D"},
+                "reason": "Initial registration",
+                "lastSurveyedAt": "",
+                "updatedAt": timestamp,
+            }
+        )
         return copy_payload(site)
 
 
@@ -622,9 +968,22 @@ def update_site(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> 
             if any(item["id"] != site_id and item["code"] == next_code for item in SITES):
                 raise ApiError(400, "SITE_CODE_DUPLICATED", "Site code is duplicated.")
             candidate["code"] = next_code
-        for key in ("name", "region", "timezone", "priority", "status", "operationStatus", "rolloutStage"):
+        for key in (
+            "name",
+            "region",
+            "location",
+            "address",
+            "timezone",
+            "priority",
+            "status",
+            "operationStatus",
+            "rolloutStage",
+        ):
             if key in payload:
                 candidate[key] = str(payload[key])
+        for key in ("latitude", "longitude"):
+            if key in payload:
+                candidate[key] = parse_float_value(key, payload[key])
         if "networkType" in payload:
             network_type = str(payload["networkType"]).strip().upper()
             network_profile(network_type)
@@ -633,7 +992,14 @@ def update_site(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> 
         for key in ("signalQuality", "targetAssetCount"):
             if key in payload:
                 candidate[key] = parse_int_value(key, payload[key])
+        candidate["updatedAt"] = now_iso()
         site.update(candidate)
+        if "networkType" in payload:
+            sync_site_network_profile(site_id, site["networkType"])
+            rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+            if rollout:
+                rollout["networkProfileId"] = site["networkType"]
+                rollout["updatedAt"] = now_iso()
         return copy_payload(site)
 
 
@@ -649,6 +1015,10 @@ def delete_site(user: dict[str, Any], site_id: str) -> dict[str, Any]:
         if any(asset["siteId"] == site_id for asset in ASSETS):
             raise ApiError(400, "SITE_HAS_ASSETS", "A site with assets cannot be deleted.")
         SITES[:] = [site for site in SITES if site["id"] != site_id]
+        ROLLOUT_PLAN_RECORDS[:] = [record for record in ROLLOUT_PLAN_RECORDS if record["siteId"] != site_id]
+        SITE_NETWORK_PROFILE_RECORDS[:] = [
+            record for record in SITE_NETWORK_PROFILE_RECORDS if record["siteId"] != site_id
+        ]
         return {"deleted": True, "siteId": site_id}
 
 
@@ -665,6 +1035,7 @@ def create_asset(user: dict[str, Any], site_id: str, payload: dict[str, Any]) ->
         if any(asset["siteId"] == site_id and asset["assetCode"] == asset_code for asset in ASSETS):
             raise ApiError(400, "ASSET_CODE_DUPLICATED", "Asset code must be unique within a site.")
         baseline = baseline_payload(payload)
+        timestamp = now_iso()
         asset = {
             "id": asset_id,
             "assetCode": asset_code,
@@ -678,6 +1049,8 @@ def create_asset(user: dict[str, Any], site_id: str, payload: dict[str, Any]) ->
             "installLocation": str(payload.get("installLocation") or ""),
             "baselineStatus": baseline["status"],
             "baseline": baseline,
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
         }
         ASSETS.append(asset)
         get_site(site_id)["assetCount"] += 1
@@ -701,6 +1074,8 @@ def update_asset(user: dict[str, Any], site_id: str, asset_id: str, payload: dic
         for key in ("name", "operationStatus", "installLocation", "baselineStatus"):
             if key in payload:
                 candidate[key] = str(payload[key])
+        if "status" in payload:
+            candidate["operationStatus"] = str(payload["status"])
         if "assetType" in payload or "type" in payload:
             candidate["assetType"] = str(payload.get("assetType") or payload.get("type"))
             candidate["type"] = candidate["assetType"]
@@ -710,6 +1085,7 @@ def update_asset(user: dict[str, Any], site_id: str, asset_id: str, payload: dic
         if "baseline" in payload or any(key.startswith("baseline") for key in payload):
             candidate["baseline"] = baseline_payload(payload, candidate.get("baseline"))
             candidate["baselineStatus"] = candidate["baseline"]["status"]
+        candidate["updatedAt"] = now_iso()
         asset.update(candidate)
         return copy_payload(asset)
 
@@ -722,9 +1098,123 @@ def delete_asset(user: dict[str, Any], site_id: str, asset_id: str) -> dict[str,
         if any(device["assetId"] == asset_id and device["mappingStatus"] == "active" for device in DEVICES):
             raise ApiError(400, "ASSET_HAS_DEVICE", "An asset with an active device mapping cannot be deleted.")
         ASSETS[:] = [asset for asset in ASSETS if asset["id"] != asset_id]
+        INSTALL_POINTS[:] = [item for item in INSTALL_POINTS if item["assetId"] != asset_id]
+        rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+        if rollout and asset_id in rollout["targetAssetIds"]:
+            rollout["targetAssetIds"] = [item for item in rollout["targetAssetIds"] if item != asset_id]
+            rollout["updatedAt"] = now_iso()
         site = get_site(site_id)
         site["assetCount"] = max(0, int(site["assetCount"]) - 1)
         return {"deleted": True, "assetId": asset_id}
+
+
+def validate_asset_device_mapping(site_id: str, asset_id: str) -> dict[str, Any]:
+    asset = get_asset(site_id, asset_id)
+    baseline = asset.get("baseline") or {}
+    missing = []
+    if not str(asset.get("name") or "").strip():
+        missing.append("name")
+    if not str(asset.get("assetType") or "").strip():
+        missing.append("assetType")
+    if int(asset.get("ratedRpm") or 0) <= 0:
+        missing.append("ratedRpm")
+    if not str(asset.get("installLocation") or "").strip():
+        missing.append("installLocation")
+    if str(baseline.get("status") or "") != "ready":
+        missing.append("baseline.status")
+    if not str(baseline.get("capturedAt") or "").strip():
+        missing.append("baseline.capturedAt")
+    if float(baseline.get("vibrationRmsMmS") or 0) <= 0:
+        missing.append("baseline.vibrationRmsMmS")
+    if float(baseline.get("acousticDb") or 0) <= 0:
+        missing.append("baseline.acousticDb")
+    if int(baseline.get("sampleCount") or 0) <= 0:
+        missing.append("baseline.sampleCount")
+    if missing:
+        raise ApiError(
+            409,
+            "ASSET_NOT_READY_FOR_MAPPING",
+            "Complete the asset master data and ready baseline before device mapping: " + ", ".join(missing),
+        )
+
+    rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+    if not rollout or not rollout.get("networkProfileId") or asset_id not in rollout.get("targetAssetIds", []):
+        raise ApiError(
+            409,
+            "ROLLOUT_PLAN_NOT_READY",
+            "Save the site network profile and include the asset in the rollout plan before device mapping.",
+        )
+    return asset
+
+
+def certificate_payload(
+    payload: dict[str, Any], existing: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    source = dict(existing or {})
+    nested = payload.get("certificate")
+    if nested is not None and not isinstance(nested, dict):
+        raise ApiError(400, "INVALID_CERTIFICATE", "certificate must be an object.")
+    if isinstance(nested, dict):
+        source.update(nested)
+    aliases = {
+        "certificateId": "id",
+        "certificateFingerprint": "fingerprint",
+        "certificateStatus": "status",
+        "certificateIssuedAt": "issuedAt",
+        "certificateExpiresAt": "expiresAt",
+    }
+    for payload_key, certificate_key in aliases.items():
+        if payload_key in payload:
+            source[certificate_key] = payload[payload_key]
+    certificate = {
+        "id": str(source.get("id") or "").strip(),
+        "fingerprint": str(source.get("fingerprint") or "").strip().lower(),
+        "status": str(source.get("status") or "registered").strip().lower(),
+        "issuedAt": str(source.get("issuedAt") or "").strip(),
+        "expiresAt": str(source.get("expiresAt") or "").strip(),
+    }
+    if certificate["status"] not in DEVICE_CERTIFICATE_STATUSES:
+        raise ApiError(400, "INVALID_CERTIFICATE_STATUS", "certificateStatus is not allowed.")
+    if not certificate["id"] or not certificate["fingerprint"]:
+        raise ApiError(
+            400,
+            "DEVICE_CERTIFICATE_REQUIRED",
+            "certificateId and certificateFingerprint are required for device registration.",
+        )
+    return certificate
+
+
+def apply_certificate_fields(device: dict[str, Any], certificate: dict[str, Any]) -> None:
+    device["certificate"] = copy_payload(certificate)
+    device["certificateId"] = certificate["id"]
+    device["certificateFingerprint"] = certificate["fingerprint"]
+    device["certificateStatus"] = certificate["status"]
+    device["certificateIssuedAt"] = certificate["issuedAt"]
+    device["certificateExpiresAt"] = certificate["expiresAt"]
+
+
+def device_replacement_snapshot(device: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "assetId": device.get("assetId"),
+        "sensorChannels": copy_payload(device.get("sensorChannels", [])),
+        "firmwareVersion": device.get("firmwareVersion") or device.get("firmware"),
+        "certificate": copy_payload(device.get("certificate", {})),
+    }
+
+
+def install_point_snapshot(install_point: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: copy_payload(install_point.get(key))
+        for key in (
+            "position",
+            "orientation",
+            "mountingMethod",
+            "acousticDirection",
+            "ambientNoiseSources",
+            "photoRefs",
+            "active",
+        )
+    }
 
 
 def create_device(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -734,7 +1224,7 @@ def create_device(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -
     asset_id = required_text(payload, "assetId").upper()
 
     with STORE_LOCK:
-        get_asset(site_id, asset_id)
+        validate_asset_device_mapping(site_id, asset_id)
         mapping_status = str(payload.get("mappingStatus") or "active")
         if any(device["id"] == device_id for device in DEVICES):
             raise ApiError(400, "DEVICE_DUPLICATED", "Device ID is already registered.")
@@ -742,19 +1232,31 @@ def create_device(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -
             device["assetId"] == asset_id and device["mappingStatus"] == "active" for device in DEVICES
         ):
             raise ApiError(400, "DEVICE_ASSET_DUPLICATED", "The asset already has an active device mapping.")
+        sensor_channels = string_list(
+            {"sensorChannels": payload.get("sensorChannels") or ["vibration", "acoustic", "rpm"]},
+            "sensorChannels",
+            required=True,
+        )
+        firmware_version = str(payload.get("firmwareVersion") or payload.get("firmware") or "edge-0.1.0")
+        certificate = certificate_payload(payload)
+        timestamp = now_iso()
         device = {
             "id": device_id,
             "siteId": site_id,
             "assetId": asset_id,
-            "sensorChannels": payload.get("sensorChannels") or ["vibration", "acoustic", "rpm"],
-            "firmware": str(payload.get("firmware") or "edge-0.1.0"),
-            "certificateStatus": str(payload.get("certificateStatus") or "registered"),
+            "sensorChannels": sensor_channels,
+            "firmware": firmware_version,
+            "firmwareVersion": firmware_version,
             "lastSeenSecAgo": parse_int_field(payload, "lastSeenSecAgo", default=0),
             "health": str(payload.get("health") or "online"),
             "mappingStatus": mapping_status,
             "mappingHistory": [{"assetId": asset_id, "mappedAt": now_text(), "status": mapping_status}],
             "replacementHistory": [],
+            "certificateHistory": [],
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
         }
+        apply_certificate_fields(device, certificate)
         DEVICES.append(device)
         site = get_site(site_id)
         site["totalDevices"] = int(site["totalDevices"]) + 1
@@ -774,13 +1276,16 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
         next_asset_id = str(payload.get("assetId", previous_asset_id)).strip().upper()
         next_mapping_status = str(payload.get("mappingStatus", device.get("mappingStatus") or "active"))
         get_asset(device["siteId"], next_asset_id)
+        if next_asset_id != previous_asset_id or (
+            next_mapping_status == "active" and device.get("mappingStatus") != "active"
+        ):
+            validate_asset_device_mapping(device["siteId"], next_asset_id)
         if next_mapping_status == "active" and any(
             item["id"] != device_id and item["assetId"] == next_asset_id and item["mappingStatus"] == "active"
             for item in DEVICES
         ):
             raise ApiError(400, "DEVICE_ASSET_DUPLICATED", "The asset already has an active device mapping.")
-        if next_asset_id != previous_asset_id:
-            previous_asset_id = device["assetId"]
+        if next_asset_id != previous_asset_id or next_mapping_status != device.get("mappingStatus"):
             candidate["assetId"] = next_asset_id
             candidate.setdefault("mappingHistory", []).append(
                 {
@@ -790,15 +1295,58 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
                     "status": next_mapping_status,
                 }
             )
-        for key in ("sensorChannels", "firmware", "certificateStatus", "health", "mappingStatus"):
+        if "sensorChannels" in payload:
+            candidate["sensorChannels"] = string_list(payload, "sensorChannels", required=True)
+        if "firmware" in payload or "firmwareVersion" in payload:
+            firmware_version = str(payload.get("firmwareVersion") or payload.get("firmware") or "").strip()
+            if not firmware_version:
+                raise ApiError(400, "MISSING_FIELD", "firmwareVersion is required.")
+            candidate["firmware"] = firmware_version
+            candidate["firmwareVersion"] = firmware_version
+        certificate_keys = {
+            "certificate",
+            "certificateId",
+            "certificateFingerprint",
+            "certificateStatus",
+            "certificateIssuedAt",
+            "certificateExpiresAt",
+        }
+        if certificate_keys.intersection(payload):
+            previous_certificate = copy_payload(device.get("certificate", {}))
+            next_certificate = certificate_payload(payload, previous_certificate)
+            apply_certificate_fields(candidate, next_certificate)
+        else:
+            previous_certificate = copy_payload(device.get("certificate", {}))
+            next_certificate = previous_certificate
+        for key in ("health", "mappingStatus"):
             if key in payload:
-                candidate[key] = payload[key]
+                candidate[key] = str(payload[key])
         if "lastSeenSecAgo" in payload:
             candidate["lastSeenSecAgo"] = parse_int_value("lastSeenSecAgo", payload["lastSeenSecAgo"])
-        if "replacementReason" in payload:
+        before = device_replacement_snapshot(device)
+        after = device_replacement_snapshot(candidate)
+        if before != after:
+            reason = str(payload.get("replacementReason") or payload.get("reason") or "").strip()
+            if not reason:
+                raise ApiError(
+                    400,
+                    "REPLACEMENT_REASON_REQUIRED",
+                    "reason is required when device mapping, firmware, sensors, or certificate changes.",
+                )
+            replaced_at = now_iso()
             candidate.setdefault("replacementHistory", []).append(
-                {"reason": str(payload["replacementReason"]), "replacedAt": now_text()}
+                {"reason": reason, "replacedAt": replaced_at, "before": before, "after": after}
             )
+            if previous_certificate != next_certificate:
+                candidate.setdefault("certificateHistory", []).append(
+                    {
+                        "reason": reason,
+                        "changedAt": replaced_at,
+                        "before": previous_certificate,
+                        "after": next_certificate,
+                    }
+                )
+        candidate["updatedAt"] = now_iso()
         next_health = str(candidate.get("health") or "")
         device.update(candidate)
         if previous_health != next_health:

@@ -62,13 +62,33 @@ def main() -> None:
         admin_token = admin_login["session"]["token"]
         operator_token = operator_login["session"]["token"]
 
+        me = request_json(port, "/api/me", token=admin_token)
+        operator_bootstrap = request_json(port, "/api/bootstrap", token=operator_token)
         sites = request_json(port, "/api/sites", token=admin_token)
         operator_sites = request_json(port, "/api/sites?role=B", token=operator_token)
         assets = request_json(port, "/api/sites/SITE-01/assets", token=admin_token)
+        devices_page = request_json(port, "/api/devices?siteId=SITE-01&page=1&size=10", token=admin_token)
         rollout = request_json(port, "/api/rollout-plans", token=admin_token)
         labels = request_json(port, "/api/acoustic-labels", token=admin_token)
         pipelines = request_json(port, "/api/data-pipelines", token=admin_token)
         telemetry = request_json(port, "/api/telemetry?siteId=SITE-01&assetId=SITE-01-MOT-02", token=admin_token)
+        expect_error(port, "/api/auth/roles", 403, token=operator_token)
+        expect_error(port, "/api/acoustic-labels", 403, token=operator_token)
+        expect_error(
+            port,
+            "/api/sites/SITE-01/network-profile",
+            403,
+            payload={
+                "networkProfileId": "A",
+                "grade": "A",
+                "directSend": True,
+                "gateway": False,
+                "offlineSync": False,
+                "reason": "operator must not update configuration",
+            },
+            token=operator_token,
+            method="PUT",
+        )
 
         created_site = request_json(
             port,
@@ -78,6 +98,7 @@ def main() -> None:
                 "code": "SMOKE",
                 "name": "Smoke Test Plant",
                 "networkType": "D",
+                "location": "Smoke Test Bay",
             },
             token=admin_token,
         )
@@ -89,17 +110,95 @@ def main() -> None:
                 "name": "Smoke Motor",
                 "assetType": "motor",
                 "ratedRpm": 1500,
+                "installLocation": "Smoke Bay 1",
+                "baselineStatus": "ready",
+                "baselineCapturedAt": "2026-08-20T10:00:00+09:00",
                 "baselineVibrationRmsMmS": 1.2,
                 "baselineAcousticDb": 51.0,
                 "baselineSampleCount": 120,
             },
             token=admin_token,
         )
+        rollout_saved = request_json(
+            port,
+            "/api/sites/SITE-SMOKE/rollout-plan",
+            {
+                "networkProfileId": "A",
+                "targetAssetIds": [created_asset["id"]],
+                "installPriority": "high",
+                "configurationType": "direct",
+                "gatewayRequired": False,
+                "note": "HTTP smoke rollout",
+            },
+            token=admin_token,
+            method="PUT",
+        )
+        network_saved = request_json(
+            port,
+            "/api/sites/SITE-SMOKE/network-profile",
+            {
+                "networkProfileId": "B",
+                "grade": "B",
+                "directSend": False,
+                "gateway": True,
+                "offlineSync": True,
+                "reason": "HTTP smoke field survey",
+            },
+            token=admin_token,
+            method="PUT",
+        )
         created_device = request_json(
             port,
-            "/api/sites/SITE-SMOKE/devices",
-            {"id": "DEV-SMOKE", "assetId": created_asset["id"]},
+            "/api/devices",
+            {
+                "id": "DEV-SMOKE",
+                "siteId": "SITE-SMOKE",
+                "assetId": created_asset["id"],
+                "certificateId": "CERT-SMOKE",
+                "certificateFingerprint": "fingerprint-smoke",
+            },
             token=admin_token,
+        )
+        patched_site = request_json(
+            port,
+            "/api/sites/SITE-SMOKE",
+            {"name": "Smoke Test Plant Updated"},
+            token=admin_token,
+            method="PATCH",
+        )
+        patched_asset = request_json(
+            port,
+            f"/api/sites/SITE-SMOKE/assets/{created_asset['id']}",
+            {"installLocation": "Smoke Bay 2"},
+            token=admin_token,
+            method="PATCH",
+        )
+        patched_device = request_json(
+            port,
+            "/api/devices/DEV-SMOKE",
+            {"firmwareVersion": "edge-0.2.0", "reason": "HTTP smoke firmware update"},
+            token=admin_token,
+            method="PATCH",
+        )
+        install_point = request_json(
+            port,
+            f"/api/assets/{created_asset['id']}/install-points",
+            {
+                "position": "drive-end bearing housing",
+                "orientation": "horizontal X",
+                "mountingMethod": "bolt fixed bracket",
+                "acousticDirection": "cooling fan",
+                "ambientNoiseSources": ["adjacent pump"],
+                "photoRefs": ["survey://smoke/front.jpg"],
+            },
+            token=admin_token,
+        )
+        patched_install_point = request_json(
+            port,
+            f"/api/assets/{created_asset['id']}/install-points/{install_point['id']}",
+            {"orientation": "vertical Z", "reason": "HTTP smoke axis correction"},
+            token=admin_token,
+            method="PATCH",
         )
         quarantined = request_json(
             port,
@@ -111,7 +210,7 @@ def main() -> None:
         expect_error(port, "/api/sites/SITE-999/assets", 404, token=admin_token)
         expect_error(port, "/api/sites/SITE-05", 403, token=operator_token)
         expect_error(port, "/api/sites/SITE-01/not-a-route", 404, token=admin_token)
-        expect_error(port, "/api/sites/SITE-01", 405, payload={"name": "bad method"}, token=admin_token, method="PUT")
+        expect_error(port, "/api/sites/SITE-01", 404, payload={"name": "bad route"}, token=admin_token, method="PUT")
         expect_error(
             port,
             "/api/sites",
@@ -134,10 +233,14 @@ def main() -> None:
 
         assert health["ok"] is True
         assert admin_login["user"]["role"] == "B"
+        assert me["user"]["username"] == "admin"
+        assert "rolePolicies" not in operator_bootstrap
+        assert "parameters" not in operator_bootstrap
         assert len(sites) == 65
         assert len(operator_sites) == 4
         assert all(site["id"] != "SITE-05" for site in operator_sites)
         assert assets[0]["siteId"] == "SITE-01"
+        assert devices_page["total"] >= 1
         assert len(rollout) == 65
         assert len(labels) >= 5
         assert len(pipelines) == 2
@@ -145,8 +248,16 @@ def main() -> None:
         assert len(telemetry["points"]) == 72
         assert created_site["id"] == "SITE-SMOKE"
         assert created_asset["baseline"]["sampleCount"] == 120
+        assert rollout_saved["targetAssetIds"] == [created_asset["id"]]
+        assert network_saved["gateway"] is True
         assert created_device["assetId"] == created_asset["id"]
+        assert patched_site["name"] == "Smoke Test Plant Updated"
+        assert patched_asset["installLocation"] == "Smoke Bay 2"
+        assert patched_device["replacementHistory"][0]["after"]["firmwareVersion"] == "edge-0.2.0"
+        assert patched_install_point["changeHistory"][0]["after"]["orientation"] == "vertical Z"
         assert quarantined["deviceId"] == "DEV-SMOKE-UNKNOWN"
+        request_json(port, "/api/auth/logout", {}, token=admin_token)
+        expect_error(port, "/api/me", 401, token=admin_token)
         print(
             "HTTP smoke OK:",
             f"sites={len(sites)}",

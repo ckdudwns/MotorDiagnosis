@@ -363,6 +363,19 @@ def rollout_configuration_for_profile(network_profile_id: str) -> dict[str, Any]
     return copy_payload(configuration)
 
 
+def network_delivery_flags_for_profile(network_profile_id: str) -> dict[str, bool]:
+    flags = {
+        "A": {"directSend": True, "gateway": False, "offlineSync": False},
+        "B": {"directSend": False, "gateway": True, "offlineSync": False},
+        "C": {"directSend": False, "gateway": False, "offlineSync": True},
+        "D": {"directSend": False, "gateway": False, "offlineSync": True},
+    }
+    profile_flags = flags.get(network_profile_id)
+    if not profile_flags:
+        raise ApiError(404, "NETWORK_PROFILE_NOT_FOUND", "Network profile was not found.")
+    return copy_payload(profile_flags)
+
+
 def build_rollout_plan_records(
     sites: list[dict[str, Any]], assets: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -390,9 +403,7 @@ def build_site_network_profile_records(sites: list[dict[str, Any]]) -> list[dict
             "siteId": site["id"],
             "networkProfileId": site["networkType"],
             "grade": site["networkType"],
-            "directSend": site["networkType"] == "A",
-            "gateway": site["networkType"] == "B",
-            "offlineSync": site["networkType"] in {"C", "D"},
+            **network_delivery_flags_for_profile(site["networkType"]),
             "reason": "Initial site survey",
             "lastSurveyedAt": "2026-08-11",
             "updatedAt": "2026-08-11T00:00:00Z",
@@ -730,9 +741,7 @@ def sync_site_network_profile(site_id: str, network_profile_id: str) -> None:
         {
             "networkProfileId": network_profile_id,
             "grade": network_profile_id,
-            "directSend": network_profile_id == "A",
-            "gateway": network_profile_id == "B",
-            "offlineSync": network_profile_id in {"C", "D"},
+            **network_delivery_flags_for_profile(network_profile_id),
             "updatedAt": now_iso(),
         }
     )
@@ -770,10 +779,8 @@ def update_site_network_profile(
         candidate.update(
             {
                 "networkProfileId": network_profile_id,
-                "grade": str(payload.get("grade") or network_profile_id),
-                "directSend": boolean_field(payload, "directSend"),
-                "gateway": boolean_field(payload, "gateway"),
-                "offlineSync": boolean_field(payload, "offlineSync"),
+                "grade": network_profile_id,
+                **network_delivery_flags_for_profile(network_profile_id),
                 "reason": reason,
                 "updatedAt": now_iso(),
             }
@@ -869,7 +876,7 @@ def parse_int_value(field: str, value: Any, default: int = 0) -> int:
         return default
     try:
         return int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ApiError(400, "INVALID_NUMBER", f"{field} must be a valid number.") from exc
 
 
@@ -974,9 +981,7 @@ def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]
                 "siteId": site_id,
                 "networkProfileId": network_type,
                 "grade": network_type,
-                "directSend": network_type == "A",
-                "gateway": network_type == "B",
-                "offlineSync": network_type in {"C", "D"},
+                **network_delivery_flags_for_profile(network_type),
                 "reason": "Initial registration",
                 "lastSurveyedAt": "",
                 "updatedAt": timestamp,

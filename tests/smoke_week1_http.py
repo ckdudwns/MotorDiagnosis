@@ -138,9 +138,9 @@ def main() -> None:
             "/api/sites/SITE-SMOKE/network-profile",
             {
                 "networkProfileId": "B",
-                "grade": "B",
-                "directSend": False,
-                "gateway": True,
+                "grade": "A",
+                "directSend": True,
+                "gateway": False,
                 "offlineSync": True,
                 "reason": "HTTP smoke field survey",
             },
@@ -247,6 +247,18 @@ def main() -> None:
             "/api/sites",
             400,
             payload={
+                "id": "SITE-INFINITE-SIGNAL",
+                "code": "INFINITE-SIGNAL",
+                "name": "Infinite Signal Plant",
+                "signalQuality": float("inf"),
+            },
+            token=admin_token,
+        )
+        expect_error(
+            port,
+            "/api/sites",
+            400,
+            payload={
                 "id": "SITE-NON-FINITE",
                 "code": "NON-FINITE",
                 "name": "Non-finite Coordinate Plant",
@@ -280,7 +292,10 @@ def main() -> None:
         assert created_site["id"] == "SITE-SMOKE"
         assert created_asset["baseline"]["sampleCount"] == 120
         assert rollout_saved["targetAssetIds"] == [created_asset["id"]]
+        assert network_saved["grade"] == "B"
+        assert network_saved["directSend"] is False
         assert network_saved["gateway"] is True
+        assert network_saved["offlineSync"] is False
         assert network_rollout["configurationType"] == "gateway"
         assert network_rollout["gatewayRequired"] is True
         assert created_device["assetId"] == created_asset["id"]

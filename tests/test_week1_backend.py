@@ -322,6 +322,32 @@ class Week1BackendTest(unittest.TestCase):
         self.assertEqual(invalid_baseline.exception.status, 400)
         self.assertEqual(invalid_baseline.exception.code, "INVALID_NUMBER")
 
+        with self.assertRaises(ApiError) as infinite_signal_quality:
+            create_site(
+                admin,
+                {
+                    "id": "SITE-INFINITE-SIGNAL",
+                    "code": "INFINITE-SIGNAL",
+                    "name": "Infinite Signal Plant",
+                    "signalQuality": float("inf"),
+                },
+            )
+        self.assertEqual(infinite_signal_quality.exception.status, 400)
+        self.assertEqual(infinite_signal_quality.exception.code, "INVALID_NUMBER")
+
+        with self.assertRaises(ApiError) as infinite_rated_rpm:
+            create_asset(
+                admin,
+                "SITE-01",
+                {
+                    "assetCode": "INFINITE-RPM",
+                    "name": "Infinite RPM Asset",
+                    "ratedRpm": float("inf"),
+                },
+            )
+        self.assertEqual(infinite_rated_rpm.exception.status, 400)
+        self.assertEqual(infinite_rated_rpm.exception.code, "INVALID_NUMBER")
+
     def test_device_mapping_requires_ready_asset_rollout_and_certificate(self) -> None:
         admin = self.admin_user()
         site = create_site(admin, {"id": "SITE-READY", "code": "READY", "name": "Ready Check Plant"})
@@ -399,15 +425,18 @@ class Week1BackendTest(unittest.TestCase):
             site["id"],
             {
                 "networkProfileId": "B",
-                "grade": "B",
-                "directSend": False,
-                "gateway": True,
+                "grade": "A",
+                "directSend": True,
+                "gateway": False,
                 "offlineSync": True,
                 "reason": "Field survey confirmed gateway relay",
             },
         )
         self.assertEqual(site_network["networkProfileId"], "B")
+        self.assertEqual(site_network["grade"], "B")
+        self.assertFalse(site_network["directSend"])
         self.assertTrue(site_network["gateway"])
+        self.assertFalse(site_network["offlineSync"])
 
         install_point = create_install_point(
             admin,
@@ -516,6 +545,12 @@ class Week1BackendTest(unittest.TestCase):
         self.assertEqual(current_device["health"], original_device["health"])
         self.assertEqual(len(current_device["mappingHistory"]), original_history_count)
         self.assertEqual(get_site(site["id"])["onlineDevices"], original_online_count)
+
+        with self.assertRaises(ApiError) as infinite_last_seen:
+            update_device(admin, device["id"], {"lastSeenSecAgo": float("inf")})
+        self.assertEqual(infinite_last_seen.exception.status, 400)
+        self.assertEqual(infinite_last_seen.exception.code, "INVALID_NUMBER")
+        self.assertEqual(get_device(device["id"])["lastSeenSecAgo"], original_device["lastSeenSecAgo"])
 
     def test_unknown_site_is_not_replaced_by_first_site(self) -> None:
         with self.assertRaises(ApiError) as context:

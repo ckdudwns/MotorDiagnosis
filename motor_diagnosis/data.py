@@ -21,6 +21,7 @@ DEVICE_MAPPING_STATUSES = {"active", "inactive"}
 
 NETWORK_PROFILES = [
     {
+        "id": "NET-DIRECT",
         "type": "A",
         "name": "Direct upload",
         "condition": "Stable wired or Wi-Fi network is available at the site.",
@@ -29,6 +30,7 @@ NETWORK_PROFILES = [
         "qualityChecks": ["RSSI", "packet loss", "display latency under 5 seconds"],
     },
     {
+        "id": "NET-GATEWAY",
         "type": "B",
         "name": "Gateway relay",
         "condition": "Equipment network is available but external access is unstable.",
@@ -37,6 +39,7 @@ NETWORK_PROFILES = [
         "qualityChecks": ["gateway power", "site survey", "device heartbeat"],
     },
     {
+        "id": "NET-STORE-FWD",
         "type": "C",
         "name": "Limited network",
         "condition": "Always-on communication is hard or bandwidth is constrained.",
@@ -45,6 +48,7 @@ NETWORK_PROFILES = [
         "qualityChecks": ["offline retention hours", "capacity threshold", "duplicate removal"],
     },
     {
+        "id": "NET-OFFLINE",
         "type": "D",
         "name": "Offline verification",
         "condition": "The site is in early verification or network type is undecided.",
@@ -53,6 +57,9 @@ NETWORK_PROFILES = [
         "qualityChecks": ["missing data prevention", "time sync", "field self-check"],
     },
 ]
+
+NETWORK_PROFILE_IDS = {profile["type"]: profile["id"] for profile in NETWORK_PROFILES}
+NETWORK_PROFILE_TYPES = {profile["id"]: profile["type"] for profile in NETWORK_PROFILES}
 
 PROFILE_CYCLE = ["A", "B", "C", "A", "B", "C", "D", "A", "B", "C"]
 STATUS_CYCLE = ["normal", "normal", "warning", "normal", "critical", "normal", "device"]
@@ -350,16 +357,28 @@ def build_devices(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return devices
 
 
+def network_profile_type(network_profile_id: str) -> str:
+    normalized = str(network_profile_id).strip().upper()
+    if normalized in NETWORK_PROFILE_IDS:
+        return normalized
+    profile_type = NETWORK_PROFILE_TYPES.get(normalized)
+    if not profile_type:
+        raise ApiError(404, "NETWORK_PROFILE_NOT_FOUND", "Network profile was not found.")
+    return profile_type
+
+
+def canonical_network_profile_id(network_profile_id: str) -> str:
+    return NETWORK_PROFILE_IDS[network_profile_type(network_profile_id)]
+
+
 def rollout_configuration_for_profile(network_profile_id: str) -> dict[str, Any]:
     configurations = {
         "A": {"configurationType": "direct", "gatewayRequired": False},
         "B": {"configurationType": "gateway", "gatewayRequired": True},
-        "C": {"configurationType": "store_and_forward", "gatewayRequired": False},
+        "C": {"configurationType": "store-and-forward", "gatewayRequired": True},
         "D": {"configurationType": "offline", "gatewayRequired": False},
     }
-    configuration = configurations.get(network_profile_id)
-    if not configuration:
-        raise ApiError(404, "NETWORK_PROFILE_NOT_FOUND", "Network profile was not found.")
+    configuration = configurations[network_profile_type(network_profile_id)]
     return copy_payload(configuration)
 
 
@@ -367,12 +386,10 @@ def network_delivery_flags_for_profile(network_profile_id: str) -> dict[str, boo
     flags = {
         "A": {"directSend": True, "gateway": False, "offlineSync": False},
         "B": {"directSend": False, "gateway": True, "offlineSync": False},
-        "C": {"directSend": False, "gateway": False, "offlineSync": True},
+        "C": {"directSend": False, "gateway": True, "offlineSync": True},
         "D": {"directSend": False, "gateway": False, "offlineSync": True},
     }
-    profile_flags = flags.get(network_profile_id)
-    if not profile_flags:
-        raise ApiError(404, "NETWORK_PROFILE_NOT_FOUND", "Network profile was not found.")
+    profile_flags = flags[network_profile_type(network_profile_id)]
     return copy_payload(profile_flags)
 
 
@@ -386,7 +403,7 @@ def build_rollout_plan_records(
         records.append(
             {
                 "siteId": site["id"],
-                "networkProfileId": site["networkType"],
+                "networkProfileId": canonical_network_profile_id(site["networkType"]),
                 "targetAssetIds": target_asset_ids,
                 "installPriority": site["priority"],
                 **configuration,
@@ -401,7 +418,7 @@ def build_site_network_profile_records(sites: list[dict[str, Any]]) -> list[dict
     return [
         {
             "siteId": site["id"],
-            "networkProfileId": site["networkType"],
+            "networkProfileId": canonical_network_profile_id(site["networkType"]),
             "grade": site["networkType"],
             **network_delivery_flags_for_profile(site["networkType"]),
             "reason": "Initial site survey",
@@ -633,11 +650,9 @@ def get_device(device_id: str) -> dict[str, Any]:
     return device
 
 
-def network_profile(profile_type: str) -> dict[str, Any]:
-    profile = next((item for item in NETWORK_PROFILES if item["type"] == profile_type), None)
-    if not profile:
-        raise ApiError(404, "NETWORK_PROFILE_NOT_FOUND", "Network profile was not found.")
-    return profile
+def network_profile(profile_id_or_type: str) -> dict[str, Any]:
+    profile_type = network_profile_type(profile_id_or_type)
+    return next(item for item in NETWORK_PROFILES if item["type"] == profile_type)
 
 
 def assets_for(site_id: str) -> list[dict[str, Any]]:
@@ -678,8 +693,8 @@ def rollout_plan_for(site_id: str) -> dict[str, Any]:
 def update_rollout_plan(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     require_permission(user, "rollout:write")
     require_site_access(user, site_id)
-    network_profile_id = required_text(payload, "networkProfileId").upper()
-    network_profile(network_profile_id)
+    network_profile_id = canonical_network_profile_id(required_text(payload, "networkProfileId"))
+    profile_type = network_profile_type(network_profile_id)
     configuration = rollout_configuration_for_profile(network_profile_id)
     target_asset_ids = string_list(payload, "targetAssetIds", required=True, uppercase=True)
 
@@ -704,8 +719,8 @@ def update_rollout_plan(user: dict[str, Any], site_id: str, payload: dict[str, A
             }
         )
         record.update(candidate)
-        site["network"] = network_profile_id
-        site["networkType"] = network_profile_id
+        site["network"] = profile_type
+        site["networkType"] = profile_type
         site["priority"] = candidate["installPriority"]
         site["targetAssetCount"] = len(target_asset_ids)
         sync_site_network_profile(site_id, network_profile_id)
@@ -725,7 +740,7 @@ def site_network_profile(site_id: str) -> dict[str, Any]:
     response.update(
         {
             "siteName": site["name"],
-            "networkType": record["networkProfileId"],
+            "networkType": record["grade"],
             "profile": network_profile(record["networkProfileId"]),
             "signalQuality": site["signalQuality"],
         }
@@ -734,28 +749,31 @@ def site_network_profile(site_id: str) -> dict[str, Any]:
 
 
 def sync_site_network_profile(site_id: str, network_profile_id: str) -> None:
+    profile_type = network_profile_type(network_profile_id)
+    canonical_profile_id = canonical_network_profile_id(network_profile_id)
     record = next((item for item in SITE_NETWORK_PROFILE_RECORDS if item["siteId"] == site_id), None)
     if not record:
         raise ApiError(404, "SITE_NETWORK_PROFILE_NOT_FOUND", "The site network profile was not found.")
     record.update(
         {
-            "networkProfileId": network_profile_id,
-            "grade": network_profile_id,
-            **network_delivery_flags_for_profile(network_profile_id),
+            "networkProfileId": canonical_profile_id,
+            "grade": profile_type,
+            **network_delivery_flags_for_profile(profile_type),
             "updatedAt": now_iso(),
         }
     )
-    sync_rollout_network_configuration(site_id, network_profile_id)
+    sync_rollout_network_configuration(site_id, canonical_profile_id)
 
 
 def sync_rollout_network_configuration(site_id: str, network_profile_id: str) -> None:
+    canonical_profile_id = canonical_network_profile_id(network_profile_id)
     rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
     if not rollout:
         raise ApiError(404, "ROLLOUT_PLAN_NOT_FOUND", "The site rollout plan was not found.")
     rollout.update(
         {
-            "networkProfileId": network_profile_id,
-            **rollout_configuration_for_profile(network_profile_id),
+            "networkProfileId": canonical_profile_id,
+            **rollout_configuration_for_profile(canonical_profile_id),
             "updatedAt": now_iso(),
         }
     )
@@ -766,8 +784,8 @@ def update_site_network_profile(
 ) -> dict[str, Any]:
     require_permission(user, "network-profile:write")
     require_site_access(user, site_id)
-    network_profile_id = required_text(payload, "networkProfileId").upper()
-    network_profile(network_profile_id)
+    network_profile_id = canonical_network_profile_id(required_text(payload, "networkProfileId"))
+    profile_type = network_profile_type(network_profile_id)
     reason = required_text(payload, "reason")
 
     with STORE_LOCK:
@@ -779,15 +797,15 @@ def update_site_network_profile(
         candidate.update(
             {
                 "networkProfileId": network_profile_id,
-                "grade": network_profile_id,
+                "grade": profile_type,
                 **network_delivery_flags_for_profile(network_profile_id),
                 "reason": reason,
                 "updatedAt": now_iso(),
             }
         )
         record.update(candidate)
-        site["network"] = network_profile_id
-        site["networkType"] = network_profile_id
+        site["network"] = profile_type
+        site["networkType"] = profile_type
         sync_rollout_network_configuration(site_id, network_profile_id)
         return site_network_profile(site_id)
 
@@ -930,8 +948,8 @@ def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]
     require_permission(user, "site:write")
     site_id = required_text(payload, "id").upper()
     site_code = str(payload.get("code") or site_id).strip().upper()
-    network_type = str(payload.get("networkType") or "D").strip().upper()
-    network_profile(network_type)
+    network_type = network_profile_type(str(payload.get("networkType") or "D"))
+    network_profile_id = canonical_network_profile_id(network_type)
 
     with STORE_LOCK:
         if any(site["id"] == site_id for site in SITES):
@@ -968,7 +986,7 @@ def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]
         ROLLOUT_PLAN_RECORDS.append(
             {
                 "siteId": site_id,
-                "networkProfileId": network_type,
+                "networkProfileId": network_profile_id,
                 "targetAssetIds": [],
                 "installPriority": site["priority"],
                 **rollout_configuration_for_profile(network_type),
@@ -979,7 +997,7 @@ def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]
         SITE_NETWORK_PROFILE_RECORDS.append(
             {
                 "siteId": site_id,
-                "networkProfileId": network_type,
+                "networkProfileId": network_profile_id,
                 "grade": network_type,
                 **network_delivery_flags_for_profile(network_type),
                 "reason": "Initial registration",
@@ -1018,8 +1036,7 @@ def update_site(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> 
             if key in payload:
                 candidate[key] = parse_float_value(key, payload[key])
         if "networkType" in payload:
-            network_type = str(payload["networkType"]).strip().upper()
-            network_profile(network_type)
+            network_type = network_profile_type(str(payload["networkType"]))
             candidate["networkType"] = network_type
             candidate["network"] = network_type
         for key in ("signalQuality", "targetAssetCount"):

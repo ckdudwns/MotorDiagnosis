@@ -69,6 +69,9 @@ def main() -> None:
         assets = request_json(port, "/api/sites/SITE-01/assets", token=admin_token)
         devices_page = request_json(port, "/api/devices?siteId=SITE-01&page=1&size=10", token=admin_token)
         rollout = request_json(port, "/api/rollout-plans", token=admin_token)
+        store_forward_profile = request_json(
+            port, "/api/network-profiles/NET-STORE-FWD", token=admin_token
+        )
         labels = request_json(port, "/api/acoustic-labels", token=admin_token)
         pipelines = request_json(port, "/api/data-pipelines", token=admin_token)
         telemetry = request_json(port, "/api/telemetry?siteId=SITE-01&assetId=SITE-01-MOT-02", token=admin_token)
@@ -79,7 +82,7 @@ def main() -> None:
             "/api/sites/SITE-01/network-profile",
             403,
             payload={
-                "networkProfileId": "A",
+                "networkProfileId": "NET-STORE-FWD",
                 "grade": "A",
                 "directSend": True,
                 "gateway": False,
@@ -123,11 +126,11 @@ def main() -> None:
             port,
             "/api/sites/SITE-SMOKE/rollout-plan",
             {
-                "networkProfileId": "A",
+                "networkProfileId": "NET-STORE-FWD",
                 "targetAssetIds": [created_asset["id"]],
                 "installPriority": "high",
-                "configurationType": "direct",
-                "gatewayRequired": False,
+                "configurationType": "store-and-forward",
+                "gatewayRequired": True,
                 "note": "HTTP smoke rollout",
             },
             token=admin_token,
@@ -285,6 +288,8 @@ def main() -> None:
         assert assets[0]["siteId"] == "SITE-01"
         assert devices_page["total"] >= 1
         assert len(rollout) == 65
+        assert store_forward_profile["id"] == "NET-STORE-FWD"
+        assert store_forward_profile["type"] == "C"
         assert len(labels) >= 5
         assert len(pipelines) == 2
         assert telemetry["units"]["vibrationRmsMmS"] == "mm/s RMS"
@@ -292,6 +297,9 @@ def main() -> None:
         assert created_site["id"] == "SITE-SMOKE"
         assert created_asset["baseline"]["sampleCount"] == 120
         assert rollout_saved["targetAssetIds"] == [created_asset["id"]]
+        assert rollout_saved["networkProfileId"] == "NET-STORE-FWD"
+        assert rollout_saved["configurationType"] == "store-and-forward"
+        assert rollout_saved["gatewayRequired"] is True
         assert network_saved["grade"] == "B"
         assert network_saved["directSend"] is False
         assert network_saved["gateway"] is True

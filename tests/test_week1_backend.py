@@ -432,7 +432,7 @@ class Week1BackendTest(unittest.TestCase):
                 "reason": "Field survey confirmed gateway relay",
             },
         )
-        self.assertEqual(site_network["networkProfileId"], "B")
+        self.assertEqual(site_network["networkProfileId"], "NET-GATEWAY")
         self.assertEqual(site_network["grade"], "B")
         self.assertFalse(site_network["directSend"])
         self.assertTrue(site_network["gateway"])
@@ -466,22 +466,23 @@ class Week1BackendTest(unittest.TestCase):
 
         initial_c = rollout_plan_for("SITE-03")
         initial_d = rollout_plan_for("SITE-07")
-        self.assertEqual(initial_c["configurationType"], "store_and_forward")
-        self.assertFalse(initial_c["gatewayRequired"])
+        self.assertEqual(initial_c["networkProfileId"], "NET-STORE-FWD")
+        self.assertEqual(initial_c["configurationType"], "store-and-forward")
+        self.assertTrue(initial_c["gatewayRequired"])
         self.assertEqual(initial_d["configurationType"], "offline")
         self.assertFalse(initial_d["gatewayRequired"])
 
         update_site(admin, "SITE-01", {"networkType": "B"})
         profile_b = rollout_plan_for("SITE-01")
-        self.assertEqual(profile_b["networkProfileId"], "B")
+        self.assertEqual(profile_b["networkProfileId"], "NET-GATEWAY")
         self.assertEqual(profile_b["configurationType"], "gateway")
         self.assertTrue(profile_b["gatewayRequired"])
 
-        update_site_network_profile(
+        site_network_c = update_site_network_profile(
             admin,
             "SITE-01",
             {
-                "networkProfileId": "C",
+                "networkProfileId": "NET-STORE-FWD",
                 "grade": "C",
                 "directSend": False,
                 "gateway": False,
@@ -489,10 +490,15 @@ class Week1BackendTest(unittest.TestCase):
                 "reason": "Bandwidth-limited field network",
             },
         )
+        self.assertEqual(site_network_c["networkProfileId"], "NET-STORE-FWD")
+        self.assertEqual(site_network_c["grade"], "C")
+        self.assertFalse(site_network_c["directSend"])
+        self.assertTrue(site_network_c["gateway"])
+        self.assertTrue(site_network_c["offlineSync"])
         profile_c = rollout_plan_for("SITE-01")
-        self.assertEqual(profile_c["networkProfileId"], "C")
-        self.assertEqual(profile_c["configurationType"], "store_and_forward")
-        self.assertFalse(profile_c["gatewayRequired"])
+        self.assertEqual(profile_c["networkProfileId"], "NET-STORE-FWD")
+        self.assertEqual(profile_c["configurationType"], "store-and-forward")
+        self.assertTrue(profile_c["gatewayRequired"])
 
     def test_failed_updates_do_not_partially_mutate_state(self) -> None:
         admin = self.admin_user()

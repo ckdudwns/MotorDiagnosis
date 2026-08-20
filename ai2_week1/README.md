@@ -22,8 +22,8 @@ output/ai2_week1/ai1_handoff_manifest.json
   특징량과 AI2 고정 장치 매핑을 모두 보존한다.
 - 실시간 경로: `siteId`, `assetId`, `deviceId` 등 외부 JSON 키를 쓰며, 가상 시각이
   아닌 현재 UTC 시각부터 1초 간격으로 재생한다.
-- `vibration_rms_mm_s` 및 `acoustic_db`가 공란인 것은 정상이다. raw 값을 mm/s RMS나
-  dB SPL로 표시하거나 전송하지 않는다.
+- `vibration_rms_mm_s` 및 `acoustic_db`가 공란인 것은 정상이다. raw-only 계약에서는
+  두 값에 숫자를 넣으면 검증 오류로 중단하며, 외부 JSON에는 항상 `null`만 전송한다.
 - 두 입력 경로는 모두 외부 JSON의 camelCase 키(`scenarioLabel`, `assetId` 등)와 JSON
   `null`을 사용한다. 인계 CSV의 빈 nullable 값은 리플레이에서도 `null`로 보존한다.
 

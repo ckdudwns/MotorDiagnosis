@@ -86,6 +86,72 @@ class TelemetryPayloadTest(unittest.TestCase):
                 writer.writerow(row)
             self.assertEqual(len(read_and_validate_rows(path)), 1)
 
+    def test_payload_rejects_calibrated_values_in_raw_only_contract(self) -> None:
+        for field, value in (("vibration_rms_mm_s", "9.9"), ("acousticDb", 88.0)):
+            with self.subTest(field=field):
+                record = {
+                    "timestamp": "2026-08-20T00:00:00Z",
+                    "sequence": 1,
+                    "site_id": "SYN-SITE-01",
+                    "asset_id": "SYN-ASSET-01",
+                    "device_id": "SYN-DEV-01",
+                    "vibration_rms_raw": "0.07",
+                    "vibration_peak_hz": "1037.11",
+                    "is_synthetic": "true",
+                    field: value,
+                }
+
+                with self.assertRaisesRegex(ValueError, "raw-only telemetry contract"):
+                    to_external_payload(record)
+
+    def test_handoff_validation_rejects_calibrated_values(self) -> None:
+        row = {column: "" for column in REQUIRED_COLUMNS}
+        row.update(
+            {
+                "timestamp": "2026-08-20T00:00:00Z",
+                "device_id": "SYN-DEV-01",
+                "asset_id": "SYN-ASSET-01",
+                "vibration_rms_raw": "0.07",
+                "vibration_peak_hz": "1037.11",
+                "known_vibration_label": "NORMAL",
+                "scenario_label": "vibration_anomaly",
+                "source": "CWRU_only_synthetic",
+                "is_synthetic": "true",
+                "vibration_unit_note": "raw accelerometer output",
+                "vibration_rms_mm_s": "9.9",
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "handoff.csv"
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=sorted(REQUIRED_COLUMNS | {"vibration_rms_mm_s"}),
+                )
+                writer.writeheader()
+                writer.writerow(row)
+            with self.assertRaisesRegex(ValueError, "raw-only telemetry contract"):
+                read_and_validate_rows(path)
+
+    def test_payload_rejects_non_finite_numbers(self) -> None:
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                record = {
+                    "timestamp": "2026-08-20T00:00:00Z",
+                    "sequence": 1,
+                    "site_id": "SYN-SITE-01",
+                    "asset_id": "SYN-ASSET-01",
+                    "device_id": "SYN-DEV-01",
+                    "rpm": value,
+                    "vibration_rms_raw": "0.07",
+                    "vibration_peak_hz": "1037.11",
+                    "is_synthetic": "true",
+                }
+
+                with self.assertRaisesRegex(ValueError, "finite number"):
+                    to_external_payload(record)
+
 
 if __name__ == "__main__":
     unittest.main()

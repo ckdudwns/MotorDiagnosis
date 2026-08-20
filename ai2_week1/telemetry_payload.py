@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -20,9 +21,21 @@ def get_nullable_float(
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        numeric_value = float(value)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{snake_key} must be numeric or null") from error
+    if not math.isfinite(numeric_value):
+        raise ValueError(f"{snake_key} must be a finite number or null")
+    return numeric_value
+
+
+def get_raw_only_null(record: dict[str, Any], snake_key: str, camel_key: str) -> None:
+    """Reject unavailable calibrated fields in the raw-only telemetry contract."""
+    value = get_value(record, snake_key, camel_key)
+    if value is not None and value != "":
+        raise ValueError(
+            f"{snake_key} must be null for the raw-only telemetry contract"
+        )
 
 
 def get_boolean(record: dict[str, Any], snake_key: str, camel_key: str) -> bool:
@@ -47,7 +60,7 @@ def to_external_payload(record: dict[str, Any]) -> dict[str, Any]:
         "vibrationRmsRaw": get_nullable_float(
             record, "vibration_rms_raw", "vibrationRmsRaw"
         ),
-        "vibrationRmsMmS": get_nullable_float(
+        "vibrationRmsMmS": get_raw_only_null(
             record, "vibration_rms_mm_s", "vibrationRmsMmS"
         ),
         "vibrationPeakHz": get_nullable_float(
@@ -56,7 +69,7 @@ def to_external_payload(record: dict[str, Any]) -> dict[str, Any]:
         "acousticRmsRaw": get_nullable_float(
             record, "acoustic_rms_raw", "acousticRmsRaw"
         ),
-        "acousticDb": get_nullable_float(record, "acoustic_db", "acousticDb"),
+        "acousticDb": get_raw_only_null(record, "acoustic_db", "acousticDb"),
         "acousticPeakHz": get_nullable_float(
             record, "acoustic_peak_hz", "acousticPeakHz"
         ),

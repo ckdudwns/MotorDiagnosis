@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from telemetry_payload import get_nullable_float, to_external_payload
+from telemetry_payload import get_nullable_float, get_raw_only_null, to_external_payload
 
 
 if sys.version_info[:2] != (3, 12):
@@ -101,15 +101,14 @@ def read_and_validate_rows(path: Path) -> list[dict[str, str]]:
                 raise ValueError(f"Row {row_number}: {error}") from error
             if value is None:
                 raise ValueError(f"Row {row_number}: {field} is required")
-        for field in (
-            "rpm",
-            "acoustic_rms_raw",
-            "acoustic_peak_hz",
-            "vibration_rms_mm_s",
-            "acoustic_db",
-        ):
+        for field in ("rpm", "acoustic_rms_raw", "acoustic_peak_hz"):
             try:
                 get_nullable_float(row, field, field)
+            except ValueError as error:
+                raise ValueError(f"Row {row_number}: {error}") from error
+        for field in ("vibration_rms_mm_s", "acoustic_db"):
+            try:
+                get_raw_only_null(row, field, field)
             except ValueError as error:
                 raise ValueError(f"Row {row_number}: {error}") from error
     return rows

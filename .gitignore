@@ -15,3 +15,29 @@ Bind_Edge_AI_*.txt
 *.docx
 *.xlsx
 ~$*
+
+# Python local environment and cache
+.venv/
+.local/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+
+# Public-data originals and locally generated datasets
+*.mat
+*.wav
+*.npy
+data/
+output/
+ai1_week1/*.zip
+ai1_week1/ai1_handoff_dataset.csv
+ai1_week1/ai1_handoff_dataset.json
+ai1_week1/ai1/data/external/
+ai1_week1/ai1/data/handoff/
+ai1_week1/ai1/data/prototype/
+ai1_week1/ai1/synthetic_data/
+
+# Internal planning documents
+참고/

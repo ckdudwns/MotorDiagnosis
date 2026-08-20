@@ -31,6 +31,11 @@ MQTT/TLS 수집기는 별도 프로세스의 메모리에 저장하지 않고 �
 메시지를 전달한다. 따라서 MQTT로 들어온 값도 HTTP 서버의 검증·멱등성·저장 경로를
 거쳐 `GET /api/telemetry`와 대시보드에서 동일하게 조회된다.
 
+QoS 1/2 메시지는 HTTP 처리가 끝난 뒤에만 수동 ACK한다. 일시적인 네트워크·5xx 오류와
+`408`, `425`, `429` 응답은 ACK하지 않아 브로커 재전송 대상으로 남기고, 백엔드가 이미
+격리한 영구적인 4xx 오류만 ACK하여 반복 수신을 막는다. 브로커 연결·해제 상태는 내부
+`POST /api/health/dependencies/mqtt` 경로로 보고되어 상태 조회 API에 반영된다.
+
 ```bash
 python -m motor_diagnosis.mqtt_service \
   --host mqtt.example.com \

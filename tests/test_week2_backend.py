@@ -6,6 +6,8 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -40,7 +42,12 @@ from motor_diagnosis.data import (
     telemetry_units,
     update_device_hardware_profile,
 )
-from motor_diagnosis.mqtt_service import MqttBridgeError, forward_mqtt_message
+from motor_diagnosis.mqtt_service import (
+    MqttBridgeError,
+    forward_mqtt_message,
+    process_mqtt_message,
+    report_mqtt_status,
+)
 from motor_diagnosis.server import create_server
 
 
@@ -311,6 +318,69 @@ class Week2BackendTest(unittest.TestCase):
             1,
         )
 
+    def test_mqtt_ack_policy_distinguishes_success_retry_and_quarantine(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        client = FakeClient()
+        message = SimpleNamespace(
+            topic="devices/DEV-01-GEN-01/telemetry",
+            payload=b"{}",
+            mid=7,
+            qos=1,
+        )
+        accepted_response = {
+            "deviceId": "DEV-01-GEN-01",
+            "sequence": 1,
+            "duplicate": False,
+        }
+        with patch(
+            "motor_diagnosis.mqtt_service.forward_mqtt_message",
+            return_value=(accepted_response, 201),
+        ):
+            result = process_mqtt_message(
+                client,
+                message,
+                endpoint="http://backend/api/telemetry/ingest",
+                token="token",
+            )
+        self.assertEqual(result, "accepted")
+        self.assertEqual(client.ack_calls, [(7, 1)])
+
+        message.mid = 8
+        with patch(
+            "motor_diagnosis.mqtt_service.forward_mqtt_message",
+            side_effect=MqttBridgeError(503, "INGEST_UNAVAILABLE", "temporary"),
+        ):
+            result = process_mqtt_message(
+                client,
+                message,
+                endpoint="http://backend/api/telemetry/ingest",
+                token="token",
+            )
+        self.assertEqual(result, "retry")
+        self.assertEqual(client.ack_calls, [(7, 1)])
+
+        message.mid = 9
+        message.qos = 2
+        with patch(
+            "motor_diagnosis.mqtt_service.forward_mqtt_message",
+            side_effect=MqttBridgeError(400, "INVALID_TELEMETRY_PAYLOAD", "bad"),
+        ):
+            result = process_mqtt_message(
+                client,
+                message,
+                endpoint="http://backend/api/telemetry/ingest",
+                token="token",
+            )
+        self.assertEqual(result, "quarantined")
+        self.assertEqual(client.ack_calls, [(7, 1), (9, 2)])
+
 
 class Week2HttpSmokeTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -500,6 +570,33 @@ class Week2HttpSmokeTest(unittest.TestCase):
             )
         self.assertEqual(mismatch.exception.code, "DEVICE_MAPPING_MISMATCH")
 
+        class AckClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        ack_client = AckClient()
+        invalid_message = SimpleNamespace(
+            topic="devices/DEV-01-GEN-01/telemetry",
+            payload=json.dumps(telemetry_payload(sequence=2, acousticDb=51.2)),
+            mid=12,
+            qos=1,
+        )
+        delivery = process_mqtt_message(
+            ack_client,
+            invalid_message,
+            endpoint=f"http://127.0.0.1:{self.port}/api/telemetry/ingest",
+            token="demo-mqtt-ingest-token",
+        )
+        self.assertEqual(delivery, "quarantined")
+        self.assertEqual(ack_client.ack_calls, [(12, 1)])
+        self.assertEqual(
+            QUARANTINED_DEVICE_MESSAGES[-1]["reason"], "INVALID_RAW_ONLY_FIELD"
+        )
+
     def test_actual_ai2_replay_output_is_accepted_and_queryable(self) -> None:
         source_asset_id = "SYN-ASSET-01"
         generated = build_replay_record(
@@ -556,6 +653,58 @@ class Week2HttpSmokeTest(unittest.TestCase):
         )
         self.assertEqual(query_status, 200)
         self.assertEqual([point["sequence"] for point in telemetry["points"]], [41])
+
+    def test_mqtt_connection_status_is_reflected_in_dependency_health(self) -> None:
+        endpoint = (
+            f"http://127.0.0.1:{self.port}/api/health/dependencies/mqtt"
+        )
+        failed = report_mqtt_status(
+            endpoint,
+            "demo-mqtt-ingest-token",
+            "degraded",
+            detail="Broker connection attempt failed.",
+            error_code="MQTT_CONNECT_FAILED",
+        )
+        self.assertEqual(failed["status"], "degraded")
+        self.assertIsNotNone(failed["lastFailureAt"])
+        self.assertEqual(failed["errorRatePct"], 100.0)
+
+        system_token = self.login("system", "system123")
+        status, health = self.request(
+            "/api/health/dependencies", token=system_token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(health["status"], "degraded")
+        mqtt = next(item for item in health["dependencies"] if item["id"] == "mqtt")
+        self.assertEqual(mqtt["detail"], "Broker connection attempt failed.")
+        self.assertEqual(health["events"][-1]["errorCode"], "MQTT_CONNECT_FAILED")
+
+        recovered = report_mqtt_status(
+            endpoint,
+            "demo-mqtt-ingest-token",
+            "healthy",
+            detail="Subscribed to devices/+/telemetry with QoS 1",
+        )
+        self.assertEqual(recovered["status"], "healthy")
+        self.assertIsNotNone(recovered["lastRecoveryAt"])
+        self.assertEqual(recovered["errorRatePct"], 50.0)
+        status, health = self.request(
+            "/api/health/dependencies", token=system_token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(health["status"], "healthy")
+        self.assertEqual(health["events"][-1]["status"], "recovered")
+
+        forbidden_status, forbidden = self.request(
+            "/api/health/dependencies/mqtt",
+            method="POST",
+            token="demo-telemetry-ingest-token",
+            payload={"status": "degraded"},
+        )
+        self.assertEqual(forbidden_status, 403)
+        self.assertEqual(
+            forbidden["error"]["code"], "SERVICE_HEALTH_WRITE_FORBIDDEN"
+        )
 
 
 if __name__ == "__main__":

@@ -290,8 +290,9 @@ TELEMETRY_SERVICE_TOKENS = {
     "demo-mqtt-ingest-token": {
         "id": "service-mqtt-collector",
         "type": "service",
-        "permissions": ["telemetry:ingest"],
+        "permissions": ["telemetry:ingest", "service-health:write"],
         "allowedDeviceIds": ["*"],
+        "allowedDependencyIds": ["mqtt"],
     },
 }
 
@@ -338,6 +339,10 @@ BASE_SERVICE_DEPENDENCIES = [
         "impactScope": "MQTT device ingestion",
         "lastFailureAt": None,
         "lastRecoveryAt": None,
+        "lastCheckedAt": None,
+        "detail": None,
+        "statusReportCount": 0,
+        "failureCount": 0,
     },
     {
         "id": "ingest-api",
@@ -2696,6 +2701,111 @@ def service_health_dependencies() -> dict[str, Any]:
         "quarantinedMessageCount": len(QUARANTINED_DEVICE_MESSAGES),
         "events": copy_payload(SERVICE_HEALTH_EVENTS[-20:]),
     }
+
+
+def report_service_dependency(
+    principal: dict[str, Any], dependency_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    permissions = set(principal.get("permissions", []))
+    if "*" not in permissions and "service-health:write" not in permissions:
+        raise ApiError(
+            403,
+            "SERVICE_HEALTH_WRITE_FORBIDDEN",
+            "The token cannot update service dependency health.",
+        )
+    allowed_dependency_ids = principal.get("allowedDependencyIds", ["*"])
+    if (
+        "*" not in allowed_dependency_ids
+        and dependency_id not in allowed_dependency_ids
+    ):
+        raise ApiError(
+            403,
+            "SERVICE_HEALTH_WRITE_FORBIDDEN",
+            "The token cannot update this service dependency.",
+        )
+
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"healthy", "degraded"}:
+        raise ApiError(
+            400,
+            "INVALID_SERVICE_HEALTH",
+            "status must be healthy or degraded.",
+        )
+    detail_value = payload.get("detail")
+    if detail_value is not None and not isinstance(detail_value, str):
+        raise ApiError(
+            400,
+            "INVALID_SERVICE_HEALTH",
+            "detail must be a string or null.",
+        )
+    detail = str(detail_value or "").strip() or None
+    if detail and len(detail) > 500:
+        raise ApiError(
+            400,
+            "INVALID_SERVICE_HEALTH",
+            "detail must be 500 characters or fewer.",
+        )
+    error_code_value = payload.get("errorCode")
+    if error_code_value is not None and not isinstance(error_code_value, str):
+        raise ApiError(
+            400,
+            "INVALID_SERVICE_HEALTH",
+            "errorCode must be a string or null.",
+        )
+    error_code = str(error_code_value or "").strip() or None
+
+    with STORE_LOCK:
+        dependency = next(
+            (item for item in SERVICE_DEPENDENCIES if item["id"] == dependency_id),
+            None,
+        )
+        if dependency is None:
+            raise ApiError(
+                404,
+                "SERVICE_DEPENDENCY_NOT_FOUND",
+                "Service dependency was not found.",
+            )
+        previous_status = str(dependency["status"])
+        checked_at = now_iso()
+        dependency["statusReportCount"] = int(
+            dependency.get("statusReportCount", 0)
+        ) + 1
+        if status == "degraded":
+            dependency["failureCount"] = int(dependency.get("failureCount", 0)) + 1
+        dependency["errorRatePct"] = round(
+            int(dependency.get("failureCount", 0))
+            / int(dependency["statusReportCount"])
+            * 100,
+            2,
+        )
+        dependency["status"] = status
+        dependency["lastCheckedAt"] = checked_at
+        dependency["detail"] = detail
+        if status == "degraded":
+            dependency["lastFailureAt"] = checked_at
+            SERVICE_HEALTH_EVENTS.append(
+                {
+                    "dependencyId": dependency_id,
+                    "status": "failure",
+                    "occurredAt": checked_at,
+                    "impactScope": dependency["impactScope"],
+                    "errorCode": error_code,
+                    "detail": detail,
+                }
+            )
+        elif previous_status == "degraded":
+            dependency["lastRecoveryAt"] = checked_at
+            SERVICE_HEALTH_EVENTS.append(
+                {
+                    "dependencyId": dependency_id,
+                    "status": "recovered",
+                    "occurredAt": checked_at,
+                    "impactScope": dependency["impactScope"],
+                    "detail": detail,
+                }
+            )
+        del SERVICE_HEALTH_EVENTS[:-100]
+        return copy_payload(dependency)
 
 
 def connectivity_number(

@@ -46,6 +46,7 @@ from .data import (
     network_profile,
     network_profiles_for_sites,
     quarantine_unregistered_device,
+    report_service_dependency,
     require_permission,
     require_site_access,
     review_event,
@@ -392,6 +393,15 @@ class AppHandler(BaseHTTPRequestHandler):
                 telemetry_principal_for_token(self.bearer_token()), payload
             )
             self.send_json(result, status=status)
+            return
+        if segments == ["api", "health", "dependencies", "mqtt"]:
+            self.send_json(
+                report_service_dependency(
+                    telemetry_principal_for_token(self.bearer_token()),
+                    "mqtt",
+                    payload,
+                )
+            )
             return
 
         user = self.require_user()

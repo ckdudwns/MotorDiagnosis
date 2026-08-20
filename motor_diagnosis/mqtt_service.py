@@ -1,19 +1,101 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import ssl
-
-from .data import ApiError, ingest_mqtt_message
+from dataclasses import dataclass
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 LOGGER = logging.getLogger("motor_diagnosis.mqtt")
 
 
+@dataclass
+class MqttBridgeError(Exception):
+    status: int
+    code: str
+    message: str
+
+
+def decode_mqtt_payload(topic: str, message: bytes | str) -> dict[str, Any]:
+    parts = [part for part in topic.strip("/").split("/") if part]
+    if len(parts) != 3 or parts[0] != "devices" or parts[2] != "telemetry":
+        raise MqttBridgeError(
+            400,
+            "INVALID_MQTT_TOPIC",
+            "MQTT topic must be devices/{deviceId}/telemetry.",
+        )
+    try:
+        payload = json.loads(
+            message.decode("utf-8") if isinstance(message, bytes) else message
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MqttBridgeError(
+            400, "INVALID_JSON", "MQTT payload is not valid JSON."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise MqttBridgeError(
+            400, "INVALID_JSON_BODY", "MQTT payload must be a JSON object."
+        )
+    topic_device_id = parts[1].strip().upper()
+    payload_device_id = str(payload.get("deviceId") or "").strip().upper()
+    if topic_device_id != payload_device_id:
+        raise MqttBridgeError(
+            409,
+            "DEVICE_MAPPING_MISMATCH",
+            "MQTT topic deviceId and payload deviceId must match.",
+        )
+    return payload
+
+
+def forward_mqtt_message(
+    topic: str,
+    message: bytes | str,
+    *,
+    endpoint: str,
+    token: str,
+    timeout: float = 10,
+) -> tuple[dict[str, Any], int]:
+    """Forward MQTT telemetry into the HTTP server that owns runtime storage."""
+    payload = decode_mqtt_payload(topic, message)
+    request = Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            return body, response.status
+    except HTTPError as exc:
+        try:
+            error_body = json.loads(exc.read().decode("utf-8"))
+            error = error_body.get("error", {})
+            code = str(error.get("code") or "INGEST_REJECTED")
+            message_text = str(error.get("message") or exc.reason)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            code = "INGEST_REJECTED"
+            message_text = str(exc.reason)
+        raise MqttBridgeError(exc.code, code, message_text) from exc
+    except URLError as exc:
+        raise MqttBridgeError(
+            503,
+            "INGEST_UNAVAILABLE",
+            f"Telemetry ingest API is unavailable: {exc.reason}",
+        ) from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Subscribe to MQTT/TLS telemetry and use the shared ingest validator."
+        description="Subscribe to MQTT/TLS telemetry and forward it to the ingest API."
     )
     parser.add_argument("--host", default=os.environ.get("MQTT_HOST", "127.0.0.1"))
     parser.add_argument(
@@ -30,6 +112,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ingest-token",
         default=os.environ.get("MQTT_INGEST_TOKEN", "demo-mqtt-ingest-token"),
+    )
+    parser.add_argument(
+        "--ingest-endpoint",
+        default=os.environ.get(
+            "TELEMETRY_INGEST_ENDPOINT",
+            "http://127.0.0.1:8787/api/telemetry/ingest",
+        ),
     )
     parser.add_argument(
         "--tls-insecure",
@@ -75,8 +164,11 @@ def main() -> None:
 
     def on_message(_client, _userdata, message) -> None:
         try:
-            response, status = ingest_mqtt_message(
-                message.topic, message.payload, token=args.ingest_token
+            response, status = forward_mqtt_message(
+                message.topic,
+                message.payload,
+                endpoint=args.ingest_endpoint,
+                token=args.ingest_token,
             )
             LOGGER.info(
                 "mqtt_ingest status=%s device=%s sequence=%s duplicate=%s",
@@ -85,10 +177,11 @@ def main() -> None:
                 response["sequence"],
                 response["duplicate"],
             )
-        except ApiError as error:
+        except MqttBridgeError as error:
             LOGGER.warning(
-                "mqtt_ingest_rejected topic=%s code=%s message=%s",
+                "mqtt_ingest_rejected topic=%s status=%s code=%s message=%s",
                 message.topic,
+                error.status,
                 error.code,
                 error.message,
             )

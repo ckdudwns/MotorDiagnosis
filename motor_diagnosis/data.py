@@ -1252,7 +1252,7 @@ def parse_float_value(field: str, value: Any, default: float = 0.0) -> float:
         return default
     try:
         parsed = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ApiError(
             400, "INVALID_NUMBER", f"{field} must be a valid number."
         ) from exc
@@ -2300,7 +2300,7 @@ def update_ingest_dependency(
                 "errorCode": error.code if error else None,
             }
         )
-    elif previous_status != "healthy":
+    elif previous_status != "healthy" and dependency["status"] == "healthy":
         dependency["lastRecoveryAt"] = now_iso()
         SERVICE_HEALTH_EVENTS.append(
             {
@@ -2436,35 +2436,6 @@ def ingest_telemetry(
             TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
             update_ingest_dependency(False, latency_ms, error)
             raise
-
-
-def ingest_mqtt_message(
-    topic: str, message: bytes | str, token: str = "demo-mqtt-ingest-token"
-) -> tuple[dict[str, Any], int]:
-    parts = [part for part in topic.strip("/").split("/") if part]
-    if len(parts) != 3 or parts[0] != "devices" or parts[2] != "telemetry":
-        raise ApiError(
-            400,
-            "INVALID_MQTT_TOPIC",
-            "MQTT topic must be devices/{deviceId}/telemetry.",
-        )
-    try:
-        payload = json.loads(
-            message.decode("utf-8") if isinstance(message, bytes) else message
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ApiError(400, "INVALID_JSON", "MQTT payload is not valid JSON.") from exc
-    if not isinstance(payload, dict):
-        raise ApiError(400, "INVALID_JSON_BODY", "MQTT payload must be a JSON object.")
-    topic_device_id = parts[1].strip().upper()
-    payload_device_id = str(payload.get("deviceId") or "").strip().upper()
-    if topic_device_id != payload_device_id:
-        raise ApiError(
-            409,
-            "DEVICE_MAPPING_MISMATCH",
-            "MQTT topic deviceId and payload deviceId must match.",
-        )
-    return ingest_telemetry(telemetry_principal_for_token(token), payload)
 
 
 def telemetry_for(
@@ -2730,6 +2701,12 @@ def service_health_dependencies() -> dict[str, Any]:
 def connectivity_number(
     payload: dict[str, Any], key: str, minimum: float, maximum: float
 ) -> float:
+    if key not in payload or payload[key] in (None, ""):
+        raise ApiError(
+            400,
+            "INVALID_CONNECTIVITY_TEST",
+            f"{key} is required.",
+        )
     value = parse_float_value(key, payload.get(key))
     if not minimum <= value <= maximum:
         raise ApiError(

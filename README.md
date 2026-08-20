@@ -27,10 +27,15 @@ AI-1의 공개 데이터 기반 합성 인계 파일을 AI-2가 분석 경로와
 로컬 AI-2 리플레이의 기본 수집 토큰은 `demo-telemetry-ingest-token`이다.
 운영 환경에서는 이 데모 토큰을 사용하지 않고 별도 장치/서비스 토큰으로 교체한다.
 
-MQTT/TLS 수집기는 HTTP 수집과 동일한 검증·멱등성 저장 경로를 사용한다.
+MQTT/TLS 수집기는 별도 프로세스의 메모리에 저장하지 않고 중앙 HTTP 수집 API로
+메시지를 전달한다. 따라서 MQTT로 들어온 값도 HTTP 서버의 검증·멱등성·저장 경로를
+거쳐 `GET /api/telemetry`와 대시보드에서 동일하게 조회된다.
 
 ```bash
-python -m motor_diagnosis.mqtt_service --host mqtt.example.com --ca-cert ca.pem
+python -m motor_diagnosis.mqtt_service \
+  --host mqtt.example.com \
+  --ca-cert ca.pem \
+  --ingest-endpoint http://127.0.0.1:8787/api/telemetry/ingest
 ```
 
 ## 개발 환경

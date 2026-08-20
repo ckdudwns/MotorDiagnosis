@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from ai2_week1.prepare_ai1_handoff import build_replay_record
+from ai2_week1.replay_telemetry import (
+    DEFAULT_BACKEND_ASSET_ID,
+    DEFAULT_BACKEND_DEVICE_ID,
+    DEFAULT_BACKEND_SITE_ID,
+    load_replay_payloads,
+    post_payload,
+    remap_payload,
+)
 
 from motor_diagnosis.data import (
     EVENTS,
@@ -20,7 +32,6 @@ from motor_diagnosis.data import (
     device_health_for,
     get_device,
     hardware_profiles,
-    ingest_mqtt_message,
     ingest_telemetry,
     reset_runtime_state,
     service_health_dependencies,
@@ -29,6 +40,7 @@ from motor_diagnosis.data import (
     telemetry_units,
     update_device_hardware_profile,
 )
+from motor_diagnosis.mqtt_service import MqttBridgeError, forward_mqtt_message
 from motor_diagnosis.server import create_server
 
 
@@ -122,21 +134,6 @@ class Week2BackendTest(unittest.TestCase):
                 self.assertEqual(context.exception.code, error_code)
         self.assertEqual(len(TELEMETRY_RECORDS), 0)
         self.assertEqual(len(QUARANTINED_DEVICE_MESSAGES), 4)
-
-    def test_mqtt_uses_the_same_validation_and_idempotency_path(self) -> None:
-        body = json.dumps(telemetry_payload())
-        accepted, status = ingest_mqtt_message("devices/DEV-01-GEN-01/telemetry", body)
-        duplicate, duplicate_status = ingest_mqtt_message(
-            "devices/DEV-01-GEN-01/telemetry", body
-        )
-        self.assertEqual(status, 201)
-        self.assertFalse(accepted["duplicate"])
-        self.assertEqual(duplicate_status, 200)
-        self.assertTrue(duplicate["duplicate"])
-
-        with self.assertRaises(ApiError) as mismatch:
-            ingest_mqtt_message("devices/DEV-OTHER/telemetry", body)
-        self.assertEqual(mismatch.exception.code, "DEVICE_MAPPING_MISMATCH")
 
     def test_telemetry_query_supports_a_shared_time_range(self) -> None:
         old_timestamp = utc_text(-120)
@@ -237,6 +234,50 @@ class Week2BackendTest(unittest.TestCase):
             len(hardware_profiles(board_type="pico-2", connectivity_type="gateway")), 1
         )
 
+        required_metrics = (
+            "rssiDbm",
+            "packetLossPct",
+            "retryRatePct",
+            "latencyMs",
+        )
+        base_payload = {
+            "testedAt": utc_text(),
+            "phase": "after",
+            "rssiDbm": -61,
+            "packetLossPct": 0.2,
+            "retryRatePct": 0.3,
+            "latencyMs": 40,
+            "verdict": "pass",
+        }
+        for missing_field in required_metrics:
+            with self.subTest(missing_field=missing_field):
+                invalid_payload = dict(base_payload)
+                invalid_payload.pop(missing_field)
+                with self.assertRaises(ApiError) as context:
+                    create_connectivity_test(admin, "DEV-01-GEN-01", invalid_payload)
+                self.assertEqual(context.exception.status, 400)
+                self.assertEqual(context.exception.code, "INVALID_CONNECTIVITY_TEST")
+        invalid_numbers = {
+            "rssiDbm": "not-a-number",
+            "packetLossPct": float("inf"),
+            "retryRatePct": "NaN",
+            "latencyMs": 10**1000,
+        }
+        for invalid_field, invalid_value in invalid_numbers.items():
+            with self.subTest(invalid_field=invalid_field):
+                invalid_payload = dict(base_payload)
+                invalid_payload[invalid_field] = invalid_value
+                with self.assertRaises(ApiError) as context:
+                    create_connectivity_test(admin, "DEV-01-GEN-01", invalid_payload)
+                self.assertEqual(context.exception.status, 400)
+                self.assertEqual(context.exception.code, "INVALID_NUMBER")
+        self.assertEqual(
+            connectivity_tests_for_device(
+                admin, "DEV-01-GEN-01", page=1, size=10
+            )["total"],
+            1,
+        )
+
     def test_service_health_exposes_ingest_metrics_and_failure_history(self) -> None:
         ingest_telemetry(self.principal, telemetry_payload())
         with self.assertRaises(ApiError):
@@ -250,6 +291,25 @@ class Week2BackendTest(unittest.TestCase):
         self.assertEqual(health["ingestMetrics"]["rejected"], 1)
         self.assertGreaterEqual(health["quarantinedMessageCount"], 1)
         self.assertEqual(health["events"][-1]["status"], "failure")
+
+        ingest_telemetry(self.principal, telemetry_payload(sequence=3))
+        still_degraded = service_health_dependencies()
+        self.assertEqual(still_degraded["status"], "degraded")
+        self.assertFalse(
+            any(
+                event["status"] == "recovered"
+                for event in still_degraded["events"]
+            )
+        )
+
+        for sequence in range(4, 12):
+            ingest_telemetry(self.principal, telemetry_payload(sequence=sequence))
+        recovered = service_health_dependencies()
+        self.assertEqual(recovered["status"], "healthy")
+        self.assertEqual(
+            sum(event["status"] == "recovered" for event in recovered["events"]),
+            1,
+        )
 
 
 class Week2HttpSmokeTest(unittest.TestCase):
@@ -403,6 +463,99 @@ class Week2HttpSmokeTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(updated["assetId"], "SITE-01-GEN-01")
+
+    def test_mqtt_bridge_forwards_into_http_server_storage(self) -> None:
+        payload = telemetry_payload()
+        accepted, status = forward_mqtt_message(
+            "devices/DEV-01-GEN-01/telemetry",
+            json.dumps(payload),
+            endpoint=f"http://127.0.0.1:{self.port}/api/telemetry/ingest",
+            token="demo-mqtt-ingest-token",
+        )
+        self.assertEqual(status, 201)
+        self.assertFalse(accepted["duplicate"])
+        duplicate, duplicate_status = forward_mqtt_message(
+            "devices/DEV-01-GEN-01/telemetry",
+            json.dumps(payload),
+            endpoint=f"http://127.0.0.1:{self.port}/api/telemetry/ingest",
+            token="demo-mqtt-ingest-token",
+        )
+        self.assertEqual(duplicate_status, 200)
+        self.assertTrue(duplicate["duplicate"])
+
+        operator_token = self.login("operator", "operator123")
+        query_status, telemetry = self.request(
+            "/api/telemetry?siteId=SITE-01&assetId=SITE-01-GEN-01",
+            token=operator_token,
+        )
+        self.assertEqual(query_status, 200)
+        self.assertEqual([point["sequence"] for point in telemetry["points"]], [1])
+
+        with self.assertRaises(MqttBridgeError) as mismatch:
+            forward_mqtt_message(
+                "devices/DEV-OTHER/telemetry",
+                json.dumps(payload),
+                endpoint=f"http://127.0.0.1:{self.port}/api/telemetry/ingest",
+                token="demo-mqtt-ingest-token",
+            )
+        self.assertEqual(mismatch.exception.code, "DEVICE_MAPPING_MISMATCH")
+
+    def test_actual_ai2_replay_output_is_accepted_and_queryable(self) -> None:
+        source_asset_id = "SYN-ASSET-01"
+        generated = build_replay_record(
+            {
+                "asset_id": source_asset_id,
+                "rpm": "1796.0",
+                "vibration_rms_raw": "0.079035",
+                "vibration_rms_mm_s": "",
+                "vibration_peak_hz": "1037.11",
+                "acoustic_rms_raw": "0.007019",
+                "acoustic_db": "",
+                "acoustic_peak_hz": "216.4",
+                "scenario_label": "normal",
+                "known_vibration_label": "NORMAL",
+                "known_acoustic_label": "",
+                "source": "CWRU_only_synthetic",
+                "is_synthetic": "true",
+                "vibration_unit_note": "raw accelerometer output; not mm/s",
+                "acoustic_unit_note": "raw waveform RMS; not dB SPL",
+            },
+            sequence=41,
+            timestamp=datetime.now(timezone.utc) - timedelta(seconds=2),
+            site_id="SYN-SITE-01",
+            device_map={source_asset_id: "SYN-DEV-01"},
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            replay_path = Path(directory) / "ai1_telemetry_replay.jsonl"
+            replay_path.write_text(
+                json.dumps(generated, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            replay_payload = load_replay_payloads(replay_path)[0]
+
+        self.assertEqual(replay_payload["siteId"], "SYN-SITE-01")
+        mapped_payload = remap_payload(
+            replay_payload,
+            site_id=DEFAULT_BACKEND_SITE_ID,
+            asset_id=DEFAULT_BACKEND_ASSET_ID,
+            device_id=DEFAULT_BACKEND_DEVICE_ID,
+        )
+        status, accepted = post_payload(
+            f"http://127.0.0.1:{self.port}/api/telemetry/ingest",
+            "demo-telemetry-ingest-token",
+            mapped_payload,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(accepted["deviceId"], DEFAULT_BACKEND_DEVICE_ID)
+
+        admin_token = self.login("admin", "admin123")
+        query_status, telemetry = self.request(
+            "/api/telemetry?siteId=SITE-01&assetId=SITE-01-GEN-01",
+            token=admin_token,
+        )
+        self.assertEqual(query_status, 200)
+        self.assertEqual([point["sequence"] for point in telemetry["points"]], [41])
 
 
 if __name__ == "__main__":

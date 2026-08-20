@@ -130,6 +130,18 @@ python ai2_week1/replay_telemetry.py --limit 3
 python ai2_week1/replay_telemetry.py --send --limit 10 --interval-seconds 1
 ```
 
+기본 엔드포인트는 `http://127.0.0.1:8787/api/telemetry/ingest`이며 로컬 개발용
+Bearer 토큰은 `demo-telemetry-ingest-token`이다. 다른 토큰은 환경 변수 또는 옵션으로
+전달한다.
+
+```bash
+export TELEMETRY_INGEST_TOKEN=your-device-or-service-token
+python ai2_week1/replay_telemetry.py --send --limit 10
+
+# 또는
+python ai2_week1/replay_telemetry.py --send --token your-device-or-service-token
+```
+
 ## 음향 데이터가 내려받아진 뒤
 
 음향 파일의 정상/이상 구간도 동일한 2초 창으로 특징량을 만든다. 그 결과에 `acoustic_rms`, `acoustic_peak_hz`, `acoustic_spectral_centroid_hz`를 채우고, 같은 `timestamp`와 `scenario_label` 기준으로 이 리플레이 데이터에 결합한다.

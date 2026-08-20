@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -28,7 +29,12 @@ def parse_args() -> argparse.Namespace:
         default=Path("output/ai2_week1/telemetry_replay.jsonl"),
     )
     parser.add_argument(
-        "--endpoint", default="http://127.0.0.1:8000/api/telemetry/ingest"
+        "--endpoint", default="http://127.0.0.1:8787/api/telemetry/ingest"
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("TELEMETRY_INGEST_TOKEN", "demo-telemetry-ingest-token"),
+        help="Bearer token with telemetry:ingest permission.",
     )
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument(
@@ -63,7 +69,10 @@ def main() -> None:
                 args.endpoint,
                 data=body,
                 method="POST",
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {args.token}",
+                },
             )
             try:
                 with urlopen(request, timeout=10) as response:

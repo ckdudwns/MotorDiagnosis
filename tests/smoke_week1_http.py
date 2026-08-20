@@ -69,6 +69,7 @@ def main() -> None:
         assets = request_json(port, "/api/sites/SITE-01/assets", token=admin_token)
         devices_page = request_json(port, "/api/devices?siteId=SITE-01&page=1&size=10", token=admin_token)
         rollout = request_json(port, "/api/rollout-plans", token=admin_token)
+        network_profiles = request_json(port, "/api/network-profiles", token=admin_token)
         store_forward_profile = request_json(
             port, "/api/network-profiles/NET-STORE-FWD", token=admin_token
         )
@@ -288,8 +289,15 @@ def main() -> None:
         assert assets[0]["siteId"] == "SITE-01"
         assert devices_page["total"] >= 1
         assert len(rollout) == 65
+        assert all(
+            {"id", "connectivityType", "offlineSync", "recommendedTopology"} <= profile.keys()
+            for profile in network_profiles
+        )
         assert store_forward_profile["id"] == "NET-STORE-FWD"
         assert store_forward_profile["type"] == "C"
+        assert store_forward_profile["connectivityType"] == "wifi/ethernet/lte/gateway"
+        assert store_forward_profile["offlineSync"] is True
+        assert store_forward_profile["recommendedTopology"] == "gateway"
         assert len(labels) >= 5
         assert len(pipelines) == 2
         assert telemetry["units"]["vibrationRmsMmS"] == "mm/s RMS"

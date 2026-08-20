@@ -5,6 +5,7 @@ import unittest
 from io import BytesIO
 
 from motor_diagnosis.data import (
+    NETWORK_PROFILES,
     ApiError,
     authenticate,
     create_asset,
@@ -20,6 +21,7 @@ from motor_diagnosis.data import (
     get_site,
     install_points_for_asset,
     logout,
+    network_profile,
     quarantine_unregistered_device,
     require_site_access,
     reset_runtime_state,
@@ -499,6 +501,15 @@ class Week1BackendTest(unittest.TestCase):
         self.assertEqual(profile_c["networkProfileId"], "NET-STORE-FWD")
         self.assertEqual(profile_c["configurationType"], "store-and-forward")
         self.assertTrue(profile_c["gatewayRequired"])
+
+    def test_network_profile_responses_follow_api_contract(self) -> None:
+        required_fields = {"id", "connectivityType", "offlineSync", "recommendedTopology"}
+        self.assertTrue(all(required_fields <= profile.keys() for profile in NETWORK_PROFILES))
+
+        store_forward = network_profile("NET-STORE-FWD")
+        self.assertEqual(store_forward["connectivityType"], "wifi/ethernet/lte/gateway")
+        self.assertTrue(store_forward["offlineSync"])
+        self.assertEqual(store_forward["recommendedTopology"], "gateway")
 
     def test_failed_updates_do_not_partially_mutate_state(self) -> None:
         admin = self.admin_user()

@@ -9,7 +9,7 @@ Bind Edge AI 프로젝트 1주차, AI-1 담당 영역의 초기 구조입니다.
 ## 폴더 구조
 
 ```
-ai1_week1/ai1/
+ai/ai1/week1/ai1/
 ├── labels/                 # 음향 라벨 기준표 (ACOUSTIC_LABEL_01)
 │   └── acoustic_label_criteria.md
 ├── feature_extraction/     # 신호 전처리 + 특징량 추출 코드
@@ -45,26 +45,26 @@ ai1_week1/ai1/
 다운로드한 파일을 아래 경로에 놓는다 (`.gitignore`에 등록되어 레포에는 커밋되지 않음):
 
 ```
-ai1_week1/ai1/data/external/cwru/97.mat
-ai1_week1/ai1/data/external/cwru/105.mat
-ai1_week1/ai1/data/external/cwru/118.mat
-ai1_week1/ai1/data/external/cwru/130.mat
+ai/ai1/week1/ai1/data/external/cwru/97.mat
+ai/ai1/week1/ai1/data/external/cwru/105.mat
+ai/ai1/week1/ai1/data/external/cwru/118.mat
+ai/ai1/week1/ai1/data/external/cwru/130.mat
 
-ai1_week1/ai1/data/external/mimii/pump/id_00/normal/*.wav
-ai1_week1/ai1/data/external/mimii/pump/id_00/abnormal/*.wav
-ai1_week1/ai1/data/external/mimii/pump/id_02/...   # 0_dB_pump.zip 압축 해제 후 pump/ 폴더를 이 경로에 이동
+ai/ai1/week1/ai1/data/external/mimii/pump/id_00/normal/*.wav
+ai/ai1/week1/ai1/data/external/mimii/pump/id_00/abnormal/*.wav
+ai/ai1/week1/ai1/data/external/mimii/pump/id_02/...   # 0_dB_pump.zip 압축 해제 후 pump/ 폴더를 이 경로에 이동
 ```
 
 ### 실행
 
 ```bash
-python ai1_week1/ai1/scripts/build_prototype_dataset.py \
-  --cwru-dir ai1_week1/ai1/data/external/cwru \
-  --mimii-pump-dir ai1_week1/ai1/data/external/mimii/pump \
-  --output-dir ai1_week1/ai1/data/prototype
+python ai/ai1/week1/ai1/scripts/build_prototype_dataset.py \
+  --cwru-dir ai/ai1/week1/ai1/data/external/cwru \
+  --mimii-pump-dir ai/ai1/week1/ai1/data/external/mimii/pump \
+  --output-dir ai/ai1/week1/ai1/data/prototype
 ```
 
-결과: `ai1_week1/ai1/data/prototype/features_with_labels.json` — 두 모달리티(vibration/acoustic) 각각 특징량 + 라벨이 통합 저장됨.
+결과: `ai/ai1/week1/ai1/data/prototype/features_with_labels.json` — 두 모달리티(vibration/acoustic) 각각 특징량 + 라벨이 통합 저장됨.
 
 라벨 체계 (프로토타입 한정):
 

@@ -2,12 +2,12 @@
 
 ## AI-1 결합 데이터 인계 후: AI2 경로 분리
 
-AI-1의 `ai1_week1/ai1/data/handoff/ai1_handoff_dataset.csv`를 받았다면, 원본 CWRU 변환 대신
+AI-1의 `ai/ai1/week1/ai1/data/handoff/ai1_handoff_dataset.csv`를 받았다면, 원본 CWRU 변환 대신
 아래 명령을 사용한다. 이 도구는 AI-1의 `raw` 특징량과 라벨·출처를 분석 경로에
 보존하고, 실시간 경로에는 고정 장치 매핑·현재 UTC 시각·외부 JSON 키를 적용한다.
 
 ```bash
-python ai2_week1/prepare_ai1_handoff.py
+python ai/ai2/week1/prepare_ai1_handoff.py
 ```
 
 결과는 다음과 같다.
@@ -62,7 +62,7 @@ vibration_features.csv + telemetry_replay.jsonl
 `--asset-id`, `--device-id`를 함께 지정한다.
 
 ```bash
-python ai2_week1/replay_telemetry.py \
+python ai/ai2/week1/replay_telemetry.py \
   --input output/ai2_week1/ai1_telemetry_replay.jsonl \
   --send
 ```
@@ -101,7 +101,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
-python ai2_week1/prepare_vibration.py
+python ai/ai2/week1/prepare_vibration.py
 ```
 
 현재 작업 환경처럼 `python3.12`가 시스템 PATH에 없다면, 로컬 도구 캐시의 3.12.4 실행본으로 같은 `.venv`를 만들 수 있다. `.local/`과 `.venv/`는 버전 관리하지 않는다.
@@ -113,9 +113,9 @@ python ai2_week1/prepare_vibration.py
 포맷과 기본 검사는 다음과 같다.
 
 ```bash
-python -m black ai2_week1
-python -m black --check ai2_week1
-python -m compileall ai2_week1
+python -m black ai/ai2/week1
+python -m black --check ai/ai2/week1
+python -m compileall ai/ai2/week1
 ```
 
 결과는 아래에 생성된다.
@@ -132,13 +132,13 @@ output/ai2_week1/label_mapping.csv
 먼저 3건만 콘솔에서 확인한다. 이 명령은 서버로 전송하지 않는다.
 
 ```bash
-python ai2_week1/replay_telemetry.py --limit 3
+python ai/ai2/week1/replay_telemetry.py --limit 3
 ```
 
 백엔드가 실행된 뒤 실제 API 전송은 다음처럼 한다. API의 최종 필드명은 백엔드 담당자와 맞춘다.
 
 ```bash
-python ai2_week1/replay_telemetry.py --send --limit 10 --interval-seconds 1
+python ai/ai2/week1/replay_telemetry.py --send --limit 10 --interval-seconds 1
 ```
 
 기본 엔드포인트는 `http://127.0.0.1:8787/api/telemetry/ingest`이며 로컬 개발용
@@ -147,10 +147,10 @@ Bearer 토큰은 `demo-telemetry-ingest-token`이다. 다른 토큰은 환경 �
 
 ```bash
 export TELEMETRY_INGEST_TOKEN=your-device-or-service-token
-python ai2_week1/replay_telemetry.py --send --limit 10
+python ai/ai2/week1/replay_telemetry.py --send --limit 10
 
 # 또는
-python ai2_week1/replay_telemetry.py --send --token your-device-or-service-token
+python ai/ai2/week1/replay_telemetry.py --send --token your-device-or-service-token
 ```
 
 ## 음향 데이터가 내려받아진 뒤

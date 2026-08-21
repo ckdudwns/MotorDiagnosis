@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("ai1_week1/ai1/data/handoff/ai1_handoff_dataset.csv"),
+        default=Path("ai/ai1/week1/ai1/data/handoff/ai1_handoff_dataset.csv"),
         help="AI-1 handoff CSV path.",
     )
     parser.add_argument(

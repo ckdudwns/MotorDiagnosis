@@ -51,20 +51,24 @@ NORMAL_LABEL = "NORMAL"
 DEFAULT_SIGMA_MULTIPLIER = 3.0
 
 
-def compute_feature_baseline(
-    data_dir: str,
-    window_size: int = 2048,
-    hop_size: int = 2048,
+def compute_feature_baseline_from_records(
+    records: list,
     sigma_multiplier: float = DEFAULT_SIGMA_MULTIPLIER,
 ) -> dict:
-    """NORMAL 라벨 윈도우들의 특징량을 모아 평균/표준편차/정상범위를 계산."""
-    records = load_cwru_dataset(data_dir, window_size=window_size, hop_size=hop_size)
+    """이미 로드된 레코드 리스트로 기준선을 계산한다 (디스크 I/O 없음).
+
+    기준선 계산의 실제 로직은 전부 여기에 있다. compute_feature_baseline()은
+    디스크에서 CWRU 데이터를 읽어 이 함수에 위임하는 얇은 래퍼다 — 테스트에서는
+    합성 신호로 만든 레코드 리스트를 직접 넣어 이 계산 로직을 검증할 수 있다
+    (레코드 형식은 load_cwru_vibration.load_cwru_dataset()의 반환값과 동일:
+    각 항목이 "label"/"signal"/"sample_rate" 키를 가진 dict).
+    """
     normal_records = [r for r in records if r["label"] == NORMAL_LABEL]
 
     if not normal_records:
         raise ValueError(
-            f"NORMAL 라벨 윈도우를 찾을 수 없습니다 (data_dir={data_dir}). "
-            "97.mat이 해당 경로에 있는지 확인하세요."
+            "NORMAL 라벨 레코드를 찾을 수 없습니다. records에 "
+            "label='NORMAL'인 항목이 있는지 확인하세요."
         )
 
     sample_rate = normal_records[0]["sample_rate"]
@@ -92,19 +96,44 @@ def compute_feature_baseline(
             ],
         }
 
-    baseline = {
+    return {
         "meta": {
             "label": NORMAL_LABEL,
-            "source": "CWRU 97.mat (Drive-End, NORMAL)",
+            "source": "in-memory records",
             "modality": "vibration",
             "n_windows": len(normal_records),
-            "window_size": window_size,
-            "hop_size": hop_size,
             "sample_rate": sample_rate,
             "sigma_multiplier": sigma_multiplier,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
         "features": feature_baseline,
+    }
+
+
+def compute_feature_baseline(
+    data_dir: str,
+    window_size: int = 2048,
+    hop_size: int = 2048,
+    sigma_multiplier: float = DEFAULT_SIGMA_MULTIPLIER,
+) -> dict:
+    """CWRU 데이터를 디스크에서 로드해 기준선을 계산한다.
+
+    NORMAL 라벨 윈도우들의 특징량을 모아 평균/표준편차/정상범위를 계산하는
+    실제 계산은 compute_feature_baseline_from_records()가 담당하고, 이 함수는
+    load_cwru_dataset()으로 디스크에서 레코드를 읽어와 위임하기만 한다.
+    """
+    records = load_cwru_dataset(data_dir, window_size=window_size, hop_size=hop_size)
+    baseline = compute_feature_baseline_from_records(records, sigma_multiplier)
+    baseline["meta"] = {
+        "label": NORMAL_LABEL,
+        "source": "CWRU 97.mat (Drive-End, NORMAL)",
+        "modality": "vibration",
+        "n_windows": baseline["meta"]["n_windows"],
+        "window_size": window_size,
+        "hop_size": hop_size,
+        "sample_rate": baseline["meta"]["sample_rate"],
+        "sigma_multiplier": sigma_multiplier,
+        "generated_at": baseline["meta"]["generated_at"],
     }
     return baseline
 

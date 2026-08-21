@@ -34,11 +34,35 @@ sys.path.insert(0, os.path.join(_THIS_DIR, "..", "scripts"))
 from load_cwru_vibration import load_cwru_dataset  # noqa: E402
 from extract_features import extract_all_features, FeatureConfig  # noqa: E402
 from validate_features import validate_features  # noqa: E402
-from compute_baseline import compute_feature_baseline  # noqa: E402
+from compute_baseline import (  # noqa: E402
+    compute_feature_baseline,
+    compute_feature_baseline_from_records,
+)
 from generate_synthetic_signal import (  # noqa: E402
     generate_normal,
     generate_bearing_fault,
 )
+
+
+def _build_fake_normal_records(n: int, sample_rate: int = 16000) -> list:
+    """load_cwru_dataset()과 동일한 레코드 형식으로 합성 NORMAL 레코드를 만든다.
+
+    실제 CWRU 파일을 읽지 않고도 compute_feature_baseline_from_records()에
+    그대로 넣을 수 있도록, 그 함수가 실제로 참조하는 키(label/signal/sample_rate)를
+    포함한 최소 형태로 구성한다.
+    """
+    return [
+        {
+            "sample_id": f"SYN_NORMAL_{i:03d}",
+            "label": "NORMAL",
+            "source_label": "synthetic_normal",
+            "modality": "vibration",
+            "sample_rate": sample_rate,
+            "rpm": None,
+            "signal": generate_normal(sample_rate=sample_rate),
+        }
+        for i in range(n)
+    ]
 
 
 def _cwru_data_available() -> bool:
@@ -63,36 +87,45 @@ class TestKurtosisFeature(unittest.TestCase):
 
 
 class TestSyntheticBaselineAndValidation(unittest.TestCase):
-    """합성(fixture) 신호로 기준선 산출 + 검증 핵심 로직이 항상 실행되도록 보장한다.
+    """합성(fixture) 신호로 실제 compute_feature_baseline_from_records()를 호출해
+    핵심 로직(기준선 산출 → validate_features 이상치 탐지)이 항상 실행되도록 보장한다.
 
-    CWRU 실데이터가 없는 환경(CI 등)에서도 EDGE_FEATURE_01의 핵심 흐름
-    (기준선 산출 → validate_features 이상치 탐지)이 최소 한 번은 검증된다.
+    PR #6 2차 리뷰: 이전 버전은 mean/std/3sigma 계산식을 테스트 안에서 직접
+    재구현하고 있어, compute_baseline.py의 실제 함수가 고장 나도 테스트가
+    통과하는 문제가 있었다. 지금은 합성 레코드를 실제 함수에 그대로 넣고,
+    그 함수의 진짜 반환값을 검증한다 (자체 계산 vs 실제 계산 비교가 아님).
+
+    CWRU 실데이터가 없는 환경(CI 등)에서도 EDGE_FEATURE_01의 핵심 흐름이
+    최소 한 번은 검증된다.
     """
 
     @classmethod
     def setUpClass(cls):
         cls.config = FeatureConfig(sample_rate=16000)
 
-        per_feature_values = {}
-        for _ in range(20):
-            signal = generate_normal(sample_rate=16000)
-            features = extract_all_features(signal, cls.config)
-            for name, value in features.items():
-                per_feature_values.setdefault(name, []).append(value)
+        fake_records = _build_fake_normal_records(20, sample_rate=16000)
+        # 실제 함수를 호출한다 — 계산 로직을 다시 구현하지 않고 진짜 반환값을 쓴다.
+        cls.baseline = compute_feature_baseline_from_records(
+            fake_records, sigma_multiplier=3.0
+        )
 
-        baseline_features = {}
-        for name, values in per_feature_values.items():
-            arr = np.asarray(values, dtype=np.float64)
-            mean, std = float(np.mean(arr)), float(np.std(arr))
-            baseline_features[name] = {
-                "mean": mean,
-                "std": std,
-                "normal_range": [mean - 3 * std, mean + 3 * std],
-            }
-        cls.baseline = {
-            "meta": {"label": "NORMAL", "sigma_multiplier": 3.0, "source": "synthetic"},
-            "features": baseline_features,
-        }
+    def test_real_function_returns_expected_baseline_shape(self):
+        """compute_feature_baseline_from_records()의 실제 반환값 자체를 검증한다."""
+        self.assertEqual(self.baseline["meta"]["n_windows"], 20)
+        self.assertEqual(self.baseline["meta"]["sigma_multiplier"], 3.0)
+        self.assertIn("rms_mean", self.baseline["features"])
+        self.assertIn("kurtosis_mean", self.baseline["features"])
+
+        rms_stats = self.baseline["features"]["rms_mean"]
+        self.assertIn("mean", rms_stats)
+        self.assertIn("std", rms_stats)
+        self.assertGreater(rms_stats["std"], 0.0)
+
+        low, high = rms_stats["normal_range"]
+        # normal_range가 실제로 mean ± 3*std로 계산됐는지 확인 (함수가
+        # 다른 배수를 쓰거나 부호를 뒤집는 등 고장 났다면 여기서 실패한다).
+        self.assertAlmostEqual(low, rms_stats["mean"] - 3 * rms_stats["std"], places=9)
+        self.assertAlmostEqual(high, rms_stats["mean"] + 3 * rms_stats["std"], places=9)
 
     def test_normal_signal_passes_validation(self):
         signal = generate_normal(sample_rate=16000)

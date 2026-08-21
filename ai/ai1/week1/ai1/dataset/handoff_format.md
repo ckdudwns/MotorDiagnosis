@@ -48,6 +48,11 @@
 
 (음향 데이터가 없는 경우 진동만으로 `normal` / `vibration_anomaly` 2종만 생성됨)
 
+## API 계약 대조 참고 (AI-2 경계)
+
+- `site_id`/`sequence` 필드는 AI-1 CSV에 포함되지 않으며, AI-2의 `prepare_ai1_handoff.py`에서 `--site-id` 인자와 replay 순번으로 채워진다.
+- `timestamp`는 순서 표시용 placeholder이며 timezone 정보가 없다. 실제 `/api/telemetry/ingest`로 전송되는 timestamp는 AI-2의 `build_replay_record()`가 RFC 3339(Z) 형식으로 새로 생성한다.
+
 ## 실행 방법
 
 ```bash

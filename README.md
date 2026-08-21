@@ -6,6 +6,7 @@
 ## AI 작업 구조
 
 - [AI-1 1주차: 신호 전처리·라벨·데이터셋](./ai/ai1/week1/README.md)
+- [AI-1 2주차: EDGE_FEATURE_01 — 특징량 계산·정상 기준선·품질 검증](./ai/ai1/week2/README.md)
 - [AI-2 1주차: 분석/실시간 경로 분리·리플레이](./ai/ai2/week1/README.md)
 
 AI-1의 공개 데이터 기반 합성 인계 파일을 AI-2가 분석 경로와 실시간 리플레이 경로로

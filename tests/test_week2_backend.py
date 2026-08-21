@@ -11,8 +11,8 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from ai2_week1.prepare_ai1_handoff import build_replay_record
-from ai2_week1.replay_telemetry import (
+from ai.ai2.week1.prepare_ai1_handoff import build_replay_record
+from ai.ai2.week1.replay_telemetry import (
     DEFAULT_BACKEND_ASSET_ID,
     DEFAULT_BACKEND_DEVICE_ID,
     DEFAULT_BACKEND_SITE_ID,

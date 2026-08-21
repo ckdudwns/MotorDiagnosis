@@ -46,13 +46,21 @@ python ai/ai1/week2/ai1/scripts/compute_baseline.py
 
 결과: `ai/ai1/week2/ai1/dataset/baseline.json`.
 
-**실행 결과 (실제 CWRU 97.mat, 2026-08-21 기준):** NORMAL 윈도우 119개로 26개
-특징값(rms_mean/std, zcr_mean, kurtosis_mean/std, spectral_centroid/bandwidth/rolloff,
-band_energy 5구간, mfcc 13개)의 기준선을 산출했다. `rms_std`/`kurtosis_std`/`mfcc_*`처럼
-윈도우 크기와 프레임 크기가 같아(2048=2048) 프레임 내 분산이 0으로 나오는 특징값도 있다
-— 이는 계산 오류가 아니라 "윈도우당 프레임 1개" 구조에서 자연스러운 결과다. MFCC는
-librosa 미설치 환경에서 0벡터로 대체되므로, 실제 MFCC 기준선이 필요하면
-`pip install librosa` 후 재실행해야 한다.
+**실행 결과 (실제 CWRU 97.mat, librosa 설치 환경, 2026-08-21 기준):** NORMAL
+윈도우 119개로 26개 특징값(rms_mean/std, zcr_mean, kurtosis_mean/std,
+spectral_centroid/bandwidth/rolloff, band_energy 5구간, mfcc 13개)의 기준선을
+산출했다.
+
+- `rms_std`/`kurtosis_std`는 윈도우 크기와 프레임 크기가 같아서(2048=2048)
+  프레임 내 분산이 0으로 나온다 — 계산 오류가 아니라 "윈도우당 프레임 1개"
+  구조에서 나오는 자연스러운 결과다 (프레임 여러 개가 필요한 통계라
+  프레임이 1개면 std가 항상 0).
+- `mfcc_1~13`은 librosa로 정상 계산된 실제 값이다 (예: `mfcc_1` mean=-151.41,
+  std=3.87 / `mfcc_2` mean=124.63, std=4.00 — 전체 값은 `dataset/baseline.json`
+  참고). **librosa가 설치되지 않은 환경에서 `compute_baseline.py`를 실행하면
+  MFCC가 0벡터로 대체되므로**(`extract_features.py`의 `compute_mfcc()` fallback),
+  `feature_extraction/requirements.txt`의 librosa가 실제로 설치돼 있는지 먼저
+  확인한 뒤 재실행해야 한다.
 
 ## 3. 특징값 품질 검증 (`validate_features.py`)
 

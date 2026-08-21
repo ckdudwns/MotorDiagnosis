@@ -17,13 +17,50 @@ AI-1이 `feature_extraction/validate_features.py`에 구현한 검증 규칙을,
 
 ## 규칙 1: 결측/무효값 검사
 
-특징값 dict의 각 값에 대해:
+아래 순서로 검사한다 (구현: `check_missing_or_invalid()`). 하나라도 걸리면 해당
+레코드는 `is_valid = false`.
 
-- 값이 `null`/`None` → invalid, reason=`missing`
-- 값이 숫자이고 `NaN` → invalid, reason=`nan`
-- 값이 숫자이고 `Inf`/`-Inf` → invalid, reason=`inf`
+1. **빈 dict**: 특징값 dict가 완전히 비어 있으면(`{}`), 다른 검사는 하지 않고
+   `reason=empty_features` 이슈 **하나만** 보고하고 즉시 종료한다. (키 개수만큼
+   `missing_key`를 보고하지 않는다 — 빈 dict는 그 자체로 하나의 이슈로 취급)
+2. **필수 키 누락** (baseline이 주어졌을 때만): baseline.json의 `features`에
+   정의된 키가 입력 dict에 하나라도 없으면, 없는 키마다 `reason=missing_key`를
+   보고한다. baseline을 주지 않으면 이 검사는 건너뛴다 (필수 키 개념 자체가
+   baseline에서 나오기 때문).
+3. 입력에 실제로 존재하는 각 값에 대해:
+   - 값이 `null`/`None` → `reason=missing`
+   - 값이 숫자(int/float)가 아님 → `reason=invalid_type`
+   - 값이 숫자이고 `NaN` → `reason=nan`
+   - 값이 숫자이고 `Inf`/`-Inf` → `reason=inf`
 
-하나라도 걸리면 해당 레코드는 `is_valid = false`.
+### bool 처리 주의 (invalid_type 판정 시 필수)
+
+`invalid_type` 판정에서 "숫자인지" 검사할 때 **bool을 명시적으로 제외해야 한다.**
+Python은 `bool`이 `int`의 서브클래스라 `isinstance(True, (int, float))`가
+`True`로 나오는 함정이 있다 — 다른 언어에서도 참/거짓 값이 암묵적으로
+0/1로 캐스팅되는 경우 동일한 함정이 있을 수 있으니 유의한다.
+
+의사코드:
+
+```
+is_number(value):
+    return (typeof value is int OR typeof value is float) AND (typeof value is NOT bool)
+```
+
+즉 `True`/`False`는 숫자가 아니라 `invalid_type`으로 거부해야 한다
+(구현: `is_valid_number()` 헬퍼, `check_missing_or_invalid`/`check_outliers`
+양쪽에서 공통으로 사용).
+
+### reason 요약표
+
+| reason | 트리거 조건 | baseline 필요 여부 |
+|---|---|---|
+| `empty_features` | 특징값 dict가 완전히 비어 있음 | 불필요 |
+| `missing_key` | baseline에 정의된 키가 입력에 없음 | 필요 (없으면 이 검사 생략) |
+| `missing` | 값이 `null`/`None` | 불필요 |
+| `invalid_type` | 값이 숫자가 아님 (문자열, bool 포함) | 불필요 |
+| `nan` | 값이 숫자이고 `NaN` | 불필요 |
+| `inf` | 값이 숫자이고 `Inf`/`-Inf` | 불필요 |
 
 ## 규칙 2: 기준선 대비 이상치 검사
 
@@ -41,6 +78,8 @@ normal_range = [mean - sigma_multiplier * std, mean + sigma_multiplier * std]
   범위 비교가 무의미하므로 건너뛴다.
 - 기준선에 없는 특징값(신규 특징량 등)은 비교 대상에서 제외한다 — 알 수 없으니 통과시킨다.
 - NaN/Inf 값은 여기서 다루지 않는다. 규칙 1에서 먼저 걸러야 한다.
+- 숫자가 아닌 값(문자열, bool 포함)도 비교 대상에서 제외한다 — 규칙 1과 동일한
+  `is_number()` 판정(위 bool 함정 포함)을 여기서도 그대로 적용해야 한다.
 
 ## `baseline.json` 스키마
 

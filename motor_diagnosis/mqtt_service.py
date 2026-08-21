@@ -1,0 +1,894 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+import ssl
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+LOGGER = logging.getLogger("motor_diagnosis.mqtt")
+RETRYABLE_HTTP_STATUSES = {408, 425, 429}
+BACKEND_QUARANTINED_INGEST_ERRORS = frozenset(
+    {
+        (400, "INVALID_TELEMETRY_PAYLOAD"),
+        (400, "INVALID_RAW_ONLY_FIELD"),
+        (404, "SITE_NOT_FOUND"),
+        (404, "ASSET_NOT_FOUND"),
+        (404, "DEVICE_NOT_FOUND"),
+        (409, "DEVICE_MAPPING_MISMATCH"),
+        (409, "DEVICE_CERTIFICATE_NOT_ACTIVE"),
+        (409, "SEQUENCE_CONFLICT"),
+    }
+)
+
+
+@dataclass
+class MqttBridgeError(Exception):
+    status: int
+    code: str
+    message: str
+    local: bool = False
+
+
+def decode_mqtt_payload(topic: str, message: bytes | str) -> dict[str, Any]:
+    parts = [part for part in topic.strip("/").split("/") if part]
+    if len(parts) != 3 or parts[0] != "devices" or parts[2] != "telemetry":
+        raise MqttBridgeError(
+            400,
+            "INVALID_MQTT_TOPIC",
+            "MQTT topic must be devices/{deviceId}/telemetry.",
+            local=True,
+        )
+    try:
+        payload = json.loads(
+            message.decode("utf-8") if isinstance(message, bytes) else message
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MqttBridgeError(
+            400,
+            "INVALID_JSON",
+            "MQTT payload is not valid JSON.",
+            local=True,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise MqttBridgeError(
+            400,
+            "INVALID_JSON_BODY",
+            "MQTT payload must be a JSON object.",
+            local=True,
+        )
+    topic_device_id = parts[1].strip().upper()
+    payload_device_id = str(payload.get("deviceId") or "").strip().upper()
+    if topic_device_id != payload_device_id:
+        raise MqttBridgeError(
+            409,
+            "DEVICE_MAPPING_MISMATCH",
+            "MQTT topic deviceId and payload deviceId must match.",
+            local=True,
+        )
+    return payload
+
+
+def post_json(
+    endpoint: str,
+    token: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float,
+) -> tuple[dict[str, Any], int]:
+    request = Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            try:
+                body = json.loads(response.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise MqttBridgeError(
+                    502,
+                    "INVALID_HTTP_RESPONSE",
+                    "Backend API returned an invalid JSON response.",
+                ) from exc
+            if not isinstance(body, dict):
+                raise MqttBridgeError(
+                    502,
+                    "INVALID_HTTP_RESPONSE",
+                    "Backend API response must be a JSON object.",
+                )
+            return body, response.status
+    except HTTPError as exc:
+        try:
+            error_body = json.loads(exc.read().decode("utf-8"))
+            error = error_body.get("error", {}) if isinstance(error_body, dict) else {}
+            code = str(error.get("code") or "INGEST_REJECTED")
+            message_text = str(error.get("message") or exc.reason)
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+            code = "INGEST_REJECTED"
+            message_text = str(exc.reason)
+        raise MqttBridgeError(exc.code, code, message_text) from exc
+    except (TimeoutError, URLError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise MqttBridgeError(
+            503,
+            "HTTP_SERVICE_UNAVAILABLE",
+            f"Backend API is unavailable: {reason}",
+        ) from exc
+
+
+def forward_mqtt_message(
+    topic: str,
+    message: bytes | str,
+    *,
+    endpoint: str,
+    token: str,
+    timeout: float = 10,
+) -> tuple[dict[str, Any], int]:
+    """Forward MQTT telemetry into the HTTP server that owns runtime storage."""
+    payload = decode_mqtt_payload(topic, message)
+    return post_json(endpoint, token, payload, timeout=timeout)
+
+
+def report_mqtt_status(
+    endpoint: str,
+    token: str,
+    status: str,
+    *,
+    detail: str | None = None,
+    error_code: str | None = None,
+    timeout: float = 3,
+) -> dict[str, Any]:
+    response, _status = post_json(
+        endpoint,
+        token,
+        {"status": status, "detail": detail, "errorCode": error_code},
+        timeout=timeout,
+    )
+    return response
+
+
+def quarantine_local_mqtt_message(
+    endpoint: str,
+    token: str,
+    topic: str,
+    message: bytes | str,
+    error: MqttBridgeError,
+    *,
+    timeout: float = 10,
+) -> tuple[dict[str, Any], int]:
+    raw_payload = (
+        message.decode("utf-8", errors="replace")
+        if isinstance(message, bytes)
+        else str(message)
+    )
+    return post_json(
+        endpoint,
+        token,
+        {
+            "topic": topic,
+            "payload": raw_payload,
+            "reason": error.code,
+            "message": error.message,
+        },
+        timeout=timeout,
+    )
+
+
+def is_permanent_ingest_error(error: MqttBridgeError) -> bool:
+    if error.local:
+        return 400 <= error.status < 500 and error.status not in RETRYABLE_HTTP_STATUSES
+    return (error.status, error.code) in BACKEND_QUARANTINED_INGEST_ERRORS
+
+
+def acknowledge_message(client: Any, message: Any) -> bool:
+    if int(message.qos) == 0:
+        return True
+    result = client.ack(message.mid, message.qos)
+    if int(result) == 0:
+        return True
+    LOGGER.error(
+        "mqtt_ack_failed mid=%s qos=%s result=%s",
+        message.mid,
+        message.qos,
+        result,
+    )
+    return False
+
+
+@dataclass(frozen=True)
+class RetryMessage:
+    topic: str
+    payload: bytes
+    mid: int
+    qos: int
+
+
+class MqttRetryQueue:
+    """SQLite-backed retry worker for HTTP delivery and local quarantine writes."""
+
+    def __init__(
+        self,
+        *,
+        database_path: str | Path,
+        ingest_endpoint: str,
+        quarantine_endpoint: str,
+        token: str,
+        initial_delay: float = 1.0,
+        max_delay: float = 120.0,
+        poll_interval: float = 0.5,
+    ) -> None:
+        self.database_path = Path(database_path)
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ingest_endpoint = ingest_endpoint
+        self.quarantine_endpoint = quarantine_endpoint
+        self.token = token
+        self.initial_delay = max(0.0, initial_delay)
+        self.max_delay = max(self.initial_delay, max_delay)
+        self.poll_interval = max(0.05, poll_interval)
+        self._ack_targets: dict[str, tuple[Any, RetryMessage]] = {}
+        self._target_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._worker: threading.Thread | None = None
+        self._initialize_database()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _initialize_database(self) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mqtt_retry_queue (
+                    message_key TEXT PRIMARY KEY,
+                    operation TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    payload BLOB NOT NULL,
+                    mid INTEGER NOT NULL,
+                    qos INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    next_attempt_at REAL NOT NULL,
+                    error_code TEXT NOT NULL,
+                    error_message TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+
+    @staticmethod
+    def _snapshot(message: Any) -> RetryMessage:
+        payload = message.payload
+        if isinstance(payload, str):
+            payload_bytes = payload.encode("utf-8")
+        else:
+            payload_bytes = bytes(payload)
+        return RetryMessage(
+            topic=str(message.topic),
+            payload=payload_bytes,
+            mid=int(message.mid),
+            qos=int(message.qos),
+        )
+
+    @staticmethod
+    def _message_key(operation: str, message: RetryMessage) -> str:
+        digest = hashlib.sha256()
+        digest.update(operation.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(message.topic.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(message.payload)
+        return digest.hexdigest()
+
+    def enqueue(
+        self,
+        client: Any,
+        message: Any,
+        error: MqttBridgeError,
+        *,
+        operation: str = "ingest",
+    ) -> bool:
+        if operation not in {"ingest", "quarantine"}:
+            raise ValueError(f"Unsupported retry operation: {operation}")
+        retry_message = self._snapshot(message)
+        message_key = self._message_key(operation, retry_message)
+        now = time.time()
+        with self._target_lock:
+            self._ack_targets[message_key] = (client, retry_message)
+        try:
+            with self._connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO mqtt_retry_queue (
+                        message_key, operation, topic, payload, mid, qos,
+                        attempts, next_attempt_at, error_code, error_message,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                    ON CONFLICT(message_key) DO UPDATE SET
+                        mid = excluded.mid,
+                        qos = excluded.qos,
+                        next_attempt_at = MIN(
+                            mqtt_retry_queue.next_attempt_at,
+                            excluded.next_attempt_at
+                        ),
+                        error_code = excluded.error_code,
+                        error_message = excluded.error_message
+                    """,
+                    (
+                        message_key,
+                        operation,
+                        retry_message.topic,
+                        sqlite3.Binary(retry_message.payload),
+                        retry_message.mid,
+                        retry_message.qos,
+                        now + self.initial_delay,
+                        error.code,
+                        error.message,
+                        now,
+                    ),
+                )
+        except sqlite3.Error:
+            with self._target_lock:
+                self._ack_targets.pop(message_key, None)
+            LOGGER.exception("mqtt_retry_enqueue_failed topic=%s", message.topic)
+            return False
+        self._wake_event.set()
+        LOGGER.warning(
+            "mqtt_retry_queued operation=%s topic=%s code=%s",
+            operation,
+            retry_message.topic,
+            error.code,
+        )
+        return True
+
+    def pending_count(self) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM mqtt_retry_queue"
+            ).fetchone()
+        return int(row["count"])
+
+    def _next_due(self, now: float) -> sqlite3.Row | None:
+        with self._connection() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM mqtt_retry_queue
+                WHERE next_attempt_at <= ?
+                ORDER BY next_attempt_at, created_at
+                LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+
+    def _reschedule(self, row: sqlite3.Row, error: MqttBridgeError) -> None:
+        attempts = int(row["attempts"]) + 1
+        delay = min(
+            self.max_delay,
+            self.initial_delay * (2 ** min(max(0, attempts - 1), 10)),
+        )
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET attempts = ?, next_attempt_at = ?,
+                    error_code = ?, error_message = ?
+                WHERE message_key = ?
+                """,
+                (
+                    attempts,
+                    time.time() + delay,
+                    error.code,
+                    error.message,
+                    row["message_key"],
+                ),
+            )
+        LOGGER.warning(
+            "mqtt_retry_scheduled operation=%s topic=%s attempt=%s delay=%.1f code=%s",
+            row["operation"],
+            row["topic"],
+            attempts,
+            delay,
+            error.code,
+        )
+
+    def _complete(self, row: sqlite3.Row, outcome: str) -> str:
+        message_key = str(row["message_key"])
+        with self._target_lock:
+            target = self._ack_targets.get(message_key)
+        if target is not None:
+            client, message = target
+            if not acknowledge_message(client, message):
+                self._reschedule(
+                    row,
+                    MqttBridgeError(503, "MQTT_ACK_FAILED", "MQTT ACK failed."),
+                )
+                return "retry"
+        with self._connection() as connection:
+            connection.execute(
+                "DELETE FROM mqtt_retry_queue WHERE message_key = ?",
+                (message_key,),
+            )
+        with self._target_lock:
+            self._ack_targets.pop(message_key, None)
+        LOGGER.info(
+            "mqtt_retry_completed operation=%s topic=%s outcome=%s",
+            row["operation"],
+            row["topic"],
+            outcome,
+        )
+        return outcome
+
+    def process_due_once(self, *, now: float | None = None) -> str:
+        row = self._next_due(time.time() if now is None else now)
+        if row is None:
+            return "idle"
+        try:
+            if row["operation"] == "quarantine":
+                quarantine_local_mqtt_message(
+                    self.quarantine_endpoint,
+                    self.token,
+                    str(row["topic"]),
+                    bytes(row["payload"]),
+                    MqttBridgeError(
+                        400,
+                        str(row["error_code"]),
+                        str(row["error_message"]),
+                        local=True,
+                    ),
+                )
+                return self._complete(row, "quarantined")
+
+            forward_mqtt_message(
+                str(row["topic"]),
+                bytes(row["payload"]),
+                endpoint=self.ingest_endpoint,
+                token=self.token,
+            )
+            return self._complete(row, "accepted")
+        except MqttBridgeError as error:
+            if row["operation"] == "ingest" and is_permanent_ingest_error(error):
+                return self._complete(row, "quarantined")
+            self._reschedule(row, error)
+            return "retry"
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.process_due_once()
+            except (OSError, sqlite3.Error):
+                LOGGER.exception("mqtt_retry_worker_failed")
+            self._wake_event.wait(self.poll_interval)
+            self._wake_event.clear()
+
+    def start(self) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+        self._stop_event.clear()
+        self._worker = threading.Thread(
+            target=self._run,
+            name="mqtt-http-retry",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        if self._worker:
+            self._worker.join(timeout=5)
+
+
+def process_mqtt_message(
+    client: Any,
+    message: Any,
+    *,
+    endpoint: str,
+    token: str,
+    quarantine_endpoint: str | None = None,
+    retry_queue: MqttRetryQueue | None = None,
+) -> str:
+    """Return accepted, quarantined, or retry based on HTTP processing outcome."""
+    try:
+        response, status = forward_mqtt_message(
+            message.topic,
+            message.payload,
+            endpoint=endpoint,
+            token=token,
+        )
+    except MqttBridgeError as error:
+        if is_permanent_ingest_error(error):
+            if error.local:
+                try:
+                    if not quarantine_endpoint:
+                        raise MqttBridgeError(
+                            503,
+                            "QUARANTINE_ENDPOINT_UNAVAILABLE",
+                            "A quarantine endpoint is required before MQTT ACK.",
+                        )
+                    quarantine_local_mqtt_message(
+                        quarantine_endpoint,
+                        token,
+                        message.topic,
+                        message.payload,
+                        error,
+                    )
+                except MqttBridgeError as quarantine_error:
+                    queued = bool(
+                        retry_queue
+                        and retry_queue.enqueue(
+                            client,
+                            message,
+                            error,
+                            operation="quarantine",
+                        )
+                    )
+                    LOGGER.warning(
+                        "mqtt_quarantine_retry topic=%s status=%s code=%s queued=%s",
+                        message.topic,
+                        quarantine_error.status,
+                        quarantine_error.code,
+                        queued,
+                    )
+                    return "retry"
+            acknowledged = acknowledge_message(client, message)
+            LOGGER.warning(
+                "mqtt_ingest_quarantined topic=%s status=%s code=%s message=%s",
+                message.topic,
+                error.status,
+                error.code,
+                error.message,
+            )
+            return "quarantined" if acknowledged else "retry"
+        queued = bool(retry_queue and retry_queue.enqueue(client, message, error))
+        LOGGER.warning(
+            "mqtt_ingest_retry topic=%s status=%s code=%s message=%s queued=%s",
+            message.topic,
+            error.status,
+            error.code,
+            error.message,
+            queued,
+        )
+        return "retry"
+
+    if not acknowledge_message(client, message):
+        return "retry"
+    LOGGER.info(
+        "mqtt_ingest status=%s device=%s sequence=%s duplicate=%s",
+        status,
+        response["deviceId"],
+        response["sequence"],
+        response["duplicate"],
+    )
+    return "accepted"
+
+
+def report_mqtt_status_safely(
+    *,
+    endpoint: str,
+    token: str,
+    status: str,
+    detail: str,
+    error_code: str | None = None,
+) -> None:
+    try:
+        report_mqtt_status(
+            endpoint,
+            token,
+            status,
+            detail=detail,
+            error_code=error_code,
+        )
+    except MqttBridgeError as error:
+        LOGGER.warning(
+            "mqtt_status_report_failed status=%s code=%s message=%s",
+            error.status,
+            error.code,
+            error.message,
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Subscribe to MQTT/TLS telemetry and forward it to the ingest API."
+    )
+    parser.add_argument("--host", default=os.environ.get("MQTT_HOST", "127.0.0.1"))
+    parser.add_argument(
+        "--port", type=int, default=int(os.environ.get("MQTT_PORT", "8883"))
+    )
+    parser.add_argument("--topic", default="devices/+/telemetry")
+    parser.add_argument("--qos", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--client-id", default="bind-edge-ai-backend")
+    parser.add_argument("--username", default=os.environ.get("MQTT_USERNAME"))
+    parser.add_argument("--password", default=os.environ.get("MQTT_PASSWORD"))
+    parser.add_argument("--ca-cert", default=os.environ.get("MQTT_CA_CERT"))
+    parser.add_argument("--client-cert", default=os.environ.get("MQTT_CLIENT_CERT"))
+    parser.add_argument("--client-key", default=os.environ.get("MQTT_CLIENT_KEY"))
+    parser.add_argument(
+        "--ingest-token",
+        default=os.environ.get("MQTT_INGEST_TOKEN", "demo-mqtt-ingest-token"),
+    )
+    parser.add_argument(
+        "--ingest-endpoint",
+        default=os.environ.get(
+            "TELEMETRY_INGEST_ENDPOINT",
+            "http://127.0.0.1:8787/api/telemetry/ingest",
+        ),
+    )
+    parser.add_argument(
+        "--health-endpoint",
+        default=os.environ.get(
+            "MQTT_HEALTH_ENDPOINT",
+            "http://127.0.0.1:8787/api/health/dependencies/mqtt",
+        ),
+    )
+    parser.add_argument(
+        "--quarantine-endpoint",
+        default=os.environ.get(
+            "MQTT_QUARANTINE_ENDPOINT",
+            "http://127.0.0.1:8787/api/telemetry/quarantine",
+        ),
+    )
+    parser.add_argument(
+        "--retry-db",
+        default=os.environ.get("MQTT_RETRY_DB", "output/mqtt_retry.sqlite3"),
+        help="SQLite file used to preserve pending HTTP deliveries across restarts.",
+    )
+    parser.add_argument(
+        "--tls-insecure",
+        action="store_true",
+        help="Disable broker hostname verification for local testing only.",
+    )
+    return parser.parse_args()
+
+
+def mqtt_reason_failed(reason_code: Any) -> bool:
+    is_failure = getattr(reason_code, "is_failure", None)
+    if is_failure is not None:
+        return bool(is_failure)
+    try:
+        return int(reason_code) >= 128
+    except (TypeError, ValueError):
+        return True
+
+
+def mqtt_reason_value(reason_code: Any) -> int | None:
+    value = getattr(reason_code, "value", reason_code)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def subscription_reason_meets_qos(reason_code: Any, requested_qos: int) -> bool:
+    granted_qos = mqtt_reason_value(reason_code)
+    if granted_qos is None:
+        return False
+    return (
+        not mqtt_reason_failed(reason_code)
+        and granted_qos in {0, 1, 2}
+        and granted_qos >= requested_qos
+    )
+
+
+def subscription_is_granted(reason_code_list: Any, requested_qos: int) -> bool:
+    reason_codes = list(reason_code_list or [])
+    return bool(reason_codes) and all(
+        subscription_reason_meets_qos(reason_code, requested_qos)
+        for reason_code in reason_codes
+    )
+
+
+def configure_mqtt_callbacks(
+    client: Any,
+    args: argparse.Namespace,
+    retry_queue: MqttRetryQueue,
+) -> set[int]:
+    pending_subscriptions: set[int] = set()
+
+    def on_connect(client, _userdata, _flags, reason_code, _properties) -> None:
+        if mqtt_reason_failed(reason_code):
+            LOGGER.error("mqtt_connect_failed reason=%s", reason_code)
+            report_mqtt_status_safely(
+                endpoint=args.health_endpoint,
+                token=args.ingest_token,
+                status="degraded",
+                detail=f"Broker connection refused: {reason_code}",
+                error_code="MQTT_CONNECT_REFUSED",
+            )
+            return
+        result, mid = client.subscribe(args.topic, qos=args.qos)
+        if int(result) != 0:
+            LOGGER.error("mqtt_subscribe_failed topic=%s result=%s", args.topic, result)
+            report_mqtt_status_safely(
+                endpoint=args.health_endpoint,
+                token=args.ingest_token,
+                status="degraded",
+                detail=f"Broker subscription request failed: {result}",
+                error_code="MQTT_SUBSCRIBE_FAILED",
+            )
+            return
+        pending_subscriptions.add(int(mid))
+        LOGGER.info(
+            "mqtt_subscribe_pending topic=%s qos=%s mid=%s",
+            args.topic,
+            args.qos,
+            mid,
+        )
+
+    def on_subscribe(_client, _userdata, mid, reason_code_list, _properties) -> None:
+        pending_subscriptions.discard(int(mid))
+        reason_codes = list(reason_code_list or [])
+        if not subscription_is_granted(reason_codes, args.qos):
+            reasons = ", ".join(str(code) for code in reason_codes)
+            broker_rejected = not reason_codes or any(
+                mqtt_reason_failed(code) for code in reason_codes
+            )
+            if broker_rejected:
+                error_code = "MQTT_SUBSCRIBE_REJECTED"
+                detail = (
+                    "Broker rejected subscription: "
+                    f"{reasons or 'missing SUBACK code'}"
+                )
+                LOGGER.error(
+                    "mqtt_suback_rejected topic=%s mid=%s reasons=%s",
+                    args.topic,
+                    mid,
+                    reasons or "missing",
+                )
+            else:
+                granted_qos = [mqtt_reason_value(code) for code in reason_codes]
+                error_code = "MQTT_SUBSCRIBE_QOS_DOWNGRADED"
+                detail = (
+                    f"Broker granted QoS {granted_qos} below requested "
+                    f"QoS {args.qos}."
+                )
+                LOGGER.error(
+                    "mqtt_suback_qos_downgraded topic=%s mid=%s "
+                    "requested=%s granted=%s",
+                    args.topic,
+                    mid,
+                    args.qos,
+                    granted_qos,
+                )
+            report_mqtt_status_safely(
+                endpoint=args.health_endpoint,
+                token=args.ingest_token,
+                status="degraded",
+                detail=detail,
+                error_code=error_code,
+            )
+            return
+        report_mqtt_status_safely(
+            endpoint=args.health_endpoint,
+            token=args.ingest_token,
+            status="healthy",
+            detail=f"Subscribed to {args.topic} with QoS {args.qos}",
+        )
+        LOGGER.info(
+            "mqtt_subscribed topic=%s qos=%s mid=%s",
+            args.topic,
+            args.qos,
+            mid,
+        )
+
+    def on_connect_fail(_client, _userdata) -> None:
+        LOGGER.error("mqtt_connect_failed reason=network")
+        report_mqtt_status_safely(
+            endpoint=args.health_endpoint,
+            token=args.ingest_token,
+            status="degraded",
+            detail="Broker connection attempt failed.",
+            error_code="MQTT_CONNECT_FAILED",
+        )
+
+    def on_disconnect(
+        _client, _userdata, _disconnect_flags, reason_code, _properties
+    ) -> None:
+        pending_subscriptions.clear()
+        LOGGER.warning("mqtt_disconnected reason=%s", reason_code)
+        report_mqtt_status_safely(
+            endpoint=args.health_endpoint,
+            token=args.ingest_token,
+            status="degraded",
+            detail=f"Broker disconnected: {reason_code}",
+            error_code="MQTT_DISCONNECTED",
+        )
+
+    def on_message(client, _userdata, message) -> None:
+        process_mqtt_message(
+            client,
+            message,
+            endpoint=args.ingest_endpoint,
+            quarantine_endpoint=args.quarantine_endpoint,
+            token=args.ingest_token,
+            retry_queue=retry_queue,
+        )
+
+    client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
+    client.on_connect_fail = on_connect_fail
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    return pending_subscriptions
+
+
+def main() -> None:
+    args = parse_args()
+    if bool(args.client_cert) != bool(args.client_key):
+        raise SystemExit("--client-cert and --client-key must be provided together")
+    if not args.client_id.strip():
+        raise SystemExit("--client-id is required for the persistent MQTT session")
+
+    try:
+        import paho.mqtt.client as mqtt
+    except ImportError as exc:
+        raise SystemExit(
+            "Install requirements.txt to run the MQTT/TLS service"
+        ) from exc
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        client_id=args.client_id,
+        clean_session=False,
+        protocol=mqtt.MQTTv311,
+        reconnect_on_failure=True,
+        manual_ack=True,
+    )
+    client.reconnect_delay_set(min_delay=1, max_delay=120)
+    if args.username:
+        client.username_pw_set(args.username, args.password)
+    client.tls_set(
+        ca_certs=args.ca_cert,
+        certfile=args.client_cert,
+        keyfile=args.client_key,
+        tls_version=ssl.PROTOCOL_TLS_CLIENT,
+    )
+    client.tls_insecure_set(args.tls_insecure)
+    retry_queue = MqttRetryQueue(
+        database_path=args.retry_db,
+        ingest_endpoint=args.ingest_endpoint,
+        quarantine_endpoint=args.quarantine_endpoint,
+        token=args.ingest_token,
+    )
+    configure_mqtt_callbacks(client, args, retry_queue)
+    retry_queue.start()
+    try:
+        client.connect_async(args.host, args.port, keepalive=60)
+        LOGGER.info("mqtt_connecting host=%s port=%s tls=true", args.host, args.port)
+        client.loop_forever(retry_first_connection=True)
+    finally:
+        retry_queue.stop()
+
+
+if __name__ == "__main__":
+    main()

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import math
 import secrets
 import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -18,6 +19,17 @@ SESSION_SECONDS = 60 * 60
 MAX_REVIEW_NOTE_LENGTH = 2000
 DEVICE_CERTIFICATE_STATUSES = {"pending", "registered", "revoked", "expired"}
 DEVICE_MAPPING_STATUSES = {"active", "inactive"}
+TELEMETRY_SCENARIOS = {
+    "normal",
+    "vibration_anomaly",
+    "acoustic_anomaly",
+    "combined_anomaly",
+}
+TELEMETRY_MAX_RECORDS_PER_ASSET = 1000
+TELEMETRY_MAX_FUTURE_SECONDS = 5 * 60
+CONNECTIVITY_TEST_PHASES = {"before", "after"}
+CONNECTIVITY_TEST_VERDICTS = {"pass", "warn", "fail"}
+HARDWARE_COMPONENTS = {"sensors", "board", "connectivity", "power", "enclosure"}
 
 NETWORK_PROFILES = [
     {
@@ -41,7 +53,11 @@ NETWORK_PROFILES = [
         "recommendedTopology": "gateway",
         "condition": "Equipment network is available but external access is unstable.",
         "architecture": "Sensor nodes -> local gateway -> central server",
-        "requiredEquipment": ["field gateway", "LTE or wired backhaul", "offline buffer"],
+        "requiredEquipment": [
+            "field gateway",
+            "LTE or wired backhaul",
+            "offline buffer",
+        ],
         "qualityChecks": ["gateway power", "site survey", "device heartbeat"],
     },
     {
@@ -53,8 +69,16 @@ NETWORK_PROFILES = [
         "recommendedTopology": "gateway",
         "condition": "Always-on communication is hard or bandwidth is constrained.",
         "architecture": "Summary upload + store-and-forward + event priority retry",
-        "requiredEquipment": ["local storage", "time sync", "summary feature extraction"],
-        "qualityChecks": ["offline retention hours", "capacity threshold", "duplicate removal"],
+        "requiredEquipment": [
+            "local storage",
+            "time sync",
+            "summary feature extraction",
+        ],
+        "qualityChecks": [
+            "offline retention hours",
+            "capacity threshold",
+            "duplicate removal",
+        ],
     },
     {
         "id": "NET-OFFLINE",
@@ -65,7 +89,11 @@ NETWORK_PROFILES = [
         "recommendedTopology": "offline",
         "condition": "The site is in early verification or network type is undecided.",
         "architecture": "Local storage and manual export before central ingestion",
-        "requiredEquipment": ["field storage media", "manual export tool", "temporary collector"],
+        "requiredEquipment": [
+            "field storage media",
+            "manual export tool",
+            "temporary collector",
+        ],
         "qualityChecks": ["missing data prevention", "time sync", "field self-check"],
     },
 ]
@@ -76,10 +104,30 @@ NETWORK_PROFILE_TYPES = {profile["id"]: profile["type"] for profile in NETWORK_P
 PROFILE_CYCLE = ["A", "B", "C", "A", "B", "C", "D", "A", "B", "C"]
 STATUS_CYCLE = ["normal", "normal", "warning", "normal", "critical", "normal", "device"]
 ASSET_TEMPLATES = [
-    {"suffix": "GEN-01", "name": "Generator 1", "assetType": "generator", "ratedRpm": 1800},
-    {"suffix": "MOT-02", "name": "Cooling pump motor", "assetType": "motor", "ratedRpm": 1450},
-    {"suffix": "FAN-03", "name": "Ventilation fan motor", "assetType": "motor", "ratedRpm": 1200},
-    {"suffix": "PMP-04", "name": "Fuel transfer pump", "assetType": "pump", "ratedRpm": 1600},
+    {
+        "suffix": "GEN-01",
+        "name": "Generator 1",
+        "assetType": "generator",
+        "ratedRpm": 1800,
+    },
+    {
+        "suffix": "MOT-02",
+        "name": "Cooling pump motor",
+        "assetType": "motor",
+        "ratedRpm": 1450,
+    },
+    {
+        "suffix": "FAN-03",
+        "name": "Ventilation fan motor",
+        "assetType": "motor",
+        "ratedRpm": 1200,
+    },
+    {
+        "suffix": "PMP-04",
+        "name": "Fuel transfer pump",
+        "assetType": "pump",
+        "ratedRpm": 1600,
+    },
 ]
 
 PARAMETERS = {
@@ -135,6 +183,9 @@ ROLE_POLICIES = [
             "install-point:read",
             "event:read",
             "telemetry:read",
+            "dashboard:read",
+            "connectivity-test:read",
+            "hardware-profile:read",
             "export:read",
         ],
     },
@@ -161,6 +212,11 @@ ROLE_POLICIES = [
             "event:write",
             "event:review",
             "telemetry:read",
+            "dashboard:read",
+            "connectivity-test:read",
+            "connectivity-test:write",
+            "hardware-profile:read",
+            "hardware-profile:write",
             "export:read",
         ],
     },
@@ -224,6 +280,116 @@ DATA_PIPELINES = [
     },
 ]
 
+TELEMETRY_SERVICE_TOKENS = {
+    "demo-telemetry-ingest-token": {
+        "id": "service-ai2-replay",
+        "type": "service",
+        "permissions": ["telemetry:ingest"],
+        "allowedDeviceIds": ["*"],
+    },
+    "demo-mqtt-ingest-token": {
+        "id": "service-mqtt-collector",
+        "type": "service",
+        "permissions": [
+            "telemetry:ingest",
+            "telemetry:quarantine",
+            "service-health:write",
+        ],
+        "allowedDeviceIds": ["*"],
+        "allowedDependencyIds": ["mqtt"],
+    },
+}
+
+HARDWARE_PROFILES = [
+    {
+        "id": "HW-PICO2W-DUAL-SENSOR-WIFI",
+        "name": "Pico 2 W dual-sensor Wi-Fi profile",
+        "boardType": "pico-2-w",
+        "connectivityType": "wifi",
+        "sensors": ["mpu-6050", "inmp441"],
+        "powerModule": "5v-dc-regulated",
+        "enclosure": "ip65",
+        "active": True,
+    },
+    {
+        "id": "HW-PICO2-DUAL-SENSOR-GATEWAY",
+        "name": "Pico 2 dual-sensor gateway profile",
+        "boardType": "pico-2",
+        "connectivityType": "gateway",
+        "sensors": ["mpu-6050", "inmp441"],
+        "powerModule": "5v-dc-regulated",
+        "enclosure": "ip65",
+        "active": True,
+    },
+    {
+        "id": "HW-PICO2W-VIBRATION-WIFI",
+        "name": "Pico 2 W vibration-only Wi-Fi profile",
+        "boardType": "pico-2-w",
+        "connectivityType": "wifi",
+        "sensors": ["mpu-6050"],
+        "powerModule": "5v-dc-regulated",
+        "enclosure": "ip65",
+        "active": True,
+    },
+]
+
+BASE_SERVICE_DEPENDENCIES = [
+    {
+        "id": "mqtt",
+        "name": "MQTT/TLS collection",
+        "status": "ready",
+        "latencyMs": 0.0,
+        "errorRatePct": 0.0,
+        "impactScope": "MQTT device ingestion",
+        "lastFailureAt": None,
+        "lastRecoveryAt": None,
+        "lastCheckedAt": None,
+        "detail": None,
+        "statusReportCount": 0,
+        "failureCount": 0,
+    },
+    {
+        "id": "ingest-api",
+        "name": "Telemetry ingest API",
+        "status": "healthy",
+        "latencyMs": 0.0,
+        "errorRatePct": 0.0,
+        "impactScope": "HTTP telemetry ingestion",
+        "lastFailureAt": None,
+        "lastRecoveryAt": None,
+    },
+    {
+        "id": "storage",
+        "name": "In-memory telemetry storage",
+        "status": "healthy",
+        "latencyMs": 0.0,
+        "errorRatePct": 0.0,
+        "impactScope": "Telemetry query and dashboard",
+        "lastFailureAt": None,
+        "lastRecoveryAt": None,
+    },
+    {
+        "id": "analysis",
+        "name": "Anomaly analysis worker",
+        "status": "ready",
+        "latencyMs": 0.0,
+        "errorRatePct": 0.0,
+        "impactScope": "Anomaly score updates",
+        "lastFailureAt": None,
+        "lastRecoveryAt": None,
+    },
+    {
+        "id": "alerts",
+        "name": "Alert channel",
+        "status": "ready",
+        "latencyMs": 0.0,
+        "errorRatePct": 0.0,
+        "impactScope": "External alert delivery",
+        "lastFailureAt": None,
+        "lastRecoveryAt": None,
+    },
+]
+
 
 @dataclass
 class ApiError(Exception):
@@ -251,8 +417,18 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def iso_seconds_ago(seconds: int) -> str:
+    return (
+        (datetime.now(timezone.utc) - timedelta(seconds=max(0, seconds)))
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def hash_password(password: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000).hex()
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000
+    ).hex()
 
 
 def verify_password(password: str, user: dict[str, Any]) -> bool:
@@ -276,7 +452,9 @@ def build_sites() -> list[dict[str, Any]]:
         total_devices = 3 + (index % 5)
         offline = 1 if index % 9 == 0 else 2 if index % 17 == 0 else 0
         profile_type = PROFILE_CYCLE[index % len(PROFILE_CYCLE)]
-        region = "west_coast" if index < 13 else "south_coast" if index < 33 else "east_jeju"
+        region = (
+            "west_coast" if index < 13 else "south_coast" if index < 33 else "east_jeju"
+        )
         sites.append(
             {
                 "id": f"SITE-{index + 1:02d}",
@@ -286,7 +464,11 @@ def build_sites() -> list[dict[str, Any]]:
                 "timezone": "Asia/Seoul",
                 "network": profile_type,
                 "networkType": profile_type,
-                "priority": "high" if index % 5 == 0 else "medium" if index % 3 == 0 else "normal",
+                "priority": (
+                    "high"
+                    if index % 5 == 0
+                    else "medium" if index % 3 == 0 else "normal"
+                ),
                 "status": STATUS_CYCLE[index % len(STATUS_CYCLE)],
                 "operationStatus": "active",
                 "totalDevices": total_devices,
@@ -320,9 +502,15 @@ def build_assets(sites: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "rpm": template["ratedRpm"],
                     "operationStatus": "active",
                     "installLocation": f"Bay {index}",
-                    "baselineStatus": "draft" if site["rolloutStage"] == "site_survey" else "ready",
+                    "baselineStatus": (
+                        "draft" if site["rolloutStage"] == "site_survey" else "ready"
+                    ),
                     "baseline": {
-                        "status": "draft" if site["rolloutStage"] == "site_survey" else "ready",
+                        "status": (
+                            "draft"
+                            if site["rolloutStage"] == "site_survey"
+                            else "ready"
+                        ),
                         "capturedAt": "initial",
                         "vibrationRmsMmS": vibration,
                         "acousticDb": acoustic,
@@ -339,11 +527,14 @@ def build_devices(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         health = "online" if index % 4 else "warning"
         certificate = {
             "id": f"CERT-{index:04d}",
-            "fingerprint": hashlib.sha256(f"device-certificate-{index}".encode("utf-8")).hexdigest(),
+            "fingerprint": hashlib.sha256(
+                f"device-certificate-{index}".encode("utf-8")
+            ).hexdigest(),
             "status": "registered",
             "issuedAt": "2026-08-01T00:00:00Z",
             "expiresAt": "2027-08-01T00:00:00Z",
         }
+        last_seen_sec_ago = 18 + index * 3
         devices.append(
             {
                 "id": f"DEV-{asset['id'].replace('SITE-', '')}",
@@ -358,10 +549,22 @@ def build_devices(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "certificateStatus": certificate["status"],
                 "certificateIssuedAt": certificate["issuedAt"],
                 "certificateExpiresAt": certificate["expiresAt"],
-                "lastSeenSecAgo": 18 + index * 3,
+                "lastSeenSecAgo": last_seen_sec_ago,
+                "lastReceivedAt": iso_seconds_ago(last_seen_sec_ago),
                 "health": health,
+                "healthHistory": [],
+                "offlineSince": None,
+                "lastRecoveredAt": None,
+                "missingIntervals": [],
+                "rssiDbm": -55 - (index % 20),
+                "rebootCount": index % 3,
+                "bufferUsagePct": float((index * 7) % 65),
+                "hardwareProfileId": "HW-PICO2W-DUAL-SENSOR-WIFI",
+                "hardwareProfileHistory": [],
                 "mappingStatus": "active",
-                "mappingHistory": [{"assetId": asset["id"], "mappedAt": "initial", "status": "active"}],
+                "mappingHistory": [
+                    {"assetId": asset["id"], "mappedAt": "initial", "status": "active"}
+                ],
                 "replacementHistory": [],
                 "certificateHistory": [],
             }
@@ -375,7 +578,9 @@ def network_profile_type(network_profile_id: str) -> str:
         return normalized
     profile_type = NETWORK_PROFILE_TYPES.get(normalized)
     if not profile_type:
-        raise ApiError(404, "NETWORK_PROFILE_NOT_FOUND", "Network profile was not found.")
+        raise ApiError(
+            404, "NETWORK_PROFILE_NOT_FOUND", "Network profile was not found."
+        )
     return profile_type
 
 
@@ -410,7 +615,9 @@ def build_rollout_plan_records(
 ) -> list[dict[str, Any]]:
     records = []
     for site in sites:
-        target_asset_ids = [asset["id"] for asset in assets if asset["siteId"] == site["id"]]
+        target_asset_ids = [
+            asset["id"] for asset in assets if asset["siteId"] == site["id"]
+        ]
         configuration = rollout_configuration_for_profile(site["networkType"])
         records.append(
             {
@@ -426,7 +633,9 @@ def build_rollout_plan_records(
     return records
 
 
-def build_site_network_profile_records(sites: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_site_network_profile_records(
+    sites: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     return [
         {
             "siteId": site["id"],
@@ -522,6 +731,21 @@ ROLLOUT_PLAN_RECORDS = copy_payload(BASE_ROLLOUT_PLANS)
 SITE_NETWORK_PROFILE_RECORDS = copy_payload(BASE_SITE_NETWORK_PROFILES)
 INSTALL_POINTS = copy_payload(BASE_INSTALL_POINTS)
 QUARANTINED_DEVICE_MESSAGES: list[dict[str, Any]] = []
+TELEMETRY_RECORDS: list[dict[str, Any]] = []
+TELEMETRY_IDEMPOTENCY: dict[tuple[str, int], dict[str, str]] = {}
+TELEMETRY_METRICS: dict[str, int | float | str | None] = {
+    "requests": 0,
+    "accepted": 0,
+    "duplicates": 0,
+    "rejected": 0,
+    "localRejected": 0,
+    "conflicts": 0,
+    "lastReceivedAt": None,
+    "lastLatencyMs": 0.0,
+}
+CONNECTIVITY_TEST_RECORDS: list[dict[str, Any]] = []
+SERVICE_DEPENDENCIES = copy_payload(BASE_SERVICE_DEPENDENCIES)
+SERVICE_HEALTH_EVENTS: list[dict[str, Any]] = []
 
 
 def reset_runtime_state() -> None:
@@ -534,6 +758,23 @@ def reset_runtime_state() -> None:
         SITE_NETWORK_PROFILE_RECORDS[:] = copy_payload(BASE_SITE_NETWORK_PROFILES)
         INSTALL_POINTS[:] = copy_payload(BASE_INSTALL_POINTS)
         QUARANTINED_DEVICE_MESSAGES.clear()
+        TELEMETRY_RECORDS.clear()
+        TELEMETRY_IDEMPOTENCY.clear()
+        TELEMETRY_METRICS.update(
+            {
+                "requests": 0,
+                "accepted": 0,
+                "duplicates": 0,
+                "rejected": 0,
+                "localRejected": 0,
+                "conflicts": 0,
+                "lastReceivedAt": None,
+                "lastLatencyMs": 0.0,
+            }
+        )
+        CONNECTIVITY_TEST_RECORDS.clear()
+        SERVICE_DEPENDENCIES[:] = copy_payload(BASE_SERVICE_DEPENDENCIES)
+        SERVICE_HEALTH_EVENTS.clear()
         SESSIONS.clear()
         for username in LOGIN_STATE:
             LOGIN_STATE[username] = {"failures": 0, "lockedUntil": 0.0}
@@ -549,13 +790,23 @@ def authenticate(payload: dict[str, Any]) -> dict[str, Any]:
     with STORE_LOCK:
         state = LOGIN_STATE[username]
         if float(state["lockedUntil"]) > time.time():
-            raise ApiError(423, "ACCOUNT_LOCKED", "The account is locked after repeated login failures.")
+            raise ApiError(
+                423,
+                "ACCOUNT_LOCKED",
+                "The account is locked after repeated login failures.",
+            )
         if not verify_password(password, user):
             state["failures"] = int(state["failures"]) + 1
             if int(state["failures"]) >= MAX_LOGIN_FAILURES:
                 state["lockedUntil"] = time.time() + LOCK_SECONDS
-                raise ApiError(423, "ACCOUNT_LOCKED", "The account is locked after repeated login failures.")
-            raise ApiError(400, "INVALID_CREDENTIALS", "Check the username or password.")
+                raise ApiError(
+                    423,
+                    "ACCOUNT_LOCKED",
+                    "The account is locked after repeated login failures.",
+                )
+            raise ApiError(
+                400, "INVALID_CREDENTIALS", "Check the username or password."
+            )
 
         state["failures"] = 0
         state["lockedUntil"] = 0.0
@@ -567,7 +818,11 @@ def authenticate(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     session = {"token": token, "issuedAt": now_text(), "expiresInSec": SESSION_SECONDS}
-    return {"user": public_user(user), "session": session, "rolePolicy": role_policy(user["role"])}
+    return {
+        "user": public_user(user),
+        "session": session,
+        "rolePolicy": role_policy(user["role"]),
+    }
 
 
 def current_user_for_token(token: str) -> dict[str, Any]:
@@ -613,7 +868,9 @@ def role_policy(role: str) -> dict[str, Any]:
 
 def require_permission(user: dict[str, Any], permission: str) -> None:
     if not has_permission(user, permission):
-        raise ApiError(403, "FORBIDDEN", "The user does not have permission for this API.")
+        raise ApiError(
+            403, "FORBIDDEN", "The user does not have permission for this API."
+        )
 
 
 def has_permission(user: dict[str, Any], permission: str) -> bool:
@@ -631,7 +888,9 @@ def visible_sites_for_user(user: dict[str, Any]) -> list[dict[str, Any]]:
     require_permission(user, "site:read")
     if "*" in user["allowedSiteIds"]:
         return copy_payload(SITES)
-    return copy_payload([site for site in SITES if site["id"] in user["allowedSiteIds"]])
+    return copy_payload(
+        [site for site in SITES if site["id"] in user["allowedSiteIds"]]
+    )
 
 
 def get_site(site_id: str) -> dict[str, Any]:
@@ -642,7 +901,14 @@ def get_site(site_id: str) -> dict[str, Any]:
 
 
 def get_asset(site_id: str, asset_id: str) -> dict[str, Any]:
-    asset = next((item for item in ASSETS if item["siteId"] == site_id and item["id"] == asset_id), None)
+    asset = next(
+        (
+            item
+            for item in ASSETS
+            if item["siteId"] == site_id and item["id"] == asset_id
+        ),
+        None,
+    )
     if not asset:
         raise ApiError(404, "ASSET_NOT_FOUND", "Asset was not found.")
     return asset
@@ -683,9 +949,13 @@ def rollout_plans() -> list[dict[str, Any]]:
 
 def rollout_plan_for(site_id: str) -> dict[str, Any]:
     site = get_site(site_id)
-    record = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+    record = next(
+        (item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None
+    )
     if not record:
-        raise ApiError(404, "ROLLOUT_PLAN_NOT_FOUND", "The site rollout plan was not found.")
+        raise ApiError(
+            404, "ROLLOUT_PLAN_NOT_FOUND", "The site rollout plan was not found."
+        )
     profile = network_profile(record["networkProfileId"])
     response = copy_payload(record)
     response.update(
@@ -696,29 +966,47 @@ def rollout_plan_for(site_id: str) -> dict[str, Any]:
             "networkName": profile["name"],
             "targetAssetCount": len(record["targetAssetIds"]),
             "recommendedArchitecture": profile["architecture"],
-            "installationReady": bool(record["networkProfileId"] and record["targetAssetIds"]),
+            "installationReady": bool(
+                record["networkProfileId"] and record["targetAssetIds"]
+            ),
         }
     )
     return response
 
 
-def update_rollout_plan(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_rollout_plan(
+    user: dict[str, Any], site_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
     require_permission(user, "rollout:write")
     require_site_access(user, site_id)
-    network_profile_id = canonical_network_profile_id(required_text(payload, "networkProfileId"))
+    network_profile_id = canonical_network_profile_id(
+        required_text(payload, "networkProfileId")
+    )
     profile_type = network_profile_type(network_profile_id)
     configuration = rollout_configuration_for_profile(network_profile_id)
-    target_asset_ids = string_list(payload, "targetAssetIds", required=True, uppercase=True)
+    target_asset_ids = string_list(
+        payload, "targetAssetIds", required=True, uppercase=True
+    )
 
     with STORE_LOCK:
         site = get_site(site_id)
         site_asset_ids = {asset["id"] for asset in ASSETS if asset["siteId"] == site_id}
-        invalid_asset_ids = [asset_id for asset_id in target_asset_ids if asset_id not in site_asset_ids]
+        invalid_asset_ids = [
+            asset_id for asset_id in target_asset_ids if asset_id not in site_asset_ids
+        ]
         if invalid_asset_ids:
-            raise ApiError(400, "ROLLOUT_ASSET_INVALID", "All rollout target assets must belong to the site.")
-        record = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+            raise ApiError(
+                400,
+                "ROLLOUT_ASSET_INVALID",
+                "All rollout target assets must belong to the site.",
+            )
+        record = next(
+            (item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None
+        )
         if not record:
-            raise ApiError(404, "ROLLOUT_PLAN_NOT_FOUND", "The site rollout plan was not found.")
+            raise ApiError(
+                404, "ROLLOUT_PLAN_NOT_FOUND", "The site rollout plan was not found."
+            )
         candidate = copy_payload(record)
         candidate.update(
             {
@@ -740,14 +1028,24 @@ def update_rollout_plan(user: dict[str, Any], site_id: str, payload: dict[str, A
 
 
 def network_profiles_for_sites() -> list[dict[str, Any]]:
-    return [site_network_profile(record["siteId"]) for record in SITE_NETWORK_PROFILE_RECORDS]
+    return [
+        site_network_profile(record["siteId"])
+        for record in SITE_NETWORK_PROFILE_RECORDS
+    ]
 
 
 def site_network_profile(site_id: str) -> dict[str, Any]:
     site = get_site(site_id)
-    record = next((item for item in SITE_NETWORK_PROFILE_RECORDS if item["siteId"] == site_id), None)
+    record = next(
+        (item for item in SITE_NETWORK_PROFILE_RECORDS if item["siteId"] == site_id),
+        None,
+    )
     if not record:
-        raise ApiError(404, "SITE_NETWORK_PROFILE_NOT_FOUND", "The site network profile was not found.")
+        raise ApiError(
+            404,
+            "SITE_NETWORK_PROFILE_NOT_FOUND",
+            "The site network profile was not found.",
+        )
     response = copy_payload(record)
     response.update(
         {
@@ -763,9 +1061,16 @@ def site_network_profile(site_id: str) -> dict[str, Any]:
 def sync_site_network_profile(site_id: str, network_profile_id: str) -> None:
     profile_type = network_profile_type(network_profile_id)
     canonical_profile_id = canonical_network_profile_id(network_profile_id)
-    record = next((item for item in SITE_NETWORK_PROFILE_RECORDS if item["siteId"] == site_id), None)
+    record = next(
+        (item for item in SITE_NETWORK_PROFILE_RECORDS if item["siteId"] == site_id),
+        None,
+    )
     if not record:
-        raise ApiError(404, "SITE_NETWORK_PROFILE_NOT_FOUND", "The site network profile was not found.")
+        raise ApiError(
+            404,
+            "SITE_NETWORK_PROFILE_NOT_FOUND",
+            "The site network profile was not found.",
+        )
     record.update(
         {
             "networkProfileId": canonical_profile_id,
@@ -779,9 +1084,13 @@ def sync_site_network_profile(site_id: str, network_profile_id: str) -> None:
 
 def sync_rollout_network_configuration(site_id: str, network_profile_id: str) -> None:
     canonical_profile_id = canonical_network_profile_id(network_profile_id)
-    rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+    rollout = next(
+        (item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None
+    )
     if not rollout:
-        raise ApiError(404, "ROLLOUT_PLAN_NOT_FOUND", "The site rollout plan was not found.")
+        raise ApiError(
+            404, "ROLLOUT_PLAN_NOT_FOUND", "The site rollout plan was not found."
+        )
     rollout.update(
         {
             "networkProfileId": canonical_profile_id,
@@ -796,15 +1105,28 @@ def update_site_network_profile(
 ) -> dict[str, Any]:
     require_permission(user, "network-profile:write")
     require_site_access(user, site_id)
-    network_profile_id = canonical_network_profile_id(required_text(payload, "networkProfileId"))
+    network_profile_id = canonical_network_profile_id(
+        required_text(payload, "networkProfileId")
+    )
     profile_type = network_profile_type(network_profile_id)
     reason = required_text(payload, "reason")
 
     with STORE_LOCK:
         site = get_site(site_id)
-        record = next((item for item in SITE_NETWORK_PROFILE_RECORDS if item["siteId"] == site_id), None)
+        record = next(
+            (
+                item
+                for item in SITE_NETWORK_PROFILE_RECORDS
+                if item["siteId"] == site_id
+            ),
+            None,
+        )
         if not record:
-            raise ApiError(404, "SITE_NETWORK_PROFILE_NOT_FOUND", "The site network profile was not found.")
+            raise ApiError(
+                404,
+                "SITE_NETWORK_PROFILE_NOT_FOUND",
+                "The site network profile was not found.",
+            )
         candidate = copy_payload(record)
         candidate.update(
             {
@@ -827,7 +1149,9 @@ def install_points_for(site_id: str) -> list[dict[str, Any]]:
     return copy_payload([item for item in INSTALL_POINTS if item["siteId"] == site_id])
 
 
-def install_points_for_asset(asset_id: str, active: bool | None = None) -> list[dict[str, Any]]:
+def install_points_for_asset(
+    asset_id: str, active: bool | None = None
+) -> list[dict[str, Any]]:
     get_asset_by_id(asset_id)
     rows = [item for item in INSTALL_POINTS if item["assetId"] == asset_id]
     if active is not None:
@@ -835,7 +1159,9 @@ def install_points_for_asset(asset_id: str, active: bool | None = None) -> list[
     return copy_payload(rows)
 
 
-def create_install_point(user: dict[str, Any], asset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def create_install_point(
+    user: dict[str, Any], asset_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
     require_permission(user, "install-point:write")
     asset = get_asset_by_id(asset_id)
     require_site_access(user, asset["siteId"])
@@ -843,9 +1169,18 @@ def create_install_point(user: dict[str, Any], asset_id: str, payload: dict[str,
     photo_refs = string_list(payload, "photoRefs", required=True)
 
     with STORE_LOCK:
-        install_point_id = str(payload.get("id") or f"IP-{asset_id}-{len(install_points_for_asset(asset_id)) + 1:02d}").strip().upper()
+        install_point_id = (
+            str(
+                payload.get("id")
+                or f"IP-{asset_id}-{len(install_points_for_asset(asset_id)) + 1:02d}"
+            )
+            .strip()
+            .upper()
+        )
         if any(item["id"] == install_point_id for item in INSTALL_POINTS):
-            raise ApiError(400, "INSTALL_POINT_DUPLICATED", "Install point ID is duplicated.")
+            raise ApiError(
+                400, "INSTALL_POINT_DUPLICATED", "Install point ID is duplicated."
+            )
         timestamp = now_iso()
         install_point = {
             "id": install_point_id,
@@ -876,11 +1211,17 @@ def update_install_point(
 
     with STORE_LOCK:
         install_point = next(
-            (item for item in INSTALL_POINTS if item["assetId"] == asset_id and item["id"] == install_point_id),
+            (
+                item
+                for item in INSTALL_POINTS
+                if item["assetId"] == asset_id and item["id"] == install_point_id
+            ),
             None,
         )
         if not install_point:
-            raise ApiError(404, "INSTALL_POINT_NOT_FOUND", "Install point was not found.")
+            raise ApiError(
+                404, "INSTALL_POINT_NOT_FOUND", "Install point was not found."
+            )
         candidate = copy_payload(install_point)
         for key in ("position", "orientation", "mountingMethod", "acousticDirection"):
             if key in payload:
@@ -895,7 +1236,12 @@ def update_install_point(
         candidate["updatedAt"] = now_iso()
         if before != after:
             candidate.setdefault("changeHistory", []).append(
-                {"reason": reason, "changedAt": candidate["updatedAt"], "before": before, "after": after}
+                {
+                    "reason": reason,
+                    "changedAt": candidate["updatedAt"],
+                    "before": before,
+                    "after": after,
+                }
             )
         install_point.update(candidate)
         return copy_payload(install_point)
@@ -907,7 +1253,9 @@ def parse_int_value(field: str, value: Any, default: int = 0) -> int:
     try:
         return int(value)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ApiError(400, "INVALID_NUMBER", f"{field} must be a valid number.") from exc
+        raise ApiError(
+            400, "INVALID_NUMBER", f"{field} must be a valid number."
+        ) from exc
 
 
 def parse_float_value(field: str, value: Any, default: float = 0.0) -> float:
@@ -915,8 +1263,10 @@ def parse_float_value(field: str, value: Any, default: float = 0.0) -> float:
         return default
     try:
         parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ApiError(400, "INVALID_NUMBER", f"{field} must be a valid number.") from exc
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ApiError(
+            400, "INVALID_NUMBER", f"{field} must be a valid number."
+        ) from exc
     if not math.isfinite(parsed):
         raise ApiError(400, "INVALID_NUMBER", f"{field} must be a finite number.")
     return parsed
@@ -929,7 +1279,9 @@ def parse_int_field(payload: dict[str, Any], *keys: str, default: int = 0) -> in
     return default
 
 
-def boolean_field(payload: dict[str, Any], key: str, default: bool | None = None) -> bool:
+def boolean_field(
+    payload: dict[str, Any], key: str, default: bool | None = None
+) -> bool:
     if key not in payload:
         if default is None:
             raise ApiError(400, "MISSING_FIELD", f"{key} is required.")
@@ -941,15 +1293,23 @@ def boolean_field(payload: dict[str, Any], key: str, default: bool | None = None
 
 
 def string_list(
-    payload: dict[str, Any], key: str, *, required: bool = False, uppercase: bool = False
+    payload: dict[str, Any],
+    key: str,
+    *,
+    required: bool = False,
+    uppercase: bool = False,
 ) -> list[str]:
     value = payload.get(key)
     if value is None:
         if required:
             raise ApiError(400, "MISSING_FIELD", f"{key} is required.")
         return []
-    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
-        raise ApiError(400, "INVALID_LIST", f"{key} must be a list of non-empty strings.")
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ApiError(
+            400, "INVALID_LIST", f"{key} must be a list of non-empty strings."
+        )
     result = [item.strip().upper() if uppercase else item.strip() for item in value]
     if required and not result:
         raise ApiError(400, "MISSING_FIELD", f"{key} must contain at least one item.")
@@ -1020,7 +1380,9 @@ def create_site(user: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]
         return copy_payload(site)
 
 
-def update_site(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_site(
+    user: dict[str, Any], site_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
     require_permission(user, "site:write")
     require_site_access(user, site_id)
     with STORE_LOCK:
@@ -1028,7 +1390,9 @@ def update_site(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> 
         candidate = copy_payload(site)
         if "code" in payload:
             next_code = str(payload["code"]).strip().upper()
-            if any(item["id"] != site_id and item["code"] == next_code for item in SITES):
+            if any(
+                item["id"] != site_id and item["code"] == next_code for item in SITES
+            ):
                 raise ApiError(400, "SITE_CODE_DUPLICATED", "Site code is duplicated.")
             candidate["code"] = next_code
         for key in (
@@ -1062,7 +1426,9 @@ def update_site(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> 
 
 
 def deactivate_site(user: dict[str, Any], site_id: str) -> dict[str, Any]:
-    return update_site(user, site_id, {"operationStatus": "inactive", "status": "inactive"})
+    return update_site(
+        user, site_id, {"operationStatus": "inactive", "status": "inactive"}
+    )
 
 
 def delete_site(user: dict[str, Any], site_id: str) -> dict[str, Any]:
@@ -1071,16 +1437,24 @@ def delete_site(user: dict[str, Any], site_id: str) -> dict[str, Any]:
     with STORE_LOCK:
         get_site(site_id)
         if any(asset["siteId"] == site_id for asset in ASSETS):
-            raise ApiError(400, "SITE_HAS_ASSETS", "A site with assets cannot be deleted.")
+            raise ApiError(
+                400, "SITE_HAS_ASSETS", "A site with assets cannot be deleted."
+            )
         SITES[:] = [site for site in SITES if site["id"] != site_id]
-        ROLLOUT_PLAN_RECORDS[:] = [record for record in ROLLOUT_PLAN_RECORDS if record["siteId"] != site_id]
+        ROLLOUT_PLAN_RECORDS[:] = [
+            record for record in ROLLOUT_PLAN_RECORDS if record["siteId"] != site_id
+        ]
         SITE_NETWORK_PROFILE_RECORDS[:] = [
-            record for record in SITE_NETWORK_PROFILE_RECORDS if record["siteId"] != site_id
+            record
+            for record in SITE_NETWORK_PROFILE_RECORDS
+            if record["siteId"] != site_id
         ]
         return {"deleted": True, "siteId": site_id}
 
 
-def create_asset(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def create_asset(
+    user: dict[str, Any], site_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
     require_permission(user, "asset:write")
     require_site_access(user, site_id)
     asset_code = required_text(payload, "assetCode").upper()
@@ -1090,8 +1464,13 @@ def create_asset(user: dict[str, Any], site_id: str, payload: dict[str, Any]) ->
         get_site(site_id)
         if any(asset["id"] == asset_id for asset in ASSETS):
             raise ApiError(400, "ASSET_DUPLICATED", "Asset ID is duplicated.")
-        if any(asset["siteId"] == site_id and asset["assetCode"] == asset_code for asset in ASSETS):
-            raise ApiError(400, "ASSET_CODE_DUPLICATED", "Asset code must be unique within a site.")
+        if any(
+            asset["siteId"] == site_id and asset["assetCode"] == asset_code
+            for asset in ASSETS
+        ):
+            raise ApiError(
+                400, "ASSET_CODE_DUPLICATED", "Asset code must be unique within a site."
+            )
         baseline = baseline_payload(payload)
         timestamp = now_iso()
         asset = {
@@ -1100,7 +1479,9 @@ def create_asset(user: dict[str, Any], site_id: str, payload: dict[str, Any]) ->
             "siteId": site_id,
             "name": required_text(payload, "name"),
             "type": str(payload.get("assetType") or payload.get("type") or "motor"),
-            "assetType": str(payload.get("assetType") or payload.get("type") or "motor"),
+            "assetType": str(
+                payload.get("assetType") or payload.get("type") or "motor"
+            ),
             "ratedRpm": parse_int_field(payload, "ratedRpm", "rpm", default=0),
             "rpm": parse_int_field(payload, "ratedRpm", "rpm", default=0),
             "operationStatus": str(payload.get("operationStatus") or "active"),
@@ -1115,7 +1496,9 @@ def create_asset(user: dict[str, Any], site_id: str, payload: dict[str, Any]) ->
         return copy_payload(asset)
 
 
-def update_asset(user: dict[str, Any], site_id: str, asset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_asset(
+    user: dict[str, Any], site_id: str, asset_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
     require_permission(user, "asset:write")
     require_site_access(user, site_id)
     with STORE_LOCK:
@@ -1124,10 +1507,16 @@ def update_asset(user: dict[str, Any], site_id: str, asset_id: str, payload: dic
         if "assetCode" in payload:
             next_code = str(payload["assetCode"]).strip().upper()
             if any(
-                item["id"] != asset_id and item["siteId"] == site_id and item["assetCode"] == next_code
+                item["id"] != asset_id
+                and item["siteId"] == site_id
+                and item["assetCode"] == next_code
                 for item in ASSETS
             ):
-                raise ApiError(400, "ASSET_CODE_DUPLICATED", "Asset code must be unique within a site.")
+                raise ApiError(
+                    400,
+                    "ASSET_CODE_DUPLICATED",
+                    "Asset code must be unique within a site.",
+                )
             candidate["assetCode"] = next_code
         for key in ("name", "operationStatus", "installLocation", "baselineStatus"):
             if key in payload:
@@ -1135,10 +1524,14 @@ def update_asset(user: dict[str, Any], site_id: str, asset_id: str, payload: dic
         if "status" in payload:
             candidate["operationStatus"] = str(payload["status"])
         if "assetType" in payload or "type" in payload:
-            candidate["assetType"] = str(payload.get("assetType") or payload.get("type"))
+            candidate["assetType"] = str(
+                payload.get("assetType") or payload.get("type")
+            )
             candidate["type"] = candidate["assetType"]
         if "ratedRpm" in payload or "rpm" in payload:
-            candidate["ratedRpm"] = parse_int_field(payload, "ratedRpm", "rpm", default=candidate["ratedRpm"])
+            candidate["ratedRpm"] = parse_int_field(
+                payload, "ratedRpm", "rpm", default=candidate["ratedRpm"]
+            )
             candidate["rpm"] = candidate["ratedRpm"]
         if "baseline" in payload or any(key.startswith("baseline") for key in payload):
             candidate["baseline"] = baseline_payload(payload, candidate.get("baseline"))
@@ -1153,13 +1546,26 @@ def delete_asset(user: dict[str, Any], site_id: str, asset_id: str) -> dict[str,
     require_site_access(user, site_id)
     with STORE_LOCK:
         get_asset(site_id, asset_id)
-        if any(device["assetId"] == asset_id and device["mappingStatus"] == "active" for device in DEVICES):
-            raise ApiError(400, "ASSET_HAS_DEVICE", "An asset with an active device mapping cannot be deleted.")
+        if any(
+            device["assetId"] == asset_id and device["mappingStatus"] == "active"
+            for device in DEVICES
+        ):
+            raise ApiError(
+                400,
+                "ASSET_HAS_DEVICE",
+                "An asset with an active device mapping cannot be deleted.",
+            )
         ASSETS[:] = [asset for asset in ASSETS if asset["id"] != asset_id]
-        INSTALL_POINTS[:] = [item for item in INSTALL_POINTS if item["assetId"] != asset_id]
-        rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
+        INSTALL_POINTS[:] = [
+            item for item in INSTALL_POINTS if item["assetId"] != asset_id
+        ]
+        rollout = next(
+            (item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None
+        )
         if rollout and asset_id in rollout["targetAssetIds"]:
-            rollout["targetAssetIds"] = [item for item in rollout["targetAssetIds"] if item != asset_id]
+            rollout["targetAssetIds"] = [
+                item for item in rollout["targetAssetIds"] if item != asset_id
+            ]
             rollout["updatedAt"] = now_iso()
         site = get_site(site_id)
         site["assetCount"] = max(0, int(site["assetCount"]) - 1)
@@ -1192,11 +1598,18 @@ def validate_asset_device_mapping(site_id: str, asset_id: str) -> dict[str, Any]
         raise ApiError(
             409,
             "ASSET_NOT_READY_FOR_MAPPING",
-            "Complete the asset master data and ready baseline before device mapping: " + ", ".join(missing),
+            "Complete the asset master data and ready baseline before device mapping: "
+            + ", ".join(missing),
         )
 
-    rollout = next((item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None)
-    if not rollout or not rollout.get("networkProfileId") or asset_id not in rollout.get("targetAssetIds", []):
+    rollout = next(
+        (item for item in ROLLOUT_PLAN_RECORDS if item["siteId"] == site_id), None
+    )
+    if (
+        not rollout
+        or not rollout.get("networkProfileId")
+        or asset_id not in rollout.get("targetAssetIds", [])
+    ):
         raise ApiError(
             409,
             "ROLLOUT_PLAN_NOT_READY",
@@ -1232,7 +1645,9 @@ def certificate_payload(
         "expiresAt": str(source.get("expiresAt") or "").strip(),
     }
     if certificate["status"] not in DEVICE_CERTIFICATE_STATUSES:
-        raise ApiError(400, "INVALID_CERTIFICATE_STATUS", "certificateStatus is not allowed.")
+        raise ApiError(
+            400, "INVALID_CERTIFICATE_STATUS", "certificateStatus is not allowed."
+        )
     if not certificate["id"] or not certificate["fingerprint"]:
         raise ApiError(
             400,
@@ -1242,7 +1657,9 @@ def certificate_payload(
     return certificate
 
 
-def validate_certificate_for_mapping(certificate: dict[str, Any], mapping_status: str) -> None:
+def validate_certificate_for_mapping(
+    certificate: dict[str, Any], mapping_status: str
+) -> None:
     if mapping_status != "active":
         return
     if certificate["status"] != "registered":
@@ -1254,7 +1671,11 @@ def validate_certificate_for_mapping(certificate: dict[str, Any], mapping_status
     expires_at_text = str(certificate.get("expiresAt") or "").strip()
     if not expires_at_text:
         return
-    normalized = expires_at_text[:-1] + "+00:00" if expires_at_text.endswith("Z") else expires_at_text
+    normalized = (
+        expires_at_text[:-1] + "+00:00"
+        if expires_at_text.endswith("Z")
+        else expires_at_text
+    )
     try:
         expires_at = datetime.fromisoformat(normalized)
     except ValueError as exc:
@@ -1270,15 +1691,23 @@ def validate_certificate_for_mapping(certificate: dict[str, Any], mapping_status
             "certificateExpiresAt must include a timezone.",
         )
     if expires_at <= datetime.now(timezone.utc):
-        raise ApiError(409, "CERTIFICATE_EXPIRED", "An active device mapping cannot use an expired certificate.")
+        raise ApiError(
+            409,
+            "CERTIFICATE_EXPIRED",
+            "An active device mapping cannot use an expired certificate.",
+        )
 
 
 def validate_mapping_status(mapping_status: str) -> None:
     if mapping_status not in DEVICE_MAPPING_STATUSES:
-        raise ApiError(400, "INVALID_MAPPING_STATUS", "mappingStatus must be active or inactive.")
+        raise ApiError(
+            400, "INVALID_MAPPING_STATUS", "mappingStatus must be active or inactive."
+        )
 
 
-def apply_certificate_fields(device: dict[str, Any], certificate: dict[str, Any]) -> None:
+def apply_certificate_fields(
+    device: dict[str, Any], certificate: dict[str, Any]
+) -> None:
     device["certificate"] = copy_payload(certificate)
     device["certificateId"] = certificate["id"]
     device["certificateFingerprint"] = certificate["fingerprint"]
@@ -1311,7 +1740,9 @@ def install_point_snapshot(install_point: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def create_device(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def create_device(
+    user: dict[str, Any], site_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
     require_permission(user, "device:write")
     require_site_access(user, site_id)
     device_id = required_text(payload, "id").upper()
@@ -1324,18 +1755,51 @@ def create_device(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -
         if any(device["id"] == device_id for device in DEVICES):
             raise ApiError(400, "DEVICE_DUPLICATED", "Device ID is already registered.")
         if mapping_status == "active" and any(
-            device["assetId"] == asset_id and device["mappingStatus"] == "active" for device in DEVICES
+            device["assetId"] == asset_id and device["mappingStatus"] == "active"
+            for device in DEVICES
         ):
-            raise ApiError(400, "DEVICE_ASSET_DUPLICATED", "The asset already has an active device mapping.")
+            raise ApiError(
+                400,
+                "DEVICE_ASSET_DUPLICATED",
+                "The asset already has an active device mapping.",
+            )
         sensor_channels = string_list(
-            {"sensorChannels": payload.get("sensorChannels") or ["vibration", "acoustic", "rpm"]},
+            {
+                "sensorChannels": payload.get("sensorChannels")
+                or ["vibration", "acoustic", "rpm"]
+            },
             "sensorChannels",
             required=True,
         )
-        firmware_version = str(payload.get("firmwareVersion") or payload.get("firmware") or "edge-0.1.0")
+        firmware_version = str(
+            payload.get("firmwareVersion") or payload.get("firmware") or "edge-0.1.0"
+        )
         certificate = certificate_payload(payload)
         validate_certificate_for_mapping(certificate, mapping_status)
         timestamp = now_iso()
+        last_seen_sec_ago = parse_int_field(payload, "lastSeenSecAgo", default=0)
+        if last_seen_sec_ago < 0:
+            raise ApiError(
+                400, "INVALID_NUMBER", "lastSeenSecAgo must be zero or greater."
+            )
+        reboot_count = parse_int_field(payload, "rebootCount", default=0)
+        if reboot_count < 0:
+            raise ApiError(
+                400, "INVALID_NUMBER", "rebootCount must be zero or greater."
+            )
+        buffer_usage_pct = parse_float_value(
+            "bufferUsagePct", payload.get("bufferUsagePct"), 0.0
+        )
+        if not 0 <= buffer_usage_pct <= 100:
+            raise ApiError(
+                400, "INVALID_NUMBER", "bufferUsagePct must be between 0 and 100."
+            )
+        hardware_profile_id = (
+            str(payload.get("hardwareProfileId") or "HW-PICO2W-DUAL-SENSOR-WIFI")
+            .strip()
+            .upper()
+        )
+        hardware_profile(hardware_profile_id)
         device = {
             "id": device_id,
             "siteId": site_id,
@@ -1343,10 +1807,22 @@ def create_device(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -
             "sensorChannels": sensor_channels,
             "firmware": firmware_version,
             "firmwareVersion": firmware_version,
-            "lastSeenSecAgo": parse_int_field(payload, "lastSeenSecAgo", default=0),
+            "lastSeenSecAgo": last_seen_sec_ago,
+            "lastReceivedAt": iso_seconds_ago(last_seen_sec_ago),
             "health": str(payload.get("health") or "online"),
+            "healthHistory": [],
+            "offlineSince": None,
+            "lastRecoveredAt": None,
+            "missingIntervals": [],
+            "rssiDbm": parse_float_value("rssiDbm", payload.get("rssiDbm"), -60.0),
+            "rebootCount": reboot_count,
+            "bufferUsagePct": buffer_usage_pct,
+            "hardwareProfileId": hardware_profile_id,
+            "hardwareProfileHistory": [],
             "mappingStatus": mapping_status,
-            "mappingHistory": [{"assetId": asset_id, "mappedAt": now_text(), "status": mapping_status}],
+            "mappingHistory": [
+                {"assetId": asset_id, "mappedAt": now_text(), "status": mapping_status}
+            ],
             "replacementHistory": [],
             "certificateHistory": [],
             "createdAt": timestamp,
@@ -1361,7 +1837,9 @@ def create_device(user: dict[str, Any], site_id: str, payload: dict[str, Any]) -
         return copy_payload(device)
 
 
-def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_device(
+    user: dict[str, Any], device_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
     require_permission(user, "device:write")
     with STORE_LOCK:
         device = get_device(device_id)
@@ -1370,9 +1848,11 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
         previous_health = str(device.get("health") or "")
         previous_asset_id = str(device["assetId"])
         next_asset_id = str(payload.get("assetId", previous_asset_id)).strip().upper()
-        next_mapping_status = str(
-            payload.get("mappingStatus", device.get("mappingStatus") or "active")
-        ).strip().lower()
+        next_mapping_status = (
+            str(payload.get("mappingStatus", device.get("mappingStatus") or "active"))
+            .strip()
+            .lower()
+        )
         validate_mapping_status(next_mapping_status)
         get_asset(device["siteId"], next_asset_id)
         if next_asset_id != previous_asset_id or (
@@ -1380,11 +1860,19 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
         ):
             validate_asset_device_mapping(device["siteId"], next_asset_id)
         if next_mapping_status == "active" and any(
-            item["id"] != device_id and item["assetId"] == next_asset_id and item["mappingStatus"] == "active"
+            item["id"] != device_id
+            and item["assetId"] == next_asset_id
+            and item["mappingStatus"] == "active"
             for item in DEVICES
         ):
-            raise ApiError(400, "DEVICE_ASSET_DUPLICATED", "The asset already has an active device mapping.")
-        if next_asset_id != previous_asset_id or next_mapping_status != device.get("mappingStatus"):
+            raise ApiError(
+                400,
+                "DEVICE_ASSET_DUPLICATED",
+                "The asset already has an active device mapping.",
+            )
+        if next_asset_id != previous_asset_id or next_mapping_status != device.get(
+            "mappingStatus"
+        ):
             candidate["assetId"] = next_asset_id
             candidate.setdefault("mappingHistory", []).append(
                 {
@@ -1395,9 +1883,13 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
                 }
             )
         if "sensorChannels" in payload:
-            candidate["sensorChannels"] = string_list(payload, "sensorChannels", required=True)
+            candidate["sensorChannels"] = string_list(
+                payload, "sensorChannels", required=True
+            )
         if "firmware" in payload or "firmwareVersion" in payload:
-            firmware_version = str(payload.get("firmwareVersion") or payload.get("firmware") or "").strip()
+            firmware_version = str(
+                payload.get("firmwareVersion") or payload.get("firmware") or ""
+            ).strip()
             if not firmware_version:
                 raise ApiError(400, "MISSING_FIELD", "firmwareVersion is required.")
             candidate["firmware"] = firmware_version
@@ -1423,15 +1915,51 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
                 candidate[key] = str(payload[key]).strip().lower()
         if certificate_changed or (
             next_mapping_status == "active"
-            and (device.get("mappingStatus") != "active" or next_asset_id != previous_asset_id)
+            and (
+                device.get("mappingStatus") != "active"
+                or next_asset_id != previous_asset_id
+            )
         ):
             validate_certificate_for_mapping(next_certificate, next_mapping_status)
         if "lastSeenSecAgo" in payload:
-            candidate["lastSeenSecAgo"] = parse_int_value("lastSeenSecAgo", payload["lastSeenSecAgo"])
+            last_seen_sec_ago = parse_int_value(
+                "lastSeenSecAgo", payload["lastSeenSecAgo"]
+            )
+            if last_seen_sec_ago < 0:
+                raise ApiError(
+                    400, "INVALID_NUMBER", "lastSeenSecAgo must be zero or greater."
+                )
+            candidate["lastSeenSecAgo"] = last_seen_sec_ago
+            candidate["lastReceivedAt"] = iso_seconds_ago(last_seen_sec_ago)
+        if "rebootCount" in payload:
+            reboot_count = parse_int_value("rebootCount", payload["rebootCount"])
+            if reboot_count < 0:
+                raise ApiError(
+                    400, "INVALID_NUMBER", "rebootCount must be zero or greater."
+                )
+            candidate["rebootCount"] = reboot_count
+        if "bufferUsagePct" in payload:
+            buffer_usage_pct = parse_float_value(
+                "bufferUsagePct", payload["bufferUsagePct"]
+            )
+            if not 0 <= buffer_usage_pct <= 100:
+                raise ApiError(
+                    400, "INVALID_NUMBER", "bufferUsagePct must be between 0 and 100."
+                )
+            candidate["bufferUsagePct"] = buffer_usage_pct
+        if "rssiDbm" in payload:
+            rssi_dbm = parse_float_value("rssiDbm", payload["rssiDbm"])
+            if not -120 <= rssi_dbm <= 0:
+                raise ApiError(
+                    400, "INVALID_NUMBER", "rssiDbm must be between -120 and 0."
+                )
+            candidate["rssiDbm"] = rssi_dbm
         before = device_replacement_snapshot(device)
         after = device_replacement_snapshot(candidate)
         if before != after:
-            reason = str(payload.get("replacementReason") or payload.get("reason") or "").strip()
+            reason = str(
+                payload.get("replacementReason") or payload.get("reason") or ""
+            ).strip()
             if not reason:
                 raise ApiError(
                     400,
@@ -1440,7 +1968,12 @@ def update_device(user: dict[str, Any], device_id: str, payload: dict[str, Any])
                 )
             replaced_at = now_iso()
             candidate.setdefault("replacementHistory", []).append(
-                {"reason": reason, "replacedAt": replaced_at, "before": before, "after": after}
+                {
+                    "reason": reason,
+                    "replacedAt": replaced_at,
+                    "before": before,
+                    "after": after,
+                }
             )
             if previous_certificate != next_certificate:
                 candidate.setdefault("certificateHistory", []).append(
@@ -1480,7 +2013,9 @@ def quarantine_unregistered_device(payload: dict[str, Any]) -> dict[str, Any]:
     device_id = required_text(payload, "deviceId").upper()
     with STORE_LOCK:
         if any(device["id"] == device_id for device in DEVICES):
-            raise ApiError(400, "DEVICE_REGISTERED", "The device is already registered.")
+            raise ApiError(
+                400, "DEVICE_REGISTERED", "The device is already registered."
+            )
         record = {
             "id": f"Q-{len(QUARANTINED_DEVICE_MESSAGES) + 1:04d}",
             "deviceId": device_id,
@@ -1492,13 +2027,518 @@ def quarantine_unregistered_device(payload: dict[str, Any]) -> dict[str, Any]:
         return copy_payload(record)
 
 
-def telemetry_for(site_id: str, asset_id: str) -> list[dict[str, Any]]:
+def parse_rfc3339(
+    field: str, value: Any, error_code: str = "INVALID_TIMESTAMP"
+) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError(400, error_code, f"{field} must be an RFC 3339 timestamp.")
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ApiError(
+            400, error_code, f"{field} must be an RFC 3339 timestamp."
+        ) from exc
+    if parsed.tzinfo is None:
+        raise ApiError(400, error_code, f"{field} must include a timezone.")
+    return parsed.astimezone(timezone.utc)
+
+
+def format_rfc3339(value: datetime) -> str:
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def telemetry_principal_for_token(token: str) -> dict[str, Any]:
+    if not token:
+        raise ApiError(
+            401, "AUTH_REQUIRED", "A bearer device or service token is required."
+        )
+    service = TELEMETRY_SERVICE_TOKENS.get(token)
+    if service:
+        return copy_payload(service)
+    user = current_user_for_token(token)
+    if not has_permission(user, "telemetry:ingest"):
+        raise ApiError(
+            403,
+            "TELEMETRY_INGEST_FORBIDDEN",
+            "The token does not have telemetry:ingest permission.",
+        )
+    return {
+        **copy_payload(user),
+        "type": "user",
+        "permissions": copy_payload(role_policy(user["role"])["permissions"]),
+        "allowedDeviceIds": ["*"],
+    }
+
+
+def principal_can_ingest(principal: dict[str, Any], device_id: str) -> None:
+    permissions = set(principal.get("permissions", []))
+    if "*" not in permissions and "telemetry:ingest" not in permissions:
+        raise ApiError(
+            403,
+            "TELEMETRY_INGEST_FORBIDDEN",
+            "The token does not have telemetry:ingest permission.",
+        )
+    allowed_device_ids = principal.get("allowedDeviceIds", ["*"])
+    if "*" not in allowed_device_ids and device_id not in allowed_device_ids:
+        raise ApiError(
+            403,
+            "TELEMETRY_INGEST_FORBIDDEN",
+            "The token cannot ingest telemetry for this device.",
+        )
+
+
+def telemetry_number(
+    payload: dict[str, Any], key: str, *, required: bool, nullable: bool
+) -> float | None:
+    if key not in payload:
+        if required:
+            raise ApiError(400, "INVALID_TELEMETRY_PAYLOAD", f"{key} is required.")
+        return None
+    value = payload[key]
+    if value is None:
+        if nullable:
+            return None
+        raise ApiError(
+            400, "INVALID_TELEMETRY_PAYLOAD", f"{key} must be a finite number."
+        )
+    if isinstance(value, bool):
+        raise ApiError(
+            400, "INVALID_TELEMETRY_PAYLOAD", f"{key} must be a finite number."
+        )
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ApiError(
+            400, "INVALID_TELEMETRY_PAYLOAD", f"{key} must be a finite number."
+        ) from exc
+    if not math.isfinite(parsed):
+        raise ApiError(
+            400, "INVALID_TELEMETRY_PAYLOAD", f"{key} must be a finite number."
+        )
+    return parsed
+
+
+def telemetry_optional_text(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(
+            400, "INVALID_TELEMETRY_PAYLOAD", f"{key} must be a string or null."
+        )
+    return value.strip() or None
+
+
+def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    allowed_fields = {
+        "timestamp",
+        "sequence",
+        "siteId",
+        "assetId",
+        "deviceId",
+        "rpm",
+        "vibrationRmsRaw",
+        "vibrationRmsMmS",
+        "vibrationPeakHz",
+        "acousticRmsRaw",
+        "acousticDb",
+        "acousticPeakHz",
+        "scenarioLabel",
+        "knownVibrationLabel",
+        "knownAcousticLabel",
+        "source",
+        "isSynthetic",
+        "vibrationUnitNote",
+        "acousticUnitNote",
+    }
+    unknown_fields = sorted(set(payload) - allowed_fields)
+    if unknown_fields:
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "Unknown telemetry fields: " + ", ".join(unknown_fields),
+        )
+
+    identifiers: dict[str, str] = {}
+    for key in ("siteId", "assetId", "deviceId"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ApiError(400, "INVALID_TELEMETRY_PAYLOAD", f"{key} is required.")
+        identifiers[key] = value.strip().upper()
+
+    sequence = payload.get("sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "sequence must be an integer greater than or equal to 1.",
+        )
+
+    timestamp = parse_rfc3339(
+        "timestamp", payload.get("timestamp"), "INVALID_TELEMETRY_PAYLOAD"
+    )
+    current = datetime.now(timezone.utc)
+    if timestamp > current + timedelta(seconds=TELEMETRY_MAX_FUTURE_SECONDS):
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "timestamp is too far in the future.",
+        )
+    if timestamp < current - timedelta(days=int(PARAMETERS["RETENTION_RAW_DAYS"])):
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "timestamp is outside the raw telemetry retention window.",
+        )
+
+    for key in ("vibrationRmsMmS", "acousticDb"):
+        if key not in payload or payload[key] is not None:
+            raise ApiError(
+                400,
+                "INVALID_RAW_ONLY_FIELD",
+                f"{key} must be present and null for the raw-only contract.",
+            )
+
+    scenario_label = payload.get("scenarioLabel")
+    if scenario_label not in TELEMETRY_SCENARIOS:
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "scenarioLabel is not supported.",
+        )
+    is_synthetic = payload.get("isSynthetic")
+    if not isinstance(is_synthetic, bool):
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "isSynthetic must be a boolean.",
+        )
+
+    return {
+        "timestamp": format_rfc3339(timestamp),
+        "sequence": sequence,
+        **identifiers,
+        "rpm": telemetry_number(payload, "rpm", required=False, nullable=True),
+        "vibrationRmsRaw": telemetry_number(
+            payload, "vibrationRmsRaw", required=True, nullable=False
+        ),
+        "vibrationRmsMmS": None,
+        "vibrationPeakHz": telemetry_number(
+            payload, "vibrationPeakHz", required=True, nullable=False
+        ),
+        "acousticRmsRaw": telemetry_number(
+            payload, "acousticRmsRaw", required=False, nullable=True
+        ),
+        "acousticDb": None,
+        "acousticPeakHz": telemetry_number(
+            payload, "acousticPeakHz", required=False, nullable=True
+        ),
+        "scenarioLabel": scenario_label,
+        "knownVibrationLabel": telemetry_optional_text(payload, "knownVibrationLabel"),
+        "knownAcousticLabel": telemetry_optional_text(payload, "knownAcousticLabel"),
+        "source": telemetry_optional_text(payload, "source"),
+        "isSynthetic": is_synthetic,
+        "vibrationUnitNote": telemetry_optional_text(payload, "vibrationUnitNote"),
+        "acousticUnitNote": telemetry_optional_text(payload, "acousticUnitNote"),
+    }
+
+
+def validate_telemetry_mapping(record: dict[str, Any]) -> dict[str, Any]:
+    get_site(record["siteId"])
+    get_asset(record["siteId"], record["assetId"])
+    device = get_device(record["deviceId"])
+    if (
+        device["siteId"] != record["siteId"]
+        or device["assetId"] != record["assetId"]
+        or device.get("mappingStatus") != "active"
+    ):
+        raise ApiError(
+            409,
+            "DEVICE_MAPPING_MISMATCH",
+            "deviceId is not actively mapped to the requested siteId and assetId.",
+        )
+    if device.get("certificateStatus") != "registered":
+        raise ApiError(
+            409,
+            "DEVICE_CERTIFICATE_NOT_ACTIVE",
+            "The device certificate is not active for telemetry ingestion.",
+        )
+    return device
+
+
+def quarantine_telemetry_error(payload: dict[str, Any], error: ApiError) -> None:
+    QUARANTINED_DEVICE_MESSAGES.append(
+        {
+            "id": f"Q-TEL-{len(QUARANTINED_DEVICE_MESSAGES) + 1:04d}",
+            "deviceId": str(payload.get("deviceId") or "").strip().upper() or None,
+            "reason": error.code,
+            "message": error.message,
+            "receivedAt": now_iso(),
+            "payload": copy_payload(payload),
+        }
+    )
+
+
+def quarantine_mqtt_message(
+    principal: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    permissions = set(principal.get("permissions", []))
+    if "*" not in permissions and "telemetry:quarantine" not in permissions:
+        raise ApiError(
+            403,
+            "TELEMETRY_QUARANTINE_FORBIDDEN",
+            "The token cannot quarantine MQTT messages.",
+        )
+
+    topic = required_text(payload, "topic")
+    reason = required_text(payload, "reason")
+    message = required_text(payload, "message")
+    raw_payload = payload.get("payload")
+    if not isinstance(raw_payload, str):
+        raise ApiError(
+            400,
+            "INVALID_QUARANTINE_PAYLOAD",
+            "payload must contain the original MQTT message as text.",
+        )
+
+    topic_parts = [part for part in topic.strip("/").split("/") if part]
+    device_id = None
+    if (
+        len(topic_parts) == 3
+        and topic_parts[0] == "devices"
+        and topic_parts[2] == "telemetry"
+    ):
+        device_id = topic_parts[1].strip().upper() or None
+
+    with STORE_LOCK:
+        TELEMETRY_METRICS["requests"] = int(TELEMETRY_METRICS["requests"]) + 1
+        TELEMETRY_METRICS["rejected"] = int(TELEMETRY_METRICS["rejected"]) + 1
+        TELEMETRY_METRICS["localRejected"] = int(TELEMETRY_METRICS["localRejected"]) + 1
+        record = {
+            "id": f"Q-MQTT-{len(QUARANTINED_DEVICE_MESSAGES) + 1:04d}",
+            "source": "mqtt_bridge",
+            "deviceId": device_id,
+            "topic": topic,
+            "reason": reason,
+            "message": message,
+            "receivedAt": now_iso(),
+            "payload": raw_payload,
+        }
+        QUARANTINED_DEVICE_MESSAGES.append(record)
+        return copy_payload(record)
+
+
+def update_ingest_dependency(
+    success: bool, latency_ms: float, error: ApiError | None = None
+) -> None:
+    dependency = next(
+        item for item in SERVICE_DEPENDENCIES if item["id"] == "ingest-api"
+    )
+    requests = int(TELEMETRY_METRICS["requests"])
+    rejected = int(TELEMETRY_METRICS["rejected"])
+    dependency["latencyMs"] = round(latency_ms, 2)
+    dependency["errorRatePct"] = round(
+        (rejected / requests * 100) if requests else 0.0, 2
+    )
+    previous_status = dependency["status"]
+    dependency["status"] = "healthy" if dependency["errorRatePct"] < 10 else "degraded"
+    if not success:
+        dependency["lastFailureAt"] = now_iso()
+        SERVICE_HEALTH_EVENTS.append(
+            {
+                "dependencyId": dependency["id"],
+                "status": "failure",
+                "occurredAt": dependency["lastFailureAt"],
+                "impactScope": dependency["impactScope"],
+                "errorCode": error.code if error else None,
+            }
+        )
+    elif previous_status != "healthy" and dependency["status"] == "healthy":
+        dependency["lastRecoveryAt"] = now_iso()
+        SERVICE_HEALTH_EVENTS.append(
+            {
+                "dependencyId": dependency["id"],
+                "status": "recovered",
+                "occurredAt": dependency["lastRecoveryAt"],
+                "impactScope": dependency["impactScope"],
+            }
+        )
+    del SERVICE_HEALTH_EVENTS[:-100]
+
+
+def recover_device_from_telemetry(device: dict[str, Any], received_at: str) -> None:
+    previous_health = str(device.get("health") or "")
+    offline_since = device.get("offlineSince")
+    if offline_since:
+        interval = {"from": offline_since, "to": received_at, "reason": "telemetry_gap"}
+        device.setdefault("missingIntervals", []).append(interval)
+        device["lastRecoveredAt"] = received_at
+        device.setdefault("healthHistory", []).append(
+            {"from": previous_health, "to": "online", "changedAt": received_at}
+        )
+        EVENTS.insert(
+            0,
+            {
+                "id": f"EV-DEVICE-{len(EVENTS) + 1:04d}",
+                "siteId": device["siteId"],
+                "assetId": device["assetId"],
+                "deviceId": device["id"],
+                "severity": "device",
+                "eventType": "device_recovered",
+                "title": f"{device['id']} telemetry recovered",
+                "time": received_at,
+                "duration": "recovered",
+                "score": 0,
+                "label": "needs_review",
+                "note": "Telemetry resumed after an offline interval.",
+            },
+        )
+    if previous_health == "offline":
+        site = get_site(device["siteId"])
+        site["onlineDevices"] = int(site["onlineDevices"]) + 1
+        site["eventCount"] = int(site["eventCount"]) + 1
+    device["health"] = "online"
+    device["offlineSince"] = None
+    device["lastReceivedAt"] = received_at
+    device["lastSeenSecAgo"] = 0
+    device["updatedAt"] = received_at
+
+
+def ingest_telemetry(
+    principal: dict[str, Any], payload: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    started = time.monotonic()
+    with STORE_LOCK:
+        TELEMETRY_METRICS["requests"] = int(TELEMETRY_METRICS["requests"]) + 1
+        try:
+            record = normalize_telemetry_payload(payload)
+            principal_can_ingest(principal, record["deviceId"])
+            device = validate_telemetry_mapping(record)
+            payload_hash = hashlib.sha256(
+                json.dumps(
+                    record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            idempotency_key = (record["deviceId"], int(record["sequence"]))
+            existing = TELEMETRY_IDEMPOTENCY.get(idempotency_key)
+            if existing:
+                if existing["payloadHash"] != payload_hash:
+                    raise ApiError(
+                        409,
+                        "SEQUENCE_CONFLICT",
+                        "The same deviceId and sequence already exist with a different payload.",
+                    )
+                TELEMETRY_METRICS["duplicates"] = (
+                    int(TELEMETRY_METRICS["duplicates"]) + 1
+                )
+                latency_ms = (time.monotonic() - started) * 1000
+                TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
+                update_ingest_dependency(True, latency_ms)
+                return (
+                    {
+                        "accepted": True,
+                        "duplicate": True,
+                        "deviceId": record["deviceId"],
+                        "sequence": record["sequence"],
+                        "receivedAt": existing["receivedAt"],
+                    },
+                    200,
+                )
+
+            received_at = format_rfc3339(datetime.now(timezone.utc))
+            stored_record = {**record, "receivedAt": received_at}
+            TELEMETRY_RECORDS.append(stored_record)
+            TELEMETRY_IDEMPOTENCY[idempotency_key] = {
+                "payloadHash": payload_hash,
+                "receivedAt": received_at,
+            }
+            asset_records = [
+                item
+                for item in TELEMETRY_RECORDS
+                if item["siteId"] == record["siteId"]
+                and item["assetId"] == record["assetId"]
+            ]
+            overflow = len(asset_records) - TELEMETRY_MAX_RECORDS_PER_ASSET
+            for expired_record in asset_records[: max(0, overflow)]:
+                TELEMETRY_RECORDS.remove(expired_record)
+                TELEMETRY_IDEMPOTENCY.pop(
+                    (expired_record["deviceId"], int(expired_record["sequence"])), None
+                )
+            recover_device_from_telemetry(device, received_at)
+            TELEMETRY_METRICS["accepted"] = int(TELEMETRY_METRICS["accepted"]) + 1
+            TELEMETRY_METRICS["lastReceivedAt"] = received_at
+            latency_ms = (time.monotonic() - started) * 1000
+            TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
+            update_ingest_dependency(True, latency_ms)
+            return (
+                {
+                    "accepted": True,
+                    "duplicate": False,
+                    "deviceId": record["deviceId"],
+                    "sequence": record["sequence"],
+                    "receivedAt": received_at,
+                },
+                201,
+            )
+        except ApiError as error:
+            TELEMETRY_METRICS["rejected"] = int(TELEMETRY_METRICS["rejected"]) + 1
+            if error.code == "SEQUENCE_CONFLICT":
+                TELEMETRY_METRICS["conflicts"] = int(TELEMETRY_METRICS["conflicts"]) + 1
+            quarantine_telemetry_error(payload, error)
+            latency_ms = (time.monotonic() - started) * 1000
+            TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
+            update_ingest_dependency(False, latency_ms, error)
+            raise
+
+
+def telemetry_for(
+    site_id: str,
+    asset_id: str,
+    from_timestamp: str | None = None,
+    to_timestamp: str | None = None,
+) -> list[dict[str, Any]]:
     asset = get_asset(site_id, asset_id)
+    stored = [
+        copy_payload(record)
+        for record in TELEMETRY_RECORDS
+        if record["siteId"] == site_id and record["assetId"] == asset_id
+    ]
+    from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
+    to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
+    if from_value and to_value and from_value > to_value:
+        raise ApiError(
+            400, "INVALID_TIME_RANGE", "from must be earlier than or equal to to."
+        )
+    if stored:
+        filtered = []
+        for record in stored:
+            timestamp = parse_rfc3339("timestamp", record["timestamp"])
+            if from_value and timestamp < from_value:
+                continue
+            if to_value and timestamp > to_value:
+                continue
+            filtered.append(record)
+        return sorted(filtered, key=lambda item: item["timestamp"])
+
     seed = sum(ord(ch) for ch in asset["id"])
     points = []
+    current = datetime.now(timezone.utc)
     for index in range(72):
-        vibration = 1.8 + math.sin(index / 7 + seed / 11) * 0.28 + ((seed + index * 13) % 19) / 100
-        acoustic = 52 + math.sin(index / 8 + seed / 8) * 4 + ((seed + index * 7) % 9) / 2
+        vibration = (
+            1.8
+            + math.sin(index / 7 + seed / 11) * 0.28
+            + ((seed + index * 13) % 19) / 100
+        )
+        acoustic = (
+            52 + math.sin(index / 8 + seed / 8) * 4 + ((seed + index * 7) % 9) / 2
+        )
         rpm = asset["ratedRpm"] + math.sin(index / 11) * 18 + ((seed + index * 3) % 12)
         score = 34 + max(0, vibration - 1.9) * 18 + max(0, acoustic - 54) * 1.6
         if asset["id"].endswith("MOT-02") and index > 52:
@@ -1506,7 +2546,7 @@ def telemetry_for(site_id: str, asset_id: str) -> list[dict[str, Any]]:
         points.append(
             {
                 "minute": index - 71,
-                "timestamp": index - 71,
+                "timestamp": format_rfc3339(current - timedelta(minutes=71 - index)),
                 "vibration": round(vibration, 2),
                 "vibrationRmsMmS": round(vibration, 2),
                 "acoustic": round(acoustic, 1),
@@ -1516,10 +2556,38 @@ def telemetry_for(site_id: str, asset_id: str) -> list[dict[str, Any]]:
                 "anomalyScore": min(98, round(score)),
             }
         )
-    return points
+    if not from_value and not to_value:
+        return points
+    return [
+        point
+        for point in points
+        if (
+            not from_value
+            or parse_rfc3339("timestamp", point["timestamp"]) >= from_value
+        )
+        and (not to_value or parse_rfc3339("timestamp", point["timestamp"]) <= to_value)
+    ]
 
 
-def telemetry_units() -> dict[str, str]:
+def telemetry_units(
+    site_id: str | None = None, asset_id: str | None = None
+) -> dict[str, str]:
+    if (
+        site_id
+        and asset_id
+        and any(
+            record["siteId"] == site_id and record["assetId"] == asset_id
+            for record in TELEMETRY_RECORDS
+        )
+    ):
+        return {
+            "vibrationRmsRaw": "raw accelerometer RMS",
+            "vibrationPeakHz": "Hz",
+            "acousticRmsRaw": "raw waveform RMS",
+            "acousticPeakHz": "Hz",
+            "rpm": "rev/min",
+            "anomalyScore": "0-100",
+        }
     return {
         "vibrationRmsMmS": "mm/s RMS",
         "acousticDb": "dB",
@@ -1528,11 +2596,488 @@ def telemetry_units() -> dict[str, str]:
     }
 
 
+def device_health_for(device_id: str) -> dict[str, Any]:
+    with STORE_LOCK:
+        device = get_device(device_id)
+        last_received_at = str(device.get("lastReceivedAt") or "")
+        last_received = (
+            parse_rfc3339("lastReceivedAt", last_received_at, "INVALID_DEVICE_HEALTH")
+            if last_received_at
+            else datetime.now(timezone.utc)
+        )
+        elapsed = max(
+            int((datetime.now(timezone.utc) - last_received).total_seconds()),
+            int(device.get("lastSeenSecAgo") or 0),
+        )
+        device["lastSeenSecAgo"] = max(0, elapsed)
+        offline_threshold = int(PARAMETERS["DEVICE_OFFLINE_SEC"])
+        if elapsed > offline_threshold and device.get("health") != "offline":
+            previous_health = str(device.get("health") or "unknown")
+            offline_since = format_rfc3339(
+                last_received + timedelta(seconds=offline_threshold)
+            )
+            device["health"] = "offline"
+            device["offlineSince"] = offline_since
+            device.setdefault("healthHistory", []).append(
+                {"from": previous_health, "to": "offline", "changedAt": offline_since}
+            )
+            if previous_health == "online":
+                site = get_site(device["siteId"])
+                site["onlineDevices"] = max(0, int(site["onlineDevices"]) - 1)
+            event = {
+                "id": f"EV-DEVICE-{len(EVENTS) + 1:04d}",
+                "siteId": device["siteId"],
+                "assetId": device["assetId"],
+                "deviceId": device["id"],
+                "severity": "device",
+                "eventType": "device_offline",
+                "title": f"{device['id']} telemetry offline",
+                "time": offline_since,
+                "duration": f">{offline_threshold}s",
+                "score": 0,
+                "label": "needs_review",
+                "note": "No telemetry was received within DEVICE_OFFLINE_SEC.",
+            }
+            EVENTS.insert(0, event)
+            get_site(device["siteId"])["eventCount"] = (
+                int(get_site(device["siteId"])["eventCount"]) + 1
+            )
+
+        latest_connectivity = next(
+            (
+                copy_payload(record)
+                for record in sorted(
+                    CONNECTIVITY_TEST_RECORDS,
+                    key=lambda item: item["testedAt"],
+                    reverse=True,
+                )
+                if record["deviceId"] == device_id
+            ),
+            None,
+        )
+        return {
+            "deviceId": device["id"],
+            "siteId": device["siteId"],
+            "assetId": device["assetId"],
+            "health": device["health"],
+            "lastReceivedAt": device.get("lastReceivedAt"),
+            "lastSeenSecAgo": device["lastSeenSecAgo"],
+            "offlineThresholdSec": offline_threshold,
+            "offlineSince": device.get("offlineSince"),
+            "lastRecoveredAt": device.get("lastRecoveredAt"),
+            "missingIntervals": copy_payload(device.get("missingIntervals", [])),
+            "rssiDbm": device.get("rssiDbm"),
+            "rebootCount": int(device.get("rebootCount") or 0),
+            "bufferUsagePct": float(device.get("bufferUsagePct") or 0.0),
+            "firmwareVersion": device.get("firmwareVersion") or device.get("firmware"),
+            "certificateStatus": device["certificateStatus"],
+            "mappingStatus": device["mappingStatus"],
+            "latestConnectivityTest": latest_connectivity,
+        }
+
+
+def dashboard_sites_summary(
+    user: dict[str, Any], region: str = "", status: str = ""
+) -> list[dict[str, Any]]:
+    require_permission(user, "dashboard:read")
+    rows = []
+    for site in visible_sites_for_user(user):
+        if region and str(site.get("region", "")).lower() != region.lower():
+            continue
+        site_devices = [device for device in DEVICES if device["siteId"] == site["id"]]
+        health_rows = [device_health_for(device["id"]) for device in site_devices]
+        online_devices = sum(
+            1 for device in health_rows if device["health"] != "offline"
+        )
+        site_assets = [asset for asset in ASSETS if asset["siteId"] == site["id"]]
+        site_events = [event for event in EVENTS if event["siteId"] == site["id"]]
+        critical_asset_ids = {
+            event["assetId"]
+            for event in site_events
+            if event.get("severity") == "critical"
+        }
+        warning_asset_ids = {
+            event["assetId"]
+            for event in site_events
+            if event.get("severity") == "warning"
+            and event["assetId"] not in critical_asset_ids
+        }
+        normal_assets = max(
+            0, len(site_assets) - len(critical_asset_ids) - len(warning_asset_ids)
+        )
+        summary_status = (
+            "critical"
+            if critical_asset_ids
+            else (
+                "warning"
+                if warning_asset_ids or online_devices < len(site_devices)
+                else "normal"
+            )
+        )
+        if status and summary_status != status.lower():
+            continue
+        received_times = [
+            str(record["receivedAt"])
+            for record in TELEMETRY_RECORDS
+            if record["siteId"] == site["id"]
+        ] + [
+            str(device.get("lastReceivedAt"))
+            for device in site_devices
+            if device.get("lastReceivedAt")
+        ]
+        rows.append(
+            {
+                "siteId": site["id"],
+                "siteName": site["name"],
+                "region": site["region"],
+                "status": summary_status,
+                "totalDevices": len(site_devices),
+                "onlineDevices": online_devices,
+                "normalAssets": normal_assets,
+                "warningAssets": len(warning_asset_ids),
+                "criticalAssets": len(critical_asset_ids),
+                "unreviewedEvents": sum(
+                    1 for event in site_events if event.get("label") == "needs_review"
+                ),
+                "lastReceivedAt": max(received_times) if received_times else None,
+            }
+        )
+    return rows
+
+
+def service_health_dependencies() -> dict[str, Any]:
+    dependencies = copy_payload(SERVICE_DEPENDENCIES)
+    degraded = any(item["status"] not in {"healthy", "ready"} for item in dependencies)
+    return {
+        "status": "degraded" if degraded else "healthy",
+        "checkedAt": now_iso(),
+        "dependencies": dependencies,
+        "ingestMetrics": copy_payload(TELEMETRY_METRICS),
+        "quarantinedMessageCount": len(QUARANTINED_DEVICE_MESSAGES),
+        "events": copy_payload(SERVICE_HEALTH_EVENTS[-20:]),
+    }
+
+
+def report_service_dependency(
+    principal: dict[str, Any], dependency_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    permissions = set(principal.get("permissions", []))
+    if "*" not in permissions and "service-health:write" not in permissions:
+        raise ApiError(
+            403,
+            "SERVICE_HEALTH_WRITE_FORBIDDEN",
+            "The token cannot update service dependency health.",
+        )
+    allowed_dependency_ids = principal.get("allowedDependencyIds", ["*"])
+    if (
+        "*" not in allowed_dependency_ids
+        and dependency_id not in allowed_dependency_ids
+    ):
+        raise ApiError(
+            403,
+            "SERVICE_HEALTH_WRITE_FORBIDDEN",
+            "The token cannot update this service dependency.",
+        )
+
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"healthy", "degraded"}:
+        raise ApiError(
+            400,
+            "INVALID_SERVICE_HEALTH",
+            "status must be healthy or degraded.",
+        )
+    detail_value = payload.get("detail")
+    if detail_value is not None and not isinstance(detail_value, str):
+        raise ApiError(
+            400,
+            "INVALID_SERVICE_HEALTH",
+            "detail must be a string or null.",
+        )
+    detail = str(detail_value or "").strip() or None
+    if detail and len(detail) > 500:
+        raise ApiError(
+            400,
+            "INVALID_SERVICE_HEALTH",
+            "detail must be 500 characters or fewer.",
+        )
+    error_code_value = payload.get("errorCode")
+    if error_code_value is not None and not isinstance(error_code_value, str):
+        raise ApiError(
+            400,
+            "INVALID_SERVICE_HEALTH",
+            "errorCode must be a string or null.",
+        )
+    error_code = str(error_code_value or "").strip() or None
+
+    with STORE_LOCK:
+        dependency = next(
+            (item for item in SERVICE_DEPENDENCIES if item["id"] == dependency_id),
+            None,
+        )
+        if dependency is None:
+            raise ApiError(
+                404,
+                "SERVICE_DEPENDENCY_NOT_FOUND",
+                "Service dependency was not found.",
+            )
+        previous_status = str(dependency["status"])
+        checked_at = now_iso()
+        dependency["statusReportCount"] = (
+            int(dependency.get("statusReportCount", 0)) + 1
+        )
+        if status == "degraded":
+            dependency["failureCount"] = int(dependency.get("failureCount", 0)) + 1
+        dependency["errorRatePct"] = round(
+            int(dependency.get("failureCount", 0))
+            / int(dependency["statusReportCount"])
+            * 100,
+            2,
+        )
+        dependency["status"] = status
+        dependency["lastCheckedAt"] = checked_at
+        dependency["detail"] = detail
+        if status == "degraded":
+            dependency["lastFailureAt"] = checked_at
+            SERVICE_HEALTH_EVENTS.append(
+                {
+                    "dependencyId": dependency_id,
+                    "status": "failure",
+                    "occurredAt": checked_at,
+                    "impactScope": dependency["impactScope"],
+                    "errorCode": error_code,
+                    "detail": detail,
+                }
+            )
+        elif previous_status == "degraded":
+            dependency["lastRecoveryAt"] = checked_at
+            SERVICE_HEALTH_EVENTS.append(
+                {
+                    "dependencyId": dependency_id,
+                    "status": "recovered",
+                    "occurredAt": checked_at,
+                    "impactScope": dependency["impactScope"],
+                    "detail": detail,
+                }
+            )
+        del SERVICE_HEALTH_EVENTS[:-100]
+        return copy_payload(dependency)
+
+
+def connectivity_number(
+    payload: dict[str, Any], key: str, minimum: float, maximum: float
+) -> float:
+    if key not in payload or payload[key] in (None, ""):
+        raise ApiError(
+            400,
+            "INVALID_CONNECTIVITY_TEST",
+            f"{key} is required.",
+        )
+    value = parse_float_value(key, payload.get(key))
+    if not minimum <= value <= maximum:
+        raise ApiError(
+            400,
+            "INVALID_CONNECTIVITY_METRIC",
+            f"{key} must be between {minimum:g} and {maximum:g}.",
+        )
+    return value
+
+
+def create_connectivity_test(
+    user: dict[str, Any], device_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "connectivity-test:write")
+    with STORE_LOCK:
+        device = get_device(device_id)
+        require_site_access(user, device["siteId"])
+        tested_at = format_rfc3339(
+            parse_rfc3339(
+                "testedAt", payload.get("testedAt"), "INVALID_CONNECTIVITY_TEST"
+            )
+        )
+        phase = str(payload.get("phase") or "").strip().lower()
+        if phase not in CONNECTIVITY_TEST_PHASES:
+            raise ApiError(
+                400,
+                "INVALID_CONNECTIVITY_TEST",
+                "phase must be before or after.",
+            )
+        verdict = str(payload.get("verdict") or "").strip().lower()
+        if verdict not in CONNECTIVITY_TEST_VERDICTS:
+            raise ApiError(
+                400,
+                "INVALID_CONNECTIVITY_TEST",
+                "verdict must be pass, warn, or fail.",
+            )
+        record = {
+            "id": f"NET-TEST-{len(CONNECTIVITY_TEST_RECORDS) + 1:05d}",
+            "deviceId": device["id"],
+            "siteId": device["siteId"],
+            "assetId": device["assetId"],
+            "testedAt": tested_at,
+            "phase": phase,
+            "rssiDbm": connectivity_number(payload, "rssiDbm", -120, 0),
+            "packetLossPct": connectivity_number(payload, "packetLossPct", 0, 100),
+            "retryRatePct": connectivity_number(payload, "retryRatePct", 0, 100),
+            "latencyMs": connectivity_number(payload, "latencyMs", 0, 60000),
+            "verdict": verdict,
+            "note": str(payload.get("note") or "").strip(),
+            "createdAt": now_iso(),
+        }
+        CONNECTIVITY_TEST_RECORDS.append(record)
+        device["rssiDbm"] = record["rssiDbm"]
+        device["connectivityVerdict"] = verdict
+        device["updatedAt"] = record["createdAt"]
+        return copy_payload(record)
+
+
+def connectivity_tests_for_device(
+    user: dict[str, Any],
+    device_id: str,
+    *,
+    from_timestamp: str | None = None,
+    to_timestamp: str | None = None,
+    phase: str = "",
+    page: int = 1,
+    size: int = 50,
+) -> dict[str, Any]:
+    require_permission(user, "connectivity-test:read")
+    device = get_device(device_id)
+    require_site_access(user, device["siteId"])
+    from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
+    to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
+    if from_value and to_value and from_value > to_value:
+        raise ApiError(
+            400, "INVALID_TIME_RANGE", "from must be earlier than or equal to to."
+        )
+    normalized_phase = phase.strip().lower()
+    if normalized_phase and normalized_phase not in CONNECTIVITY_TEST_PHASES:
+        raise ApiError(400, "INVALID_QUERY_PARAMETER", "phase must be before or after.")
+    rows = []
+    for record in CONNECTIVITY_TEST_RECORDS:
+        if record["deviceId"] != device_id:
+            continue
+        tested_at = parse_rfc3339("testedAt", record["testedAt"])
+        if from_value and tested_at < from_value:
+            continue
+        if to_value and tested_at > to_value:
+            continue
+        if normalized_phase and record["phase"] != normalized_phase:
+            continue
+        rows.append(record)
+    rows.sort(key=lambda item: item["testedAt"], reverse=True)
+    total = len(rows)
+    start = (page - 1) * size
+    return {
+        "items": copy_payload(rows[start : start + size]),
+        "page": page,
+        "size": size,
+        "total": total,
+        "latest": copy_payload(rows[0]) if rows else None,
+    }
+
+
+def hardware_profile(profile_id: str) -> dict[str, Any]:
+    normalized = str(profile_id).strip().upper()
+    profile = next(
+        (item for item in HARDWARE_PROFILES if item["id"] == normalized), None
+    )
+    if not profile:
+        raise ApiError(
+            404, "HARDWARE_PROFILE_NOT_FOUND", "Hardware profile was not found."
+        )
+    return profile
+
+
+def hardware_profiles(
+    *, active: bool | None = None, board_type: str = "", connectivity_type: str = ""
+) -> list[dict[str, Any]]:
+    rows = HARDWARE_PROFILES
+    if active is not None:
+        rows = [item for item in rows if bool(item["active"]) is active]
+    if board_type:
+        rows = [
+            item
+            for item in rows
+            if item["boardType"].lower() == board_type.strip().lower()
+        ]
+    if connectivity_type:
+        rows = [
+            item
+            for item in rows
+            if item["connectivityType"].lower() == connectivity_type.strip().lower()
+        ]
+    return copy_payload(rows)
+
+
+def update_device_hardware_profile(
+    user: dict[str, Any], device_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "hardware-profile:write")
+    with STORE_LOCK:
+        device = get_device(device_id)
+        require_site_access(user, device["siteId"])
+        profile_id = required_text(payload, "profileId").upper()
+        next_profile = hardware_profile(profile_id)
+        if not next_profile["active"]:
+            raise ApiError(
+                409, "HARDWARE_PROFILE_INACTIVE", "Hardware profile is inactive."
+            )
+        replaced_components = [
+            component.lower()
+            for component in string_list(payload, "replacedComponents", required=True)
+        ]
+        invalid_components = sorted(set(replaced_components) - HARDWARE_COMPONENTS)
+        if invalid_components:
+            raise ApiError(
+                400,
+                "INVALID_HARDWARE_COMPONENT",
+                "Unsupported replacedComponents: " + ", ".join(invalid_components),
+            )
+        reason = required_text(payload, "reason")
+        effective_at = format_rfc3339(
+            parse_rfc3339(
+                "effectiveAt",
+                payload.get("effectiveAt"),
+                "INVALID_HARDWARE_REPLACEMENT",
+            )
+        )
+        previous_profile_id = str(
+            device.get("hardwareProfileId") or "HW-PICO2W-DUAL-SENSOR-WIFI"
+        )
+        changed_at = now_iso()
+        device["hardwareProfileId"] = profile_id
+        device.setdefault("hardwareProfileHistory", []).append(
+            {
+                "fromProfileId": previous_profile_id,
+                "toProfileId": profile_id,
+                "replacedComponents": list(dict.fromkeys(replaced_components)),
+                "reason": reason,
+                "effectiveAt": effective_at,
+                "changedAt": changed_at,
+                "assetId": device["assetId"],
+            }
+        )
+        device["updatedAt"] = changed_at
+        return {
+            "deviceId": device["id"],
+            "siteId": device["siteId"],
+            "assetId": device["assetId"],
+            "profileId": profile_id,
+            "profile": copy_payload(next_profile),
+            "hardwareProfileHistory": copy_payload(device["hardwareProfileHistory"]),
+            "updatedAt": changed_at,
+        }
+
+
 def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
     site_id = str(payload.get("siteId") or "SITE-01").strip().upper()
     with STORE_LOCK:
         site = get_site(site_id)
-        asset_id = str(payload.get("assetId") or assets_for(site["id"])[0]["id"]).strip().upper()
+        asset_id = (
+            str(payload.get("assetId") or assets_for(site["id"])[0]["id"])
+            .strip()
+            .upper()
+        )
         asset = get_asset(site["id"], asset_id)
         event_id = f"EV-{250 + len(EVENTS)}"
         event = {
@@ -1560,18 +3105,28 @@ def review_event(event_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not event:
             raise ApiError(404, "EVENT_NOT_FOUND", "Event was not found.")
         label = str(payload.get("label", event["label"]))
-        if label not in {"needs_review", "normal_false_positive", "confirmed_anomaly", "repair_completed", "sensor_issue"}:
+        if label not in {
+            "needs_review",
+            "normal_false_positive",
+            "confirmed_anomaly",
+            "repair_completed",
+            "sensor_issue",
+        }:
             raise ApiError(400, "INVALID_EVENT_LABEL", "Event label is not allowed.")
         note = str(payload.get("note", event["note"]))
         if len(note) > MAX_REVIEW_NOTE_LENGTH:
-            raise ApiError(400, "NOTE_TOO_LONG", "Review note must be 2000 characters or less.")
+            raise ApiError(
+                400, "NOTE_TOO_LONG", "Review note must be 2000 characters or less."
+            )
         event["label"] = label
         event["note"] = note
         event["reviewedAt"] = now_text()
         return copy_payload(event)
 
 
-def baseline_payload(payload: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+def baseline_payload(
+    payload: dict[str, Any], existing: dict[str, Any] | None = None
+) -> dict[str, Any]:
     source = dict(existing or {})
     nested = payload.get("baseline")
     if isinstance(nested, dict):
@@ -1589,9 +3144,15 @@ def baseline_payload(payload: dict[str, Any], existing: dict[str, Any] | None = 
     return {
         "status": str(source.get("status") or "draft"),
         "capturedAt": str(source.get("capturedAt") or ""),
-        "vibrationRmsMmS": parse_float_value("baseline.vibrationRmsMmS", source.get("vibrationRmsMmS"), 0.0),
-        "acousticDb": parse_float_value("baseline.acousticDb", source.get("acousticDb"), 0.0),
-        "sampleCount": parse_int_value("baseline.sampleCount", source.get("sampleCount"), 0),
+        "vibrationRmsMmS": parse_float_value(
+            "baseline.vibrationRmsMmS", source.get("vibrationRmsMmS"), 0.0
+        ),
+        "acousticDb": parse_float_value(
+            "baseline.acousticDb", source.get("acousticDb"), 0.0
+        ),
+        "sampleCount": parse_int_value(
+            "baseline.sampleCount", source.get("sampleCount"), 0
+        ),
     }
 
 

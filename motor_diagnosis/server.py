@@ -21,26 +21,33 @@ from .data import (
     authenticate,
     copy_payload,
     create_asset,
+    create_connectivity_test,
     create_device,
     create_install_point,
     create_site,
     current_user_for_token,
+    dashboard_sites_summary,
     deactivate_site,
     delete_asset,
     delete_device,
     delete_site,
     devices_for,
+    device_health_for,
     get_asset_by_id,
     get_device,
     get_site,
     has_permission,
+    hardware_profiles,
+    ingest_telemetry,
     inject_anomaly,
     install_points_for,
     install_points_for_asset,
     logout,
     network_profile,
     network_profiles_for_sites,
+    quarantine_mqtt_message,
     quarantine_unregistered_device,
+    report_service_dependency,
     require_permission,
     require_site_access,
     review_event,
@@ -48,15 +55,19 @@ from .data import (
     rollout_plans,
     rollout_plan_for,
     site_network_profile,
+    service_health_dependencies,
     telemetry_for,
+    telemetry_principal_for_token,
     telemetry_units,
     update_asset,
     update_device,
+    update_device_hardware_profile,
     update_install_point,
     update_rollout_plan,
     update_site,
     update_site_network_profile,
     visible_sites_for_user,
+    connectivity_tests_for_device,
 )
 from .web import render_page
 
@@ -106,24 +117,40 @@ class AppHandler(BaseHTTPRequestHandler):
             elif method == "DELETE":
                 self.route_delete(segments)
             else:
-                raise ApiError(405, "METHOD_NOT_ALLOWED", "HTTP method is not supported for this API.")
+                raise ApiError(
+                    405,
+                    "METHOD_NOT_ALLOWED",
+                    "HTTP method is not supported for this API.",
+                )
         except ApiError as exc:
             self.send_error_json(exc)
         except json.JSONDecodeError:
-            self.send_error_json(ApiError(400, "INVALID_JSON", "Request body is not valid JSON."))
+            self.send_error_json(
+                ApiError(400, "INVALID_JSON", "Request body is not valid JSON.")
+            )
         except Exception:
             LOGGER.exception("unexpected_error path=%s", path)
-            self.send_error_json(ApiError(500, "INTERNAL_ERROR", "Server processing failed."))
+            self.send_error_json(
+                ApiError(500, "INTERNAL_ERROR", "Server processing failed.")
+            )
         finally:
             elapsed_ms = round((time.monotonic() - request_started) * 1000, 2)
             LOGGER.info("%s %s %.2fms", method, path, elapsed_ms)
 
-    def route_get(self, path: str, segments: list[str], query: dict[str, list[str]]) -> None:
+    def route_get(
+        self, path: str, segments: list[str], query: dict[str, list[str]]
+    ) -> None:
         if path == "/":
             self.send_text(render_page(), "text/html; charset=utf-8")
             return
         if segments == ["api", "health"]:
-            self.send_json({"ok": True, "service": "Bind Edge AI backend", "timestamp": time.time()})
+            self.send_json(
+                {
+                    "ok": True,
+                    "service": "Bind Edge AI backend",
+                    "timestamp": time.time(),
+                }
+            )
             return
 
         user = self.require_user()
@@ -145,7 +172,9 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(response)
             return
         if segments == ["api", "me"]:
-            self.send_json({"user": copy_payload(user), "rolePolicy": role_policy(user["role"])})
+            self.send_json(
+                {"user": copy_payload(user), "rolePolicy": role_policy(user["role"])}
+            )
             return
         if segments == ["api", "auth", "roles"]:
             require_permission(user, "role:read")
@@ -164,19 +193,31 @@ class AppHandler(BaseHTTPRequestHandler):
             require_permission(user, "site:read")
             self.send_json(copy_payload(site))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "assets":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "assets"
+        ):
             get_site(segments[2])
             require_site_access(user, segments[2])
             require_permission(user, "asset:read")
             self.send_json(assets_for(segments[2]))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "devices":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "devices"
+        ):
             get_site(segments[2])
             require_site_access(user, segments[2])
             require_permission(user, "device:read")
             self.send_json(devices_for(segments[2]))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "install-points":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "install-points"
+        ):
             get_site(segments[2])
             require_site_access(user, segments[2])
             require_permission(user, "install-point:read")
@@ -193,28 +234,44 @@ class AppHandler(BaseHTTPRequestHandler):
             require_permission(user, "device:read")
             self.send_json(paginated_devices(user, query))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "devices"] and segments[3] == "health":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "health"
+        ):
             device = get_device(segments[2])
             require_site_access(user, device["siteId"])
             require_permission(user, "device:read")
+            self.send_json(device_health_for(device["id"]))
+            return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "connectivity-tests"
+        ):
+            page = positive_query_int(query, "page", 1)
+            size = positive_query_int(query, "size", 50, maximum=200)
             self.send_json(
-                {
-                    "deviceId": device["id"],
-                    "siteId": device["siteId"],
-                    "assetId": device["assetId"],
-                    "health": device["health"],
-                    "lastSeenSecAgo": device["lastSeenSecAgo"],
-                    "firmwareVersion": device.get("firmwareVersion") or device.get("firmware"),
-                    "certificateStatus": device["certificateStatus"],
-                    "mappingStatus": device["mappingStatus"],
-                }
+                connectivity_tests_for_device(
+                    user,
+                    segments[2],
+                    from_timestamp=query.get("from", [None])[0],
+                    to_timestamp=query.get("to", [None])[0],
+                    phase=query.get("phase", [""])[0],
+                    page=page,
+                    size=size,
+                )
             )
             return
         if segments == ["api", "rollout-plans"]:
             require_permission(user, "rollout:read")
             self.send_json(filter_site_rows(user, rollout_plans()))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "rollout-plan":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "rollout-plan"
+        ):
             require_site_access(user, segments[2])
             require_permission(user, "rollout:read")
             self.send_json(rollout_plan_for(segments[2]))
@@ -231,7 +288,11 @@ class AppHandler(BaseHTTPRequestHandler):
             require_permission(user, "network-profile:read")
             self.send_json(filter_site_rows(user, network_profiles_for_sites()))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "network-profile":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "network-profile"
+        ):
             require_site_access(user, segments[2])
             require_permission(user, "network-profile:read")
             self.send_json(site_network_profile(segments[2]))
@@ -243,7 +304,11 @@ class AppHandler(BaseHTTPRequestHandler):
             require_permission(user, "install-point:read")
             self.send_json(install_points_for(site_id))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "assets"] and segments[3] == "install-points":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "assets"]
+            and segments[3] == "install-points"
+        ):
             asset = get_asset_by_id(segments[2])
             require_site_access(user, asset["siteId"])
             require_permission(user, "install-point:read")
@@ -258,6 +323,29 @@ class AppHandler(BaseHTTPRequestHandler):
             require_permission(user, "configuration:read")
             self.send_json(copy_payload(DATA_PIPELINES))
             return
+        if segments == ["api", "dashboard", "sites-summary"]:
+            self.send_json(
+                dashboard_sites_summary(
+                    user,
+                    region=query.get("region", [""])[0],
+                    status=query.get("status", [""])[0],
+                )
+            )
+            return
+        if segments == ["api", "health", "dependencies"]:
+            require_permission(user, "service-health:read")
+            self.send_json(service_health_dependencies())
+            return
+        if segments == ["api", "device-hardware-profiles"]:
+            require_permission(user, "hardware-profile:read")
+            self.send_json(
+                hardware_profiles(
+                    active=optional_boolean_query(query, "active"),
+                    board_type=query.get("boardType", [""])[0],
+                    connectivity_type=query.get("connectivityType", [""])[0],
+                )
+            )
+            return
         if segments == ["api", "events"]:
             self.send_json(authorized_events(user))
             return
@@ -271,8 +359,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 {
                     "siteId": site_id,
                     "assetId": asset_id,
-                    "units": telemetry_units(),
-                    "points": telemetry_for(site_id, asset_id),
+                    "units": telemetry_units(site_id, asset_id),
+                    "points": telemetry_for(
+                        site_id,
+                        asset_id,
+                        from_timestamp=query.get("from", [None])[0],
+                        to_timestamp=query.get("to", [None])[0],
+                    ),
                 }
             )
             return
@@ -296,6 +389,29 @@ class AppHandler(BaseHTTPRequestHandler):
             current_user_for_token(token)
             self.send_json(logout(token))
             return
+        if segments == ["api", "telemetry", "ingest"]:
+            result, status = ingest_telemetry(
+                telemetry_principal_for_token(self.bearer_token()), payload
+            )
+            self.send_json(result, status=status)
+            return
+        if segments == ["api", "telemetry", "quarantine"]:
+            self.send_json(
+                quarantine_mqtt_message(
+                    telemetry_principal_for_token(self.bearer_token()), payload
+                ),
+                status=201,
+            )
+            return
+        if segments == ["api", "health", "dependencies", "mqtt"]:
+            self.send_json(
+                report_service_dependency(
+                    telemetry_principal_for_token(self.bearer_token()),
+                    "mqtt",
+                    payload,
+                )
+            )
+            return
 
         user = self.require_user()
 
@@ -305,16 +421,32 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(segments) == 3 and segments[:2] == ["api", "sites"]:
             self.send_json(update_site(user, segments[2], payload))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "deactivate":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "deactivate"
+        ):
             self.send_json(deactivate_site(user, segments[2]))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "assets":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "assets"
+        ):
             self.send_json(create_asset(user, segments[2], payload), status=201)
             return
-        if len(segments) == 5 and segments[:2] == ["api", "sites"] and segments[3] == "assets":
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "assets"
+        ):
             self.send_json(update_asset(user, segments[2], segments[4], payload))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "devices":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "devices"
+        ):
             self.send_json(create_device(user, segments[2], payload), status=201)
             return
         if segments == ["api", "devices"]:
@@ -330,14 +462,31 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(segments) == 3 and segments[:2] == ["api", "devices"]:
             self.send_json(update_device(user, segments[2], payload))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "assets"] and segments[3] == "install-points":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "connectivity-tests"
+        ):
+            self.send_json(
+                create_connectivity_test(user, segments[2], payload), status=201
+            )
+            return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "assets"]
+            and segments[3] == "install-points"
+        ):
             self.send_json(create_install_point(user, segments[2], payload), status=201)
             return
         if segments == ["api", "demo", "inject-anomaly"]:
             require_permission(user, "event:write")
             self.send_json(inject_anomaly(payload), status=201)
             return
-        if len(segments) == 4 and segments[:2] == ["api", "events"] and segments[3] == "review":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "review"
+        ):
             require_permission(user, "event:review")
             self.send_json(review_event(segments[2], payload))
             return
@@ -346,11 +495,26 @@ class AppHandler(BaseHTTPRequestHandler):
     def route_put(self, segments: list[str]) -> None:
         payload = self.read_json()
         user = self.require_user()
-        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "rollout-plan":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "rollout-plan"
+        ):
             self.send_json(update_rollout_plan(user, segments[2], payload))
             return
-        if len(segments) == 4 and segments[:2] == ["api", "sites"] and segments[3] == "network-profile":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "network-profile"
+        ):
             self.send_json(update_site_network_profile(user, segments[2], payload))
+            return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "hardware-profile"
+        ):
+            self.send_json(update_device_hardware_profile(user, segments[2], payload))
             return
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
@@ -360,14 +524,24 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(segments) == 3 and segments[:2] == ["api", "sites"]:
             self.send_json(update_site(user, segments[2], payload))
             return
-        if len(segments) == 5 and segments[:2] == ["api", "sites"] and segments[3] == "assets":
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "assets"
+        ):
             self.send_json(update_asset(user, segments[2], segments[4], payload))
             return
         if len(segments) == 3 and segments[:2] == ["api", "devices"]:
             self.send_json(update_device(user, segments[2], payload))
             return
-        if len(segments) == 5 and segments[:2] == ["api", "assets"] and segments[3] == "install-points":
-            self.send_json(update_install_point(user, segments[2], segments[4], payload))
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "assets"]
+            and segments[3] == "install-points"
+        ):
+            self.send_json(
+                update_install_point(user, segments[2], segments[4], payload)
+            )
             return
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
@@ -376,7 +550,11 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(segments) == 3 and segments[:2] == ["api", "sites"]:
             self.send_json(delete_site(user, segments[2]))
             return
-        if len(segments) == 5 and segments[:2] == ["api", "sites"] and segments[3] == "assets":
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "sites"]
+            and segments[3] == "assets"
+        ):
             self.send_json(delete_asset(user, segments[2], segments[4]))
             return
         if len(segments) == 3 and segments[:2] == ["api", "devices"]:
@@ -401,16 +579,24 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             length = int(length_text)
         except ValueError as exc:
-            raise ApiError(400, "INVALID_CONTENT_LENGTH", "Content-Length is invalid.") from exc
+            raise ApiError(
+                400, "INVALID_CONTENT_LENGTH", "Content-Length is invalid."
+            ) from exc
         if length < 0:
             raise ApiError(400, "INVALID_CONTENT_LENGTH", "Content-Length is invalid.")
         if length > MAX_JSON_BODY_BYTES:
-            raise ApiError(413, "REQUEST_TOO_LARGE", "Request body must be 64KB or less.")
+            raise ApiError(
+                413, "REQUEST_TOO_LARGE", "Request body must be 64KB or less."
+            )
         if length == 0:
             return {}
         content_type = self.headers.get("content-type", "").split(";")[0].lower()
         if content_type != "application/json":
-            raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "Only application/json requests are supported.")
+            raise ApiError(
+                415,
+                "UNSUPPORTED_MEDIA_TYPE",
+                "Only application/json requests are supported.",
+            )
         data = json.loads(self.rfile.read(length).decode("utf-8"))
         if not isinstance(data, dict):
             raise ApiError(400, "INVALID_JSON_BODY", "JSON body must be an object.")
@@ -424,9 +610,16 @@ class AppHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_error_json(self, exc: ApiError) -> None:
-        self.send_json({"error": {"code": exc.code, "message": exc.message}}, status=exc.status)
+        self.send_json(
+            {"error": {"code": exc.code, "message": exc.message}}, status=exc.status
+        )
 
-    def send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200) -> None:
+    def send_text(
+        self,
+        text: str,
+        content_type: str = "text/plain; charset=utf-8",
+        status: int = 200,
+    ) -> None:
         body = text.encode("utf-8")
         self.send_response(status)
         self.send_common_headers(content_type, len(body))
@@ -437,7 +630,17 @@ class AppHandler(BaseHTTPRequestHandler):
         points = telemetry_for(site_id, asset_id)
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["site_id", "asset_id", "minute", "vibration_rms_mm_s", "acoustic_db", "rpm", "anomaly_score"])
+        writer.writerow(
+            [
+                "site_id",
+                "asset_id",
+                "minute",
+                "vibration_rms_mm_s",
+                "acoustic_db",
+                "rpm",
+                "anomaly_score",
+            ]
+        )
         for point in points:
             writer.writerow(
                 [
@@ -457,7 +660,9 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("content-disposition", f'attachment; filename="{filename}"')
         self.send_header("cache-control", "no-store")
         self.send_header("access-control-allow-origin", "*")
-        self.send_header("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+        self.send_header(
+            "access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        )
         self.send_header("access-control-allow-headers", "authorization, content-type")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
@@ -467,7 +672,9 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("content-type", content_type)
         self.send_header("cache-control", "no-store")
         self.send_header("access-control-allow-origin", "*")
-        self.send_header("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+        self.send_header(
+            "access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        )
         self.send_header("access-control-allow-headers", "authorization, content-type")
         self.send_header("content-length", str(content_length))
 
@@ -483,14 +690,18 @@ def authorized_events(user: dict[str, Any]) -> list[dict[str, Any]]:
     return copy_payload([event for event in EVENTS if event["siteId"] in allowed])
 
 
-def filter_site_rows(user: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def filter_site_rows(
+    user: dict[str, Any], rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     allowed = user.get("allowedSiteIds", [])
     if "*" in allowed:
         return copy_payload(rows)
     return copy_payload([row for row in rows if row.get("siteId") in allowed])
 
 
-def paginated_devices(user: dict[str, Any], query: dict[str, list[str]]) -> dict[str, Any]:
+def paginated_devices(
+    user: dict[str, Any], query: dict[str, list[str]]
+) -> dict[str, Any]:
     site_id = query.get("siteId", [""])[0].strip().upper()
     if site_id:
         get_site(site_id)
@@ -509,14 +720,23 @@ def paginated_devices(user: dict[str, Any], query: dict[str, list[str]]) -> dict
         rows = [
             row
             for row in rows
-            if status in {str(row.get("health", "")).lower(), str(row.get("mappingStatus", "")).lower()}
+            if status
+            in {
+                str(row.get("health", "")).lower(),
+                str(row.get("mappingStatus", "")).lower(),
+            }
         ]
 
     page = positive_query_int(query, "page", 1)
     size = positive_query_int(query, "size", 50, maximum=200)
     total = len(rows)
     start = (page - 1) * size
-    return {"items": copy_payload(rows[start : start + size]), "page": page, "size": size, "total": total}
+    return {
+        "items": copy_payload(rows[start : start + size]),
+        "page": page,
+        "size": size,
+        "total": total,
+    }
 
 
 def path_segments(path: str) -> list[str]:
@@ -537,10 +757,14 @@ def positive_query_int(
     try:
         parsed = int(value)
     except ValueError as exc:
-        raise ApiError(400, "INVALID_QUERY_PARAMETER", f"{key} must be a positive integer.") from exc
+        raise ApiError(
+            400, "INVALID_QUERY_PARAMETER", f"{key} must be a positive integer."
+        ) from exc
     if parsed <= 0 or (maximum is not None and parsed > maximum):
         suffix = f" up to {maximum}" if maximum is not None else ""
-        raise ApiError(400, "INVALID_QUERY_PARAMETER", f"{key} must be a positive integer{suffix}.")
+        raise ApiError(
+            400, "INVALID_QUERY_PARAMETER", f"{key} must be a positive integer{suffix}."
+        )
     return parsed
 
 

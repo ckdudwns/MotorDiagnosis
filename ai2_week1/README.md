@@ -56,6 +56,17 @@ vibration_features.csv + telemetry_replay.jsonl
 
 `telemetry_replay.jsonl`을 한 건씩 읽어 센서 단말처럼 보낸다. 기본 실행은 안전한 콘솔 미리보기이며 서버로 전송하지 않는다. `--send`를 붙였을 때만 `/api/telemetry/ingest`에 HTTP POST한다.
 
+리플레이 파일의 `SYN-*` 식별자는 분석 데이터의 출처를 보존하기 위한 값이다. 실제
+송신 시에는 기본적으로 백엔드에 등록된 `SITE-01` / `SITE-01-GEN-01` /
+`DEV-01-GEN-01` 매핑으로 변환한다. 다른 등록 장치를 사용할 때는 `--site-id`,
+`--asset-id`, `--device-id`를 함께 지정한다.
+
+```bash
+python ai2_week1/replay_telemetry.py \
+  --input output/ai2_week1/ai1_telemetry_replay.jsonl \
+  --send
+```
+
 ```text
 변환된 JSONL
       ↓  (--interval-seconds 값마다 1건)
@@ -128,6 +139,18 @@ python ai2_week1/replay_telemetry.py --limit 3
 
 ```bash
 python ai2_week1/replay_telemetry.py --send --limit 10 --interval-seconds 1
+```
+
+기본 엔드포인트는 `http://127.0.0.1:8787/api/telemetry/ingest`이며 로컬 개발용
+Bearer 토큰은 `demo-telemetry-ingest-token`이다. 다른 토큰은 환경 변수 또는 옵션으로
+전달한다.
+
+```bash
+export TELEMETRY_INGEST_TOKEN=your-device-or-service-token
+python ai2_week1/replay_telemetry.py --send --limit 10
+
+# 또는
+python ai2_week1/replay_telemetry.py --send --token your-device-or-service-token
 ```
 
 ## 음향 데이터가 내려받아진 뒤

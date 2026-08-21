@@ -12,13 +12,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from telemetry_payload import get_nullable_float, get_raw_only_null, to_external_payload
-
-
-if sys.version_info[:2] != (3, 12):
-    raise SystemExit(
-        "Python 3.12.x is required by the team development standard. "
-        f"Current version: {sys.version.split()[0]}"
+try:
+    from .telemetry_payload import (
+        get_nullable_float,
+        get_raw_only_null,
+        to_external_payload,
+    )
+except ImportError:
+    from telemetry_payload import (
+        get_nullable_float,
+        get_raw_only_null,
+        to_external_payload,
     )
 
 
@@ -183,6 +187,11 @@ def write_csv(path: Path, rows: list[dict[str, str]]) -> None:
 
 
 def main() -> None:
+    if sys.version_info[:2] != (3, 12):
+        raise SystemExit(
+            "Python 3.12.x is required by the team development standard. "
+            f"Current version: {sys.version.split()[0]}"
+        )
     args = parse_args()
     if args.replay_interval_sec <= 0:
         raise SystemExit("--replay-interval-sec must be greater than zero")

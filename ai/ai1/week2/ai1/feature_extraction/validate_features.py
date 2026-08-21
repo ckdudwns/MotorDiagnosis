@@ -7,6 +7,12 @@ extract_all_features()가 반환한 특징값 dict의 품질을 점검한다.
 1. 결측/무효값 검사 (check_missing_or_invalid)
    - None, NaN, Inf/-Inf → 데이터 품질 문제. 계산 오류 또는 센서 결함 가능성이 높으므로
      원칙적으로 "거부(reject)" 대상. 이상치가 아니라 애초에 신뢰할 수 없는 값이다.
+   - 특징값 dict가 비어있으면 거부한다 (reason="empty_features").
+   - baseline이 주어지면, baseline에 정의된 특징값 키가 하나라도 빠져 있으면 거부한다
+     (reason="missing_key").
+   - 값이 실제 숫자(int/float)가 아니면 거부한다 (reason="invalid_type").
+     Python에서 bool은 int의 서브클래스라 `isinstance(True, (int, float))`가 True로
+     나오는 함정이 있어, bool은 명시적으로 숫자가 아닌 것으로 취급한다.
 
 2. 기준선 대비 이상치 검사 (check_outliers)
    - baseline.json(`compute_baseline.py` 산출물)의 mean/std를 이용해
@@ -26,18 +32,46 @@ import json
 DEFAULT_SIGMA_MULTIPLIER = 3.0
 
 
-def check_missing_or_invalid(features: dict) -> list:
-    """None/NaN/Inf 값을 가진 특징값 키 목록을 반환한다. 없으면 빈 리스트."""
+def is_valid_number(value) -> bool:
+    """value가 실제 숫자(int/float)인지 판정한다. bool은 숫자로 취급하지 않는다.
+
+    Python에서 bool은 int의 서브클래스라 isinstance(True, (int, float))가 True로
+    나오는 함정이 있어, 여기서 명시적으로 bool을 제외한다.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def check_missing_or_invalid(features: dict, baseline: dict = None) -> list:
+    """None/NaN/Inf/빈 dict/필수 키 누락/비숫자 값을 검출해 이슈 목록을 반환한다.
+
+    baseline이 주어지면 baseline["features"]에 정의된 키가 features에 하나라도
+    빠져 있는지도 함께 검사한다 (reason="missing_key").
+    """
+    if not features:
+        return [{"feature": None, "value": None, "reason": "empty_features"}]
+
     invalid = []
+
+    if baseline is not None:
+        baseline_features = baseline.get("features", baseline)
+        for required_name in baseline_features:
+            if required_name not in features:
+                invalid.append(
+                    {"feature": required_name, "value": None, "reason": "missing_key"}
+                )
+
     for name, value in features.items():
         if value is None:
             invalid.append({"feature": name, "value": None, "reason": "missing"})
             continue
-        if isinstance(value, (int, float)):
-            if isinstance(value, float) and math.isnan(value):
-                invalid.append({"feature": name, "value": value, "reason": "nan"})
-            elif isinstance(value, float) and math.isinf(value):
-                invalid.append({"feature": name, "value": value, "reason": "inf"})
+        if not is_valid_number(value):
+            invalid.append({"feature": name, "value": value, "reason": "invalid_type"})
+            continue
+        if isinstance(value, float) and math.isnan(value):
+            invalid.append({"feature": name, "value": value, "reason": "nan"})
+        elif isinstance(value, float) and math.isinf(value):
+            invalid.append({"feature": name, "value": value, "reason": "inf"})
+
     return invalid
 
 
@@ -56,7 +90,7 @@ def check_outliers(
     outliers = []
 
     for name, value in features.items():
-        if not isinstance(value, (int, float)):
+        if not is_valid_number(value):
             continue
         if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
             continue  # 무효값은 check_missing_or_invalid의 책임
@@ -96,12 +130,12 @@ def validate_features(
 
     반환 예:
     {
-        "is_valid": bool,          # 결측/무효값이 없으면 True (이상치 존재는 별개)
+        "is_valid": bool,          # 결측/무효값/빈 dict/필수 키 누락이 없으면 True
         "missing_or_invalid": [...],
         "outliers": [...],         # baseline이 주어졌을 때만 채워짐
     }
     """
-    missing_or_invalid = check_missing_or_invalid(features)
+    missing_or_invalid = check_missing_or_invalid(features, baseline)
     outliers = check_outliers(features, baseline, sigma_multiplier) if baseline else []
 
     return {

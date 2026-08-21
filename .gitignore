@@ -46,13 +46,13 @@ __pycache__/
 *.npy
 data/
 output/
-ai1_week1/*.zip
-ai1_week1/ai1_handoff_dataset.csv
-ai1_week1/ai1_handoff_dataset.json
-ai1_week1/ai1/data/external/
-ai1_week1/ai1/data/handoff/
-ai1_week1/ai1/data/prototype/
-ai1_week1/ai1/synthetic_data/
+ai/ai1/week1/*.zip
+ai/ai1/week1/ai1_handoff_dataset.csv
+ai/ai1/week1/ai1_handoff_dataset.json
+ai/ai1/week1/ai1/data/external/
+ai/ai1/week1/ai1/data/handoff/
+ai/ai1/week1/ai1/data/prototype/
+ai/ai1/week1/ai1/synthetic_data/
 
 # Internal planning documents
 참고/

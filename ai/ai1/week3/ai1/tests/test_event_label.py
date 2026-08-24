@@ -120,6 +120,32 @@ class TestApplyLabelChange(unittest.TestCase):
                 reason="아무 이유",
             )
 
+    def test_list_new_label_rejected_with_value_error_not_type_error(self):
+        """list처럼 unhashable한 값은 `in EVENT_REVIEW_LABELS` 집합 조회에서
+        TypeError를 내므로, 타입 검증을 먼저 해서 ValueError로 통일해야 한다."""
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(),
+                new_label=["confirmed_anomaly"],
+                changed_by="op",
+                reason="아무 이유",
+            )
+
+    def test_dict_new_label_rejected_with_value_error_not_type_error(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(),
+                new_label={"label": "confirmed_anomaly"},
+                changed_by="op",
+                reason="아무 이유",
+            )
+
+    def test_none_new_label_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(), new_label=None, changed_by="op", reason="아무 이유"
+            )
+
     def test_blank_changed_by_rejected(self):
         with self.assertRaises(ValueError):
             apply_label_change(

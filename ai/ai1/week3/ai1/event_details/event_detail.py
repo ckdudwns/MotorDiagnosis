@@ -58,6 +58,17 @@ def _feature_delta(before_summary: dict, after_summary: dict) -> dict:
     return delta
 
 
+def _validate_positive_finite_number(name: str, value) -> None:
+    """bool을 제외한 유한한 양수인지 검증한다 (0/음수/NaN/inf/bool/문자열 거부)."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{name}는 0보다 큰 유한한 숫자여야 합니다: {value!r}")
+
+
 def build_event_detail(
     *,
     event: dict,
@@ -69,17 +80,12 @@ def build_event_detail(
     applied_threshold_version: str = None,
 ) -> dict:
     """이벤트 전후 구간을 비교하는 EVENT_DETAIL_01 응답 dict를 만든다."""
-    if window_duration_sec <= 0:
-        raise ValueError("window_duration_sec은 0보다 커야 합니다.")
-    if (
-        isinstance(window_seconds, bool)
-        or not isinstance(window_seconds, (int, float))
-        or not math.isfinite(window_seconds)
-        or window_seconds <= 0
-    ):
-        # 0/음수/NaN을 넣으면 max(1, ceil(...))이 조용히 1개 윈도우 요청으로
-        # 바꿔버려 응답의 요청값과 실제 계산이 어긋난다 — 여기서 먼저 거부한다.
-        raise ValueError(f"window_seconds는 0보다 큰 유한한 숫자여야 합니다: {window_seconds!r}")
+    # window_duration_sec이 무한대/NaN/bool/문자열이면 이후 n_windows 계산이나
+    # time_range 값이 조용히 잘못된 값(예: inf)으로 새 나간다 — 먼저 거부한다.
+    _validate_positive_finite_number("window_duration_sec", window_duration_sec)
+    # window_seconds가 0/음수/NaN이면 max(1, ceil(...))이 조용히 1개 윈도우
+    # 요청으로 바꿔버려 응답의 요청값과 실제 계산이 어긋난다 — 먼저 거부한다.
+    _validate_positive_finite_number("window_seconds", window_seconds)
     if not ordered_windows or not (0 <= event_index < len(ordered_windows)):
         raise ValueError(
             f"event_index({event_index})가 ordered_windows 범위(0~{len(ordered_windows) - 1})를 "

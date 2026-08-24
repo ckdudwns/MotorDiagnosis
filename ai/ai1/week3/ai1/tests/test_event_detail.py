@@ -164,6 +164,54 @@ class TestBuildEventDetailSynthetic(unittest.TestCase):
                 window_duration_sec=0.2,
             )
 
+    def test_infinite_window_duration_sec_rejected(self):
+        """window_duration_sec이 무한대면 <= 0 검사를 통과해 [0.0, inf] 같은
+        잘못된 time_range가 조용히 반환된다 — 먼저 유한값인지 검증해야 한다."""
+        windows = _fixture_windows([0.0] * 5)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index=2,
+                window_seconds=1.0,
+                window_duration_sec=float("inf"),
+            )
+
+    def test_nan_window_duration_sec_rejected(self):
+        windows = _fixture_windows([0.0] * 5)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index=2,
+                window_seconds=1.0,
+                window_duration_sec=float("nan"),
+            )
+
+    def test_bool_window_duration_sec_rejected(self):
+        """True는 <= 0 검사만으로는 1초로 통과돼 버린다 — bool은 숫자 타입에서
+        제외해야 한다."""
+        windows = _fixture_windows([0.0] * 5)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index=2,
+                window_seconds=1.0,
+                window_duration_sec=True,
+            )
+
+    def test_string_window_duration_sec_rejected(self):
+        windows = _fixture_windows([0.0] * 5)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index=2,
+                window_seconds=1.0,
+                window_duration_sec="0.2",
+            )
+
     def test_empty_ordered_windows_raises(self):
         with self.assertRaises(ValueError):
             build_event_detail(

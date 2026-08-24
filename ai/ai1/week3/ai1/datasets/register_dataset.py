@@ -58,6 +58,11 @@ DATASET_LABEL_MAPPING = {
 LABEL_TAXONOMY_VERSION = "CWRU-FAULT-V1"
 DEFAULT_SPLIT_RATIOS = {"train": 0.7, "validation": 0.2, "test": 0.1}
 
+# week2 extract_features.py의 특징 추출 로직(계산식/특징 목록)을 식별하는 버전표.
+# extract_all_features()의 산출 스키마나 계산식이 바뀌면 반드시 함께 올려야
+# 체크섬이 "같은 원본에서 다른 특징값이 나온" 상황을 잡아낼 수 있다.
+FEATURE_PIPELINE_VERSION = "week2.extract_all_features.v1"
+
 
 def sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
     """원본 파일 체크섬(sha256) 계산 — 매니페스트의 source.files에 저장해 원본 추적에 쓴다."""
@@ -131,6 +136,15 @@ def validate_split_ratios(ratios: dict) -> None:
     if missing:
         raise ValueError(f"split_ratios에 필수 키가 없습니다: {missing}")
 
+    extra = sorted(set(ratios) - set(_REQUIRED_SPLIT_KEYS))
+    if extra:
+        # holdout처럼 쓰이지 않는 키가 섞여 있으면, 실제 결과(group_split)는
+        # 동일한데도 체크섬 payload에 그 키가 포함돼 다른 dataset id가 나온다.
+        raise ValueError(
+            f"split_ratios에 허용되지 않은 키가 있습니다: {extra} "
+            f"(허용 키: {list(_REQUIRED_SPLIT_KEYS)})"
+        )
+
     for key in _REQUIRED_SPLIT_KEYS:
         value = ratios[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -164,7 +178,7 @@ def group_split(
     이 예외가 발생하는 것이 정상이며, 자산이 늘어나거나 train 전용 등
     분할 비율을 조정해야 해소된다.
     """
-    ratios = ratios or DEFAULT_SPLIT_RATIOS
+    ratios = DEFAULT_SPLIT_RATIOS if ratios is None else ratios
     validate_split_ratios(ratios)
     required_splits = [
         name for name in ("train", "validation", "test") if ratios.get(name, 0) > 0
@@ -225,23 +239,38 @@ def compute_version_checksum(
     seed: int,
     label_taxonomy_version: str,
     label_mapping: dict,
+    feature_config: FeatureConfig,
+    feature_pipeline_version: str = FEATURE_PIPELINE_VERSION,
 ) -> str:
-    """원본 파일 체크섬 + 전처리/분할/라벨 정규화 설정으로 불변 버전 체크섬을 만든다.
+    """원본 파일·라벨·전처리/분할/특징 추출 설정으로 불변 버전 체크섬을 만든다.
 
-    입력 파일 구성, window/hop 크기, 분할 비율, seed, label taxonomy 버전,
-    label mapping 중 하나라도 달라지면 다른 체크섬이 나와야 같은 날짜에 생성된
-    서로 다른 데이터셋 버전이 동일 ID로 충돌하는 것을 막을 수 있다. label
-    mapping을 빼면 정규화 결과(common_label)만 바뀐 버전이 원본 파일·분할
-    설정이 같다는 이유로 이전 버전과 동일한 checksum/id를 갖게 된다.
+    입력 파일 sha256 + **파일별 source label**, window/hop 크기, 분할 비율,
+    seed, label taxonomy 버전, label mapping, 특징 추출 설정(FeatureConfig:
+    sample_rate/frame_length/hop_length/n_mfcc/band_edges)과 파이프라인 버전
+    중 하나라도 달라지면 다른 체크섬이 나와야 한다. 실제 정규화 산출물
+    (known_label, 특징값)에 영향을 주는 입력을 빠짐없이 포함해야, 같은 파일
+    sha256에서 source label만 바뀌거나 특징 추출 설정/로직만 바뀐 경우에도
+    같은 dataset id가 재사용되는 것을 막을 수 있다.
     """
     payload = {
-        "files": {name: info["sha256"] for name, info in sorted(source_files.items())},
+        "files": {
+            name: {"sha256": info["sha256"], "label": info["label"]}
+            for name, info in sorted(source_files.items())
+        },
         "window_size": window_size,
         "hop_size": hop_size,
         "split_ratios": {name: split_ratios[name] for name in sorted(split_ratios)},
         "seed": seed,
         "label_taxonomy_version": label_taxonomy_version,
         "label_mapping": {name: label_mapping[name] for name in sorted(label_mapping)},
+        "feature_pipeline_version": feature_pipeline_version,
+        "feature_config": {
+            "sample_rate": feature_config.sample_rate,
+            "frame_length": feature_config.frame_length,
+            "hop_length": feature_config.hop_length,
+            "n_mfcc": feature_config.n_mfcc,
+            "band_edges": list(feature_config.band_edges),
+        },
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
@@ -255,7 +284,7 @@ def build_manifest(
     seed: int = 42,
 ) -> dict:
     """CWRU 데이터를 로드해 DATA_EXPORT_01 매니페스트(dict)를 만든다."""
-    split_ratios = split_ratios or DEFAULT_SPLIT_RATIOS
+    split_ratios = DEFAULT_SPLIT_RATIOS if split_ratios is None else split_ratios
     validate_split_ratios(split_ratios)
 
     records = load_cwru_dataset(data_dir, window_size=window_size, hop_size=hop_size)
@@ -263,6 +292,7 @@ def build_manifest(
         raise FileNotFoundError(f"{data_dir}에서 CWRU 레코드를 하나도 로드하지 못했습니다.")
 
     source = build_source_block(data_dir)
+    config = FeatureConfig(sample_rate=records[0]["sample_rate"])
     version_checksum = compute_version_checksum(
         source["files"],
         window_size,
@@ -271,12 +301,12 @@ def build_manifest(
         seed,
         LABEL_TAXONOMY_VERSION,
         DATASET_LABEL_MAPPING,
+        config,
     )
     source["checksum"] = version_checksum
     compatibility = build_compatibility_block(records)
     splits = group_split(records, split_ratios, seed)
 
-    config = FeatureConfig(sample_rate=records[0]["sample_rate"])
     rows = []
     for rec, split in zip(records, splits):
         known_label = rec["label"]

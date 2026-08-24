@@ -30,9 +30,11 @@ from register_dataset import (  # noqa: E402
     sha256_of_file,
     DATASET_LABEL_MAPPING,
     LABEL_TAXONOMY_VERSION,
+    FEATURE_PIPELINE_VERSION,
     InsufficientAssetGroupsError,
 )
 from export_dataset import export_dataset  # noqa: E402
+from extract_features import FeatureConfig  # noqa: E402
 
 
 def _cwru_data_available() -> bool:
@@ -132,6 +134,8 @@ class TestComputeVersionChecksum(unittest.TestCase):
             seed=42,
             label_taxonomy_version=LABEL_TAXONOMY_VERSION,
             label_mapping=DATASET_LABEL_MAPPING,
+            feature_config=FeatureConfig(sample_rate=12000),
+            feature_pipeline_version=FEATURE_PIPELINE_VERSION,
         )
         kwargs.update(overrides)
         return compute_version_checksum(**kwargs)
@@ -159,6 +163,24 @@ class TestComputeVersionChecksum(unittest.TestCase):
         changed = self._checksum(label_mapping=relabeled)
         self.assertNotEqual(self._checksum(), changed)
 
+    def test_changes_when_source_label_changes_with_same_sha256(self):
+        """같은 sha256이라도 파일에 배정된 source label(known_label)이 바뀌면
+        정규화 산출물(known_label/common_label)이 달라지므로 체크섬도 달라져야
+        한다 — 이전에는 payload에서 label이 빠져 sha256만 같으면 동일했다."""
+        relabeled_files = {"97.mat": {"sha256": "sha256:aaa", "label": "BEARING_FAULT_INNER"}}
+        changed = self._checksum(source_files=relabeled_files)
+        self.assertNotEqual(self._checksum(), changed)
+
+    def test_changes_when_feature_config_changes(self):
+        """frame_length/hop_length/n_mfcc/band_edges 중 하나라도 바뀌면 특징값
+        산출물이 달라지므로 체크섬도 달라져야 한다."""
+        changed = self._checksum(feature_config=FeatureConfig(sample_rate=12000, n_mfcc=20))
+        self.assertNotEqual(self._checksum(), changed)
+
+    def test_changes_when_feature_pipeline_version_changes(self):
+        changed = self._checksum(feature_pipeline_version="week2.extract_all_features.v2")
+        self.assertNotEqual(self._checksum(), changed)
+
 
 class TestValidateSplitRatios(unittest.TestCase):
     def test_default_ratios_are_valid(self):
@@ -167,6 +189,19 @@ class TestValidateSplitRatios(unittest.TestCase):
     def test_missing_key_rejected(self):
         with self.assertRaises(ValueError):
             validate_split_ratios({"train": 0.8, "validation": 0.2})
+
+    def test_extra_key_rejected(self):
+        """holdout처럼 실제로 쓰이지 않는 추가 키가 섞여 있으면, group_split
+        결과는 정상 3-way 구성과 동일한데도 checksum payload에 그 키가 포함돼
+        다른 dataset id가 생기므로 미리 거부해야 한다."""
+        with self.assertRaises(ValueError):
+            validate_split_ratios(
+                {"train": 0.7, "validation": 0.2, "test": 0.1, "holdout": 0.0}
+            )
+
+    def test_empty_dict_rejected_not_replaced_with_default(self):
+        with self.assertRaises(ValueError):
+            validate_split_ratios({})
 
     def test_sum_greater_than_one_rejected(self):
         with self.assertRaises(ValueError):
@@ -218,6 +253,20 @@ class TestValidateSplitRatios(unittest.TestCase):
             build_manifest(
                 data_dir=os.path.join(_THIS_DIR, "__no_such_dir__"),
                 split_ratios={"train": 0.8, "validation": 0.3, "test": 0.1},
+            )
+
+    def test_group_split_empty_dict_rejected_not_replaced_with_default(self):
+        """split_ratios={}는 `ratios or DEFAULT`의 truthiness 때문에 기본값으로
+        치환되면 안 된다 — 명시적으로 빈 dict를 넘겼다면 필수 키 누락으로
+        거부해야지, 조용히 기본 3-way 분할을 실행하면 안 된다."""
+        records = _grouped_records("NORMAL", {"a.mat": 10, "b.mat": 10})
+        with self.assertRaises(ValueError):
+            group_split(records, ratios={}, seed=1)
+
+    def test_build_manifest_empty_dict_rejected_not_replaced_with_default(self):
+        with self.assertRaises(ValueError):
+            build_manifest(
+                data_dir=os.path.join(_THIS_DIR, "__no_such_dir__"), split_ratios={}
             )
 
 

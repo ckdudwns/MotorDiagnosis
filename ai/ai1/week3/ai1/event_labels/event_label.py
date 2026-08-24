@@ -53,6 +53,10 @@ def apply_label_change(
 
     반환: (updated_event, history_entry)
     """
+    if not isinstance(new_label, str):
+        # list/dict 등 unhashable 값은 집합 조회(`in EVENT_REVIEW_LABELS`)에서
+        # TypeError를 내므로, 먼저 타입을 걸러 일관된 ValueError로 바꾼다.
+        raise ValueError(f"new_label은 문자열이어야 합니다: {new_label!r}")
     if new_label not in EVENT_REVIEW_LABELS:
         raise ValueError(
             f"허용되지 않은 라벨입니다: {new_label!r} "

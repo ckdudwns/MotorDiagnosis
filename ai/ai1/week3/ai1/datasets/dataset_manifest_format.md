@@ -20,13 +20,13 @@ API 명세서 v1.2의 `09_보완API상세` 시트 `POST /api/datasets`(MVP-042) 
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
-| `id` | string | 데이터셋 버전 ID (`DS-CWRU-VIBRATION-<날짜>-<버전체크섬 12자리>` 형식) — 같은 날짜라도 입력 파일/윈도우/분할 설정/라벨 taxonomy·mapping이 다르면 다른 ID가 나온다 |
+| `id` | string | 데이터셋 버전 ID (`DS-CWRU-VIBRATION-<날짜>-<버전체크섬 12자리>` 형식) — 같은 날짜라도 입력 파일/라벨/윈도우/분할 설정/라벨 taxonomy·mapping/특징 추출 설정이 다르면 다른 ID가 나온다 |
 | `name` | string | 데이터셋 이름 (`cwru-bearing-vibration-v1`) |
 | `source.type` | string | `external` (외부 공개 데이터셋) |
 | `source.uri` | string | CWRU Bearing Data Center 공식 URL |
 | `source.license` | string | 라이선스/이용 조건 메모 (학술 공개, 재배포 시 출처 표기) |
 | `source.files` | object | 실제 배치된 원본 파일별 `{sha256, label}` — **체크섬으로 원본 추적** |
-| `source.checksum` | string | 원본 파일 체크섬들 + window/hop 크기 + 분할 비율 + seed + labelTaxonomyVersion + labelMapping으로 만든 불변 버전 체크섬(`compute_version_checksum()`) — `id`의 접미사와 동일 값. 라벨 mapping/taxonomy도 포함해야 같은 원본·분할 설정이라도 정규화 결과(common_label)가 바뀌면 다른 체크섬/id가 나온다 |
+| `source.checksum` | string | 원본 파일 `{sha256, label}` 전체 + window/hop 크기 + 분할 비율 + seed + labelTaxonomyVersion + labelMapping + 특징 추출 설정(FeatureConfig: sample_rate/frame_length/hop_length/n_mfcc/band_edges) + `FEATURE_PIPELINE_VERSION`으로 만든 불변 버전 체크섬(`compute_version_checksum()`) — `id`의 접미사와 동일 값. 실제 정규화 산출물(known_label/특징값)에 영향을 주는 입력을 빠짐없이 포함해야, 같은 파일 sha256에서 source label만 바뀌거나 특징 추출 설정/로직만 바뀐 경우에도 같은 id가 재사용되는 것을 막을 수 있다 |
 | `compatibility.signalType` | string[] | `["vibration"]` |
 | `compatibility.samplingRateHz` | number | `12000` (CWRU Drive-End 12kHz) |
 | `compatibility.units` | object | `{"vibration": "g (raw accelerometer output, uncalibrated)"}` |

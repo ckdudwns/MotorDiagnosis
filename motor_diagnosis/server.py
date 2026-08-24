@@ -9,11 +9,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from ai.ai2.week2.anomaly_score import (
-    annotate_telemetry_points,
-    latest_asset_statuses,
-)
-
 from .data import (
     ACOUSTIC_LABEL_TAXONOMY,
     DATA_PIPELINES,
@@ -21,7 +16,6 @@ from .data import (
     NETWORK_PROFILES,
     PARAMETERS,
     ROLE_POLICIES,
-    TELEMETRY_RECORDS,
     ApiError,
     assets_for,
     authenticate,
@@ -51,7 +45,6 @@ from .data import (
     logout,
     network_profile,
     network_profiles_for_sites,
-    parse_rfc3339,
     quarantine_mqtt_message,
     quarantine_unregistered_device,
     report_service_dependency,
@@ -336,7 +329,6 @@ class AppHandler(BaseHTTPRequestHandler):
                     user,
                     region=query.get("region", [""])[0],
                     status=query.get("status", [""])[0],
-                    live_asset_statuses=latest_asset_statuses(TELEMETRY_RECORDS),
                 )
             )
             return
@@ -355,15 +347,7 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
         if segments == ["api", "events"]:
-            self.send_json(
-                authorized_events(
-                    user,
-                    site_id=query.get("siteId", [""])[0],
-                    asset_id=query.get("assetId", [""])[0],
-                    from_timestamp=query.get("from", [None])[0],
-                    to_timestamp=query.get("to", [None])[0],
-                )
-            )
+            self.send_json(authorized_events(user))
             return
         if segments == ["api", "telemetry"]:
             site_id = required_query(query, "siteId")
@@ -371,20 +355,17 @@ class AppHandler(BaseHTTPRequestHandler):
             get_site(site_id)
             require_site_access(user, site_id)
             require_permission(user, "telemetry:read")
-            points = annotate_telemetry_points(
-                telemetry_for(
-                    site_id,
-                    asset_id,
-                    from_timestamp=query.get("from", [None])[0],
-                    to_timestamp=query.get("to", [None])[0],
-                )
-            )
             self.send_json(
                 {
                     "siteId": site_id,
                     "assetId": asset_id,
                     "units": telemetry_units(site_id, asset_id),
-                    "points": points,
+                    "points": telemetry_for(
+                        site_id,
+                        asset_id,
+                        from_timestamp=query.get("from", [None])[0],
+                        to_timestamp=query.get("to", [None])[0],
+                    ),
                 }
             )
             return
@@ -646,68 +627,32 @@ class AppHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_csv(self, site_id: str, asset_id: str) -> None:
-        points = annotate_telemetry_points(telemetry_for(site_id, asset_id))
+        points = telemetry_for(site_id, asset_id)
         output = io.StringIO()
         writer = csv.writer(output)
-        raw_telemetry = any("vibrationRmsRaw" in point for point in points)
-        if raw_telemetry:
+        writer.writerow(
+            [
+                "site_id",
+                "asset_id",
+                "minute",
+                "vibration_rms_mm_s",
+                "acoustic_db",
+                "rpm",
+                "anomaly_score",
+            ]
+        )
+        for point in points:
             writer.writerow(
                 [
-                    "timestamp",
-                    "sequence",
-                    "site_id",
-                    "asset_id",
-                    "device_id",
-                    "vibration_rms_raw",
-                    "vibration_peak_hz",
-                    "acoustic_rms_raw",
-                    "acoustic_peak_hz",
-                    "rpm",
-                    "anomaly_score",
-                    "anomaly_status",
+                    site_id,
+                    asset_id,
+                    point["minute"],
+                    point["vibrationRmsMmS"],
+                    point["acousticDb"],
+                    point["rpm"],
+                    point["anomalyScore"],
                 ]
             )
-            for point in points:
-                writer.writerow(
-                    [
-                        point.get("timestamp"),
-                        point.get("sequence"),
-                        point.get("siteId"),
-                        point.get("assetId"),
-                        point.get("deviceId"),
-                        point.get("vibrationRmsRaw"),
-                        point.get("vibrationPeakHz"),
-                        point.get("acousticRmsRaw"),
-                        point.get("acousticPeakHz"),
-                        point.get("rpm"),
-                        point.get("anomalyScore"),
-                        point.get("anomalyStatus"),
-                    ]
-                )
-        else:
-            writer.writerow(
-                [
-                    "site_id",
-                    "asset_id",
-                    "minute",
-                    "vibration_rms_mm_s",
-                    "acoustic_db",
-                    "rpm",
-                    "anomaly_score",
-                ]
-            )
-            for point in points:
-                writer.writerow(
-                    [
-                        site_id,
-                        asset_id,
-                        point.get("minute"),
-                        point.get("vibrationRmsMmS"),
-                        point.get("acousticDb"),
-                        point.get("rpm"),
-                        point.get("anomalyScore"),
-                    ]
-                )
         body = ("\ufeff" + output.getvalue()).encode("utf-8")
         filename = f"{site_id}_{asset_id}.csv"
         self.send_response(200)
@@ -737,57 +682,12 @@ class AppHandler(BaseHTTPRequestHandler):
         LOGGER.info("client=%s %s", self.address_string(), fmt % args)
 
 
-def authorized_events(
-    user: dict[str, Any],
-    site_id: str = "",
-    asset_id: str = "",
-    from_timestamp: str | None = None,
-    to_timestamp: str | None = None,
-) -> list[dict[str, Any]]:
+def authorized_events(user: dict[str, Any]) -> list[dict[str, Any]]:
     require_permission(user, "event:read")
-    normalized_site_id = site_id.strip().upper()
-    normalized_asset_id = asset_id.strip().upper()
-    if normalized_site_id:
-        get_site(normalized_site_id)
-        require_site_access(user, normalized_site_id)
-    if normalized_asset_id:
-        asset = get_asset_by_id(normalized_asset_id)
-        if normalized_site_id and asset["siteId"] != normalized_site_id:
-            raise ApiError(
-                400, "ASSET_SITE_MISMATCH", "assetId does not belong to siteId."
-            )
-        require_site_access(user, asset["siteId"])
-    from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
-    to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
-    if from_value and to_value and from_value > to_value:
-        raise ApiError(
-            400, "INVALID_TIME_RANGE", "from must be earlier than or equal to to."
-        )
     allowed = user.get("allowedSiteIds", [])
-    rows = [event for event in EVENTS if "*" in allowed or event["siteId"] in allowed]
-    if normalized_site_id:
-        rows = [event for event in rows if event["siteId"] == normalized_site_id]
-    if normalized_asset_id:
-        rows = [event for event in rows if event["assetId"] == normalized_asset_id]
-    filtered = []
-    for event in rows:
-        occurred_at = event.get("occurredAt", event.get("time"))
-        try:
-            occurred_value = parse_rfc3339("event.occurredAt", occurred_at)
-        except ApiError:
-            continue
-        if from_value and occurred_value < from_value:
-            continue
-        if to_value and occurred_value > to_value:
-            continue
-        filtered.append(event)
-    return copy_payload(
-        sorted(
-            filtered,
-            key=lambda event: str(event.get("occurredAt") or event.get("time") or ""),
-            reverse=True,
-        )
-    )
+    if "*" in allowed:
+        return copy_payload(EVENTS)
+    return copy_payload([event for event in EVENTS if event["siteId"] in allowed])
 
 
 def filter_site_rows(

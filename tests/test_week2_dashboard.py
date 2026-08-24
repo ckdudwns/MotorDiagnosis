@@ -65,6 +65,10 @@ class Week2DashboardTest(unittest.TestCase):
             "if (requestGeneration !== assetGeneration || siteId !== selectedSite().id) return false;",
             page,
         )
-        self.assertIn("const requestGeneration = ++assetGeneration;", page)
-        self.assertIn("if (!await renderAssets(requestGeneration)) return;", page)
+        self.assertIn("const assetRequestGeneration = ++assetGeneration;", page)
+        self.assertIn(
+            "assetRequestGeneration = ++assetGeneration;\n      renderGeneration += 1;",
+            page,
+        )
+        self.assertIn("if (!await renderAssets(assetRequestGeneration)) return;", page)
         self.assertIn('$("refreshBtn").addEventListener("click", render);', page)

@@ -309,8 +309,9 @@ def render_page() -> str:
     $("loginBtn").addEventListener("click", () => login().catch(error => alert(error.message)));
     $("siteSelect").addEventListener("change", async () => {
       clearEventSelection();
-      const requestGeneration = ++assetGeneration;
-      if (!await renderAssets(requestGeneration)) return;
+      const assetRequestGeneration = ++assetGeneration;
+      renderGeneration += 1;
+      if (!await renderAssets(assetRequestGeneration)) return;
       await render();
     });
     $("assetSelect").addEventListener("change", async () => {

@@ -54,14 +54,17 @@ class Week2DashboardTest(unittest.TestCase):
         self.assertIn("await Promise.all([", page)
         self.assertIn("if (requestGeneration !== renderGeneration) return;", page)
 
-    def test_stale_site_asset_response_cannot_replace_current_site_assets(self) -> None:
+    def test_asset_request_uses_its_own_generation_from_dashboard_render(self) -> None:
         page = render_page()
 
+        self.assertIn("renderGeneration = 0, assetGeneration = 0", page)
         self.assertIn(
-            "async function renderAssets(requestGeneration = renderGeneration)", page
+            "async function renderAssets(requestGeneration = assetGeneration)", page
         )
         self.assertIn(
-            "if (requestGeneration !== renderGeneration || siteId !== selectedSite().id) return false;",
+            "if (requestGeneration !== assetGeneration || siteId !== selectedSite().id) return false;",
             page,
         )
+        self.assertIn("const requestGeneration = ++assetGeneration;", page)
         self.assertIn("if (!await renderAssets(requestGeneration)) return;", page)
+        self.assertIn('$("refreshBtn").addEventListener("click", render);', page)

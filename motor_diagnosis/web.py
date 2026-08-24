@@ -105,7 +105,7 @@ def render_page() -> str:
     </section>
   </main>
   <script>
-    let token = "", sites = [], events = [], siteSummaries = [], selectedEventId = null, latestPoints = [], latestUnits = {}, renderGeneration = 0;
+    let token = "", sites = [], events = [], siteSummaries = [], selectedEventId = null, latestPoints = [], latestUnits = {}, renderGeneration = 0, assetGeneration = 0;
     const $ = (id) => document.getElementById(id);
 
     async function api(path, options = {}) {
@@ -143,11 +143,11 @@ def render_page() -> str:
       return sites.find(s => s.id === $("siteSelect").value) || sites[0];
     }
 
-    async function renderAssets(requestGeneration = renderGeneration) {
+    async function renderAssets(requestGeneration = assetGeneration) {
       const site = selectedSite();
       const siteId = site.id;
       const assets = await api(`/api/sites/${site.id}/assets`);
-      if (requestGeneration !== renderGeneration || siteId !== selectedSite().id) return false;
+      if (requestGeneration !== assetGeneration || siteId !== selectedSite().id) return false;
       setOptions($("assetSelect"), assets, item => item.id, item => item.name);
       return true;
     }
@@ -309,7 +309,7 @@ def render_page() -> str:
     $("loginBtn").addEventListener("click", () => login().catch(error => alert(error.message)));
     $("siteSelect").addEventListener("change", async () => {
       clearEventSelection();
-      const requestGeneration = ++renderGeneration;
+      const requestGeneration = ++assetGeneration;
       if (!await renderAssets(requestGeneration)) return;
       await render();
     });

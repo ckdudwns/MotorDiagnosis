@@ -38,6 +38,7 @@ from motor_diagnosis.data import (
     hardware_profiles,
     ingest_telemetry,
     reset_runtime_state,
+    review_event,
     service_health_dependencies,
     telemetry_for,
     telemetry_principal_for_token,
@@ -179,6 +180,17 @@ class Week2BackendTest(unittest.TestCase):
 
         self.assertEqual(site["criticalAssets"], 2)
         self.assertEqual(site["warningAssets"], 0)
+
+    def test_resolved_or_false_positive_event_no_longer_sets_asset_status(self) -> None:
+        for label in ("normal_false_positive", "repair_completed"):
+            with self.subTest(label=label):
+                reset_runtime_state()
+                review_event("EV-241", {"label": label, "note": "reviewed"})
+                summaries = dashboard_sites_summary(self.user("admin", "admin123"))
+                site = next(row for row in summaries if row["siteId"] == "SITE-01")
+
+                self.assertEqual(site["criticalAssets"], 0)
+                self.assertEqual(site["unreviewedEvents"], 0)
 
     def test_device_offline_and_recovery_history_are_recorded(self) -> None:
         device = get_device("DEV-01-GEN-01")
@@ -687,6 +699,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
                 for event in filtered_events
             )
         )
+        self.assertTrue(all("occurredAt" in event for event in filtered_events))
 
         status, summary = self.request(
             "/api/dashboard/sites-summary", token=operator_token

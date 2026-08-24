@@ -30,6 +30,7 @@ TELEMETRY_MAX_FUTURE_SECONDS = 5 * 60
 CONNECTIVITY_TEST_PHASES = {"before", "after"}
 CONNECTIVITY_TEST_VERDICTS = {"pass", "warn", "fail"}
 HARDWARE_COMPONENTS = {"sensors", "board", "connectivity", "power", "enclosure"}
+RESOLVED_EVENT_LABELS = {"normal_false_positive", "repair_completed"}
 
 NETWORK_PROFILES = [
     {
@@ -2396,6 +2397,7 @@ def recover_device_from_telemetry(device: dict[str, Any], received_at: str) -> N
                 "severity": "device",
                 "eventType": "device_recovered",
                 "title": f"{device['id']} telemetry recovered",
+                "occurredAt": received_at,
                 "time": received_at,
                 "duration": "recovered",
                 "score": 0,
@@ -2635,6 +2637,7 @@ def device_health_for(device_id: str) -> dict[str, Any]:
                 "severity": "device",
                 "eventType": "device_offline",
                 "title": f"{device['id']} telemetry offline",
+                "occurredAt": offline_since,
                 "time": offline_since,
                 "duration": f">{offline_threshold}s",
                 "score": 0,
@@ -2700,6 +2703,8 @@ def dashboard_sites_summary(
         asset_statuses = {asset["id"]: "normal" for asset in site_assets}
         severity_rank = {"normal": 0, "warning": 1, "critical": 2}
         for event in site_events:
+            if event.get("label") in RESOLVED_EVENT_LABELS:
+                continue
             severity = str(event.get("severity") or "")
             asset_id = event.get("assetId")
             if asset_id in asset_statuses and severity in severity_rank:

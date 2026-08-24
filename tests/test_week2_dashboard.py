@@ -31,3 +31,10 @@ class Week2DashboardTest(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIn(text, page)
+
+    def test_event_display_uses_occurred_at_as_the_single_time_source(self) -> None:
+        page = render_page()
+
+        self.assertIn("formatLocalTime(event.occurredAt)", page)
+        self.assertIn("function formatLocalTime(timestamp)", page)
+        self.assertNotIn("event.time", page)

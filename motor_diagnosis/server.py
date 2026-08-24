@@ -771,7 +771,7 @@ def authorized_events(
         rows = [event for event in rows if event["assetId"] == normalized_asset_id]
     filtered = []
     for event in rows:
-        occurred_at = event.get("occurredAt", event.get("time"))
+        occurred_at = event.get("occurredAt")
         try:
             occurred_value = parse_rfc3339("event.occurredAt", occurred_at)
         except ApiError:
@@ -784,7 +784,7 @@ def authorized_events(
     return copy_payload(
         sorted(
             filtered,
-            key=lambda event: str(event.get("occurredAt") or event.get("time") or ""),
+            key=lambda event: str(event.get("occurredAt") or ""),
             reverse=True,
         )
     )

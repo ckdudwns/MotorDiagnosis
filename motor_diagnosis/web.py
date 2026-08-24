@@ -201,10 +201,19 @@ def render_page() -> str:
         const pill = document.createElement("span");
         pill.className = `pill ${event.severity}`;
         pill.textContent = event.label;
-        meta.append(pill, ` ${event.time} - ${event.score}`);
+        meta.append(pill, ` ${formatLocalTime(event.occurredAt)} - ${event.score}`);
         button.append(title, document.createElement("br"), meta);
         return button;
       }));
+    }
+
+    function formatLocalTime(timestamp) {
+      const value = new Date(timestamp);
+      if (Number.isNaN(value.getTime())) return "-";
+      return new Intl.DateTimeFormat("ko-KR", {
+        dateStyle: "short",
+        timeStyle: "medium",
+      }).format(value);
     }
 
     function finiteNumber(value) {
@@ -269,7 +278,7 @@ def render_page() -> str:
       detail.replaceChildren();
       const title = document.createElement("b");
       title.textContent = event.title;
-      detail.append(title, document.createElement("br"), `${event.duration} - ${event.score}`, document.createElement("br"), event.note);
+      detail.append(title, document.createElement("br"), `${formatLocalTime(event.occurredAt)} · ${event.duration} - ${event.score}`, document.createElement("br"), event.note);
       $("labelSelect").value = event.label;
       $("noteInput").value = event.note;
     });

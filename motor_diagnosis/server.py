@@ -23,15 +23,23 @@ from .data import (
     ROLE_POLICIES,
     TELEMETRY_RECORDS,
     ApiError,
+    acoustic_taxonomies_for,
+    alert_policies_for,
+    anomaly_rule_for,
+    audit_logs_for,
     assets_for,
     authenticate,
     copy_payload,
     create_asset,
     create_connectivity_test,
     create_device,
+    create_dataset_version,
+    create_environment_inspection,
     create_install_point,
     create_site,
     current_user_for_token,
+    dataset_export_for,
+    dataset_version_for,
     dashboard_sites_summary,
     deactivate_site,
     delete_asset,
@@ -39,6 +47,9 @@ from .data import (
     delete_site,
     devices_for,
     device_health_for,
+    environment_inspections_for,
+    event_detail_for,
+    event_reviews_for,
     get_asset_by_id,
     get_device,
     get_site,
@@ -63,18 +74,24 @@ from .data import (
     rollout_plan_for,
     site_network_profile,
     service_health_dependencies,
+    sensor_faults_for_device,
     telemetry_for,
     telemetry_principal_for_token,
     telemetry_units,
     update_asset,
     update_device,
     update_device_hardware_profile,
+    update_acoustic_taxonomy,
+    update_alert_policy,
+    update_anomaly_rule,
     update_install_point,
     update_rollout_plan,
+    update_parameter,
     update_site,
     update_site_network_profile,
     visible_sites_for_user,
     connectivity_tests_for_device,
+    parameters_for,
 )
 from .web import render_page
 
@@ -270,6 +287,44 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "environment-inspections"
+        ):
+            page = positive_query_int(query, "page", 1)
+            size = positive_query_int(query, "size", 50, maximum=200)
+            self.send_json(
+                environment_inspections_for(
+                    user,
+                    segments[2],
+                    from_timestamp=query.get("from", [None])[0],
+                    to_timestamp=query.get("to", [None])[0],
+                    page=page,
+                    size=size,
+                )
+            )
+            return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "faults"
+        ):
+            page = positive_query_int(query, "page", 1)
+            size = positive_query_int(query, "size", 50, maximum=200)
+            self.send_json(
+                sensor_faults_for_device(
+                    user,
+                    segments[2],
+                    from_timestamp=query.get("from", [None])[0],
+                    to_timestamp=query.get("to", [None])[0],
+                    status=query.get("status", [""])[0],
+                    fault_type=query.get("faultType", [""])[0],
+                    page=page,
+                    size=size,
+                )
+            )
+            return
         if segments == ["api", "rollout-plans"]:
             require_permission(user, "rollout:read")
             self.send_json(filter_site_rows(user, rollout_plans()))
@@ -326,6 +381,9 @@ class AppHandler(BaseHTTPRequestHandler):
             require_permission(user, "configuration:read")
             self.send_json(copy_payload(ACOUSTIC_LABEL_TAXONOMY))
             return
+        if segments == ["api", "label-taxonomies", "acoustic"]:
+            self.send_json(acoustic_taxonomies_for(user, query.get("version", [""])[0]))
+            return
         if segments == ["api", "data-pipelines"]:
             require_permission(user, "configuration:read")
             self.send_json(copy_payload(DATA_PIPELINES))
@@ -354,16 +412,60 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
             )
             return
-        if segments == ["api", "events"]:
+        if segments == ["api", "alerts", "policies"]:
+            self.send_json(alert_policies_for(user))
+            return
+        if segments == ["api", "parameters"]:
+            self.send_json(parameters_for(user, query.get("category", [""])[0]))
+            return
+        if segments == ["api", "audit-logs"]:
+            page = positive_query_int(query, "page", 1)
+            size = positive_query_int(query, "size", 50, maximum=200)
             self.send_json(
-                authorized_events(
+                audit_logs_for(
                     user,
-                    site_id=query.get("siteId", [""])[0],
-                    asset_id=query.get("assetId", [""])[0],
+                    action=query.get("action", [""])[0],
+                    target_type=query.get("targetType", [""])[0],
+                    actor_id=query.get("actorId", [""])[0],
                     from_timestamp=query.get("from", [None])[0],
                     to_timestamp=query.get("to", [None])[0],
+                    page=page,
+                    size=size,
                 )
             )
+            return
+        if (
+            len(segments) == 3
+            and segments[:2] == ["api", "datasets"]
+            and segments[2] != "export"
+        ):
+            self.send_json(dataset_version_for(user, segments[2]))
+            return
+        if len(segments) == 4 and segments[:3] == ["api", "anomaly", "rules"]:
+            asset = get_asset_by_id(segments[3])
+            require_site_access(user, asset["siteId"])
+            require_permission(user, "anomaly-rule:read")
+            self.send_json(anomaly_rule_for(asset["id"]))
+            return
+        if len(segments) == 4 and segments[:3] == ["api", "anomaly", "events"]:
+            detail = event_detail_for(user, segments[3])
+            if detail["context"]["source"] == "stored":
+                detail["context"]["points"] = annotate_telemetry_points(
+                    detail["context"]["points"]
+                )
+            self.send_json(detail)
+            return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "reviews"
+        ):
+            page = positive_query_int(query, "page", 1)
+            size = positive_query_int(query, "size", 50, maximum=200)
+            self.send_json(event_reviews_for(user, segments[2], page=page, size=size))
+            return
+        if segments == ["api", "events"]:
+            self.send_json(paginated_events(user, query))
             return
         if segments == ["api", "telemetry"]:
             site_id = required_query(query, "siteId")
@@ -395,6 +497,27 @@ class AppHandler(BaseHTTPRequestHandler):
             require_site_access(user, site_id)
             require_permission(user, "export:read")
             self.send_csv(site_id, asset_id)
+            return
+        if segments == ["api", "datasets", "export"]:
+            export_format = query.get("format", ["csv"])[0].strip().lower()
+            if export_format != "csv":
+                raise ApiError(
+                    501,
+                    "EXPORT_FORMAT_NOT_IMPLEMENTED",
+                    "Only CSV export is available in the week 3 backend.",
+                )
+            site_id = required_query(query, "siteId")
+            asset_id = required_query(query, "assetId")
+            self.send_dataset_csv(
+                dataset_export_for(
+                    user,
+                    site_id,
+                    asset_id,
+                    dataset_id=query.get("datasetId", [""])[0],
+                    from_timestamp=query.get("from", [None])[0],
+                    to_timestamp=query.get("to", [None])[0],
+                )
+            )
             return
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
@@ -492,6 +615,15 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if (
             len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "environment-inspections"
+        ):
+            self.send_json(
+                create_environment_inspection(user, segments[2], payload), status=201
+            )
+            return
+        if (
+            len(segments) == 4
             and segments[:2] == ["api", "assets"]
             and segments[3] == "install-points"
         ):
@@ -507,7 +639,10 @@ class AppHandler(BaseHTTPRequestHandler):
             and segments[3] == "review"
         ):
             require_permission(user, "event:review")
-            self.send_json(review_event(segments[2], payload))
+            self.send_json(review_event(user, segments[2], payload))
+            return
+        if segments == ["api", "datasets"]:
+            self.send_json(create_dataset_version(user, payload), status=201)
             return
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
@@ -534,6 +669,18 @@ class AppHandler(BaseHTTPRequestHandler):
             and segments[3] == "hardware-profile"
         ):
             self.send_json(update_device_hardware_profile(user, segments[2], payload))
+            return
+        if len(segments) == 4 and segments[:3] == ["api", "anomaly", "rules"]:
+            self.send_json(update_anomaly_rule(user, segments[3], payload))
+            return
+        if len(segments) == 4 and segments[:3] == ["api", "alerts", "policies"]:
+            self.send_json(update_alert_policy(user, segments[3], payload))
+            return
+        if len(segments) == 3 and segments[:2] == ["api", "parameters"]:
+            self.send_json(update_parameter(user, segments[2], payload))
+            return
+        if segments == ["api", "label-taxonomies", "acoustic"]:
+            self.send_json(update_acoustic_taxonomy(user, payload))
             return
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
@@ -723,6 +870,91 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_dataset_csv(self, export: dict[str, Any]) -> None:
+        manifest = export["manifest"]
+        rows = []
+        for item in export["rows"]:
+            rows.append(
+                {
+                    **item,
+                    "manifest_checksum": manifest["checksum"],
+                    "source_uri": manifest["source"].get("uri"),
+                    "source_license": manifest["source"].get("license"),
+                    "source_checksum": manifest["source"].get("checksum"),
+                    "signal_types": json.dumps(
+                        manifest["compatibility"].get("signalType", []),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    "sampling_rate_hz": manifest["compatibility"].get("samplingRateHz"),
+                    "units": json.dumps(
+                        manifest["compatibility"].get("units", {}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "operating_conditions": json.dumps(
+                        manifest["compatibility"].get("operatingConditions", {}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "label_mapping": json.dumps(
+                        manifest.get("labelMapping", {}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "split_policy": manifest["splitPolicy"],
+                }
+            )
+        fieldnames = [
+            "site_id",
+            "asset_id",
+            "device_id",
+            "timestamp",
+            "sequence",
+            "vibration_rms_raw",
+            "vibration_rms_mm_s",
+            "acoustic_rms_raw",
+            "acoustic_db",
+            "rpm",
+            "event_id",
+            "event_label",
+            "label_taxonomy_version",
+            "dataset_split",
+            "manifest_checksum",
+            "source_uri",
+            "source_license",
+            "source_checksum",
+            "signal_types",
+            "sampling_rate_hz",
+            "units",
+            "operating_conditions",
+            "label_mapping",
+            "split_policy",
+        ]
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        body = ("\ufeff" + output.getvalue()).encode("utf-8")
+        filename = f"{manifest['siteId']}_{manifest['assetId']}_dataset.csv"
+        self.send_response(200)
+        self.send_header("content-type", "text/csv; charset=utf-8")
+        self.send_header("content-disposition", f'attachment; filename="{filename}"')
+        self.send_header("x-dataset-checksum", manifest["checksum"])
+        self.send_header("x-dataset-record-count", str(manifest["recordCount"]))
+        self.send_header("cache-control", "no-store")
+        self.send_header("access-control-allow-origin", "*")
+        self.send_header(
+            "access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        )
+        self.send_header("access-control-allow-headers", "authorization, content-type")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def send_common_headers(self, content_type: str, content_length: int) -> None:
         self.send_header("content-type", content_type)
         self.send_header("cache-control", "no-store")
@@ -788,6 +1020,60 @@ def authorized_events(
             reverse=True,
         )
     )
+
+
+def paginated_events(
+    user: dict[str, Any], query: dict[str, list[str]]
+) -> dict[str, Any]:
+    rows = authorized_events(
+        user,
+        site_id=query.get("siteId", [""])[0],
+        asset_id=query.get("assetId", [""])[0],
+        from_timestamp=query.get("from", [None])[0],
+        to_timestamp=query.get("to", [None])[0],
+    )
+    severity = query.get("severity", [""])[0].strip().lower()
+    label = query.get("label", [""])[0].strip().lower()
+    reviewed = optional_boolean_query(query, "reviewed")
+    if severity:
+        if severity not in {"warning", "critical", "device"}:
+            raise ApiError(400, "INVALID_SEVERITY", "severity filter is not supported.")
+        rows = [
+            item for item in rows if str(item.get("severity", "")).lower() == severity
+        ]
+    if label:
+        rows = [item for item in rows if str(item.get("label", "")).lower() == label]
+    if reviewed is not None:
+        rows = [item for item in rows if bool(item.get("reviewed", False)) is reviewed]
+    for item in rows:
+        item["maxScore"] = item.get("maxScore", item.get("score"))
+        item["durationSec"] = item.get("durationSec")
+        item["reviewed"] = bool(item.get("reviewed", False))
+    sort = query.get("sort", ["unreviewed_desc"])[0].strip()
+    if sort == "unreviewed_desc":
+        rows.sort(
+            key=lambda item: str(item.get("occurredAt") or item.get("time") or ""),
+            reverse=True,
+        )
+        rows.sort(key=lambda item: bool(item.get("reviewed", False)))
+    elif sort == "occurredAt_desc":
+        rows.sort(key=lambda item: str(item.get("occurredAt", "")), reverse=True)
+    elif sort == "occurredAt_asc":
+        rows.sort(key=lambda item: str(item.get("occurredAt", "")))
+    elif sort == "score_desc":
+        rows.sort(key=lambda item: float(item.get("maxScore") or 0), reverse=True)
+    else:
+        raise ApiError(400, "INVALID_SORT", "sort is not supported for event lookup.")
+    page = positive_query_int(query, "page", 1)
+    size = positive_query_int(query, "size", 50, maximum=200)
+    total = len(rows)
+    start = (page - 1) * size
+    return {
+        "items": copy_payload(rows[start : start + size]),
+        "page": page,
+        "size": size,
+        "total": total,
+    }
 
 
 def filter_site_rows(

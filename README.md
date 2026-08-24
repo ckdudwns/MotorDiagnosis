@@ -42,6 +42,25 @@ MQTT JSON·토픽은
 `POST /api/health/dependencies/mqtt`에 보고하되, SUBACK 승인 QoS가 요청 QoS 이상일 때만
 `healthy`로 전환한다.
 
+## 3주차 백엔드 범위
+
+- `GET /api/events`: 기간·사이트·설비·심각도·라벨·검토 여부 필터와 페이지 조회
+- `GET /api/anomaly/events/{eventId}`: 이벤트 전후 신호, 특징·규칙·모델·장치 스냅샷 조회
+- `POST /api/events/{eventId}/review`, `GET /api/events/{eventId}/reviews`:
+  운영자 판정과 변경 전후·담당자·사유 이력
+- `GET/PUT /api/anomaly/rules/{assetId}`: 점수·지속시간·히스테리시스·병합 구간 버전 관리
+- `GET /api/alerts/policies`, `PUT /api/alerts/policies/{policyId}`:
+  심각도·수신자·채널·근무시간·중복 알림 방지 구간 관리
+- `GET /api/parameters`, `PUT /api/parameters/{key}`, `GET /api/audit-logs`:
+  운영 파라미터 변경과 감사 이력
+- `POST/GET /api/devices/{deviceId}/environment-inspections`:
+  방진·방수·염해·케이블 글랜드·함체 점검 및 조치 이력
+- `GET /api/devices/{deviceId}/faults`: 센서 고장 후보를 설비 이상 이벤트와 분리 조회
+- `GET/PUT /api/label-taxonomies/acoustic`, `POST/GET /api/datasets`:
+  음향 라벨 버전과 기존 데이터셋의 출처·라이선스·호환성·체크섬·분할 정책 관리
+- `GET /api/datasets/export`: 학습 누수 방지를 위한 설비 단위 분할과 manifest 메타데이터를
+  포함한 CSV 내보내기. XLSX는 후속 범위다.
+
 ```bash
 python -m motor_diagnosis.mqtt_service \
   --host mqtt.example.com \

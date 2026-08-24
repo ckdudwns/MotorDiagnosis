@@ -17,6 +17,7 @@ MAX_LOGIN_FAILURES = 5
 LOCK_SECONDS = 15 * 60
 SESSION_SECONDS = 60 * 60
 MAX_REVIEW_NOTE_LENGTH = 2000
+MAX_REASON_LENGTH = 1000
 DEVICE_CERTIFICATE_STATUSES = {"pending", "registered", "revoked", "expired"}
 DEVICE_MAPPING_STATUSES = {"active", "inactive"}
 TELEMETRY_SCENARIOS = {
@@ -30,6 +31,21 @@ TELEMETRY_MAX_FUTURE_SECONDS = 5 * 60
 CONNECTIVITY_TEST_PHASES = {"before", "after"}
 CONNECTIVITY_TEST_VERDICTS = {"pass", "warn", "fail"}
 HARDWARE_COMPONENTS = {"sensors", "board", "connectivity", "power", "enclosure"}
+EVENT_LABELS = {
+    "needs_review",
+    "normal_false_positive",
+    "confirmed_anomaly",
+    "repair_completed",
+    "sensor_issue",
+}
+EVENT_SEVERITIES = {"normal", "warning", "critical", "device"}
+ALERT_CHANNELS = {"web", "email", "webhook", "stub"}
+ENVIRONMENT_INSPECTION_STATUSES = {
+    "not_checked",
+    "ok",
+    "attention",
+    "critical",
+}
 
 NETWORK_PROFILES = [
     {
@@ -139,6 +155,66 @@ PARAMETERS = {
     "RETENTION_RAW_DAYS": 30,
 }
 
+PARAMETER_DEFINITIONS = {
+    "TELEMETRY_INTERVAL_SEC": {
+        "category": "telemetry",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 3600,
+        "unit": "seconds",
+    },
+    "ANOMALY_SCORE_THRESHOLD": {
+        "category": "anomaly",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 100,
+        "unit": "score",
+    },
+    "ANOMALY_HOLD_SEC": {
+        "category": "anomaly",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 3600,
+        "unit": "seconds",
+    },
+    "DEVICE_OFFLINE_SEC": {
+        "category": "device",
+        "type": "integer",
+        "minimum": 5,
+        "maximum": 86400,
+        "unit": "seconds",
+    },
+    "EDGE_BUFFER_HOURS": {
+        "category": "edge",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 168,
+        "unit": "hours",
+    },
+    "RETENTION_RAW_DAYS": {
+        "category": "retention",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 3650,
+        "unit": "days",
+    },
+}
+
+BASE_ALERT_POLICIES = [
+    {
+        "id": "ALERT-POLICY-DEFAULT",
+        "severity": "critical",
+        "siteIds": [],
+        "assetIds": [],
+        "workHours": {"start": "00:00", "end": "23:59"},
+        "recipients": ["operations"],
+        "channels": ["web"],
+        "cooldownSec": 300,
+        "enabled": True,
+        "updatedAt": "2026-08-24T00:00:00Z",
+    }
+]
+
 USERS = [
     {
         "id": "user-operator",
@@ -182,11 +258,20 @@ ROLE_POLICIES = [
             "network-profile:read",
             "install-point:read",
             "event:read",
+            "event:review",
             "telemetry:read",
             "dashboard:read",
             "connectivity-test:read",
             "hardware-profile:read",
             "export:read",
+            "alert-policy:read",
+            "parameter:read",
+            "audit-log:read",
+            "environment-inspection:read",
+            "sensor-fault:read",
+            "anomaly-rule:read",
+            "dataset:read",
+            "label-taxonomy:read",
         ],
     },
     {
@@ -218,6 +303,20 @@ ROLE_POLICIES = [
             "hardware-profile:read",
             "hardware-profile:write",
             "export:read",
+            "alert-policy:read",
+            "alert-policy:write",
+            "parameter:read",
+            "parameter:write",
+            "audit-log:read",
+            "environment-inspection:read",
+            "environment-inspection:write",
+            "sensor-fault:read",
+            "anomaly-rule:read",
+            "anomaly-rule:write",
+            "dataset:read",
+            "dataset:write",
+            "label-taxonomy:read",
+            "label-taxonomy:write",
         ],
     },
     {
@@ -683,9 +782,15 @@ def build_events() -> list[dict[str, Any]]:
             "occurredAt": iso_seconds_ago(18 * 60),
             "time": "19:42:12",
             "duration": "48s",
+            "durationSec": 48,
             "score": 92,
+            "maxScore": 92,
             "label": "needs_review",
             "note": "Vibration and acoustic features rose together in the same time window.",
+            "reviewed": False,
+            "status": "open",
+            "thresholdVersion": "RULE-SITE-01-MOT-02-v1",
+            "modelVersion": "ai1_week2_vibration_rms_baseline_v1",
         },
         {
             "id": "EV-238",
@@ -697,9 +802,15 @@ def build_events() -> list[dict[str, Any]]:
             "occurredAt": iso_seconds_ago(29 * 60),
             "time": "19:31:05",
             "duration": "31s",
+            "durationSec": 31,
             "score": 78,
+            "maxScore": 78,
             "label": "needs_review",
             "note": "High-frequency acoustic band increased compared with the normal baseline.",
+            "reviewed": False,
+            "status": "open",
+            "thresholdVersion": "RULE-SITE-02-GEN-01-v1",
+            "modelVersion": "ai1_week2_vibration_rms_baseline_v1",
         },
         {
             "id": "EV-233",
@@ -711,10 +822,35 @@ def build_events() -> list[dict[str, Any]]:
             "occurredAt": iso_seconds_ago(40 * 60),
             "time": "19:20:44",
             "duration": "8m",
+            "durationSec": 480,
             "score": 64,
+            "maxScore": 64,
             "label": "sensor_issue",
             "note": "Classified as sensor state event rather than equipment abnormality.",
+            "reviewed": True,
+            "status": "open",
+            "thresholdVersion": "RULE-SITE-05-FAN-03-v1",
+            "modelVersion": "sensor-fault-rules-v1",
         },
+    ]
+
+
+def build_anomaly_rules(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "assetId": asset["id"],
+            "siteId": asset["siteId"],
+            "version": f"RULE-{asset['id']}-v1",
+            "scoreThreshold": 75.0,
+            "durationSec": 10,
+            "hysteresis": 5.0,
+            "mergeWindowSec": 30,
+            "active": True,
+            "reason": "Initial week 3 anomaly rule",
+            "updatedAt": "2026-08-24T00:00:00Z",
+            "history": [],
+        }
+        for asset in assets
     ]
 
 
@@ -725,6 +861,8 @@ BASE_EVENTS = build_events()
 BASE_ROLLOUT_PLANS = build_rollout_plan_records(BASE_SITES, BASE_ASSETS)
 BASE_SITE_NETWORK_PROFILES = build_site_network_profile_records(BASE_SITES)
 BASE_INSTALL_POINTS = build_install_point_records(BASE_ASSETS)
+BASE_ANOMALY_RULES = build_anomaly_rules(BASE_ASSETS)
+BASE_PARAMETERS = copy_payload(PARAMETERS)
 
 SITES = copy_payload(BASE_SITES)
 ASSETS = copy_payload(BASE_ASSETS)
@@ -733,6 +871,8 @@ EVENTS = copy_payload(BASE_EVENTS)
 ROLLOUT_PLAN_RECORDS = copy_payload(BASE_ROLLOUT_PLANS)
 SITE_NETWORK_PROFILE_RECORDS = copy_payload(BASE_SITE_NETWORK_PROFILES)
 INSTALL_POINTS = copy_payload(BASE_INSTALL_POINTS)
+ANOMALY_RULES = copy_payload(BASE_ANOMALY_RULES)
+ALERT_POLICIES = copy_payload(BASE_ALERT_POLICIES)
 QUARANTINED_DEVICE_MESSAGES: list[dict[str, Any]] = []
 TELEMETRY_RECORDS: list[dict[str, Any]] = []
 TELEMETRY_IDEMPOTENCY: dict[tuple[str, int], dict[str, str]] = {}
@@ -749,6 +889,19 @@ TELEMETRY_METRICS: dict[str, int | float | str | None] = {
 CONNECTIVITY_TEST_RECORDS: list[dict[str, Any]] = []
 SERVICE_DEPENDENCIES = copy_payload(BASE_SERVICE_DEPENDENCIES)
 SERVICE_HEALTH_EVENTS: list[dict[str, Any]] = []
+EVENT_REVIEW_HISTORY: list[dict[str, Any]] = []
+AUDIT_LOGS: list[dict[str, Any]] = []
+ENVIRONMENT_INSPECTIONS: list[dict[str, Any]] = []
+DATASET_VERSIONS: list[dict[str, Any]] = []
+ACOUSTIC_TAXONOMY_VERSIONS: list[dict[str, Any]] = [
+    {
+        "version": "ACOUSTIC-V1",
+        "labels": copy_payload(ACOUSTIC_LABEL_TAXONOMY),
+        "active": True,
+        "reason": "Initial acoustic label taxonomy",
+        "updatedAt": "2026-08-24T00:00:00Z",
+    }
+]
 
 
 def reset_runtime_state() -> None:
@@ -760,6 +913,10 @@ def reset_runtime_state() -> None:
         ROLLOUT_PLAN_RECORDS[:] = copy_payload(BASE_ROLLOUT_PLANS)
         SITE_NETWORK_PROFILE_RECORDS[:] = copy_payload(BASE_SITE_NETWORK_PROFILES)
         INSTALL_POINTS[:] = copy_payload(BASE_INSTALL_POINTS)
+        ANOMALY_RULES[:] = copy_payload(BASE_ANOMALY_RULES)
+        ALERT_POLICIES[:] = copy_payload(BASE_ALERT_POLICIES)
+        PARAMETERS.clear()
+        PARAMETERS.update(copy_payload(BASE_PARAMETERS))
         QUARANTINED_DEVICE_MESSAGES.clear()
         TELEMETRY_RECORDS.clear()
         TELEMETRY_IDEMPOTENCY.clear()
@@ -778,6 +935,19 @@ def reset_runtime_state() -> None:
         CONNECTIVITY_TEST_RECORDS.clear()
         SERVICE_DEPENDENCIES[:] = copy_payload(BASE_SERVICE_DEPENDENCIES)
         SERVICE_HEALTH_EVENTS.clear()
+        EVENT_REVIEW_HISTORY.clear()
+        AUDIT_LOGS.clear()
+        ENVIRONMENT_INSPECTIONS.clear()
+        DATASET_VERSIONS.clear()
+        ACOUSTIC_TAXONOMY_VERSIONS[:] = [
+            {
+                "version": "ACOUSTIC-V1",
+                "labels": copy_payload(ACOUSTIC_LABEL_TAXONOMY),
+                "active": True,
+                "reason": "Initial acoustic label taxonomy",
+                "updatedAt": "2026-08-24T00:00:00Z",
+            }
+        ]
         SESSIONS.clear()
         for username in LOGIN_STATE:
             LOGIN_STATE[username] = {"failures": 0, "lockedUntil": 0.0}
@@ -3107,9 +3277,15 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             "occurredAt": now_iso(),
             "time": now_text(),
             "duration": "10s",
+            "durationSec": 10,
             "score": 94,
+            "maxScore": 94,
             "label": "needs_review",
             "note": "This event was generated by the demo anomaly injection API.",
+            "reviewed": False,
+            "status": "open",
+            "thresholdVersion": anomaly_rule_for(asset["id"])["version"],
+            "modelVersion": "demo-anomaly-injection-v1",
         }
         EVENTS.insert(0, event)
         site["status"] = "critical"
@@ -3117,29 +3293,60 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
         return copy_payload(event)
 
 
-def review_event(event_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def review_event(
+    user: dict[str, Any], event_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "event:review")
     with STORE_LOCK:
-        event = next((item for item in EVENTS if item["id"] == event_id), None)
-        if not event:
-            raise ApiError(404, "EVENT_NOT_FOUND", "Event was not found.")
+        event = get_event(event_id)
+        require_site_access(user, event["siteId"])
         label = str(payload.get("label", event["label"]))
-        if label not in {
-            "needs_review",
-            "normal_false_positive",
-            "confirmed_anomaly",
-            "repair_completed",
-            "sensor_issue",
-        }:
+        if label not in EVENT_LABELS:
             raise ApiError(400, "INVALID_EVENT_LABEL", "Event label is not allowed.")
         note = str(payload.get("note", event["note"]))
         if len(note) > MAX_REVIEW_NOTE_LENGTH:
             raise ApiError(
                 400, "NOTE_TOO_LONG", "Review note must be 2000 characters or less."
             )
+        reason = str(payload.get("reason") or "Event review updated").strip()
+        if len(reason) > MAX_REASON_LENGTH:
+            raise ApiError(
+                400, "REASON_TOO_LONG", "Change reason must be 1000 characters or less."
+            )
+        before = {"label": event.get("label"), "note": event.get("note")}
+        changed_at = now_iso()
         event["label"] = label
         event["note"] = note
-        event["reviewedAt"] = now_text()
-        return copy_payload(event)
+        event["reviewed"] = True
+        event["reviewedAt"] = changed_at
+        event["reviewedBy"] = user["id"]
+        review = {
+            "id": f"REVIEW-{len(EVENT_REVIEW_HISTORY) + 1:05d}",
+            "eventId": event["id"],
+            "siteId": event["siteId"],
+            "assetId": event["assetId"],
+            "actor": {
+                "id": user["id"],
+                "name": user["name"],
+                "role": user["role"],
+            },
+            "changedAt": changed_at,
+            "reason": reason,
+            "before": before,
+            "after": {"label": label, "note": note},
+        }
+        EVENT_REVIEW_HISTORY.append(review)
+        append_audit_log(
+            user,
+            "event.review",
+            "event",
+            event["id"],
+            before,
+            review["after"],
+            reason,
+            site_id=event["siteId"],
+        )
+        return {"event": copy_payload(event), "review": copy_payload(review)}
 
 
 def baseline_payload(
@@ -3179,3 +3386,1086 @@ def required_text(payload: dict[str, Any], key: str) -> str:
     if not value:
         raise ApiError(400, "MISSING_FIELD", f"{key} is required.")
     return value
+
+
+def get_event(event_id: str) -> dict[str, Any]:
+    normalized = event_id.strip().upper()
+    event = next((item for item in EVENTS if item["id"] == normalized), None)
+    if not event:
+        raise ApiError(404, "EVENT_NOT_FOUND", "Event was not found.")
+    return event
+
+
+def append_audit_log(
+    user: dict[str, Any],
+    action: str,
+    target_type: str,
+    target_id: str,
+    before: Any,
+    after: Any,
+    reason: str,
+    *,
+    site_id: str | None = None,
+    effective_at: str | None = None,
+) -> dict[str, Any]:
+    entry = {
+        "id": f"AUDIT-{len(AUDIT_LOGS) + 1:06d}",
+        "actor": {
+            "id": user["id"],
+            "name": user["name"],
+            "role": user["role"],
+        },
+        "action": action,
+        "targetType": target_type,
+        "targetId": target_id,
+        "siteId": site_id,
+        "before": copy_payload(before),
+        "after": copy_payload(after),
+        "reason": reason,
+        "effectiveAt": effective_at,
+        "changedAt": now_iso(),
+    }
+    AUDIT_LOGS.append(entry)
+    return copy_payload(entry)
+
+
+def event_reviews_for(
+    user: dict[str, Any], event_id: str, *, page: int, size: int
+) -> dict[str, Any]:
+    require_permission(user, "event:read")
+    event = get_event(event_id)
+    require_site_access(user, event["siteId"])
+    rows = sorted(
+        (
+            copy_payload(item)
+            for item in EVENT_REVIEW_HISTORY
+            if item["eventId"] == event["id"]
+        ),
+        key=lambda item: item["changedAt"],
+        reverse=True,
+    )
+    total = len(rows)
+    start = (page - 1) * size
+    return {
+        "items": rows[start : start + size],
+        "page": page,
+        "size": size,
+        "total": total,
+    }
+
+
+def anomaly_rule_for(asset_id: str) -> dict[str, Any]:
+    asset = get_asset_by_id(asset_id)
+    rule = next(
+        (item for item in ANOMALY_RULES if item["assetId"] == asset["id"]), None
+    )
+    if not rule:
+        raise ApiError(404, "ANOMALY_RULE_NOT_FOUND", "Anomaly rule was not found.")
+    return copy_payload(rule)
+
+
+def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
+    require_permission(user, "event:read")
+    event = get_event(event_id)
+    require_site_access(user, event["siteId"])
+    occurred_at = parse_rfc3339("event.occurredAt", event["occurredAt"])
+    context_from = format_rfc3339(occurred_at - timedelta(minutes=5))
+    context_to = format_rfc3339(occurred_at + timedelta(minutes=5))
+    points = telemetry_for(
+        event["siteId"],
+        event["assetId"],
+        from_timestamp=context_from,
+        to_timestamp=context_to,
+    )
+    has_stored_raw = any(
+        record["siteId"] == event["siteId"] and record["assetId"] == event["assetId"]
+        for record in TELEMETRY_RECORDS
+    )
+    device = next(
+        (
+            item
+            for item in DEVICES
+            if item["assetId"] == event["assetId"]
+            and item.get("mappingStatus") == "active"
+        ),
+        None,
+    )
+    latest_review = next(
+        (
+            item
+            for item in reversed(EVENT_REVIEW_HISTORY)
+            if item["eventId"] == event["id"]
+        ),
+        None,
+    )
+    return {
+        "event": copy_payload(event),
+        "context": {
+            "from": context_from,
+            "to": context_to,
+            "points": copy_payload(points),
+            "units": telemetry_units(event["siteId"], event["assetId"]),
+            "source": "stored" if has_stored_raw else "demo",
+            "rawDataMissing": not has_stored_raw,
+        },
+        "featureSnapshot": copy_payload(points[-1]) if points else None,
+        "appliedRule": anomaly_rule_for(event["assetId"]),
+        "modelVersion": event.get("modelVersion"),
+        "deviceSnapshot": copy_payload(device) if device else None,
+        "latestReview": copy_payload(latest_review) if latest_review else None,
+    }
+
+
+def _bounded_number(
+    field: str, value: Any, minimum: float, maximum: float, *, integer: bool = False
+) -> int | float:
+    if isinstance(value, bool):
+        raise ApiError(400, "INVALID_NUMBER", f"{field} must be a valid number.")
+    parsed = parse_float_value(field, value)
+    if parsed < minimum or parsed > maximum:
+        raise ApiError(
+            400,
+            "VALUE_OUT_OF_RANGE",
+            f"{field} must be between {minimum} and {maximum}.",
+        )
+    if integer:
+        if not parsed.is_integer():
+            raise ApiError(400, "INVALID_NUMBER", f"{field} must be an integer.")
+        return int(parsed)
+    return parsed
+
+
+def update_anomaly_rule(
+    user: dict[str, Any], asset_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "anomaly-rule:write")
+    asset = get_asset_by_id(asset_id)
+    require_site_access(user, asset["siteId"])
+    reason = required_text(payload, "reason")
+    if len(reason) > MAX_REASON_LENGTH:
+        raise ApiError(
+            400, "REASON_TOO_LONG", "reason must be 1000 characters or less."
+        )
+    with STORE_LOCK:
+        rule = next(item for item in ANOMALY_RULES if item["assetId"] == asset["id"])
+        before = copy_payload(
+            {key: value for key, value in rule.items() if key != "history"}
+        )
+        score_threshold = _bounded_number(
+            "scoreThreshold",
+            payload.get("scoreThreshold", rule["scoreThreshold"]),
+            0,
+            100,
+        )
+        duration_sec = _bounded_number(
+            "durationSec",
+            payload.get("durationSec", rule["durationSec"]),
+            1,
+            3600,
+            integer=True,
+        )
+        hysteresis = _bounded_number(
+            "hysteresis",
+            payload.get("hysteresis", rule["hysteresis"]),
+            0,
+            50,
+        )
+        merge_window_sec = _bounded_number(
+            "mergeWindowSec",
+            payload.get("mergeWindowSec", rule["mergeWindowSec"]),
+            0,
+            3600,
+            integer=True,
+        )
+        if hysteresis >= score_threshold:
+            raise ApiError(
+                400,
+                "INVALID_HYSTERESIS",
+                "hysteresis must be lower than scoreThreshold.",
+            )
+        rule["history"].append(before)
+        rule.update(
+            {
+                "version": f"RULE-{asset['id']}-v{len(rule['history']) + 1}",
+                "scoreThreshold": score_threshold,
+                "durationSec": duration_sec,
+                "hysteresis": hysteresis,
+                "mergeWindowSec": merge_window_sec,
+                "active": boolean_field(payload, "active", default=rule["active"]),
+                "reason": reason,
+                "updatedAt": now_iso(),
+            }
+        )
+        after = copy_payload(
+            {key: value for key, value in rule.items() if key != "history"}
+        )
+        append_audit_log(
+            user,
+            "anomaly-rule.update",
+            "anomalyRule",
+            asset["id"],
+            before,
+            after,
+            reason,
+            site_id=asset["siteId"],
+        )
+        return copy_payload(rule)
+
+
+def alert_policies_for(user: dict[str, Any]) -> list[dict[str, Any]]:
+    require_permission(user, "alert-policy:read")
+    allowed = user.get("allowedSiteIds", [])
+    rows = []
+    for policy in ALERT_POLICIES:
+        site_ids = policy.get("siteIds", [])
+        if (
+            "*" in allowed
+            or not site_ids
+            or any(site_id in allowed for site_id in site_ids)
+        ):
+            rows.append(copy_payload(policy))
+    return rows
+
+
+def _time_of_day(field: str, value: Any) -> str:
+    text = str(value or "").strip()
+    try:
+        datetime.strptime(text, "%H:%M")
+    except ValueError as exc:
+        raise ApiError(400, "INVALID_TIME_OF_DAY", f"{field} must use HH:MM.") from exc
+    return text
+
+
+def update_alert_policy(
+    user: dict[str, Any], policy_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "alert-policy:write")
+    reason = required_text(payload, "reason")
+    if len(reason) > MAX_REASON_LENGTH:
+        raise ApiError(
+            400, "REASON_TOO_LONG", "reason must be 1000 characters or less."
+        )
+    with STORE_LOCK:
+        policy = next(
+            (item for item in ALERT_POLICIES if item["id"] == policy_id), None
+        )
+        if not policy:
+            raise ApiError(404, "ALERT_POLICY_NOT_FOUND", "Alert policy was not found.")
+        before = copy_payload(policy)
+        severity = str(payload.get("severity", policy["severity"])).strip().lower()
+        if severity not in EVENT_SEVERITIES - {"normal", "device"}:
+            raise ApiError(
+                400, "INVALID_SEVERITY", "severity must be warning or critical."
+            )
+        site_ids = (
+            string_list(payload, "siteIds", uppercase=True)
+            if "siteIds" in payload
+            else copy_payload(policy["siteIds"])
+        )
+        asset_ids = (
+            string_list(payload, "assetIds", uppercase=True)
+            if "assetIds" in payload
+            else copy_payload(policy["assetIds"])
+        )
+        for site_id in site_ids:
+            get_site(site_id)
+            require_site_access(user, site_id)
+        for asset_id in asset_ids:
+            asset = get_asset_by_id(asset_id)
+            require_site_access(user, asset["siteId"])
+            if site_ids and asset["siteId"] not in site_ids:
+                raise ApiError(
+                    400,
+                    "ASSET_SITE_MISMATCH",
+                    "assetIds must belong to the selected siteIds.",
+                )
+        recipients = (
+            string_list(payload, "recipients", required=True)
+            if "recipients" in payload
+            else copy_payload(policy["recipients"])
+        )
+        channels = (
+            string_list(payload, "channels", required=True)
+            if "channels" in payload
+            else copy_payload(policy["channels"])
+        )
+        if any(channel not in ALERT_CHANNELS for channel in channels):
+            raise ApiError(
+                400, "INVALID_ALERT_CHANNEL", "An alert channel is not supported."
+            )
+        work_hours = payload.get("workHours", policy["workHours"])
+        if not isinstance(work_hours, dict):
+            raise ApiError(400, "INVALID_WORK_HOURS", "workHours must be an object.")
+        normalized_work_hours = {
+            "start": _time_of_day("workHours.start", work_hours.get("start")),
+            "end": _time_of_day("workHours.end", work_hours.get("end")),
+        }
+        policy.update(
+            {
+                "severity": severity,
+                "siteIds": site_ids,
+                "assetIds": asset_ids,
+                "workHours": normalized_work_hours,
+                "recipients": recipients,
+                "channels": channels,
+                "cooldownSec": _bounded_number(
+                    "cooldownSec",
+                    payload.get("cooldownSec", policy["cooldownSec"]),
+                    0,
+                    86400,
+                    integer=True,
+                ),
+                "enabled": boolean_field(payload, "enabled", default=policy["enabled"]),
+                "updatedAt": now_iso(),
+            }
+        )
+        append_audit_log(
+            user,
+            "alert-policy.update",
+            "alertPolicy",
+            policy["id"],
+            before,
+            policy,
+            reason,
+        )
+        return copy_payload(policy)
+
+
+def parameters_for(user: dict[str, Any], category: str = "") -> list[dict[str, Any]]:
+    require_permission(user, "parameter:read")
+    normalized_category = category.strip().lower()
+    rows = []
+    for key, definition in PARAMETER_DEFINITIONS.items():
+        if normalized_category and definition["category"] != normalized_category:
+            continue
+        rows.append({"key": key, "value": PARAMETERS[key], **copy_payload(definition)})
+    return rows
+
+
+def update_parameter(
+    user: dict[str, Any], key: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "parameter:write")
+    normalized_key = key.strip().upper()
+    definition = PARAMETER_DEFINITIONS.get(normalized_key)
+    if not definition:
+        raise ApiError(404, "PARAMETER_NOT_FOUND", "Parameter was not found.")
+    if "value" not in payload:
+        raise ApiError(400, "MISSING_FIELD", "value is required.")
+    reason = required_text(payload, "reason")
+    if len(reason) > MAX_REASON_LENGTH:
+        raise ApiError(
+            400, "REASON_TOO_LONG", "reason must be 1000 characters or less."
+        )
+    effective_at = str(payload.get("effectiveAt") or "").strip() or None
+    if effective_at:
+        parse_rfc3339("effectiveAt", effective_at)
+    value = _bounded_number(
+        "value",
+        payload["value"],
+        float(definition["minimum"]),
+        float(definition["maximum"]),
+        integer=definition["type"] == "integer",
+    )
+    with STORE_LOCK:
+        before = PARAMETERS[normalized_key]
+        PARAMETERS[normalized_key] = value
+        updated_at = now_iso()
+        audit = append_audit_log(
+            user,
+            "parameter.update",
+            "parameter",
+            normalized_key,
+            before,
+            value,
+            reason,
+            effective_at=effective_at,
+        )
+        return {
+            "key": normalized_key,
+            "value": value,
+            **copy_payload(definition),
+            "reason": reason,
+            "effectiveAt": effective_at,
+            "updatedAt": updated_at,
+            "auditId": audit["id"],
+        }
+
+
+def audit_logs_for(
+    user: dict[str, Any],
+    *,
+    action: str = "",
+    target_type: str = "",
+    actor_id: str = "",
+    from_timestamp: str | None = None,
+    to_timestamp: str | None = None,
+    page: int,
+    size: int,
+) -> dict[str, Any]:
+    require_permission(user, "audit-log:read")
+    from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
+    to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
+    if from_value and to_value and from_value > to_value:
+        raise ApiError(
+            400, "INVALID_TIME_RANGE", "from must be earlier than or equal to to."
+        )
+    allowed = user.get("allowedSiteIds", [])
+    rows = []
+    for entry in AUDIT_LOGS:
+        site_id = entry.get("siteId")
+        if site_id and "*" not in allowed and site_id not in allowed:
+            continue
+        if action and entry["action"] != action:
+            continue
+        if target_type and entry["targetType"] != target_type:
+            continue
+        if actor_id and entry["actor"]["id"] != actor_id:
+            continue
+        changed_at = parse_rfc3339("audit.changedAt", entry["changedAt"])
+        if from_value and changed_at < from_value:
+            continue
+        if to_value and changed_at > to_value:
+            continue
+        rows.append(copy_payload(entry))
+    rows.sort(key=lambda item: item["changedAt"], reverse=True)
+    total = len(rows)
+    start = (page - 1) * size
+    return {
+        "items": rows[start : start + size],
+        "page": page,
+        "size": size,
+        "total": total,
+    }
+
+
+def _inspection_status(field: str, value: Any) -> str:
+    status = str(value or "").strip().lower()
+    if status not in ENVIRONMENT_INSPECTION_STATUSES:
+        allowed = ", ".join(sorted(ENVIRONMENT_INSPECTION_STATUSES))
+        raise ApiError(
+            400, "INVALID_INSPECTION_STATUS", f"{field} must be one of {allowed}."
+        )
+    return status
+
+
+def create_environment_inspection(
+    user: dict[str, Any], device_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "environment-inspection:write")
+    device = get_device(device_id)
+    require_site_access(user, device["siteId"])
+    inspected_at = required_text(payload, "inspectedAt")
+    parse_rfc3339("inspectedAt", inspected_at)
+    maintenance_action = str(payload.get("maintenanceAction") or "").strip() or None
+    if maintenance_action and len(maintenance_action) > MAX_REVIEW_NOTE_LENGTH:
+        raise ApiError(
+            400,
+            "MAINTENANCE_ACTION_TOO_LONG",
+            "maintenanceAction must be 2000 characters or less.",
+        )
+    with STORE_LOCK:
+        record = {
+            "id": f"ENV-{len(ENVIRONMENT_INSPECTIONS) + 1:06d}",
+            "deviceId": device["id"],
+            "siteId": device["siteId"],
+            "assetId": device["assetId"],
+            "inspectedAt": inspected_at,
+            "dust": _inspection_status("dust", payload.get("dust")),
+            "waterIngress": _inspection_status(
+                "waterIngress", payload.get("waterIngress")
+            ),
+            "saltCorrosion": _inspection_status(
+                "saltCorrosion", payload.get("saltCorrosion")
+            ),
+            "glandStatus": _inspection_status(
+                "glandStatus", payload.get("glandStatus")
+            ),
+            "enclosureStatus": _inspection_status(
+                "enclosureStatus", payload.get("enclosureStatus")
+            ),
+            "maintenanceAction": maintenance_action,
+            "inspector": {"id": user["id"], "name": user["name"]},
+            "createdAt": now_iso(),
+        }
+        statuses = [
+            record["dust"],
+            record["waterIngress"],
+            record["saltCorrosion"],
+            record["glandStatus"],
+            record["enclosureStatus"],
+        ]
+        record["overallStatus"] = (
+            "critical"
+            if "critical" in statuses
+            else "attention" if "attention" in statuses else "ok"
+        )
+        ENVIRONMENT_INSPECTIONS.append(record)
+        device["environmentStatus"] = record["overallStatus"]
+        device["lastEnvironmentInspectionAt"] = inspected_at
+        if maintenance_action:
+            device.setdefault("maintenanceHistory", []).append(
+                {
+                    "inspectionId": record["id"],
+                    "action": maintenance_action,
+                    "recordedAt": record["createdAt"],
+                    "recordedBy": user["id"],
+                }
+            )
+        append_audit_log(
+            user,
+            "environment-inspection.create",
+            "device",
+            device["id"],
+            None,
+            record,
+            maintenance_action or "Environment inspection recorded",
+            site_id=device["siteId"],
+        )
+        return copy_payload(record)
+
+
+def environment_inspections_for(
+    user: dict[str, Any],
+    device_id: str,
+    *,
+    from_timestamp: str | None = None,
+    to_timestamp: str | None = None,
+    page: int,
+    size: int,
+) -> dict[str, Any]:
+    require_permission(user, "environment-inspection:read")
+    device = get_device(device_id)
+    require_site_access(user, device["siteId"])
+    from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
+    to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
+    if from_value and to_value and from_value > to_value:
+        raise ApiError(
+            400, "INVALID_TIME_RANGE", "from must be earlier than or equal to to."
+        )
+    rows = []
+    for item in ENVIRONMENT_INSPECTIONS:
+        if item["deviceId"] != device["id"]:
+            continue
+        inspected_at = parse_rfc3339("inspectedAt", item["inspectedAt"])
+        if from_value and inspected_at < from_value:
+            continue
+        if to_value and inspected_at > to_value:
+            continue
+        rows.append(copy_payload(item))
+    rows.sort(key=lambda item: item["inspectedAt"], reverse=True)
+    total = len(rows)
+    start = (page - 1) * size
+    return {
+        "latest": rows[0] if rows else None,
+        "items": rows[start : start + size],
+        "page": page,
+        "size": size,
+        "total": total,
+    }
+
+
+def _sensor_fault_record(
+    device: dict[str, Any],
+    fault_type: str,
+    severity: str,
+    detail: str,
+    detected_at: str,
+) -> dict[str, Any]:
+    return {
+        "id": f"FAULT-{device['id']}-{fault_type.upper()}",
+        "deviceId": device["id"],
+        "siteId": device["siteId"],
+        "assetId": device["assetId"],
+        "faultType": fault_type,
+        "severity": severity,
+        "status": "open",
+        "detail": detail,
+        "detectedAt": detected_at,
+        "classification": "sensor_fault",
+        "assetEventExcluded": True,
+    }
+
+
+def sensor_faults_for_device(
+    user: dict[str, Any],
+    device_id: str,
+    *,
+    from_timestamp: str | None = None,
+    to_timestamp: str | None = None,
+    status: str = "",
+    fault_type: str = "",
+    page: int,
+    size: int,
+) -> dict[str, Any]:
+    require_permission(user, "sensor-fault:read")
+    device = get_device(device_id)
+    require_site_access(user, device["siteId"])
+    detected_at = str(device.get("lastReceivedAt") or now_iso())
+    rows: list[dict[str, Any]] = []
+    if device.get("health") == "offline" or int(device.get("lastSeenSecAgo", 0)) > int(
+        PARAMETERS["DEVICE_OFFLINE_SEC"]
+    ):
+        rows.append(
+            _sensor_fault_record(
+                device,
+                "no_signal",
+                "critical",
+                "Device telemetry is missing beyond the offline threshold.",
+                detected_at,
+            )
+        )
+    if int(device.get("rebootCount", 0)) >= 3:
+        rows.append(
+            _sensor_fault_record(
+                device,
+                "reboot_loop",
+                "warning",
+                "Repeated device reboots were observed.",
+                detected_at,
+            )
+        )
+    battery_pct = device.get("batteryPct")
+    if battery_pct is not None and not isinstance(battery_pct, bool):
+        if parse_float_value("device.batteryPct", battery_pct) <= 20:
+            rows.append(
+                _sensor_fault_record(
+                    device,
+                    "power",
+                    "warning",
+                    "Battery or power level is below the operating threshold.",
+                    detected_at,
+                )
+            )
+    samples = [item for item in TELEMETRY_RECORDS if item["deviceId"] == device["id"]][
+        -5:
+    ]
+    if len(samples) >= 5:
+        signatures = {
+            (
+                item.get("vibrationRmsRaw"),
+                item.get("acousticRmsRaw"),
+                item.get("rpm"),
+            )
+            for item in samples
+        }
+        if len(signatures) == 1:
+            rows.append(
+                _sensor_fault_record(
+                    device,
+                    "stuck_value",
+                    "warning",
+                    "The last five telemetry samples contain identical sensor values.",
+                    samples[-1]["timestamp"],
+                )
+            )
+        acoustic_values = [
+            float(item["acousticRmsRaw"])
+            for item in samples
+            if item.get("acousticRmsRaw") is not None
+        ]
+        if acoustic_values and sum(acoustic_values) / len(acoustic_values) > 0.05:
+            rows.append(
+                _sensor_fault_record(
+                    device,
+                    "noise_floor",
+                    "warning",
+                    "Acoustic raw RMS remained above the sensor noise-floor threshold.",
+                    samples[-1]["timestamp"],
+                )
+            )
+    for event in EVENTS:
+        if (
+            event.get("eventType") == "sensor_fault_candidate"
+            and event["assetId"] == device["assetId"]
+        ):
+            rows.append(
+                {
+                    **_sensor_fault_record(
+                        device,
+                        "sensor_event",
+                        str(event["severity"]),
+                        str(event["note"]),
+                        str(event["occurredAt"]),
+                    ),
+                    "eventId": event["id"],
+                    "status": event.get("status", "open"),
+                }
+            )
+    normalized_status = status.strip().lower()
+    normalized_type = fault_type.strip().lower()
+    if normalized_status:
+        rows = [item for item in rows if item["status"] == normalized_status]
+    if normalized_type:
+        rows = [item for item in rows if item["faultType"] == normalized_type]
+    from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
+    to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
+    if from_value and to_value and from_value > to_value:
+        raise ApiError(
+            400, "INVALID_TIME_RANGE", "from must be earlier than or equal to to."
+        )
+    filtered = []
+    for item in rows:
+        timestamp = parse_rfc3339("fault.detectedAt", item["detectedAt"])
+        if from_value and timestamp < from_value:
+            continue
+        if to_value and timestamp > to_value:
+            continue
+        filtered.append(item)
+    filtered.sort(key=lambda item: item["detectedAt"], reverse=True)
+    total = len(filtered)
+    start = (page - 1) * size
+    return {
+        "items": copy_payload(filtered[start : start + size]),
+        "page": page,
+        "size": size,
+        "total": total,
+    }
+
+
+def acoustic_taxonomies_for(
+    user: dict[str, Any], version: str = ""
+) -> dict[str, Any] | list[dict[str, Any]]:
+    require_permission(user, "label-taxonomy:read")
+    normalized = version.strip().upper()
+    if normalized:
+        taxonomy = next(
+            (
+                item
+                for item in ACOUSTIC_TAXONOMY_VERSIONS
+                if item["version"].upper() == normalized
+            ),
+            None,
+        )
+        if not taxonomy:
+            raise ApiError(
+                404, "LABEL_TAXONOMY_NOT_FOUND", "Label taxonomy was not found."
+            )
+        return copy_payload(taxonomy)
+    return copy_payload(ACOUSTIC_TAXONOMY_VERSIONS)
+
+
+def update_acoustic_taxonomy(
+    user: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "label-taxonomy:write")
+    version = required_text(payload, "version").upper()
+    reason = required_text(payload, "reason")
+    if len(reason) > MAX_REASON_LENGTH:
+        raise ApiError(
+            400, "REASON_TOO_LONG", "reason must be 1000 characters or less."
+        )
+    labels = payload.get("labels")
+    if not isinstance(labels, list) or not labels:
+        raise ApiError(400, "INVALID_LABELS", "labels must be a non-empty list.")
+    normalized_labels = []
+    codes: set[str] = set()
+    for index, label in enumerate(labels):
+        if not isinstance(label, dict):
+            raise ApiError(400, "INVALID_LABEL", f"labels[{index}] must be an object.")
+        code = required_text(label, "code").upper()
+        if code in codes:
+            raise ApiError(409, "DUPLICATE_LABEL_CODE", "Label codes must be unique.")
+        codes.add(code)
+        sample_refs = string_list(label, "sampleRefs")
+        normalized_labels.append(
+            {
+                "code": code,
+                "name": required_text(label, "name"),
+                "criteria": required_text(label, "criteria"),
+                "sampleRefs": sample_refs,
+            }
+        )
+    with STORE_LOCK:
+        if any(
+            item["version"].upper() == version for item in ACOUSTIC_TAXONOMY_VERSIONS
+        ):
+            raise ApiError(
+                409,
+                "LABEL_TAXONOMY_VERSION_EXISTS",
+                "Label taxonomy versions are immutable and must be unique.",
+            )
+        before = next(
+            (item for item in ACOUSTIC_TAXONOMY_VERSIONS if item.get("active")), None
+        )
+        for item in ACOUSTIC_TAXONOMY_VERSIONS:
+            item["active"] = False
+        record = {
+            "version": version,
+            "labels": normalized_labels,
+            "active": True,
+            "reason": reason,
+            "updatedAt": now_iso(),
+        }
+        ACOUSTIC_TAXONOMY_VERSIONS.append(record)
+        append_audit_log(
+            user,
+            "label-taxonomy.update",
+            "acousticLabelTaxonomy",
+            version,
+            before,
+            record,
+            reason,
+        )
+        return copy_payload(record)
+
+
+def _dataset_source(payload: dict[str, Any]) -> dict[str, Any]:
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        raise ApiError(400, "INVALID_DATASET_SOURCE", "source must be an object.")
+    return {
+        "type": required_text(source, "type").lower(),
+        "uri": required_text(source, "uri"),
+        "license": required_text(source, "license"),
+        "checksum": required_text(source, "checksum").lower(),
+    }
+
+
+def _dataset_compatibility(payload: dict[str, Any]) -> dict[str, Any]:
+    compatibility = payload.get("compatibility")
+    if not isinstance(compatibility, dict):
+        raise ApiError(
+            400, "INVALID_DATASET_COMPATIBILITY", "compatibility must be an object."
+        )
+    signal_types = string_list(compatibility, "signalType", required=True)
+    units = compatibility.get("units")
+    if not isinstance(units, dict) or not units:
+        raise ApiError(400, "INVALID_DATASET_UNITS", "compatibility.units is required.")
+    normalized_units = {
+        str(key).strip(): str(value).strip()
+        for key, value in units.items()
+        if str(key).strip() and str(value).strip()
+    }
+    if len(normalized_units) != len(units):
+        raise ApiError(
+            400,
+            "INVALID_DATASET_UNITS",
+            "compatibility.units keys and values must be non-empty.",
+        )
+    operating_conditions = compatibility.get("operatingConditions")
+    if not isinstance(operating_conditions, dict):
+        raise ApiError(
+            400,
+            "INVALID_OPERATING_CONDITIONS",
+            "compatibility.operatingConditions must be an object.",
+        )
+    return {
+        "signalType": signal_types,
+        "samplingRateHz": _bounded_number(
+            "compatibility.samplingRateHz",
+            compatibility.get("samplingRateHz"),
+            1,
+            1000000,
+            integer=True,
+        ),
+        "units": normalized_units,
+        "operatingConditions": copy_payload(operating_conditions),
+    }
+
+
+def _dataset_split(payload: dict[str, Any]) -> dict[str, float]:
+    split = payload.get("split")
+    if not isinstance(split, dict):
+        raise ApiError(400, "INVALID_DATASET_SPLIT", "split must be an object.")
+    result = {
+        name: float(_bounded_number(f"split.{name}", split.get(name), 0.000001, 1))
+        for name in ("train", "validation", "test")
+    }
+    if not math.isclose(sum(result.values()), 1.0, rel_tol=0, abs_tol=1e-9):
+        raise ApiError(400, "INVALID_DATASET_SPLIT", "split ratios must sum to 1.0.")
+    return result
+
+
+def create_dataset_version(
+    user: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "dataset:write")
+    name = required_text(payload, "name")
+    source = _dataset_source(payload)
+    compatibility = _dataset_compatibility(payload)
+    label_taxonomy_version = required_text(payload, "labelTaxonomyVersion").upper()
+    taxonomy = acoustic_taxonomies_for(user, label_taxonomy_version)
+    label_mapping = payload.get("labelMapping")
+    if not isinstance(label_mapping, dict) or not label_mapping:
+        raise ApiError(
+            400, "INVALID_LABEL_MAPPING", "labelMapping must be a non-empty object."
+        )
+    normalized_mapping = {
+        str(key).strip(): str(value).strip().upper()
+        for key, value in label_mapping.items()
+        if str(key).strip() and str(value).strip()
+    }
+    if len(normalized_mapping) != len(label_mapping):
+        raise ApiError(
+            400, "INVALID_LABEL_MAPPING", "labelMapping entries must be non-empty."
+        )
+    taxonomy_codes = {str(item["code"]).strip().upper() for item in taxonomy["labels"]}
+    unknown_codes = sorted(set(normalized_mapping.values()) - taxonomy_codes)
+    if unknown_codes:
+        raise ApiError(
+            400,
+            "INVALID_LABEL_MAPPING",
+            "labelMapping contains codes outside the selected taxonomy: "
+            + ", ".join(unknown_codes),
+        )
+    split = _dataset_split(payload)
+    reason = required_text(payload, "reason")
+    if len(reason) > MAX_REASON_LENGTH:
+        raise ApiError(
+            400, "REASON_TOO_LONG", "reason must be 1000 characters or less."
+        )
+    source_filters = payload.get("sourceFilters")
+    if source_filters is not None and not isinstance(source_filters, dict):
+        raise ApiError(
+            400, "INVALID_SOURCE_FILTERS", "sourceFilters must be an object."
+        )
+    with STORE_LOCK:
+        if any(
+            item["source"]["checksum"] == source["checksum"]
+            for item in DATASET_VERSIONS
+        ):
+            raise ApiError(
+                409,
+                "DATASET_CHECKSUM_EXISTS",
+                "A dataset version with the same checksum is already registered.",
+            )
+        record = {
+            "id": f"DATASET-{len(DATASET_VERSIONS) + 1:05d}",
+            "name": name,
+            "source": source,
+            "compatibility": compatibility,
+            "sourceFilters": copy_payload(source_filters) if source_filters else None,
+            "labelTaxonomyVersion": label_taxonomy_version,
+            "labelMapping": normalized_mapping,
+            "split": split,
+            "splitPolicy": "asset_or_operating_condition_grouped",
+            "status": "frozen",
+            "artifactRefs": [],
+            "reason": reason,
+            "createdAt": now_iso(),
+            "createdBy": user["id"],
+        }
+        DATASET_VERSIONS.append(record)
+        append_audit_log(
+            user,
+            "dataset.create",
+            "dataset",
+            record["id"],
+            None,
+            record,
+            reason,
+        )
+        return copy_payload(record)
+
+
+def dataset_version_for(user: dict[str, Any], dataset_id: str) -> dict[str, Any]:
+    require_permission(user, "dataset:read")
+    normalized = dataset_id.strip().upper()
+    record = next((item for item in DATASET_VERSIONS if item["id"] == normalized), None)
+    if not record:
+        raise ApiError(404, "DATASET_NOT_FOUND", "Dataset version was not found.")
+    return copy_payload(record)
+
+
+def _split_for_group(group_id: str, split: dict[str, float]) -> str:
+    value = (
+        int(hashlib.sha256(group_id.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+    )
+    if value < split["train"]:
+        return "train"
+    if value < split["train"] + split["validation"]:
+        return "validation"
+    return "test"
+
+
+def dataset_export_for(
+    user: dict[str, Any],
+    site_id: str,
+    asset_id: str,
+    *,
+    dataset_id: str = "",
+    from_timestamp: str | None = None,
+    to_timestamp: str | None = None,
+) -> dict[str, Any]:
+    require_permission(user, "export:read")
+    require_permission(user, "dataset:read")
+    site = get_site(site_id)
+    require_site_access(user, site["id"])
+    asset = get_asset(site["id"], asset_id)
+    dataset = dataset_version_for(user, dataset_id) if dataset_id else None
+    split = (
+        dataset["split"] if dataset else {"train": 0.7, "validation": 0.2, "test": 0.1}
+    )
+    group_split = _split_for_group(asset["id"], split)
+    points = telemetry_for(
+        site["id"],
+        asset["id"],
+        from_timestamp=from_timestamp,
+        to_timestamp=to_timestamp,
+    )
+    asset_events = sorted(
+        (item for item in EVENTS if item["assetId"] == asset["id"]),
+        key=lambda item: item["occurredAt"],
+        reverse=True,
+    )
+    latest_event = asset_events[0] if asset_events else None
+    rows = []
+    for point in points:
+        rows.append(
+            {
+                "site_id": site["id"],
+                "asset_id": asset["id"],
+                "device_id": point.get("deviceId"),
+                "timestamp": point.get("timestamp"),
+                "sequence": point.get("sequence"),
+                "vibration_rms_raw": point.get("vibrationRmsRaw"),
+                "vibration_rms_mm_s": point.get("vibrationRmsMmS"),
+                "acoustic_rms_raw": point.get("acousticRmsRaw"),
+                "acoustic_db": point.get("acousticDb"),
+                "rpm": point.get("rpm"),
+                "event_id": latest_event.get("id") if latest_event else None,
+                "event_label": latest_event.get("label") if latest_event else None,
+                "label_taxonomy_version": (
+                    dataset["labelTaxonomyVersion"] if dataset else "ACOUSTIC-V1"
+                ),
+                "dataset_split": group_split,
+            }
+        )
+    checksum = hashlib.sha256(
+        json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    manifest = {
+        "datasetId": dataset["id"] if dataset else None,
+        "source": (
+            dataset["source"]
+            if dataset
+            else {"type": "internal", "uri": "api://telemetry"}
+        ),
+        "compatibility": (
+            dataset["compatibility"]
+            if dataset
+            else {
+                "signalType": sorted(telemetry_units(site["id"], asset["id"])),
+                "samplingRateHz": None,
+                "units": telemetry_units(site["id"], asset["id"]),
+                "operatingConditions": {
+                    "ratedRpm": asset.get("ratedRpm"),
+                    "source": "live_or_demo_telemetry",
+                },
+            }
+        ),
+        "labelTaxonomyVersion": (
+            dataset["labelTaxonomyVersion"] if dataset else "ACOUSTIC-V1"
+        ),
+        "labelMapping": dataset["labelMapping"] if dataset else {},
+        "siteId": site["id"],
+        "assetId": asset["id"],
+        "recordCount": len(rows),
+        "split": split,
+        "splitPolicy": "asset_grouped",
+        "assignedSplit": group_split,
+        "checksum": f"sha256:{checksum}",
+        "generatedAt": now_iso(),
+    }
+    return {"manifest": manifest, "rows": rows}

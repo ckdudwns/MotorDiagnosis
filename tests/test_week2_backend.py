@@ -680,11 +680,13 @@ class Week2HttpSmokeTest(unittest.TestCase):
             token=operator_token,
         )
         self.assertEqual(status, 200)
-        self.assertTrue(filtered_events)
+        self.assertEqual(filtered_events["page"], 1)
+        self.assertGreater(filtered_events["total"], 0)
+        self.assertTrue(filtered_events["items"])
         self.assertTrue(
             all(
                 event["siteId"] == "SITE-01" and event["assetId"] == "SITE-01-MOT-02"
-                for event in filtered_events
+                for event in filtered_events["items"]
             )
         )
 

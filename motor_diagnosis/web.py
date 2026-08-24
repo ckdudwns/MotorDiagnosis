@@ -156,7 +156,8 @@ def render_page() -> str:
       const from = new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString();
       const telem = await api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
       siteSummaries = await api("/api/dashboard/sites-summary");
-      events = await api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
+      const eventPage = await api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
+      events = eventPage.items;
       $("siteCount").textContent = siteSummaries.length;
       $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
       $("warningAssets").textContent = siteSummaries.reduce((n, s) => n + s.warningAssets, 0);

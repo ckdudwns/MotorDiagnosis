@@ -12,15 +12,18 @@ from motor_diagnosis.data import (
     ApiError,
     EVENTS,
     TELEMETRY_RECORDS,
+    audit_logs_for,
     authenticate,
     create_dataset_version,
     create_environment_inspection,
     current_user_for_token,
     dataset_export_for,
+    dataset_version_for,
     event_detail_for,
     format_rfc3339,
     parse_rfc3339,
     reset_runtime_state,
+    update_acoustic_taxonomy,
     update_anomaly_rule,
 )
 from motor_diagnosis.server import create_server
@@ -36,19 +39,49 @@ class Week3DataBoundaryTest(unittest.TestCase):
         login = authenticate({"username": username, "password": password})
         return current_user_for_token(login["session"]["token"])
 
-    def telemetry_record(self, timestamp: str, sequence: int) -> dict[str, object]:
+    def telemetry_record(
+        self,
+        timestamp: str,
+        sequence: int,
+        *,
+        site_id: str = "SITE-01",
+        asset_id: str = "SITE-01-MOT-02",
+        device_id: str = "DEV-01-MOT-02",
+        rpm: float = 1780.0,
+    ) -> dict[str, object]:
         return {
             "timestamp": timestamp,
             "sequence": sequence,
-            "siteId": "SITE-01",
-            "assetId": "SITE-01-MOT-02",
-            "deviceId": "DEV-01-MOT-02",
-            "rpm": 1780.0,
+            "siteId": site_id,
+            "assetId": asset_id,
+            "deviceId": device_id,
+            "rpm": rpm,
             "vibrationRmsRaw": 0.08,
             "vibrationRmsMmS": None,
             "acousticRmsRaw": 0.007,
             "acousticDb": None,
         }
+
+    def add_split_ready_telemetry(
+        self,
+        timestamp,
+        *,
+        site_id: str = "SITE-01",
+        asset_id: str = "SITE-01-MOT-02",
+        device_id: str = "DEV-01-MOT-02",
+        sequence_start: int = 1,
+    ) -> None:
+        for offset, rpm in enumerate((1500.0, 1800.0, 2100.0)):
+            TELEMETRY_RECORDS.append(
+                self.telemetry_record(
+                    format_rfc3339(timestamp + timedelta(seconds=offset * 5)),
+                    sequence_start + offset,
+                    site_id=site_id,
+                    asset_id=asset_id,
+                    device_id=device_id,
+                    rpm=rpm,
+                )
+            )
 
     def dataset_payload(
         self,
@@ -191,9 +224,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
     def test_dataset_export_applies_registered_label_mapping(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
         event_time = parse_rfc3339("occurredAt", event["occurredAt"])
-        TELEMETRY_RECORDS.append(
-            self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=10)), 1)
-        )
+        self.add_split_ready_telemetry(event_time + timedelta(seconds=10))
         dataset = create_dataset_version(
             self.admin,
             self.dataset_payload(
@@ -223,13 +254,12 @@ class Week3DataBoundaryTest(unittest.TestCase):
             exported["manifest"]["sourceFilters"],
             {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"},
         )
-        self.assertEqual(exported["manifest"]["sourceRecordCount"], 1)
-        self.assertEqual(exported["manifest"]["normalizedRecordCount"], 1)
-        self.assertEqual(sum(exported["manifest"]["splitCounts"].values()), 1)
-        self.assertEqual(
-            exported["manifest"]["splitCounts"][exported["manifest"]["assignedSplit"]],
-            1,
-        )
+        self.assertEqual(exported["manifest"]["sourceRecordCount"], 3)
+        self.assertEqual(exported["manifest"]["normalizedRecordCount"], 3)
+        self.assertEqual(sum(exported["manifest"]["splitCounts"].values()), 3)
+        self.assertTrue(all(exported["manifest"]["splitCounts"].values()))
+        self.assertIsNone(exported["manifest"]["assignedSplit"])
+        self.assertEqual(exported["manifest"]["splitPolicy"], dataset["splitPolicy"])
 
     def test_label_mapping_rejects_casefold_key_collisions(self) -> None:
         payload = self.dataset_payload(
@@ -253,9 +283,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
     def test_same_source_checksum_allows_a_new_normalized_version(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
         event_time = parse_rfc3339("occurredAt", event["occurredAt"])
-        TELEMETRY_RECORDS.append(
-            self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=10)), 1)
-        )
+        self.add_split_ready_telemetry(event_time + timedelta(seconds=10))
         first_payload = self.dataset_payload(
             checksum="sha256:shared-raw-source",
             source_filters={
@@ -295,6 +323,180 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(empty_snapshot.exception.status, 400)
         self.assertEqual(empty_snapshot.exception.code, "EMPTY_DATASET_SNAPSHOT")
 
+    def test_internal_snapshot_does_not_freeze_demo_telemetry(self) -> None:
+        payload = self.dataset_payload(
+            checksum="sha256:no-demo-fallback",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-GEN-01",
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+
+        with self.assertRaises(ApiError) as empty_snapshot:
+            create_dataset_version(self.admin, payload)
+
+        self.assertEqual(TELEMETRY_RECORDS, [])
+        self.assertEqual(empty_snapshot.exception.status, 400)
+        self.assertEqual(empty_snapshot.exception.code, "EMPTY_DATASET_SNAPSHOT")
+
+    def test_internal_version_fingerprint_tracks_the_canonical_snapshot(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        self.add_split_ready_telemetry(event_time)
+        payload = self.dataset_payload(
+            checksum="sha256:reported-source-a",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+            },
+            label_mapping={
+                "needs_review": "BEARING_SUSPECT",
+                "confirmed_anomaly": "NORMAL",
+            },
+        )
+
+        first = create_dataset_version(self.admin, payload)
+        changed_reported_checksum = json.loads(json.dumps(payload))
+        changed_reported_checksum["source"]["checksum"] = "sha256:reported-source-b"
+        with self.assertRaises(ApiError) as same_snapshot:
+            create_dataset_version(self.admin, changed_reported_checksum)
+        self.assertEqual(same_snapshot.exception.code, "DATASET_VERSION_EXISTS")
+
+        TELEMETRY_RECORDS.append(
+            self.telemetry_record(
+                format_rfc3339(event_time + timedelta(seconds=15)),
+                4,
+                rpm=2300.0,
+            )
+        )
+        after_telemetry = create_dataset_version(self.admin, payload)
+        self.assertNotEqual(
+            first["snapshotChecksum"], after_telemetry["snapshotChecksum"]
+        )
+        self.assertNotEqual(
+            first["versionFingerprint"], after_telemetry["versionFingerprint"]
+        )
+
+        event["label"] = "confirmed_anomaly"
+        after_review = create_dataset_version(self.admin, payload)
+        self.assertNotEqual(
+            after_telemetry["snapshotChecksum"], after_review["snapshotChecksum"]
+        )
+        self.assertNotEqual(
+            after_telemetry["versionFingerprint"], after_review["versionFingerprint"]
+        )
+
+    def test_dataset_split_requires_usable_operating_condition_groups(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        TELEMETRY_RECORDS.extend(
+            [
+                self.telemetry_record(format_rfc3339(event_time), 1),
+                self.telemetry_record(
+                    format_rfc3339(event_time + timedelta(seconds=5)), 2
+                ),
+            ]
+        )
+        payload = self.dataset_payload(
+            checksum="sha256:single-operating-condition",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+
+        with self.assertRaises(ApiError) as invalid_split:
+            create_dataset_version(self.admin, payload)
+
+        self.assertEqual(invalid_split.exception.status, 400)
+        self.assertEqual(invalid_split.exception.code, "INVALID_DATASET_SPLIT")
+
+    def test_dataset_split_rejects_unsupported_keys(self) -> None:
+        payload = self.dataset_payload(
+            checksum="sha256:unsupported-split-key",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["split"] = {
+            "train": 0.5,
+            "validation": 0.15,
+            "test": 0.1,
+            "holdout": 0.25,
+        }
+
+        with self.assertRaises(ApiError) as invalid_split:
+            create_dataset_version(self.admin, payload)
+
+        self.assertEqual(invalid_split.exception.status, 400)
+        self.assertEqual(invalid_split.exception.code, "INVALID_DATASET_SPLIT")
+
+    def test_dataset_read_and_create_audit_enforce_site_scope(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        self.add_split_ready_telemetry(event_time)
+        dataset = create_dataset_version(
+            self.admin,
+            self.dataset_payload(
+                checksum="sha256:site-scoped-dataset",
+                source_filters={
+                    "siteId": "SITE-01",
+                    "assetId": "SITE-01-MOT-02",
+                },
+                label_mapping={"needs_review": "BEARING_SUSPECT"},
+            ),
+        )
+        site_02_operator = {**self.operator, "allowedSiteIds": ["SITE-02"]}
+
+        with self.assertRaises(ApiError) as forbidden:
+            dataset_version_for(site_02_operator, dataset["id"])
+        self.assertEqual(forbidden.exception.status, 403)
+        self.assertEqual(forbidden.exception.code, "SITE_FORBIDDEN")
+
+        hidden_audits = audit_logs_for(site_02_operator, page=1, size=20)
+        self.assertNotIn(
+            "dataset.create", {item["action"] for item in hidden_audits["items"]}
+        )
+        visible_audits = audit_logs_for(self.operator, page=1, size=20)
+        dataset_audit = next(
+            item
+            for item in visible_audits["items"]
+            if item["action"] == "dataset.create"
+        )
+        self.assertEqual(dataset_audit["siteId"], "SITE-01")
+        self.assertEqual(dataset_audit["siteIds"], ["SITE-01"])
+
+    def test_taxonomy_audit_preserves_the_previous_active_state(self) -> None:
+        update_acoustic_taxonomy(
+            self.admin,
+            {
+                "version": "ACOUSTIC-V2",
+                "labels": [
+                    {
+                        "code": "normal",
+                        "name": "Normal",
+                        "criteria": "Verified normal sound",
+                        "sampleRefs": [],
+                    }
+                ],
+                "reason": "Verify taxonomy audit snapshots",
+            },
+        )
+
+        audits = audit_logs_for(
+            self.admin,
+            action="label-taxonomy.update",
+            page=1,
+            size=10,
+        )
+        self.assertEqual(audits["total"], 1)
+        self.assertTrue(audits["items"][0]["before"]["active"])
+        self.assertTrue(audits["items"][0]["after"]["active"])
+
     def test_source_filter_assets_must_belong_to_selected_sites(self) -> None:
         payload = self.dataset_payload(
             checksum="sha256:cross-site-filter-mismatch",
@@ -314,9 +516,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
     def test_frozen_dataset_export_is_unchanged_after_new_telemetry(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
         event_time = parse_rfc3339("occurredAt", event["occurredAt"])
-        TELEMETRY_RECORDS.append(
-            self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=10)), 1)
-        )
+        self.add_split_ready_telemetry(event_time + timedelta(seconds=10))
         dataset = create_dataset_version(
             self.admin,
             self.dataset_payload(
@@ -336,7 +536,11 @@ class Week3DataBoundaryTest(unittest.TestCase):
         )
 
         TELEMETRY_RECORDS.append(
-            self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=20)), 2)
+            self.telemetry_record(
+                format_rfc3339(event_time + timedelta(seconds=30)),
+                4,
+                rpm=2300.0,
+            )
         )
         event["label"] = "sensor_issue"
         second_export = dataset_export_for(
@@ -348,13 +552,21 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
         self.assertEqual(first_export["rows"], second_export["rows"])
         self.assertEqual(first_export["manifest"], second_export["manifest"])
-        self.assertEqual(first_export["manifest"]["recordCount"], 1)
-        self.assertEqual(dataset["snapshotRecordCount"], 1)
+        self.assertEqual(first_export["manifest"]["recordCount"], 3)
+        self.assertEqual(dataset["snapshotRecordCount"], 3)
         self.assertEqual(
             dataset["snapshotChecksum"], first_export["manifest"]["checksum"]
         )
 
     def test_dataset_export_rejects_site_outside_source_filters(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-238")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        self.add_split_ready_telemetry(
+            event_time,
+            site_id="SITE-02",
+            asset_id="SITE-02-GEN-01",
+            device_id="DEV-02-GEN-01",
+        )
         dataset = create_dataset_version(
             self.admin,
             self.dataset_payload(
@@ -782,6 +994,25 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertTrue(headers["x-dataset-checksum"].startswith("sha256:"))
         self.assertGreater(int(headers["x-dataset-record-count"]), 0)
 
+        TELEMETRY_RECORDS.extend(
+            [
+                {
+                    "timestamp": f"2026-08-24T03:00:{second:02d}Z",
+                    "sequence": index,
+                    "siteId": "SITE-01",
+                    "assetId": "SITE-01-GEN-01",
+                    "deviceId": "DEV-01-GEN-01",
+                    "rpm": rpm,
+                    "vibrationRmsRaw": 0.08,
+                    "vibrationRmsMmS": None,
+                    "acousticRmsRaw": 0.007,
+                    "acousticDb": None,
+                }
+                for index, (second, rpm) in enumerate(
+                    ((0, 1500.0), (5, 1800.0), (10, 2100.0)), start=1
+                )
+            ]
+        )
         internal_payload = json.loads(json.dumps(dataset_payload))
         internal_payload["name"] = "internal-filtered-telemetry-v1"
         internal_payload["source"] = {

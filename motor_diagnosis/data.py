@@ -46,6 +46,7 @@ ENVIRONMENT_INSPECTION_STATUSES = {
     "attention",
     "critical",
 }
+DATASET_SPLIT_POLICY = "asset_or_operating_condition_grouped"
 NON_ASSET_ANOMALY_EVENT_LABELS = {
     "normal_false_positive",
     "repair_completed",
@@ -2694,13 +2695,13 @@ def ingest_telemetry(
             raise
 
 
-def telemetry_for(
+def _stored_telemetry_for(
     site_id: str,
     asset_id: str,
     from_timestamp: str | None = None,
     to_timestamp: str | None = None,
 ) -> list[dict[str, Any]]:
-    asset = get_asset(site_id, asset_id)
+    get_asset(site_id, asset_id)
     stored = [
         copy_payload(record)
         for record in TELEMETRY_RECORDS
@@ -2712,16 +2713,38 @@ def telemetry_for(
         raise ApiError(
             400, "INVALID_TIME_RANGE", "from must be earlier than or equal to to."
         )
-    if stored:
-        filtered = []
-        for record in stored:
-            timestamp = parse_rfc3339("timestamp", record["timestamp"])
-            if from_value and timestamp < from_value:
-                continue
-            if to_value and timestamp > to_value:
-                continue
-            filtered.append(record)
-        return sorted(filtered, key=lambda item: item["timestamp"])
+    filtered = []
+    for record in stored:
+        timestamp = parse_rfc3339("timestamp", record["timestamp"])
+        if from_value and timestamp < from_value:
+            continue
+        if to_value and timestamp > to_value:
+            continue
+        filtered.append(record)
+    return sorted(filtered, key=lambda item: item["timestamp"])
+
+
+def telemetry_for(
+    site_id: str,
+    asset_id: str,
+    from_timestamp: str | None = None,
+    to_timestamp: str | None = None,
+) -> list[dict[str, Any]]:
+    asset = get_asset(site_id, asset_id)
+    stored = _stored_telemetry_for(
+        site_id,
+        asset_id,
+        from_timestamp=from_timestamp,
+        to_timestamp=to_timestamp,
+    )
+    if stored or any(
+        record["siteId"] == site_id and record["assetId"] == asset_id
+        for record in TELEMETRY_RECORDS
+    ):
+        return stored
+
+    from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
+    to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
 
     seed = sum(ord(ch) for ch in asset["id"])
     points = []
@@ -3432,8 +3455,15 @@ def append_audit_log(
     reason: str,
     *,
     site_id: str | None = None,
+    site_ids: list[str] | None = None,
     effective_at: str | None = None,
 ) -> dict[str, Any]:
+    normalized_site_ids = sorted(
+        {str(value).strip().upper() for value in (site_ids or []) if str(value).strip()}
+    )
+    if site_id and site_id not in normalized_site_ids:
+        normalized_site_ids.append(site_id)
+        normalized_site_ids.sort()
     entry = {
         "id": f"AUDIT-{len(AUDIT_LOGS) + 1:06d}",
         "actor": {
@@ -3445,6 +3475,7 @@ def append_audit_log(
         "targetType": target_type,
         "targetId": target_id,
         "siteId": site_id,
+        "siteIds": normalized_site_ids,
         "before": copy_payload(before),
         "after": copy_payload(after),
         "reason": reason,
@@ -3881,8 +3912,14 @@ def audit_logs_for(
     allowed = user.get("allowedSiteIds", [])
     rows = []
     for entry in AUDIT_LOGS:
-        site_id = entry.get("siteId")
-        if site_id and "*" not in allowed and site_id not in allowed:
+        entry_site_ids = set(entry.get("siteIds") or [])
+        if entry.get("siteId"):
+            entry_site_ids.add(entry["siteId"])
+        if (
+            entry_site_ids
+            and "*" not in allowed
+            and not entry_site_ids.issubset(set(allowed))
+        ):
             continue
         if action and entry["action"] != action:
             continue
@@ -4257,8 +4294,11 @@ def update_acoustic_taxonomy(
                 "LABEL_TAXONOMY_VERSION_EXISTS",
                 "Label taxonomy versions are immutable and must be unique.",
             )
-        before = next(
-            (item for item in ACOUSTIC_TAXONOMY_VERSIONS if item.get("active")), None
+        before = copy_payload(
+            next(
+                (item for item in ACOUSTIC_TAXONOMY_VERSIONS if item.get("active")),
+                None,
+            )
         )
         for item in ACOUSTIC_TAXONOMY_VERSIONS:
             item["active"] = False
@@ -4340,8 +4380,15 @@ def _dataset_split(payload: dict[str, Any]) -> dict[str, float]:
     split = payload.get("split")
     if not isinstance(split, dict):
         raise ApiError(400, "INVALID_DATASET_SPLIT", "split must be an object.")
+    expected_keys = {"train", "validation", "test"}
+    if set(split) != expected_keys:
+        raise ApiError(
+            400,
+            "INVALID_DATASET_SPLIT",
+            "split must contain exactly train, validation, and test.",
+        )
     result = {
-        name: float(_bounded_number(f"split.{name}", split.get(name), 0.000001, 1))
+        name: float(_bounded_number(f"split.{name}", split.get(name), 0, 1))
         for name in ("train", "validation", "test")
     }
     if not math.isclose(sum(result.values()), 1.0, rel_tol=0, abs_tol=1e-9):
@@ -4426,19 +4473,24 @@ def _dataset_version_fingerprint(
     label_taxonomy_version: str,
     label_mapping: dict[str, str],
     split: dict[str, float],
+    snapshot_checksum: str | None = None,
 ) -> str:
     canonical_compatibility = copy_payload(compatibility)
     canonical_compatibility["signalType"] = sorted(
         canonical_compatibility.get("signalType", [])
     )
+    canonical_source = copy_payload(source)
+    if snapshot_checksum:
+        canonical_source.pop("checksum", None)
     canonical_definition = {
-        "source": copy_payload(source),
+        "source": canonical_source,
         "compatibility": canonical_compatibility,
         "sourceFilters": copy_payload(source_filters),
         "labelTaxonomyVersion": label_taxonomy_version,
         "labelMapping": {key.casefold(): value for key, value in label_mapping.items()},
         "split": copy_payload(split),
-        "splitPolicy": "asset_or_operating_condition_grouped",
+        "splitPolicy": DATASET_SPLIT_POLICY,
+        "snapshotChecksum": snapshot_checksum,
     }
     digest = hashlib.sha256(
         json.dumps(
@@ -4500,24 +4552,7 @@ def create_dataset_version(
             400, "REASON_TOO_LONG", "reason must be 1000 characters or less."
         )
     source_filters = _dataset_source_filters(payload)
-    version_fingerprint = _dataset_version_fingerprint(
-        source,
-        compatibility,
-        source_filters,
-        label_taxonomy_version,
-        normalized_mapping,
-        split,
-    )
     with STORE_LOCK:
-        if any(
-            item.get("versionFingerprint") == version_fingerprint
-            for item in DATASET_VERSIONS
-        ):
-            raise ApiError(
-                409,
-                "DATASET_VERSION_EXISTS",
-                "An identical normalized dataset version is already registered.",
-            )
         created_at = now_iso()
         record = {
             "id": f"DATASET-{len(DATASET_VERSIONS) + 1:05d}",
@@ -4528,7 +4563,7 @@ def create_dataset_version(
             "labelTaxonomyVersion": label_taxonomy_version,
             "labelMapping": normalized_mapping,
             "split": split,
-            "splitPolicy": "asset_or_operating_condition_grouped",
+            "splitPolicy": DATASET_SPLIT_POLICY,
             "status": "frozen",
             "artifactRefs": [],
             "reason": reason,
@@ -4536,9 +4571,10 @@ def create_dataset_version(
             "frozenAt": created_at,
             "snapshotRecordCount": None,
             "snapshotChecksum": None,
-            "versionFingerprint": version_fingerprint,
+            "versionFingerprint": None,
             "createdBy": user["id"],
         }
+        snapshot = None
         if (
             str(source.get("type", "")).lower() == "internal"
             and source.get("uri") == "api://telemetry"
@@ -4560,8 +4596,28 @@ def create_dataset_version(
             ).hexdigest()
             record["snapshotRecordCount"] = len(snapshot_rows)
             record["snapshotChecksum"] = f"sha256:{snapshot_checksum}"
+        record["versionFingerprint"] = _dataset_version_fingerprint(
+            source,
+            compatibility,
+            source_filters,
+            label_taxonomy_version,
+            normalized_mapping,
+            split,
+            record["snapshotChecksum"],
+        )
+        if any(
+            item.get("versionFingerprint") == record["versionFingerprint"]
+            for item in DATASET_VERSIONS
+        ):
+            raise ApiError(
+                409,
+                "DATASET_VERSION_EXISTS",
+                "An identical normalized dataset version is already registered.",
+            )
+        if snapshot is not None:
             DATASET_SNAPSHOTS[record["id"]] = snapshot
         DATASET_VERSIONS.append(record)
+        dataset_site_ids = _dataset_site_ids(record)
         append_audit_log(
             user,
             "dataset.create",
@@ -4570,6 +4626,8 @@ def create_dataset_version(
             None,
             record,
             reason,
+            site_id=dataset_site_ids[0] if len(dataset_site_ids) == 1 else None,
+            site_ids=dataset_site_ids,
         )
         return copy_payload(record)
 
@@ -4580,6 +4638,8 @@ def dataset_version_for(user: dict[str, Any], dataset_id: str) -> dict[str, Any]
     record = next((item for item in DATASET_VERSIONS if item["id"] == normalized), None)
     if not record:
         raise ApiError(404, "DATASET_NOT_FOUND", "Dataset version was not found.")
+    for site_id in _dataset_site_ids(record):
+        require_site_access(user, site_id)
     return copy_payload(record)
 
 
@@ -4592,6 +4652,93 @@ def _split_for_group(group_id: str, split: dict[str, float]) -> str:
     if value < split["train"] + split["validation"]:
         return "validation"
     return "test"
+
+
+def _dataset_group_key(row: dict[str, Any]) -> str:
+    rpm = row.get("rpm")
+    if isinstance(rpm, bool) or rpm is None:
+        rpm_band = "unknown"
+    else:
+        try:
+            rpm_value = float(rpm)
+        except (TypeError, ValueError, OverflowError):
+            rpm_band = "unknown"
+        else:
+            rpm_band = (
+                str(int(math.floor(rpm_value / 100.0) * 100))
+                if math.isfinite(rpm_value)
+                else "unknown"
+            )
+    return f"{row.get('site_id')}:{row.get('asset_id')}:rpm-{rpm_band}"
+
+
+def _assign_dataset_splits(
+    rows: list[dict[str, Any]],
+    split: dict[str, float],
+    *,
+    require_complete: bool,
+) -> None:
+    group_keys = sorted(
+        {_dataset_group_key(row) for row in rows},
+        key=lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest(),
+    )
+    positive_splits = [
+        name for name in ("train", "validation", "test") if split[name] > 0
+    ]
+    if require_complete and len(group_keys) < len(positive_splits):
+        raise ApiError(
+            400,
+            "INVALID_DATASET_SPLIT",
+            "The snapshot must contain enough operating-condition groups for every positive split.",
+        )
+
+    assignments: dict[str, str] = {}
+    if len(group_keys) >= len(positive_splits):
+        target_counts = {name: 1 for name in positive_splits}
+        remaining = len(group_keys) - len(positive_splits)
+        if remaining:
+            weighted = {
+                name: remaining
+                * split[name]
+                / sum(split[item] for item in positive_splits)
+                for name in positive_splits
+            }
+            for name in positive_splits:
+                target_counts[name] += int(math.floor(weighted[name]))
+            unassigned = len(group_keys) - sum(target_counts.values())
+            ranked = sorted(
+                positive_splits,
+                key=lambda name: (
+                    weighted[name] - math.floor(weighted[name]),
+                    split[name],
+                ),
+                reverse=True,
+            )
+            for name in ranked[:unassigned]:
+                target_counts[name] += 1
+        offset = 0
+        for name in positive_splits:
+            for group_key in group_keys[offset : offset + target_counts[name]]:
+                assignments[group_key] = name
+            offset += target_counts[name]
+    else:
+        assignments = {
+            group_key: _split_for_group(group_key, split) for group_key in group_keys
+        }
+
+    for row in rows:
+        row["dataset_split"] = assignments[_dataset_group_key(row)]
+
+    if require_complete:
+        populated = {row["dataset_split"] for row in rows}
+        missing = [name for name in positive_splits if name not in populated]
+        if missing:
+            raise ApiError(
+                400,
+                "INVALID_DATASET_SPLIT",
+                "The snapshot leaves positive dataset splits empty: "
+                + ", ".join(missing),
+            )
 
 
 def _event_for_dataset_point(
@@ -4706,6 +4853,26 @@ def _dataset_snapshot_key(site_id: str, asset_id: str) -> str:
     return f"{site_id}:{asset_id}"
 
 
+def _dataset_site_ids(dataset: dict[str, Any]) -> list[str]:
+    if (
+        str(dataset.get("source", {}).get("type", "")).lower() != "internal"
+        or dataset.get("source", {}).get("uri") != "api://telemetry"
+    ):
+        return []
+    source_filters = dataset.get("sourceFilters") or {}
+    site_ids = set(source_filters.get("siteIds", []))
+    if source_filters.get("siteId"):
+        site_ids.add(source_filters["siteId"])
+    for asset_id in [
+        *source_filters.get("assetIds", []),
+        *([source_filters["assetId"]] if source_filters.get("assetId") else []),
+    ]:
+        site_ids.add(get_asset_by_id(asset_id)["siteId"])
+    snapshot = DATASET_SNAPSHOTS.get(dataset.get("id"), {})
+    site_ids.update(key.split(":", 1)[0] for key, rows in snapshot.items() if rows)
+    return sorted(site_ids)
+
+
 def _dataset_scope_assets(
     user: dict[str, Any], dataset: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -4753,10 +4920,6 @@ def _dataset_rows_for_points(
     asset_id: str,
     points: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    split = (
-        dataset["split"] if dataset else {"train": 0.7, "validation": 0.2, "test": 0.1}
-    )
-    group_split = _split_for_group(asset_id, split)
     asset_events = sorted(
         (item for item in EVENTS if item["assetId"] == asset_id),
         key=lambda item: item["occurredAt"],
@@ -4783,7 +4946,6 @@ def _dataset_rows_for_points(
                 "event_id": matching_event.get("id") if matching_event else None,
                 "event_label": event_label,
                 "label_taxonomy_version": label_taxonomy_version,
-                "dataset_split": group_split,
             }
         )
     return rows
@@ -4801,7 +4963,7 @@ def _freeze_internal_dataset_snapshot(
             None,
             None,
         )
-        points = telemetry_for(
+        points = _stored_telemetry_for(
             asset["siteId"],
             asset["id"],
             from_timestamp=from_timestamp,
@@ -4814,6 +4976,15 @@ def _freeze_internal_dataset_snapshot(
                 asset["id"],
                 points,
             )
+        )
+    snapshot_rows = [
+        row for scope_key in sorted(snapshot) for row in snapshot[scope_key]
+    ]
+    if snapshot_rows:
+        _assign_dataset_splits(
+            snapshot_rows,
+            dataset["split"],
+            require_complete=True,
         )
     return snapshot
 
@@ -4875,7 +5046,6 @@ def dataset_export_for(
     split = (
         dataset["split"] if dataset else {"train": 0.7, "validation": 0.2, "test": 0.1}
     )
-    group_split = _split_for_group(asset["id"], split)
     if dataset:
         snapshot = DATASET_SNAPSHOTS.get(dataset["id"])
         if snapshot is None:
@@ -4901,6 +5071,7 @@ def dataset_export_for(
             to_timestamp=to_timestamp,
         )
         rows = _dataset_rows_for_points(None, site["id"], asset["id"], points)
+        _assign_dataset_splits(rows, split, require_complete=False)
         source_record_count = len(points)
     split_counts = {name: 0 for name in ("train", "validation", "test")}
     for row in rows:
@@ -4909,6 +5080,7 @@ def dataset_export_for(
         json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     export_checksum = f"sha256:{checksum}"
+    populated_splits = [name for name, count in split_counts.items() if count]
     source = (
         copy_payload(dataset["source"])
         if dataset
@@ -4946,8 +5118,8 @@ def dataset_export_for(
         "normalizedRecordCount": len(rows),
         "splitCounts": split_counts,
         "split": split,
-        "splitPolicy": "asset_grouped",
-        "assignedSplit": group_split,
+        "splitPolicy": DATASET_SPLIT_POLICY,
+        "assignedSplit": populated_splits[0] if len(populated_splits) == 1 else None,
         "checksum": export_checksum,
         "generatedAt": dataset["frozenAt"] if dataset else now_iso(),
     }

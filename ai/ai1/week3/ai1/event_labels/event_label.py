@@ -63,8 +63,11 @@ def apply_label_change(
             "changed_by는 공백이 아닌 문자열이어야 합니다 (감사 추적을 위해 변경자를 "
             "식별할 수 있어야 함)."
         )
-    if not reason or not reason.strip():
-        raise ValueError("reason은 필수입니다 (빈 문자열/공백만 있는 값은 허용하지 않음).")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(
+            "reason은 공백이 아닌 문자열이어야 합니다 (빈 문자열/공백만 있는 값이나 "
+            "숫자·list 등 비문자열 값은 허용하지 않음)."
+        )
     if new_note is not None:
         if not isinstance(new_note, str):
             raise ValueError("note는 문자열이어야 합니다.")

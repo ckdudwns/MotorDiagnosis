@@ -129,6 +129,41 @@ class TestBuildEventDetailSynthetic(unittest.TestCase):
                 window_duration_sec=0.2,
             )
 
+    def test_zero_window_seconds_rejected(self):
+        """0을 넣으면 max(1, ceil(...))이 조용히 1개 윈도우 요청으로 바꿔 응답의
+        요청값과 실제 계산이 어긋나므로, 미리 명확한 오류로 거부해야 한다."""
+        windows = _fixture_windows([0.0] * 5)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index=2,
+                window_seconds=0,
+                window_duration_sec=0.2,
+            )
+
+    def test_negative_window_seconds_rejected(self):
+        windows = _fixture_windows([0.0] * 5)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index=2,
+                window_seconds=-1.0,
+                window_duration_sec=0.2,
+            )
+
+    def test_nan_window_seconds_rejected(self):
+        windows = _fixture_windows([0.0] * 5)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index=2,
+                window_seconds=float("nan"),
+                window_duration_sec=0.2,
+            )
+
     def test_empty_ordered_windows_raises(self):
         with self.assertRaises(ValueError):
             build_event_detail(

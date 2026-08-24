@@ -147,6 +147,27 @@ class TestApplyLabelChange(unittest.TestCase):
                 _sample_event(), new_label="confirmed_anomaly", changed_by="op", reason="   "
             )
 
+    def test_numeric_reason_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(), new_label="confirmed_anomaly", changed_by="op", reason=123
+            )
+
+    def test_list_reason_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(),
+                new_label="confirmed_anomaly",
+                changed_by="op",
+                reason=["사유"],
+            )
+
+    def test_none_reason_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(), new_label="confirmed_anomaly", changed_by="op", reason=None
+            )
+
     def test_note_too_long_rejected(self):
         with self.assertRaises(ValueError):
             apply_label_change(

@@ -26,8 +26,10 @@ from register_dataset import (  # noqa: E402
     build_manifest,
     group_split,
     compute_version_checksum,
+    validate_split_ratios,
     sha256_of_file,
     DATASET_LABEL_MAPPING,
+    LABEL_TAXONOMY_VERSION,
     InsufficientAssetGroupsError,
 )
 from export_dataset import export_dataset  # noqa: E402
@@ -121,22 +123,102 @@ class TestComputeVersionChecksum(unittest.TestCase):
     def _files(self):
         return {"97.mat": {"sha256": "sha256:aaa", "label": "NORMAL"}}
 
+    def _checksum(self, **overrides):
+        kwargs = dict(
+            source_files=self._files(),
+            window_size=2048,
+            hop_size=2048,
+            split_ratios={"train": 1.0},
+            seed=42,
+            label_taxonomy_version=LABEL_TAXONOMY_VERSION,
+            label_mapping=DATASET_LABEL_MAPPING,
+        )
+        kwargs.update(overrides)
+        return compute_version_checksum(**kwargs)
+
     def test_deterministic_given_same_inputs(self):
-        a = compute_version_checksum(self._files(), 2048, 2048, {"train": 1.0}, 42)
-        b = compute_version_checksum(self._files(), 2048, 2048, {"train": 1.0}, 42)
-        self.assertEqual(a, b)
+        self.assertEqual(self._checksum(), self._checksum())
 
     def test_changes_when_window_size_changes(self):
-        base = compute_version_checksum(self._files(), 2048, 2048, {"train": 1.0}, 42)
-        changed = compute_version_checksum(self._files(), 4096, 2048, {"train": 1.0}, 42)
-        self.assertNotEqual(base, changed)
+        self.assertNotEqual(self._checksum(), self._checksum(window_size=4096))
 
     def test_changes_when_split_ratios_change(self):
-        base = compute_version_checksum(self._files(), 2048, 2048, {"train": 1.0}, 42)
-        changed = compute_version_checksum(
-            self._files(), 2048, 2048, {"train": 0.5, "test": 0.5}, 42
-        )
-        self.assertNotEqual(base, changed)
+        changed = self._checksum(split_ratios={"train": 0.5, "test": 0.5})
+        self.assertNotEqual(self._checksum(), changed)
+
+    def test_changes_when_label_taxonomy_version_changes(self):
+        changed = self._checksum(label_taxonomy_version="CWRU-FAULT-V2")
+        self.assertNotEqual(self._checksum(), changed)
+
+    def test_changes_when_label_mapping_changes(self):
+        """DATASET_LABEL_MAPPING을 재정의(예: NORMAL -> ANOMALY)해 정규화 결과가
+        바뀌면, 원본 파일/window/hop/분할/seed가 같아도 체크섬이 달라져야 한다 —
+        그래야 같은 id가 서로 다른 학습 데이터를 가리키는 상황을 막을 수 있다."""
+        relabeled = dict(DATASET_LABEL_MAPPING)
+        relabeled["NORMAL"] = "ANOMALY"
+        changed = self._checksum(label_mapping=relabeled)
+        self.assertNotEqual(self._checksum(), changed)
+
+
+class TestValidateSplitRatios(unittest.TestCase):
+    def test_default_ratios_are_valid(self):
+        validate_split_ratios({"train": 0.7, "validation": 0.2, "test": 0.1})
+
+    def test_missing_key_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_split_ratios({"train": 0.8, "validation": 0.2})
+
+    def test_sum_greater_than_one_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_split_ratios({"train": 0.8, "validation": 0.3, "test": 0.1})
+
+    def test_sum_less_than_one_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_split_ratios({"train": 0.5, "validation": 0.2, "test": 0.1})
+
+    def test_all_zero_rejected_instead_of_raising_max_iterable_empty(self):
+        with self.assertRaises(ValueError):
+            validate_split_ratios({"train": 0.0, "validation": 0.0, "test": 0.0})
+
+    def test_negative_ratio_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_split_ratios({"train": 1.2, "validation": -0.1, "test": -0.1})
+
+    def test_ratio_above_one_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_split_ratios({"train": 1.5, "validation": -0.5, "test": 0.0})
+
+    def test_non_numeric_ratio_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_split_ratios({"train": "0.7", "validation": 0.2, "test": 0.1})
+
+    def test_bool_ratio_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_split_ratios({"train": True, "validation": 0.0, "test": 0.0})
+
+    def test_nan_ratio_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_split_ratios({"train": float("nan"), "validation": 0.2, "test": 0.1})
+
+    def test_group_split_rejects_invalid_ratios_before_max_call(self):
+        """전부 0인 비율은 InsufficientAssetGroupsError(그룹 부족)가 아니라,
+        group_split 내부의 max() 빈 시퀀스 오류보다 먼저 명확한 입력 검증
+        오류로 걸러져야 한다."""
+        records = _grouped_records("NORMAL", {"a.mat": 10, "b.mat": 10})
+        with self.assertRaises(ValueError) as ctx:
+            group_split(
+                records, ratios={"train": 0.0, "validation": 0.0, "test": 0.0}, seed=1
+            )
+        self.assertNotIsInstance(ctx.exception, InsufficientAssetGroupsError)
+
+    def test_build_manifest_rejects_invalid_ratios_before_loading_data(self):
+        """CWRU 실데이터 유무와 무관하게, build_manifest는 데이터 로딩보다 먼저
+        split_ratios를 검증해야 한다 (data_dir이 없어도 ValueError가 나야 함)."""
+        with self.assertRaises(ValueError):
+            build_manifest(
+                data_dir=os.path.join(_THIS_DIR, "__no_such_dir__"),
+                split_ratios={"train": 0.8, "validation": 0.3, "test": 0.1},
+            )
 
 
 class TestExportDatasetSynthetic(unittest.TestCase):

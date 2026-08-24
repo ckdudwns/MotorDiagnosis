@@ -14,6 +14,7 @@ CWRU Bearing Dataset(1주차 인계 경로의 .mat 4개)을 API 명세서 v1.2
 import os
 import sys
 import json
+import math
 import random
 import hashlib
 import argparse
@@ -112,6 +113,38 @@ class InsufficientAssetGroupsError(ValueError):
     그룹을 쪼개지 않고는(=리크 없이는) 분할을 만들 수 없을 때 발생한다."""
 
 
+_REQUIRED_SPLIT_KEYS = ("train", "validation", "test")
+
+
+def validate_split_ratios(ratios: dict) -> None:
+    """분할 비율의 키/타입/범위/합계를 매니페스트 생성 전에 검증한다.
+
+    예를 들어 {train: 0.8, validation: 0.3, test: 0.1}처럼 합이 1.0이 아니면
+    조용히 통과시키지 않고, 전부 0이면(group_split 내부에서 `max() iterable is
+    empty`로 불명확하게 죽는 대신) 여기서 먼저 명확한 입력 오류로 거부한다.
+    합이 1.0이면 range(0~1) 검증과 합쳐 최소 하나는 항상 양수임이 보장된다.
+    """
+    if not isinstance(ratios, dict):
+        raise ValueError(f"split_ratios는 dict여야 합니다: {ratios!r}")
+
+    missing = [key for key in _REQUIRED_SPLIT_KEYS if key not in ratios]
+    if missing:
+        raise ValueError(f"split_ratios에 필수 키가 없습니다: {missing}")
+
+    for key in _REQUIRED_SPLIT_KEYS:
+        value = ratios[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"split_ratios[{key!r}]는 숫자여야 합니다: {value!r}")
+        if not math.isfinite(value):
+            raise ValueError(f"split_ratios[{key!r}]는 유한한 값이어야 합니다: {value!r}")
+        if not (0 <= value <= 1):
+            raise ValueError(f"split_ratios[{key!r}]는 0~1 범위여야 합니다: {value!r}")
+
+    total = sum(ratios[key] for key in _REQUIRED_SPLIT_KEYS)
+    if not math.isclose(total, 1.0, rel_tol=0, abs_tol=1e-6):
+        raise ValueError(f"split_ratios 합계는 1.0이어야 합니다 (현재 {total}): {ratios!r}")
+
+
 def group_split(
     records: list, ratios: dict = None, seed: int = 42, group_key: str = "source_label"
 ) -> list:
@@ -132,6 +165,7 @@ def group_split(
     분할 비율을 조정해야 해소된다.
     """
     ratios = ratios or DEFAULT_SPLIT_RATIOS
+    validate_split_ratios(ratios)
     required_splits = [
         name for name in ("train", "validation", "test") if ratios.get(name, 0) > 0
     ]
@@ -189,12 +223,16 @@ def compute_version_checksum(
     hop_size: int,
     split_ratios: dict,
     seed: int,
+    label_taxonomy_version: str,
+    label_mapping: dict,
 ) -> str:
-    """원본 파일 체크섬 + 전처리/분할 설정으로 불변 버전 체크섬을 만든다.
+    """원본 파일 체크섬 + 전처리/분할/라벨 정규화 설정으로 불변 버전 체크섬을 만든다.
 
-    입력 파일 구성, window/hop 크기, 분할 비율, seed 중 하나라도 달라지면
-    다른 체크섬이 나와야 같은 날짜에 생성된 서로 다른 데이터셋 버전이
-    동일 ID로 충돌하는 것을 막을 수 있다.
+    입력 파일 구성, window/hop 크기, 분할 비율, seed, label taxonomy 버전,
+    label mapping 중 하나라도 달라지면 다른 체크섬이 나와야 같은 날짜에 생성된
+    서로 다른 데이터셋 버전이 동일 ID로 충돌하는 것을 막을 수 있다. label
+    mapping을 빼면 정규화 결과(common_label)만 바뀐 버전이 원본 파일·분할
+    설정이 같다는 이유로 이전 버전과 동일한 checksum/id를 갖게 된다.
     """
     payload = {
         "files": {name: info["sha256"] for name, info in sorted(source_files.items())},
@@ -202,6 +240,8 @@ def compute_version_checksum(
         "hop_size": hop_size,
         "split_ratios": {name: split_ratios[name] for name in sorted(split_ratios)},
         "seed": seed,
+        "label_taxonomy_version": label_taxonomy_version,
+        "label_mapping": {name: label_mapping[name] for name in sorted(label_mapping)},
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
@@ -216,6 +256,7 @@ def build_manifest(
 ) -> dict:
     """CWRU 데이터를 로드해 DATA_EXPORT_01 매니페스트(dict)를 만든다."""
     split_ratios = split_ratios or DEFAULT_SPLIT_RATIOS
+    validate_split_ratios(split_ratios)
 
     records = load_cwru_dataset(data_dir, window_size=window_size, hop_size=hop_size)
     if not records:
@@ -223,7 +264,13 @@ def build_manifest(
 
     source = build_source_block(data_dir)
     version_checksum = compute_version_checksum(
-        source["files"], window_size, hop_size, split_ratios, seed
+        source["files"],
+        window_size,
+        hop_size,
+        split_ratios,
+        seed,
+        LABEL_TAXONOMY_VERSION,
+        DATASET_LABEL_MAPPING,
     )
     source["checksum"] = version_checksum
     compatibility = build_compatibility_block(records)

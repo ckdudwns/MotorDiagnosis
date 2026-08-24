@@ -53,6 +53,13 @@ MIMII 음향 데이터는 이 저장소에 실제 파일이 배치돼 있지 않
 `export_dataset.py`가 `dataset_manifest.json`(GET 응답 형태) + `dataset_rows.csv` +
 `dataset_export.xlsx`(manifest/rows 2개 시트)로 내보낸다.
 
+**XLSX 내보내기는 루트 `requirements.txt`에 없는 `openpyxl`이 필요하다** — 실행·테스트
+전에 이 폴더의 의존성을 추가로 설치해야 한다:
+
+```bash
+python -m pip install -r ai/ai1/week3/ai1/requirements.txt
+```
+
 - 원본 파일별 SHA-256 체크섬을 매니페스트에 기록해 원본 추적 가능 — 원본 체크섬들 +
   window/hop 크기 + 분할 비율 + seed로 만든 불변 버전 체크섬(`source.checksum`)을 데이터셋
   `id`에도 반영해, 같은 날짜에 입력·설정이 다른 버전이 같은 ID로 충돌하지 않도록 했다

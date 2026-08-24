@@ -71,6 +71,15 @@ def build_event_detail(
     """이벤트 전후 구간을 비교하는 EVENT_DETAIL_01 응답 dict를 만든다."""
     if window_duration_sec <= 0:
         raise ValueError("window_duration_sec은 0보다 커야 합니다.")
+    if (
+        isinstance(window_seconds, bool)
+        or not isinstance(window_seconds, (int, float))
+        or not math.isfinite(window_seconds)
+        or window_seconds <= 0
+    ):
+        # 0/음수/NaN을 넣으면 max(1, ceil(...))이 조용히 1개 윈도우 요청으로
+        # 바꿔버려 응답의 요청값과 실제 계산이 어긋난다 — 여기서 먼저 거부한다.
+        raise ValueError(f"window_seconds는 0보다 큰 유한한 숫자여야 합니다: {window_seconds!r}")
     if not ordered_windows or not (0 <= event_index < len(ordered_windows)):
         raise ValueError(
             f"event_index({event_index})가 ordered_windows 범위(0~{len(ordered_windows) - 1})를 "

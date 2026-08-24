@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import threading
 import unittest
@@ -221,6 +222,49 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(
             exported["manifest"]["sourceFilters"],
             {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"},
+        )
+
+    def test_frozen_dataset_export_is_unchanged_after_new_telemetry(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        TELEMETRY_RECORDS.append(
+            self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=10)), 1)
+        )
+        dataset = create_dataset_version(
+            self.admin,
+            self.dataset_payload(
+                checksum="sha256:frozen-dataset-regression",
+                source_filters={
+                    "siteId": "SITE-01",
+                    "assetId": "SITE-01-MOT-02",
+                },
+                label_mapping={"needs_review": "BEARING_SUSPECT"},
+            ),
+        )
+        first_export = dataset_export_for(
+            self.admin,
+            "SITE-01",
+            "SITE-01-MOT-02",
+            dataset_id=dataset["id"],
+        )
+
+        TELEMETRY_RECORDS.append(
+            self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=20)), 2)
+        )
+        event["label"] = "sensor_issue"
+        second_export = dataset_export_for(
+            self.admin,
+            "SITE-01",
+            "SITE-01-MOT-02",
+            dataset_id=dataset["id"],
+        )
+
+        self.assertEqual(first_export["rows"], second_export["rows"])
+        self.assertEqual(first_export["manifest"], second_export["manifest"])
+        self.assertEqual(first_export["manifest"]["recordCount"], 1)
+        self.assertEqual(dataset["snapshotRecordCount"], 1)
+        self.assertEqual(
+            dataset["snapshotChecksum"], first_export["manifest"]["checksum"]
         )
 
     def test_dataset_export_rejects_site_outside_source_filters(self) -> None:
@@ -650,6 +694,44 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertNotIn(dataset_payload["source"]["uri"], csv_text)
         self.assertTrue(headers["x-dataset-checksum"].startswith("sha256:"))
         self.assertGreater(int(headers["x-dataset-record-count"]), 0)
+
+        internal_payload = json.loads(json.dumps(dataset_payload))
+        internal_payload["name"] = "internal-filtered-telemetry-v1"
+        internal_payload["source"] = {
+            "type": "internal",
+            "uri": "api://telemetry",
+            "license": "project-internal",
+            "checksum": "sha256:week3-internal-filtered-v1",
+        }
+        internal_payload["sourceFilters"] = {
+            "siteId": "SITE-01",
+            "assetId": "SITE-01-GEN-01",
+        }
+        internal_payload["labelMapping"] = {"needs_review": "BEARING_SUSPECT"}
+        status, internal_dataset = self.request(
+            "/api/datasets",
+            method="POST",
+            payload=internal_payload,
+            token=self.admin_token,
+        )
+        self.assertEqual(status, 201)
+
+        status, filtered_csv_body, _ = self.request_raw(
+            "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01"
+            f"&datasetId={internal_dataset['id']}&format=csv",
+            token=self.operator_token,
+        )
+        self.assertEqual(status, 200)
+        filtered_csv = filtered_csv_body.decode("utf-8-sig")
+        reader = csv.DictReader(filtered_csv.splitlines())
+        first_row = next(reader)
+        self.assertIn("dataset_id", reader.fieldnames or [])
+        self.assertIn("source_filters", reader.fieldnames or [])
+        self.assertEqual(first_row["dataset_id"], internal_dataset["id"])
+        self.assertEqual(
+            json.loads(first_row["source_filters"]),
+            internal_payload["sourceFilters"],
+        )
 
         status, not_implemented = self.request(
             "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01&format=xlsx",

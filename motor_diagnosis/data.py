@@ -898,6 +898,7 @@ EVENT_REVIEW_HISTORY: list[dict[str, Any]] = []
 AUDIT_LOGS: list[dict[str, Any]] = []
 ENVIRONMENT_INSPECTIONS: list[dict[str, Any]] = []
 DATASET_VERSIONS: list[dict[str, Any]] = []
+DATASET_SNAPSHOTS: dict[str, dict[str, list[dict[str, Any]]]] = {}
 ACOUSTIC_TAXONOMY_VERSIONS: list[dict[str, Any]] = [
     {
         "version": "ACOUSTIC-V1",
@@ -944,6 +945,7 @@ def reset_runtime_state() -> None:
         AUDIT_LOGS.clear()
         ENVIRONMENT_INSPECTIONS.clear()
         DATASET_VERSIONS.clear()
+        DATASET_SNAPSHOTS.clear()
         ACOUSTIC_TAXONOMY_VERSIONS[:] = [
             {
                 "version": "ACOUSTIC-V1",
@@ -4466,6 +4468,7 @@ def create_dataset_version(
                 "DATASET_CHECKSUM_EXISTS",
                 "A dataset version with the same checksum is already registered.",
             )
+        created_at = now_iso()
         record = {
             "id": f"DATASET-{len(DATASET_VERSIONS) + 1:05d}",
             "name": name,
@@ -4479,9 +4482,28 @@ def create_dataset_version(
             "status": "frozen",
             "artifactRefs": [],
             "reason": reason,
-            "createdAt": now_iso(),
+            "createdAt": created_at,
+            "frozenAt": created_at,
+            "snapshotRecordCount": None,
+            "snapshotChecksum": None,
             "createdBy": user["id"],
         }
+        if (
+            str(source.get("type", "")).lower() == "internal"
+            and source.get("uri") == "api://telemetry"
+        ):
+            snapshot = _freeze_internal_dataset_snapshot(user, record)
+            snapshot_rows = [
+                row for scope_key in sorted(snapshot) for row in snapshot[scope_key]
+            ]
+            snapshot_checksum = hashlib.sha256(
+                json.dumps(snapshot_rows, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            record["snapshotRecordCount"] = len(snapshot_rows)
+            record["snapshotChecksum"] = f"sha256:{snapshot_checksum}"
+            DATASET_SNAPSHOTS[record["id"]] = snapshot
         DATASET_VERSIONS.append(record)
         append_audit_log(
             user,
@@ -4617,6 +4639,133 @@ def _dataset_label_for_event(
     return mapped_label, dataset["labelTaxonomyVersion"]
 
 
+def _dataset_snapshot_key(site_id: str, asset_id: str) -> str:
+    return f"{site_id}:{asset_id}"
+
+
+def _dataset_scope_assets(
+    user: dict[str, Any], dataset: dict[str, Any]
+) -> list[dict[str, Any]]:
+    source_filters = dataset.get("sourceFilters") or {}
+    site_ids = set(source_filters.get("siteIds", []))
+    if source_filters.get("siteId"):
+        site_ids.add(source_filters["siteId"])
+    asset_ids = set(source_filters.get("assetIds", []))
+    if source_filters.get("assetId"):
+        asset_ids.add(source_filters["assetId"])
+
+    for site_id in site_ids:
+        get_site(site_id)
+        require_site_access(user, site_id)
+    for asset_id in asset_ids:
+        asset = get_asset_by_id(asset_id)
+        require_site_access(user, asset["siteId"])
+
+    allowed_site_ids = user.get("allowedSiteIds", [])
+    assets = [
+        asset
+        for asset in ASSETS
+        if (not site_ids or asset["siteId"] in site_ids)
+        and (not asset_ids or asset["id"] in asset_ids)
+        and ("*" in allowed_site_ids or asset["siteId"] in allowed_site_ids)
+    ]
+    if not assets:
+        raise ApiError(
+            400,
+            "EMPTY_DATASET_SCOPE",
+            "sourceFilters do not select any accessible assets.",
+        )
+    return sorted(assets, key=lambda item: (item["siteId"], item["id"]))
+
+
+def _dataset_rows_for_points(
+    dataset: dict[str, Any] | None,
+    site_id: str,
+    asset_id: str,
+    points: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    split = (
+        dataset["split"] if dataset else {"train": 0.7, "validation": 0.2, "test": 0.1}
+    )
+    group_split = _split_for_group(asset_id, split)
+    asset_events = sorted(
+        (item for item in EVENTS if item["assetId"] == asset_id),
+        key=lambda item: item["occurredAt"],
+        reverse=True,
+    )
+    rows = []
+    for point in points:
+        matching_event = _event_for_dataset_point(asset_events, point.get("timestamp"))
+        event_label, label_taxonomy_version = _dataset_label_for_event(
+            dataset, matching_event
+        )
+        rows.append(
+            {
+                "site_id": site_id,
+                "asset_id": asset_id,
+                "device_id": point.get("deviceId"),
+                "timestamp": point.get("timestamp"),
+                "sequence": point.get("sequence"),
+                "vibration_rms_raw": point.get("vibrationRmsRaw"),
+                "vibration_rms_mm_s": point.get("vibrationRmsMmS"),
+                "acoustic_rms_raw": point.get("acousticRmsRaw"),
+                "acoustic_db": point.get("acousticDb"),
+                "rpm": point.get("rpm"),
+                "event_id": matching_event.get("id") if matching_event else None,
+                "event_label": event_label,
+                "label_taxonomy_version": label_taxonomy_version,
+                "dataset_split": group_split,
+            }
+        )
+    return rows
+
+
+def _freeze_internal_dataset_snapshot(
+    user: dict[str, Any], dataset: dict[str, Any]
+) -> dict[str, list[dict[str, Any]]]:
+    snapshot = {}
+    for asset in _dataset_scope_assets(user, dataset):
+        from_timestamp, to_timestamp = _dataset_export_window(
+            dataset,
+            asset["siteId"],
+            asset["id"],
+            None,
+            None,
+        )
+        points = telemetry_for(
+            asset["siteId"],
+            asset["id"],
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+        )
+        snapshot[_dataset_snapshot_key(asset["siteId"], asset["id"])] = (
+            _dataset_rows_for_points(
+                dataset,
+                asset["siteId"],
+                asset["id"],
+                points,
+            )
+        )
+    return snapshot
+
+
+def _rows_in_time_range(
+    rows: list[dict[str, Any]],
+    from_timestamp: str | None,
+    to_timestamp: str | None,
+) -> list[dict[str, Any]]:
+    from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
+    to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
+    return [
+        copy_payload(row)
+        for row in rows
+        if (
+            not from_value or parse_rfc3339("timestamp", row["timestamp"]) >= from_value
+        )
+        and (not to_value or parse_rfc3339("timestamp", row["timestamp"]) <= to_value)
+    ]
+
+
 def dataset_export_for(
     user: dict[str, Any],
     site_id: str,
@@ -4652,41 +4801,30 @@ def dataset_export_for(
         dataset["split"] if dataset else {"train": 0.7, "validation": 0.2, "test": 0.1}
     )
     group_split = _split_for_group(asset["id"], split)
-    points = telemetry_for(
-        site["id"],
-        asset["id"],
-        from_timestamp=from_timestamp,
-        to_timestamp=to_timestamp,
-    )
-    asset_events = sorted(
-        (item for item in EVENTS if item["assetId"] == asset["id"]),
-        key=lambda item: item["occurredAt"],
-        reverse=True,
-    )
-    rows = []
-    for point in points:
-        matching_event = _event_for_dataset_point(asset_events, point.get("timestamp"))
-        event_label, label_taxonomy_version = _dataset_label_for_event(
-            dataset, matching_event
+    if dataset:
+        snapshot = DATASET_SNAPSHOTS.get(dataset["id"])
+        if snapshot is None:
+            raise ApiError(
+                409,
+                "DATASET_SNAPSHOT_NOT_FOUND",
+                "The frozen dataset snapshot is unavailable.",
+            )
+        snapshot_key = _dataset_snapshot_key(site["id"], asset["id"])
+        if snapshot_key not in snapshot:
+            raise ApiError(
+                409,
+                "DATASET_SOURCE_FILTER_MISMATCH",
+                "The requested asset was not part of the frozen dataset snapshot.",
+            )
+        rows = _rows_in_time_range(snapshot[snapshot_key], from_timestamp, to_timestamp)
+    else:
+        points = telemetry_for(
+            site["id"],
+            asset["id"],
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
         )
-        rows.append(
-            {
-                "site_id": site["id"],
-                "asset_id": asset["id"],
-                "device_id": point.get("deviceId"),
-                "timestamp": point.get("timestamp"),
-                "sequence": point.get("sequence"),
-                "vibration_rms_raw": point.get("vibrationRmsRaw"),
-                "vibration_rms_mm_s": point.get("vibrationRmsMmS"),
-                "acoustic_rms_raw": point.get("acousticRmsRaw"),
-                "acoustic_db": point.get("acousticDb"),
-                "rpm": point.get("rpm"),
-                "event_id": matching_event.get("id") if matching_event else None,
-                "event_label": event_label,
-                "label_taxonomy_version": label_taxonomy_version,
-                "dataset_split": group_split,
-            }
-        )
+        rows = _dataset_rows_for_points(None, site["id"], asset["id"], points)
     checksum = hashlib.sha256(
         json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -4728,6 +4866,6 @@ def dataset_export_for(
         "splitPolicy": "asset_grouped",
         "assignedSplit": group_split,
         "checksum": export_checksum,
-        "generatedAt": now_iso(),
+        "generatedAt": dataset["frozenAt"] if dataset else now_iso(),
     }
     return {"manifest": manifest, "rows": rows}

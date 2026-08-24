@@ -877,6 +877,13 @@ class AppHandler(BaseHTTPRequestHandler):
             rows.append(
                 {
                     **item,
+                    "dataset_id": manifest.get("datasetId"),
+                    "source_filters": json.dumps(
+                        manifest.get("sourceFilters"),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                     "manifest_checksum": manifest["checksum"],
                     "source_uri": manifest["source"].get("uri"),
                     "source_license": manifest["source"].get("license"),
@@ -923,6 +930,8 @@ class AppHandler(BaseHTTPRequestHandler):
             "event_label",
             "label_taxonomy_version",
             "dataset_split",
+            "dataset_id",
+            "source_filters",
             "manifest_checksum",
             "source_uri",
             "source_license",

@@ -77,7 +77,7 @@ def render_page() -> str:
       <section class="grid">
         <article class="panel">
           <h2>Site Summary</h2>
-          <table><thead><tr><th>Site</th><th>Network</th><th>Status</th><th>Devices</th></tr></thead><tbody id="siteRows"></tbody></table>
+          <table><thead><tr><th>Site</th><th>Region</th><th>Status</th><th>Normal</th><th>Warning</th><th>Critical</th><th>Unreviewed</th><th>Last received</th><th>Devices</th></tr></thead><tbody id="siteRows"></tbody></table>
         </article>
         <article class="panel">
           <h2 id="chartTitle">Telemetry</h2>
@@ -156,7 +156,7 @@ def render_page() -> str:
       const from = new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString();
       const telem = await api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
       siteSummaries = await api("/api/dashboard/sites-summary");
-      events = await api("/api/events");
+      events = await api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
       $("siteCount").textContent = siteSummaries.length;
       $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
       $("warningAssets").textContent = siteSummaries.reduce((n, s) => n + s.warningAssets, 0);
@@ -180,7 +180,7 @@ def render_page() -> str:
       const body = $("siteRows");
       body.replaceChildren(...siteSummaries.slice(0, 12).map(site => {
         const row = document.createElement("tr");
-        for (const value of [site.siteName, site.region, site.status, `${site.onlineDevices}/${site.totalDevices}`]) {
+        for (const value of [site.siteName, site.region, site.status, site.normalAssets, site.warningAssets, site.criticalAssets, site.unreviewedEvents, site.lastReceivedAt || "-", `${site.onlineDevices}/${site.totalDevices}`]) {
           const cell = document.createElement("td");
           cell.textContent = value;
           row.appendChild(cell);
@@ -217,6 +217,12 @@ def render_page() -> str:
       latestUnits = units;
       const c = $("chart"), ctx = c.getContext("2d"), w = c.width, h = c.height, pad = 34;
       ctx.clearRect(0,0,w,h); ctx.fillStyle = "#fff"; ctx.fillRect(0,0,w,h);
+      if (!points.length) {
+        ctx.fillStyle = "#66716d"; ctx.font = "16px Segoe UI";
+        ctx.fillText("No telemetry is available for the selected period.", pad, h / 2);
+        $("chartHint").textContent = "No telemetry is available for the selected site, asset, and period.";
+        return;
+      }
       ctx.strokeStyle = "#d8ded9"; ctx.lineWidth = 1;
       for (let i=0;i<=4;i++){ const y=pad+(h-pad*2)/4*i; ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(w-pad,y); ctx.stroke(); }
       const series = [
@@ -242,6 +248,13 @@ def render_page() -> str:
           if (started) ctx.lineTo(x,y); else { ctx.moveTo(x,y); started = true; }
         });
         ctx.stroke();
+        if (values.length === 1) {
+          const pointIndex = points.findIndex(point => map(point) !== null);
+          const value = map(points[pointIndex]);
+          const x = pad + (w-pad*2)*pointIndex/Math.max(1, points.length-1);
+          const y = pad + (h-pad*2)*(1-(value-min)/range);
+          ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
+        }
         ctx.fillStyle = color; ctx.font = "12px Segoe UI"; ctx.fillText(name, legendX, 18); legendX += ctx.measureText(name).width + 16;
       }
       $("chartHint").textContent = "Signals are independently scaled for comparison. Hover for raw values and score evidence.";

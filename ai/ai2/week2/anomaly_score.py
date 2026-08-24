@@ -83,15 +83,16 @@ def score_telemetry_point(
     deviation_sigma = abs(value - mean) / std
     excess_sigma = max(0.0, deviation_sigma - sigma_multiplier)
     score = min(100.0, excess_sigma / sigma_multiplier * 100.0)
-    if score >= 75:
+    rounded_score = round(score)
+    if rounded_score >= 75:
         status = "critical"
-    elif score >= 50:
+    elif rounded_score >= 50:
         status = "warning"
     else:
         status = "normal"
 
     return {
-        "anomalyScore": round(score),
+        "anomalyScore": rounded_score,
         "anomalyStatus": status,
         "anomalyModel": MODEL_ID,
         "anomalyEvidence": [
@@ -115,3 +116,24 @@ def annotate_telemetry_points(
     if baseline is None:
         baseline = load_baseline()
     return [{**point, **score_telemetry_point(point, baseline)} for point in points]
+
+
+def latest_asset_statuses(
+    points: list[dict[str, Any]], baseline: dict[str, Any] | None = None
+) -> dict[str, str]:
+    """Return the latest score-derived status for each stored asset."""
+    if baseline is None:
+        baseline = load_baseline()
+    latest_by_asset: dict[str, dict[str, Any]] = {}
+    for point in points:
+        asset_id = point.get("assetId")
+        timestamp = point.get("timestamp")
+        if not isinstance(asset_id, str) or not isinstance(timestamp, str):
+            continue
+        existing = latest_by_asset.get(asset_id)
+        if existing is None or timestamp > str(existing.get("timestamp")):
+            latest_by_asset[asset_id] = point
+    return {
+        asset_id: score_telemetry_point(point, baseline)["anomalyStatus"]
+        for asset_id, point in latest_by_asset.items()
+    }

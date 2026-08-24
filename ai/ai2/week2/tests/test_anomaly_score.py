@@ -31,6 +31,15 @@ class AnomalyScoreTest(unittest.TestCase):
         self.assertEqual(result["anomalyStatus"], "critical")
         self.assertEqual(result["anomalyEvidence"][0]["deviationSigma"], 6.0)
 
+    def test_rounded_score_boundaries_match_status(self) -> None:
+        warning = score_telemetry_point({"vibrationRmsRaw": 18.976}, BASELINE)
+        critical = score_telemetry_point({"vibrationRmsRaw": 20.476}, BASELINE)
+
+        self.assertEqual(warning["anomalyScore"], 50)
+        self.assertEqual(warning["anomalyStatus"], "warning")
+        self.assertEqual(critical["anomalyScore"], 75)
+        self.assertEqual(critical["anomalyStatus"], "critical")
+
     def test_missing_raw_vibration_keeps_score_unavailable(self) -> None:
         result = score_telemetry_point({}, BASELINE)
 

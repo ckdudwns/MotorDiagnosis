@@ -1,0 +1,9 @@
+#pragma once
+
+#define WIFI_SSID_VALUE "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD_VALUE "YOUR_WIFI_PASSWORD"
+
+#define INGEST_URL_VALUE "http://YOUR_BACKEND_IP:8787/api/telemetry/ingest"
+#define HEALTH_URL_VALUE "http://YOUR_BACKEND_IP:8787/api/health"
+
+#define INGEST_TOKEN_VALUE "YOUR_INGEST_TOKEN"

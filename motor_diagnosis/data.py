@@ -779,7 +779,6 @@ def build_events() -> list[dict[str, Any]]:
             "severity": "critical",
             "eventType": "asset_anomaly_candidate",
             "title": "Cooling pump motor bearing suspect",
-            "occurredAt": iso_seconds_ago(18 * 60),
             "time": "19:42:12",
             "duration": "48s",
             "durationSec": 48,
@@ -799,7 +798,6 @@ def build_events() -> list[dict[str, Any]]:
             "severity": "warning",
             "eventType": "asset_anomaly_candidate",
             "title": "Generator acoustic spectrum drift",
-            "occurredAt": iso_seconds_ago(29 * 60),
             "time": "19:31:05",
             "duration": "31s",
             "durationSec": 31,
@@ -819,7 +817,6 @@ def build_events() -> list[dict[str, Any]]:
             "severity": "device",
             "eventType": "sensor_fault_candidate",
             "title": "Acoustic sensor noise floor fault",
-            "occurredAt": iso_seconds_ago(40 * 60),
             "time": "19:20:44",
             "duration": "8m",
             "durationSec": 480,
@@ -2850,10 +2847,7 @@ def device_health_for(device_id: str) -> dict[str, Any]:
 
 
 def dashboard_sites_summary(
-    user: dict[str, Any],
-    region: str = "",
-    status: str = "",
-    live_asset_statuses: dict[str, str] | None = None,
+    user: dict[str, Any], region: str = "", status: str = ""
 ) -> list[dict[str, Any]]:
     require_permission(user, "dashboard:read")
     rows = []
@@ -2867,30 +2861,19 @@ def dashboard_sites_summary(
         )
         site_assets = [asset for asset in ASSETS if asset["siteId"] == site["id"]]
         site_events = [event for event in EVENTS if event["siteId"] == site["id"]]
-        asset_statuses = {asset["id"]: "normal" for asset in site_assets}
-        severity_rank = {"normal": 0, "warning": 1, "critical": 2}
-        for event in site_events:
-            severity = str(event.get("severity") or "")
-            asset_id = event.get("assetId")
-            if asset_id in asset_statuses and severity in severity_rank:
-                if severity_rank[severity] > severity_rank[asset_statuses[asset_id]]:
-                    asset_statuses[asset_id] = severity
-        for asset_id, live_status in (live_asset_statuses or {}).items():
-            if asset_id in asset_statuses and live_status in severity_rank:
-                if severity_rank[live_status] > severity_rank[asset_statuses[asset_id]]:
-                    asset_statuses[asset_id] = live_status
         critical_asset_ids = {
-            asset_id
-            for asset_id, asset_status in asset_statuses.items()
-            if asset_status == "critical"
+            event["assetId"]
+            for event in site_events
+            if event.get("severity") == "critical"
         }
         warning_asset_ids = {
-            asset_id
-            for asset_id, asset_status in asset_statuses.items()
-            if asset_status == "warning"
+            event["assetId"]
+            for event in site_events
+            if event.get("severity") == "warning"
+            and event["assetId"] not in critical_asset_ids
         }
-        normal_assets = sum(
-            1 for asset_status in asset_statuses.values() if asset_status == "normal"
+        normal_assets = max(
+            0, len(site_assets) - len(critical_asset_ids) - len(warning_asset_ids)
         )
         summary_status = (
             "critical"
@@ -3274,7 +3257,6 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             "severity": "critical",
             "eventType": "asset_anomaly_candidate",
             "title": f"{asset['name']} anomaly injection event",
-            "occurredAt": now_iso(),
             "time": now_text(),
             "duration": "10s",
             "durationSec": 10,

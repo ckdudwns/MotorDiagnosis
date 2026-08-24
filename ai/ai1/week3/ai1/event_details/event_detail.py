@@ -86,6 +86,11 @@ def build_event_detail(
     # window_seconds가 0/음수/NaN이면 max(1, ceil(...))이 조용히 1개 윈도우
     # 요청으로 바꿔버려 응답의 요청값과 실제 계산이 어긋난다 — 먼저 거부한다.
     _validate_positive_finite_number("window_seconds", window_seconds)
+    if isinstance(event_index, bool) or not isinstance(event_index, int):
+        # bool은 int의 서브클래스라 True/False가 조용히 1/0 인덱스로 쓰이고,
+        # float(0.5)은 범위 비교는 통과했다가 이후 슬라이싱에서야 TypeError로
+        # 터진다 — 여기서 먼저 정수 타입인지 확실히 검증한다.
+        raise ValueError(f"event_index는 정수여야 합니다: {event_index!r}")
     if not ordered_windows or not (0 <= event_index < len(ordered_windows)):
         raise ValueError(
             f"event_index({event_index})가 ordered_windows 범위(0~{len(ordered_windows) - 1})를 "

@@ -26,7 +26,7 @@ API 명세서 v1.2의 `09_보완API상세` 시트 `POST /api/datasets`(MVP-042) 
 | `source.uri` | string | CWRU Bearing Data Center 공식 URL |
 | `source.license` | string | 라이선스/이용 조건 메모 (학술 공개, 재배포 시 출처 표기) |
 | `source.files` | object | 실제 배치된 원본 파일별 `{sha256, label}` — **체크섬으로 원본 추적** |
-| `source.checksum` | string | 원본 파일 `{sha256, label}` 전체 + window/hop 크기 + 분할 비율 + seed + labelTaxonomyVersion + labelMapping + 특징 추출 설정(FeatureConfig: sample_rate/frame_length/hop_length/n_mfcc/band_edges) + `FEATURE_PIPELINE_VERSION`으로 만든 불변 버전 체크섬(`compute_version_checksum()`) — `id`의 접미사와 동일 값. 실제 정규화 산출물(known_label/특징값)에 영향을 주는 입력을 빠짐없이 포함해야, 같은 파일 sha256에서 source label만 바뀌거나 특징 추출 설정/로직만 바뀐 경우에도 같은 id가 재사용되는 것을 막을 수 있다 |
+| `source.checksum` | string | 원본 파일 `{sha256, label}` 전체 + window/hop 크기 + 분할 비율 + seed + labelTaxonomyVersion + labelMapping + 특징 추출 설정(FeatureConfig: sample_rate/frame_length/hop_length/n_mfcc/band_edges) + `FEATURE_PIPELINE_VERSION` + **실제 산출된 특징값의 fingerprint**(`compute_feature_output_fingerprint()`)로 만든 불변 버전 체크섬(`compute_version_checksum()`) — `id`의 접미사와 동일 값. 실제 정규화 산출물(known_label/특징값)에 영향을 주는 입력을 빠짐없이 포함해야, 같은 파일 sha256에서 source label만 바뀌거나 특징 추출 설정/로직만 바뀐 경우에도 같은 id가 재사용되는 것을 막을 수 있다. fingerprint는 메타데이터가 아니라 최종 특징값 자체를 해시하므로, librosa 유무처럼 소스 코드/설정에는 드러나지 않는 실행 환경 차이(MFCC 0벡터 폴백 등)도 잡아낸다 |
 | `compatibility.signalType` | string[] | `["vibration"]` |
 | `compatibility.samplingRateHz` | number | `12000` (CWRU Drive-End 12kHz) |
 | `compatibility.units` | object | `{"vibration": "g (raw accelerometer output, uncalibrated)"}` |

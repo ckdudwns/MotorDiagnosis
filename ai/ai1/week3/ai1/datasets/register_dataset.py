@@ -231,6 +231,23 @@ def group_split(
     return [split_of_index[i] for i in range(len(records))]
 
 
+def compute_feature_output_fingerprint(rows: list) -> str:
+    """실제로 계산된 특징값 산출물 자체의 canonical hash.
+
+    week2 `extract_all_features()`의 MFCC는 librosa가 없으면 조용히 0벡터로
+    대체된다(`compute_mfcc()` fallback). 이 차이는 소스 코드/설정 어디에도
+    드러나지 않으므로, feature_pipeline_version이나 FeatureConfig만으로는
+    같은 원본에서 실제 MFCC 값과 0벡터가 나온 두 실행을 구분할 수 없다.
+    그래서 메타데이터가 아니라 **최종 산출된 특징값 자체**를 해시해, 실행
+    환경 차이로 산출물이 달라지면 반드시 체크섬도 달라지게 한다.
+    """
+    payload = [
+        {name: row[name] for name in sorted(row)} for row in rows
+    ]
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
 def compute_version_checksum(
     source_files: dict,
     window_size: int,
@@ -240,17 +257,18 @@ def compute_version_checksum(
     label_taxonomy_version: str,
     label_mapping: dict,
     feature_config: FeatureConfig,
+    feature_output_fingerprint: str,
     feature_pipeline_version: str = FEATURE_PIPELINE_VERSION,
 ) -> str:
-    """원본 파일·라벨·전처리/분할/특징 추출 설정으로 불변 버전 체크섬을 만든다.
+    """원본 파일·라벨·전처리/분할/특징 추출 설정 + 실제 산출물로 불변 버전 체크섬을 만든다.
 
     입력 파일 sha256 + **파일별 source label**, window/hop 크기, 분할 비율,
     seed, label taxonomy 버전, label mapping, 특징 추출 설정(FeatureConfig:
-    sample_rate/frame_length/hop_length/n_mfcc/band_edges)과 파이프라인 버전
-    중 하나라도 달라지면 다른 체크섬이 나와야 한다. 실제 정규화 산출물
-    (known_label, 특징값)에 영향을 주는 입력을 빠짐없이 포함해야, 같은 파일
-    sha256에서 source label만 바뀌거나 특징 추출 설정/로직만 바뀐 경우에도
-    같은 dataset id가 재사용되는 것을 막을 수 있다.
+    sample_rate/frame_length/hop_length/n_mfcc/band_edges), 파이프라인 버전,
+    **실제 계산된 특징값의 fingerprint(compute_feature_output_fingerprint())**
+    중 하나라도 달라지면 다른 체크섬이 나와야 한다. feature_output_fingerprint를
+    포함해야 librosa 유무처럼 소스 코드/설정에는 드러나지 않는 실행 환경
+    차이(MFCC 0벡터 폴백 등)로 산출물이 달라진 경우까지 잡아낼 수 있다.
     """
     payload = {
         "files": {
@@ -271,6 +289,7 @@ def compute_version_checksum(
             "n_mfcc": feature_config.n_mfcc,
             "band_edges": list(feature_config.band_edges),
         },
+        "feature_output_fingerprint": feature_output_fingerprint,
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
@@ -293,17 +312,6 @@ def build_manifest(
 
     source = build_source_block(data_dir)
     config = FeatureConfig(sample_rate=records[0]["sample_rate"])
-    version_checksum = compute_version_checksum(
-        source["files"],
-        window_size,
-        hop_size,
-        split_ratios,
-        seed,
-        LABEL_TAXONOMY_VERSION,
-        DATASET_LABEL_MAPPING,
-        config,
-    )
-    source["checksum"] = version_checksum
     compatibility = build_compatibility_block(records)
     splits = group_split(records, split_ratios, seed)
 
@@ -323,6 +331,19 @@ def build_manifest(
             **features,
         }
         rows.append(row)
+
+    version_checksum = compute_version_checksum(
+        source["files"],
+        window_size,
+        hop_size,
+        split_ratios,
+        seed,
+        LABEL_TAXONOMY_VERSION,
+        DATASET_LABEL_MAPPING,
+        config,
+        compute_feature_output_fingerprint(rows),
+    )
+    source["checksum"] = version_checksum
 
     split_counts = {"train": 0, "validation": 0, "test": 0}
     for split in splits:

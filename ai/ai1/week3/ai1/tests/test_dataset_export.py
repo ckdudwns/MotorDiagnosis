@@ -26,6 +26,7 @@ from register_dataset import (  # noqa: E402
     build_manifest,
     group_split,
     compute_version_checksum,
+    compute_feature_output_fingerprint,
     validate_split_ratios,
     sha256_of_file,
     DATASET_LABEL_MAPPING,
@@ -135,6 +136,7 @@ class TestComputeVersionChecksum(unittest.TestCase):
             label_taxonomy_version=LABEL_TAXONOMY_VERSION,
             label_mapping=DATASET_LABEL_MAPPING,
             feature_config=FeatureConfig(sample_rate=12000),
+            feature_output_fingerprint="sha256:fixed-fingerprint",
             feature_pipeline_version=FEATURE_PIPELINE_VERSION,
         )
         kwargs.update(overrides)
@@ -180,6 +182,40 @@ class TestComputeVersionChecksum(unittest.TestCase):
     def test_changes_when_feature_pipeline_version_changes(self):
         changed = self._checksum(feature_pipeline_version="week2.extract_all_features.v2")
         self.assertNotEqual(self._checksum(), changed)
+
+    def test_changes_when_feature_output_fingerprint_changes(self):
+        """librosa 유무처럼 소스 코드/설정 어디에도 드러나지 않는 실행 환경
+        차이(MFCC 0벡터 폴백 등)로 실제 산출된 특징값이 달라지면, 다른 입력이
+        전부 같아도 fingerprint를 통해 체크섬이 달라져야 한다."""
+        changed = self._checksum(feature_output_fingerprint="sha256:different-fingerprint")
+        self.assertNotEqual(self._checksum(), changed)
+
+
+class TestComputeFeatureOutputFingerprint(unittest.TestCase):
+    def test_deterministic_given_same_rows(self):
+        rows = [{"sample_id": "97_0000", "mfcc_1": -151.41, "rms_mean": 0.05}]
+        self.assertEqual(
+            compute_feature_output_fingerprint(rows),
+            compute_feature_output_fingerprint(rows),
+        )
+
+    def test_changes_when_mfcc_values_differ_like_librosa_fallback(self):
+        """librosa가 있으면 실제 MFCC 값이, 없으면 0벡터가 나온다(같은 원본/설정).
+        두 실행의 rows가 이 지점에서만 달라지는 상황을 재현한다."""
+        rows_with_librosa = [{"sample_id": "97_0000", "mfcc_1": -151.41}]
+        rows_without_librosa = [{"sample_id": "97_0000", "mfcc_1": 0.0}]
+        self.assertNotEqual(
+            compute_feature_output_fingerprint(rows_with_librosa),
+            compute_feature_output_fingerprint(rows_without_librosa),
+        )
+
+    def test_changes_when_row_order_differs(self):
+        rows_a = [{"sample_id": "a"}, {"sample_id": "b"}]
+        rows_b = [{"sample_id": "b"}, {"sample_id": "a"}]
+        self.assertNotEqual(
+            compute_feature_output_fingerprint(rows_a),
+            compute_feature_output_fingerprint(rows_b),
+        )
 
 
 class TestValidateSplitRatios(unittest.TestCase):

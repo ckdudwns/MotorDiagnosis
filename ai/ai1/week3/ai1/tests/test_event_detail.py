@@ -129,6 +129,42 @@ class TestBuildEventDetailSynthetic(unittest.TestCase):
                 window_duration_sec=0.2,
             )
 
+    def test_bool_event_index_rejected(self):
+        """bool은 int의 서브클래스라 True가 조용히 인덱스 1로 쓰일 수 있다."""
+        windows = _fixture_windows([0.0] * 5)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index=True,
+                window_seconds=0.2,
+                window_duration_sec=0.2,
+            )
+
+    def test_float_event_index_rejected(self):
+        """0.5는 범위 검사(0 <= event_index < len)는 통과하지만 슬라이싱에서
+        TypeError가 나므로, 범위 검사 전에 정수 타입을 먼저 검증해야 한다."""
+        windows = _fixture_windows([0.0] * 5)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index=2.5,
+                window_seconds=0.2,
+                window_duration_sec=0.2,
+            )
+
+    def test_string_event_index_rejected(self):
+        windows = _fixture_windows([0.0] * 5)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index="2",
+                window_seconds=0.2,
+                window_duration_sec=0.2,
+            )
+
     def test_zero_window_seconds_rejected(self):
         """0을 넣으면 max(1, ceil(...))이 조용히 1개 윈도우 요청으로 바꿔 응답의
         요청값과 실제 계산이 어긋나므로, 미리 명확한 오류로 거부해야 한다."""

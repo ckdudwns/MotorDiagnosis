@@ -55,6 +55,32 @@ class TestAnomalyRuleConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             AnomalyRuleConfig(min_consecutive_enter=0)
 
+    def test_nan_sigma_enter_rejected(self):
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(sigma_enter=float("nan"))
+
+    def test_negative_sigma_exit_rejected(self):
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(sigma_exit=-1.0, sigma_enter=3.0)
+
+    def test_infinite_sigma_enter_rejected(self):
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(sigma_enter=float("inf"))
+
+    def test_bool_sigma_enter_rejected(self):
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(sigma_enter=True)
+
+    def test_float_min_consecutive_enter_rejected(self):
+        """1.5는 `< 1` 검사만으로는 통과된다 — 정수 타입인지 먼저 검증해야 한다."""
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(min_consecutive_enter=1.5)
+
+    def test_bool_min_consecutive_exit_rejected(self):
+        """bool은 int의 서브클래스라 `True >= 1` 검사를 통과해 버린다."""
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(min_consecutive_exit=True)
+
 
 class TestAssetBaselineRegistry(unittest.TestCase):
     def test_resolve_prefers_asset_id_over_asset_type_over_default(self):
@@ -130,6 +156,41 @@ class TestHysteresisSuppressesSingleSpike(unittest.TestCase):
         self.assertEqual(len(result["events"]), 1)
         self.assertEqual(result["events"][0]["max_deviation_sigma"], 10.0)
         self.assertEqual(result["events"][0]["start_index"], 3)
+
+    def test_invalid_window_does_not_close_anomaly_event(self):
+        """check_outliers()는 NaN/Inf 특징값을 건너뛰어 _max_deviation_sigma()가
+        0.0(=NORMAL)을 반환한다 — 예전 로직대로면 진행 중인 이벤트가 NaN
+        윈도우 2개만으로 조기 종료됐다. 무효 윈도우는 consecutive_under에
+        포함되면 안 되므로 이벤트가 계속 열려 있어야 한다."""
+        baseline = _fake_baseline()
+        config = AnomalyRuleConfig(min_consecutive_enter=2, min_consecutive_exit=2)
+        windows = (
+            [{"x": 0.0}] * 5
+            + [{"x": 20.0}] * 4  # 이상 진입
+            + [{"x": float("nan")}] * 3  # 무효 윈도우 - 조기 종료를 유발하면 안 됨
+        )
+        result = evaluate_feature_stream(windows, baseline, config)
+
+        self.assertEqual(len(result["events"]), 1)
+        self.assertIsNone(
+            result["events"][0]["end_index"],
+            "무효 윈도우 때문에 이벤트가 조기 종료되면 안 된다",
+        )
+        invalid_states = [w for w in result["window_states"] if w["state"] == "INVALID"]
+        self.assertEqual(len(invalid_states), 3)
+
+    def test_inf_feature_value_flagged_invalid_not_normal(self):
+        baseline = _fake_baseline()
+        windows = [{"x": float("inf")}]
+        result = evaluate_feature_stream(windows, baseline, AnomalyRuleConfig())
+        self.assertEqual(result["window_states"][0]["state"], "INVALID")
+        self.assertEqual(result["events"], [])
+
+    def test_missing_required_feature_flagged_invalid(self):
+        baseline = _fake_baseline()  # "x"가 필수 특징값
+        windows = [{}]
+        result = evaluate_feature_stream(windows, baseline, AnomalyRuleConfig())
+        self.assertEqual(result["window_states"][0]["state"], "INVALID")
 
     def test_hysteresis_prevents_flicker_near_boundary(self):
         """진입(3sigma)과 복귀(2sigma) 임계값 사이(2.5sigma)를 오가는 값은,

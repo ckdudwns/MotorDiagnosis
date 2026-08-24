@@ -14,6 +14,7 @@ week2 `validate_features.check_outliers()`(baseline mean/std 기반 정상범위
 
 import os
 import sys
+import math
 from dataclasses import dataclass
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -22,7 +23,7 @@ _WEEK2_FEATURE_DIR = os.path.normpath(
 )
 sys.path.insert(0, _WEEK2_FEATURE_DIR)
 
-from validate_features import check_outliers  # noqa: E402
+from validate_features import check_outliers, check_missing_or_invalid  # noqa: E402
 
 
 @dataclass
@@ -34,13 +35,26 @@ class AnomalyRuleConfig:
     version: str = "v1"
 
     def __post_init__(self):
+        for name in ("sigma_enter", "sigma_exit"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                # NaN/음수 sigma는 이상 진입이 아예 안 되거나(예: NaN 비교는 항상
+                # False) 모든 윈도우가 이상으로 판정되는 결과로 이어진다.
+                raise ValueError(f"{name}는 0보다 큰 유한한 숫자여야 합니다: {value!r}")
+        for name in ("min_consecutive_enter", "min_consecutive_exit"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name}는 1 이상의 정수여야 합니다: {value!r}")
         if self.sigma_exit >= self.sigma_enter:
             raise ValueError(
                 "sigma_exit는 sigma_enter보다 작아야 합니다 (히스테리시스 조건, "
                 f"sigma_enter={self.sigma_enter}, sigma_exit={self.sigma_exit})"
             )
-        if self.min_consecutive_enter < 1 or self.min_consecutive_exit < 1:
-            raise ValueError("min_consecutive_enter/exit는 1 이상이어야 합니다.")
 
 
 class AssetBaselineRegistry:
@@ -124,6 +138,24 @@ def evaluate_feature_stream(
     pending_max_dev = 0.0  # 진입 대기(consecutive_over) 구간에서 관측된 최대 편차 누적
 
     for i, features in enumerate(feature_windows):
+        invalid_issues = check_missing_or_invalid(features, baseline)
+        if invalid_issues:
+            # NaN/Inf/결측 특징값은 check_outliers()가 조용히 건너뛰어
+            # _max_deviation_sigma()가 0.0(=NORMAL)을 반환한다. 이를 그대로
+            # 두면 진행 중인 이상 이벤트가 무효 윈도우 때문에 조기 종료될 수
+            # 있으므로, 히스테리시스 카운터(consecutive_over/under)와 현재
+            # 이벤트를 전혀 건드리지 않고 별도 INVALID 상태로만 기록한다.
+            window_states.append(
+                {
+                    "index": i,
+                    "state": "INVALID",
+                    "max_deviation_sigma": None,
+                    "outlier_features": [],
+                    "invalid_reasons": sorted({issue["reason"] for issue in invalid_issues}),
+                }
+            )
+            continue
+
         max_dev = _max_deviation_sigma(features, baseline)
         over_enter = max_dev >= config.sigma_enter
         under_exit = max_dev < config.sigma_exit

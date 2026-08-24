@@ -46,7 +46,14 @@ ENVIRONMENT_INSPECTION_STATUSES = {
     "attention",
     "critical",
 }
-DATASET_SPLIT_POLICY = "asset_or_operating_condition_grouped"
+DATASET_SPLIT_POLICY = "asset_grouped"
+DATASET_LABEL_PRIORITY = [
+    "event_review",
+    "known_vibration_label",
+    "known_acoustic_label",
+    "scenario_label",
+    "event_candidate",
+]
 NON_ASSET_ANOMALY_EVENT_LABELS = {
     "normal_false_positive",
     "repair_completed",
@@ -2695,6 +2702,33 @@ def ingest_telemetry(
             raise
 
 
+def _telemetry_sort_key(record: dict[str, Any]) -> tuple[str, str, int, str]:
+    sequence = record.get("sequence")
+    normalized_sequence = sequence if isinstance(sequence, int) else 0
+    canonical_record = {
+        key: value for key, value in record.items() if key != "receivedAt"
+    }
+    return (
+        str(record.get("timestamp") or ""),
+        str(record.get("deviceId") or ""),
+        normalized_sequence,
+        json.dumps(canonical_record, sort_keys=True, separators=(",", ":")),
+    )
+
+
+def _canonical_telemetry_checksum(records: list[dict[str, Any]]) -> str:
+    canonical_records = [
+        {key: value for key, value in record.items() if key != "receivedAt"}
+        for record in sorted(records, key=_telemetry_sort_key)
+    ]
+    digest = hashlib.sha256(
+        json.dumps(canonical_records, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
 def _stored_telemetry_for(
     site_id: str,
     asset_id: str,
@@ -2721,7 +2755,7 @@ def _stored_telemetry_for(
         if to_value and timestamp > to_value:
             continue
         filtered.append(record)
-    return sorted(filtered, key=lambda item: item["timestamp"])
+    return sorted(filtered, key=_telemetry_sort_key)
 
 
 def telemetry_for(
@@ -4326,11 +4360,38 @@ def _dataset_source(payload: dict[str, Any]) -> dict[str, Any]:
     source = payload.get("source")
     if not isinstance(source, dict):
         raise ApiError(400, "INVALID_DATASET_SOURCE", "source must be an object.")
+    source_type = required_text(source, "type").lower()
+    uri = required_text(source, "uri")
+    checksum = required_text(source, "checksum").lower()
+    if source_type not in {"internal", "external"}:
+        raise ApiError(
+            400,
+            "INVALID_DATASET_SOURCE",
+            "source.type must be internal or external.",
+        )
+    if source_type == "internal" and uri != "api://telemetry":
+        raise ApiError(
+            400,
+            "INVALID_DATASET_SOURCE",
+            "Internal datasets must use source.uri api://telemetry.",
+        )
+    if source_type == "external" and uri == "api://telemetry":
+        raise ApiError(
+            400,
+            "INVALID_DATASET_SOURCE",
+            "source.uri api://telemetry is reserved for internal datasets.",
+        )
+    if not checksum.startswith("sha256:") or not checksum.removeprefix("sha256:"):
+        raise ApiError(
+            400,
+            "INVALID_DATASET_SOURCE",
+            "source.checksum must use the sha256:<value> format.",
+        )
     return {
-        "type": required_text(source, "type").lower(),
-        "uri": required_text(source, "uri"),
+        "type": source_type,
+        "uri": uri,
         "license": required_text(source, "license"),
-        "checksum": required_text(source, "checksum").lower(),
+        "checksum": checksum,
     }
 
 
@@ -4575,11 +4636,8 @@ def create_dataset_version(
             "createdBy": user["id"],
         }
         snapshot = None
-        if (
-            str(source.get("type", "")).lower() == "internal"
-            and source.get("uri") == "api://telemetry"
-        ):
-            snapshot = _freeze_internal_dataset_snapshot(user, record)
+        if source["type"] == "internal":
+            snapshot, source_records = _freeze_internal_dataset_snapshot(user, record)
             snapshot_rows = [
                 row for scope_key in sorted(snapshot) for row in snapshot[scope_key]
             ]
@@ -4589,6 +4647,7 @@ def create_dataset_version(
                     "EMPTY_DATASET_SNAPSHOT",
                     "The selected sourceFilters contain no telemetry records.",
                 )
+            record["source"]["checksum"] = _canonical_telemetry_checksum(source_records)
             snapshot_checksum = hashlib.sha256(
                 json.dumps(snapshot_rows, sort_keys=True, separators=(",", ":")).encode(
                     "utf-8"
@@ -4614,10 +4673,12 @@ def create_dataset_version(
                 "DATASET_VERSION_EXISTS",
                 "An identical normalized dataset version is already registered.",
             )
+        dataset_site_ids = _dataset_site_ids(record, snapshot)
+        for site_id in dataset_site_ids:
+            require_site_access(user, site_id)
         if snapshot is not None:
             DATASET_SNAPSHOTS[record["id"]] = snapshot
         DATASET_VERSIONS.append(record)
-        dataset_site_ids = _dataset_site_ids(record)
         append_audit_log(
             user,
             "dataset.create",
@@ -4655,21 +4716,31 @@ def _split_for_group(group_id: str, split: dict[str, float]) -> str:
 
 
 def _dataset_group_key(row: dict[str, Any]) -> str:
-    rpm = row.get("rpm")
-    if isinstance(rpm, bool) or rpm is None:
-        rpm_band = "unknown"
-    else:
+    return f"{row.get('site_id')}:{row.get('asset_id')}"
+
+
+def _dataset_group_stratum(rows: list[dict[str, Any]]) -> str:
+    rpm_values = []
+    for row in rows:
+        rpm = row.get("rpm")
+        if isinstance(rpm, bool) or rpm is None:
+            continue
         try:
-            rpm_value = float(rpm)
+            parsed = float(rpm)
         except (TypeError, ValueError, OverflowError):
-            rpm_band = "unknown"
-        else:
-            rpm_band = (
-                str(int(math.floor(rpm_value / 100.0) * 100))
-                if math.isfinite(rpm_value)
-                else "unknown"
-            )
-    return f"{row.get('site_id')}:{row.get('asset_id')}:rpm-{rpm_band}"
+            continue
+        if math.isfinite(parsed):
+            rpm_values.append(parsed)
+    if not rpm_values:
+        return "rpm-unknown"
+    rpm_values.sort()
+    midpoint = len(rpm_values) // 2
+    median_rpm = (
+        rpm_values[midpoint]
+        if len(rpm_values) % 2
+        else (rpm_values[midpoint - 1] + rpm_values[midpoint]) / 2
+    )
+    return f"rpm-{int(math.floor(median_rpm / 100.0) * 100)}"
 
 
 def _assign_dataset_splits(
@@ -4678,10 +4749,10 @@ def _assign_dataset_splits(
     *,
     require_complete: bool,
 ) -> None:
-    group_keys = sorted(
-        {_dataset_group_key(row) for row in rows},
-        key=lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest(),
-    )
+    grouped_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped_rows.setdefault(_dataset_group_key(row), []).append(row)
+    group_keys = list(grouped_rows)
     positive_splits = [
         name for name in ("train", "validation", "test") if split[name] > 0
     ]
@@ -4689,38 +4760,77 @@ def _assign_dataset_splits(
         raise ApiError(
             400,
             "INVALID_DATASET_SPLIT",
-            "The snapshot must contain enough operating-condition groups for every positive split.",
+            "The snapshot must contain enough asset groups for every positive split.",
         )
 
     assignments: dict[str, str] = {}
     if len(group_keys) >= len(positive_splits):
-        target_counts = {name: 1 for name in positive_splits}
-        remaining = len(group_keys) - len(positive_splits)
-        if remaining:
-            weighted = {
-                name: remaining
-                * split[name]
-                / sum(split[item] for item in positive_splits)
-                for name in positive_splits
-            }
-            for name in positive_splits:
-                target_counts[name] += int(math.floor(weighted[name]))
-            unassigned = len(group_keys) - sum(target_counts.values())
-            ranked = sorted(
-                positive_splits,
-                key=lambda name: (
-                    weighted[name] - math.floor(weighted[name]),
-                    split[name],
-                ),
-                reverse=True,
-            )
-            for name in ranked[:unassigned]:
-                target_counts[name] += 1
-        offset = 0
+        split_names = ("train", "validation", "test")
+        exact_counts = {name: len(group_keys) * split[name] for name in split_names}
+        target_counts = {
+            name: int(math.floor(exact_counts[name])) for name in split_names
+        }
+        unassigned = len(group_keys) - sum(target_counts.values())
+        ranked = sorted(
+            split_names,
+            key=lambda name: (
+                exact_counts[name] - target_counts[name],
+                split[name],
+                -split_names.index(name),
+            ),
+            reverse=True,
+        )
+        for name in ranked[:unassigned]:
+            target_counts[name] += 1
+
         for name in positive_splits:
-            for group_key in group_keys[offset : offset + target_counts[name]]:
-                assignments[group_key] = name
-            offset += target_counts[name]
+            if target_counts[name] > 0:
+                continue
+            donors = [
+                candidate
+                for candidate in positive_splits
+                if target_counts[candidate] > 1
+            ]
+            if not donors:
+                raise ApiError(
+                    400,
+                    "INVALID_DATASET_SPLIT",
+                    "Every positive split requires at least one asset group.",
+                )
+            donor = max(
+                donors,
+                key=lambda candidate: (
+                    target_counts[candidate] - exact_counts[candidate],
+                    target_counts[candidate],
+                    split[candidate],
+                ),
+            )
+            target_counts[donor] -= 1
+            target_counts[name] += 1
+        groups_by_stratum: dict[str, list[str]] = {}
+        for group_key in group_keys:
+            stratum = _dataset_group_stratum(grouped_rows[group_key])
+            groups_by_stratum.setdefault(stratum, []).append(group_key)
+        remaining_counts = copy_payload(target_counts)
+        for stratum in sorted(groups_by_stratum):
+            stratum_groups = sorted(
+                groups_by_stratum[stratum],
+                key=lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest(),
+            )
+            for group_key in stratum_groups:
+                candidates = [
+                    name for name in split_names if remaining_counts[name] > 0
+                ]
+                selected = max(
+                    candidates,
+                    key=lambda name: (
+                        remaining_counts[name] / target_counts[name],
+                        split[name],
+                        -split_names.index(name),
+                    ),
+                )
+                assignments[group_key] = selected
+                remaining_counts[selected] -= 1
     else:
         assignments = {
             group_key: _split_for_group(group_key, split) for group_key in group_keys
@@ -4849,27 +4959,119 @@ def _dataset_label_for_event(
     return mapped_label, dataset["labelTaxonomyVersion"]
 
 
+def _dataset_target_label(
+    dataset: dict[str, Any] | None, source_label: Any
+) -> tuple[str | None, str | None]:
+    normalized = str(source_label or "").strip()
+    if not normalized:
+        return None, None
+    if not dataset:
+        return normalized, None
+    label_mapping = {
+        str(key).strip().casefold(): str(value).strip().upper()
+        for key, value in dataset.get("labelMapping", {}).items()
+    }
+    mapped = label_mapping.get(normalized.casefold())
+    if mapped:
+        return mapped, dataset["labelTaxonomyVersion"]
+    taxonomy = next(
+        (
+            item
+            for item in ACOUSTIC_TAXONOMY_VERSIONS
+            if item["version"] == dataset["labelTaxonomyVersion"]
+        ),
+        None,
+    )
+    taxonomy_codes = {
+        str(item["code"]).strip().upper() for item in (taxonomy or {}).get("labels", [])
+    }
+    direct_code = normalized.upper()
+    if direct_code in taxonomy_codes:
+        return direct_code, dataset["labelTaxonomyVersion"]
+    return None, None
+
+
+def _dataset_ground_truth(
+    dataset: dict[str, Any] | None,
+    point: dict[str, Any],
+    matching_event: dict[str, Any] | None,
+    event_label: str | None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    if (
+        matching_event
+        and matching_event.get("reviewed")
+        and str(matching_event.get("label") or "").strip()
+    ):
+        return (
+            str(matching_event["label"]).strip(),
+            "event_review",
+            event_label,
+            dataset["labelTaxonomyVersion"] if dataset and event_label else None,
+        )
+    candidates = (
+        ("knownVibrationLabel", "known_vibration_label"),
+        ("knownAcousticLabel", "known_acoustic_label"),
+        ("scenarioLabel", "scenario_label"),
+    )
+    for field, source in candidates:
+        raw_label = str(point.get(field) or "").strip()
+        if not raw_label:
+            continue
+        target_label, taxonomy_version = _dataset_target_label(dataset, raw_label)
+        return raw_label, source, target_label, taxonomy_version
+    if matching_event and str(matching_event.get("label") or "").strip():
+        return (
+            str(matching_event["label"]).strip(),
+            "event_candidate",
+            event_label,
+            dataset["labelTaxonomyVersion"] if dataset and event_label else None,
+        )
+    return None, None, None, None
+
+
 def _dataset_snapshot_key(site_id: str, asset_id: str) -> str:
     return f"{site_id}:{asset_id}"
 
 
-def _dataset_site_ids(dataset: dict[str, Any]) -> list[str]:
-    if (
-        str(dataset.get("source", {}).get("type", "")).lower() != "internal"
-        or dataset.get("source", {}).get("uri") != "api://telemetry"
-    ):
-        return []
+def _dataset_site_ids(
+    dataset: dict[str, Any],
+    snapshot_override: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[str]:
     source_filters = dataset.get("sourceFilters") or {}
-    site_ids = set(source_filters.get("siteIds", []))
+    explicit_site_ids = set(source_filters.get("siteIds", []))
     if source_filters.get("siteId"):
-        site_ids.add(source_filters["siteId"])
+        explicit_site_ids.add(source_filters["siteId"])
+    for site_id in explicit_site_ids:
+        get_site(site_id)
+    site_ids = set(explicit_site_ids)
+    is_internal = dataset.get("source", {}).get("type") == "internal"
     for asset_id in [
         *source_filters.get("assetIds", []),
         *([source_filters["assetId"]] if source_filters.get("assetId") else []),
     ]:
-        site_ids.add(get_asset_by_id(asset_id)["siteId"])
-    snapshot = DATASET_SNAPSHOTS.get(dataset.get("id"), {})
-    site_ids.update(key.split(":", 1)[0] for key, rows in snapshot.items() if rows)
+        if not is_internal and explicit_site_ids:
+            if any(asset_id.startswith(f"{site_id}-") for site_id in explicit_site_ids):
+                continue
+            raise ApiError(
+                400,
+                "INVALID_SOURCE_FILTERS",
+                f"sourceFilters assetId {asset_id} is outside the selected siteIds.",
+            )
+        asset = get_asset_by_id(asset_id)
+        if explicit_site_ids and asset["siteId"] not in explicit_site_ids:
+            raise ApiError(
+                400,
+                "INVALID_SOURCE_FILTERS",
+                f"sourceFilters assetId {asset_id} is outside the selected siteIds.",
+            )
+        site_ids.add(asset["siteId"])
+    if is_internal:
+        snapshot = (
+            snapshot_override
+            if snapshot_override is not None
+            else DATASET_SNAPSHOTS.get(dataset.get("id"), {})
+        )
+        site_ids.update(key.split(":", 1)[0] for key, rows in snapshot.items() if rows)
     return sorted(site_ids)
 
 
@@ -4931,6 +5133,12 @@ def _dataset_rows_for_points(
         event_label, label_taxonomy_version = _dataset_label_for_event(
             dataset, matching_event
         )
+        (
+            ground_truth_label,
+            ground_truth_source,
+            target_label,
+            target_label_taxonomy_version,
+        ) = _dataset_ground_truth(dataset, point, matching_event, event_label)
         rows.append(
             {
                 "site_id": site_id,
@@ -4940,12 +5148,25 @@ def _dataset_rows_for_points(
                 "sequence": point.get("sequence"),
                 "vibration_rms_raw": point.get("vibrationRmsRaw"),
                 "vibration_rms_mm_s": point.get("vibrationRmsMmS"),
+                "vibration_peak_hz": point.get("vibrationPeakHz"),
                 "acoustic_rms_raw": point.get("acousticRmsRaw"),
                 "acoustic_db": point.get("acousticDb"),
+                "acoustic_peak_hz": point.get("acousticPeakHz"),
                 "rpm": point.get("rpm"),
+                "scenario_label": point.get("scenarioLabel"),
+                "known_vibration_label": point.get("knownVibrationLabel"),
+                "known_acoustic_label": point.get("knownAcousticLabel"),
+                "telemetry_source": point.get("source"),
+                "is_synthetic": point.get("isSynthetic"),
+                "vibration_unit_note": point.get("vibrationUnitNote"),
+                "acoustic_unit_note": point.get("acousticUnitNote"),
                 "event_id": matching_event.get("id") if matching_event else None,
                 "event_label": event_label,
                 "label_taxonomy_version": label_taxonomy_version,
+                "ground_truth_label": ground_truth_label,
+                "ground_truth_source": ground_truth_source,
+                "target_label": target_label,
+                "target_label_taxonomy_version": target_label_taxonomy_version,
             }
         )
     return rows
@@ -4953,8 +5174,9 @@ def _dataset_rows_for_points(
 
 def _freeze_internal_dataset_snapshot(
     user: dict[str, Any], dataset: dict[str, Any]
-) -> dict[str, list[dict[str, Any]]]:
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
     snapshot = {}
+    source_records = []
     for asset in _dataset_scope_assets(user, dataset):
         from_timestamp, to_timestamp = _dataset_export_window(
             dataset,
@@ -4969,6 +5191,7 @@ def _freeze_internal_dataset_snapshot(
             from_timestamp=from_timestamp,
             to_timestamp=to_timestamp,
         )
+        source_records.extend(points)
         snapshot[_dataset_snapshot_key(asset["siteId"], asset["id"])] = (
             _dataset_rows_for_points(
                 dataset,
@@ -4986,7 +5209,7 @@ def _freeze_internal_dataset_snapshot(
             dataset["split"],
             require_complete=True,
         )
-    return snapshot
+    return snapshot, source_records
 
 
 def _rows_in_time_range(
@@ -5110,6 +5333,7 @@ def dataset_export_for(
         ),
         "labelTaxonomyVersion": dataset["labelTaxonomyVersion"] if dataset else None,
         "labelMapping": dataset["labelMapping"] if dataset else {},
+        "labelPriority": copy_payload(DATASET_LABEL_PRIORITY),
         "sourceFilters": copy_payload(dataset["sourceFilters"]) if dataset else None,
         "siteId": site["id"],
         "assetId": asset["id"],

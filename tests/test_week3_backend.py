@@ -4,12 +4,15 @@ import csv
 import json
 import threading
 import unittest
+from collections import Counter
 from datetime import timedelta
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from motor_diagnosis.data import (
     ApiError,
+    DATASET_SNAPSHOTS,
+    DATASET_VERSIONS,
     EVENTS,
     TELEMETRY_RECORDS,
     audit_logs_for,
@@ -110,7 +113,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
             "sourceFilters": source_filters,
             "labelTaxonomyVersion": "ACOUSTIC-V1",
             "labelMapping": label_mapping,
-            "split": {"train": 0.7, "validation": 0.2, "test": 0.1},
+            "split": {"train": 1.0, "validation": 0.0, "test": 0.0},
             "reason": "Week 3 dataset boundary regression test",
         }
 
@@ -257,8 +260,11 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(exported["manifest"]["sourceRecordCount"], 3)
         self.assertEqual(exported["manifest"]["normalizedRecordCount"], 3)
         self.assertEqual(sum(exported["manifest"]["splitCounts"].values()), 3)
-        self.assertTrue(all(exported["manifest"]["splitCounts"].values()))
-        self.assertIsNone(exported["manifest"]["assignedSplit"])
+        self.assertEqual(
+            exported["manifest"]["splitCounts"],
+            {"train": 3, "validation": 0, "test": 0},
+        )
+        self.assertEqual(exported["manifest"]["assignedSplit"], "train")
         self.assertEqual(exported["manifest"]["splitPolicy"], dataset["splitPolicy"])
 
     def test_label_mapping_rejects_casefold_key_collisions(self) -> None:
@@ -340,6 +346,34 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(empty_snapshot.exception.status, 400)
         self.assertEqual(empty_snapshot.exception.code, "EMPTY_DATASET_SNAPSHOT")
 
+    def test_internal_source_contract_rejects_invalid_type_uri_and_checksum(
+        self,
+    ) -> None:
+        payload = self.dataset_payload(
+            checksum="sha256:placeholder",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-GEN-01",
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        invalid_sources = [
+            {**payload["source"], "type": "archive"},
+            {**payload["source"], "uri": "s3://not-internal-telemetry"},
+            {**payload["source"], "checksum": "not-a-sha256"},
+        ]
+
+        for invalid_source in invalid_sources:
+            invalid_payload = json.loads(json.dumps(payload))
+            invalid_payload["source"] = invalid_source
+            with self.subTest(source=invalid_source):
+                with self.assertRaises(ApiError) as invalid:
+                    create_dataset_version(self.admin, invalid_payload)
+                self.assertEqual(invalid.exception.status, 400)
+                self.assertEqual(invalid.exception.code, "INVALID_DATASET_SOURCE")
+
+        self.assertEqual(DATASET_VERSIONS, [])
+
     def test_internal_version_fingerprint_tracks_the_canonical_snapshot(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
         event_time = parse_rfc3339("occurredAt", event["occurredAt"])
@@ -357,6 +391,14 @@ class Week3DataBoundaryTest(unittest.TestCase):
         )
 
         first = create_dataset_version(self.admin, payload)
+        self.assertNotEqual(first["source"]["checksum"], payload["source"]["checksum"])
+        self.assertEqual(len(first["source"]["checksum"]), 71)
+        self.assertTrue(
+            all(
+                character in "0123456789abcdef"
+                for character in first["source"]["checksum"][7:]
+            )
+        )
         changed_reported_checksum = json.loads(json.dumps(payload))
         changed_reported_checksum["source"]["checksum"] = "sha256:reported-source-b"
         with self.assertRaises(ApiError) as same_snapshot:
@@ -387,7 +429,138 @@ class Week3DataBoundaryTest(unittest.TestCase):
             after_telemetry["versionFingerprint"], after_review["versionFingerprint"]
         )
 
-    def test_dataset_split_requires_usable_operating_condition_groups(self) -> None:
+    def test_dataset_export_preserves_ground_truth_and_provenance(self) -> None:
+        record = self.telemetry_record("2026-08-24T03:00:00Z", 1)
+        record.update(
+            {
+                "vibrationPeakHz": 1037.11,
+                "acousticPeakHz": 216.4,
+                "scenarioLabel": "normal",
+                "knownVibrationLabel": "NORMAL",
+                "knownAcousticLabel": None,
+                "source": "CWRU_only_synthetic",
+                "isSynthetic": True,
+                "vibrationUnitNote": "raw accelerometer output; not mm/s",
+                "acousticUnitNote": "raw waveform RMS; not dB SPL",
+            }
+        )
+        TELEMETRY_RECORDS.append(record)
+        dataset = create_dataset_version(
+            self.admin,
+            self.dataset_payload(
+                checksum="sha256:provenance-placeholder",
+                source_filters={
+                    "siteId": "SITE-01",
+                    "assetId": "SITE-01-MOT-02",
+                },
+                label_mapping={"needs_review": "BEARING_SUSPECT"},
+            ),
+        )
+
+        exported = dataset_export_for(
+            self.admin,
+            "SITE-01",
+            "SITE-01-MOT-02",
+            dataset_id=dataset["id"],
+        )
+        row = exported["rows"][0]
+
+        self.assertIsNone(row["event_label"])
+        self.assertEqual(row["known_vibration_label"], "NORMAL")
+        self.assertEqual(row["scenario_label"], "normal")
+        self.assertEqual(row["ground_truth_label"], "NORMAL")
+        self.assertEqual(row["ground_truth_source"], "known_vibration_label")
+        self.assertEqual(row["target_label"], "NORMAL")
+        self.assertEqual(row["target_label_taxonomy_version"], "ACOUSTIC-V1")
+        self.assertEqual(row["telemetry_source"], "CWRU_only_synthetic")
+        self.assertTrue(row["is_synthetic"])
+        self.assertEqual(row["vibration_peak_hz"], 1037.11)
+        self.assertEqual(row["acoustic_peak_hz"], 216.4)
+        self.assertEqual(
+            row["vibration_unit_note"], "raw accelerometer output; not mm/s"
+        )
+        self.assertEqual(
+            exported["manifest"]["labelPriority"],
+            [
+                "event_review",
+                "known_vibration_label",
+                "known_acoustic_label",
+                "scenario_label",
+                "event_candidate",
+            ],
+        )
+
+    def test_dataset_split_keeps_assets_intact_and_uses_largest_remainder(
+        self,
+    ) -> None:
+        asset_ids = [f"SITE-{index:02d}-GEN-01" for index in range(1, 11)]
+        for site_index, asset_id in enumerate(asset_ids, start=1):
+            for sequence, rpm in ((1, 1500.0), (2, 2100.0)):
+                TELEMETRY_RECORDS.append(
+                    self.telemetry_record(
+                        "2026-08-24T03:00:00Z",
+                        sequence,
+                        site_id=f"SITE-{site_index:02d}",
+                        asset_id=asset_id,
+                        device_id=f"DEV-{site_index:02d}-GEN-01",
+                        rpm=rpm,
+                    )
+                )
+        payload = self.dataset_payload(
+            checksum="sha256:ten-asset-split",
+            source_filters={"assetIds": asset_ids},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["split"] = {"train": 0.7, "validation": 0.2, "test": 0.1}
+
+        dataset = create_dataset_version(self.admin, payload)
+        rows = [
+            row
+            for scope_rows in DATASET_SNAPSHOTS[dataset["id"]].values()
+            for row in scope_rows
+        ]
+        asset_splits = {
+            asset_id: {
+                row["dataset_split"] for row in rows if row["asset_id"] == asset_id
+            }
+            for asset_id in asset_ids
+        }
+
+        self.assertTrue(all(len(splits) == 1 for splits in asset_splits.values()))
+        self.assertEqual(
+            Counter(next(iter(splits)) for splits in asset_splits.values()),
+            Counter({"train": 7, "validation": 2, "test": 1}),
+        )
+        self.assertEqual(dataset["splitPolicy"], "asset_grouped")
+
+    def test_snapshot_checksum_is_stable_for_equal_timestamp_records(self) -> None:
+        records = [
+            self.telemetry_record(
+                "2026-08-24T03:00:00Z",
+                sequence,
+                rpm=1500.0 + sequence * 100,
+            )
+            for sequence in (1, 2, 3)
+        ]
+        payload = self.dataset_payload(
+            checksum="sha256:stable-order-placeholder",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        TELEMETRY_RECORDS.extend(records)
+        forward = create_dataset_version(self.admin, payload)
+
+        reset_runtime_state()
+        TELEMETRY_RECORDS.extend(reversed(records))
+        reverse = create_dataset_version(self.admin, payload)
+
+        self.assertEqual(forward["source"]["checksum"], reverse["source"]["checksum"])
+        self.assertEqual(forward["snapshotChecksum"], reverse["snapshotChecksum"])
+
+    def test_dataset_split_requires_enough_asset_groups(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
         event_time = parse_rfc3339("occurredAt", event["occurredAt"])
         TELEMETRY_RECORDS.extend(
@@ -406,6 +579,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
             },
             label_mapping={"needs_review": "BEARING_SUSPECT"},
         )
+        payload["split"] = {"train": 0.7, "validation": 0.2, "test": 0.1}
 
         with self.assertRaises(ApiError) as invalid_split:
             create_dataset_version(self.admin, payload)
@@ -469,6 +643,29 @@ class Week3DataBoundaryTest(unittest.TestCase):
         )
         self.assertEqual(dataset_audit["siteId"], "SITE-01")
         self.assertEqual(dataset_audit["siteIds"], ["SITE-01"])
+
+    def test_external_dataset_source_filters_enforce_site_scope(self) -> None:
+        payload = self.dataset_payload(
+            checksum="sha256:external-site-05",
+            source_filters={
+                "siteId": "SITE-05",
+                "assetId": "SITE-05-FAN-03",
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/site-05/fan-03.csv",
+            "license": "project-internal",
+            "checksum": "sha256:external-site-05",
+        }
+        dataset = create_dataset_version(self.admin, payload)
+
+        with self.assertRaises(ApiError) as forbidden:
+            dataset_version_for(self.operator, dataset["id"])
+
+        self.assertEqual(forbidden.exception.status, 403)
+        self.assertEqual(forbidden.exception.code, "SITE_FORBIDDEN")
 
     def test_taxonomy_audit_preserves_the_previous_active_state(self) -> None:
         update_acoustic_taxonomy(
@@ -941,7 +1138,7 @@ class Week3HttpContractTest(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         self.assertEqual(dataset["status"], "frozen")
-        self.assertEqual(dataset["splitPolicy"], "asset_or_operating_condition_grouped")
+        self.assertEqual(dataset["splitPolicy"], "asset_grouped")
 
         status, registered = self.request(
             f"/api/datasets/{dataset['id']}", token=self.operator_token
@@ -1013,6 +1210,19 @@ class Week3HttpContractTest(unittest.TestCase):
                 )
             ]
         )
+        TELEMETRY_RECORDS[0].update(
+            {
+                "vibrationPeakHz": 1037.11,
+                "acousticPeakHz": 216.4,
+                "scenarioLabel": "normal",
+                "knownVibrationLabel": "NORMAL",
+                "knownAcousticLabel": None,
+                "source": "CWRU_only_synthetic",
+                "isSynthetic": True,
+                "vibrationUnitNote": "raw accelerometer output; not mm/s",
+                "acousticUnitNote": "raw waveform RMS; not dB SPL",
+            }
+        )
         internal_payload = json.loads(json.dumps(dataset_payload))
         internal_payload["name"] = "internal-filtered-telemetry-v1"
         internal_payload["source"] = {
@@ -1026,6 +1236,11 @@ class Week3HttpContractTest(unittest.TestCase):
             "assetId": "SITE-01-GEN-01",
         }
         internal_payload["labelMapping"] = {"needs_review": "BEARING_SUSPECT"}
+        internal_payload["split"] = {
+            "train": 1.0,
+            "validation": 0.0,
+            "test": 0.0,
+        }
         status, internal_dataset = self.request(
             "/api/datasets",
             method="POST",
@@ -1053,6 +1268,17 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertIn("source_record_count", reader.fieldnames or [])
         self.assertIn("normalized_record_count", reader.fieldnames or [])
         self.assertIn("split_counts", reader.fieldnames or [])
+        self.assertIn("ground_truth_label", reader.fieldnames or [])
+        self.assertIn("ground_truth_source", reader.fieldnames or [])
+        self.assertIn("telemetry_source", reader.fieldnames or [])
+        self.assertIn("is_synthetic", reader.fieldnames or [])
+        self.assertIn("vibration_peak_hz", reader.fieldnames or [])
+        self.assertIn("acoustic_peak_hz", reader.fieldnames or [])
+        self.assertIn("label_priority", reader.fieldnames or [])
+        self.assertEqual(first_row["ground_truth_label"], "NORMAL")
+        self.assertEqual(first_row["ground_truth_source"], "known_vibration_label")
+        self.assertEqual(first_row["telemetry_source"], "CWRU_only_synthetic")
+        self.assertEqual(first_row["is_synthetic"], "True")
         self.assertEqual(
             int(first_row["source_record_count"]),
             int(first_row["normalized_record_count"]),

@@ -3488,6 +3488,22 @@ def anomaly_rule_for(asset_id: str) -> dict[str, Any]:
     return copy_payload(rule)
 
 
+def anomaly_rule_version_for(asset_id: str, version: str) -> dict[str, Any]:
+    rule = anomaly_rule_for(asset_id)
+    current = {key: value for key, value in rule.items() if key != "history"}
+    snapshots = [current, *rule.get("history", [])]
+    snapshot = next(
+        (item for item in snapshots if item.get("version") == version), None
+    )
+    if not snapshot:
+        raise ApiError(
+            409,
+            "ANOMALY_RULE_VERSION_NOT_FOUND",
+            "The anomaly rule version recorded by the event was not found.",
+        )
+    return copy_payload(snapshot)
+
+
 def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
     require_permission(user, "event:read")
     event = get_event(event_id)
@@ -3501,10 +3517,17 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
         from_timestamp=context_from,
         to_timestamp=context_to,
     )
+    context_from_value = occurred_at - timedelta(minutes=5)
+    context_to_value = occurred_at + timedelta(minutes=5)
     has_stored_raw = any(
-        record["siteId"] == event["siteId"] and record["assetId"] == event["assetId"]
+        record["siteId"] == event["siteId"]
+        and record["assetId"] == event["assetId"]
+        and context_from_value
+        <= parse_rfc3339("telemetry.timestamp", record["timestamp"])
+        <= context_to_value
         for record in TELEMETRY_RECORDS
     )
+    context_source = "stored" if has_stored_raw else "demo" if points else "unavailable"
     device = next(
         (
             item
@@ -3522,6 +3545,12 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
         ),
         None,
     )
+    threshold_version = str(event.get("thresholdVersion") or "").strip()
+    applied_rule = (
+        anomaly_rule_version_for(event["assetId"], threshold_version)
+        if threshold_version
+        else None
+    )
     return {
         "event": copy_payload(event),
         "context": {
@@ -3529,11 +3558,11 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
             "to": context_to,
             "points": copy_payload(points),
             "units": telemetry_units(event["siteId"], event["assetId"]),
-            "source": "stored" if has_stored_raw else "demo",
+            "source": context_source,
             "rawDataMissing": not has_stored_raw,
         },
         "featureSnapshot": copy_payload(points[-1]) if points else None,
-        "appliedRule": anomaly_rule_for(event["assetId"]),
+        "appliedRule": applied_rule,
         "modelVersion": event.get("modelVersion"),
         "deviceSnapshot": copy_payload(device) if device else None,
         "latestReview": copy_payload(latest_review) if latest_review else None,
@@ -3664,7 +3693,7 @@ def update_alert_policy(
     user: dict[str, Any], policy_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
     require_permission(user, "alert-policy:write")
-    reason = required_text(payload, "reason")
+    reason = str(payload.get("reason") or "Alert policy updated").strip()
     if len(reason) > MAX_REASON_LENGTH:
         raise ApiError(
             400, "REASON_TOO_LONG", "reason must be 1000 characters or less."
@@ -3922,7 +3951,11 @@ def create_environment_inspection(
         record["overallStatus"] = (
             "critical"
             if "critical" in statuses
-            else "attention" if "attention" in statuses else "ok"
+            else (
+                "attention"
+                if "attention" in statuses
+                else "not_checked" if "not_checked" in statuses else "ok"
+            )
         )
         ENVIRONMENT_INSPECTIONS.append(record)
         device["environmentStatus"] = record["overallStatus"]
@@ -4403,6 +4436,18 @@ def _split_for_group(group_id: str, split: dict[str, float]) -> str:
     return "test"
 
 
+def _event_for_dataset_point(
+    asset_events: list[dict[str, Any]], timestamp: Any
+) -> dict[str, Any] | None:
+    point_time = parse_rfc3339("telemetry.timestamp", timestamp)
+    for event in asset_events:
+        event_start = parse_rfc3339("event.occurredAt", event["occurredAt"])
+        duration_sec = max(0, int(event.get("durationSec") or 0))
+        if event_start <= point_time <= event_start + timedelta(seconds=duration_sec):
+            return event
+    return None
+
+
 def dataset_export_for(
     user: dict[str, Any],
     site_id: str,
@@ -4418,6 +4463,15 @@ def dataset_export_for(
     require_site_access(user, site["id"])
     asset = get_asset(site["id"], asset_id)
     dataset = dataset_version_for(user, dataset_id) if dataset_id else None
+    if dataset and (
+        str(dataset["source"].get("type", "")).lower() != "internal"
+        or dataset["source"].get("uri") != "api://telemetry"
+    ):
+        raise ApiError(
+            409,
+            "DATASET_SOURCE_MISMATCH",
+            "External dataset metadata cannot be used to export internal telemetry.",
+        )
     split = (
         dataset["split"] if dataset else {"train": 0.7, "validation": 0.2, "test": 0.1}
     )
@@ -4433,9 +4487,9 @@ def dataset_export_for(
         key=lambda item: item["occurredAt"],
         reverse=True,
     )
-    latest_event = asset_events[0] if asset_events else None
     rows = []
     for point in points:
+        matching_event = _event_for_dataset_point(asset_events, point.get("timestamp"))
         rows.append(
             {
                 "site_id": site["id"],
@@ -4448,8 +4502,8 @@ def dataset_export_for(
                 "acoustic_rms_raw": point.get("acousticRmsRaw"),
                 "acoustic_db": point.get("acousticDb"),
                 "rpm": point.get("rpm"),
-                "event_id": latest_event.get("id") if latest_event else None,
-                "event_label": latest_event.get("label") if latest_event else None,
+                "event_id": matching_event.get("id") if matching_event else None,
+                "event_label": matching_event.get("label") if matching_event else None,
                 "label_taxonomy_version": (
                     dataset["labelTaxonomyVersion"] if dataset else "ACOUSTIC-V1"
                 ),
@@ -4459,13 +4513,21 @@ def dataset_export_for(
     checksum = hashlib.sha256(
         json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    export_checksum = f"sha256:{checksum}"
+    source = (
+        copy_payload(dataset["source"])
+        if dataset
+        else {
+            "type": "internal",
+            "uri": "api://telemetry",
+            "license": "project-internal",
+            "checksum": export_checksum,
+        }
+    )
     manifest = {
         "datasetId": dataset["id"] if dataset else None,
-        "source": (
-            dataset["source"]
-            if dataset
-            else {"type": "internal", "uri": "api://telemetry"}
-        ),
+        "exportType": "internal_telemetry",
+        "source": source,
         "compatibility": (
             dataset["compatibility"]
             if dataset
@@ -4489,7 +4551,7 @@ def dataset_export_for(
         "split": split,
         "splitPolicy": "asset_grouped",
         "assignedSplit": group_split,
-        "checksum": f"sha256:{checksum}",
+        "checksum": export_checksum,
         "generatedAt": now_iso(),
     }
     return {"manifest": manifest, "rows": rows}

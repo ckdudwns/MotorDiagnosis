@@ -62,7 +62,8 @@ MQTT JSON·토픽은
 - `GET/PUT /api/label-taxonomies/acoustic`, `POST/GET /api/datasets`:
   음향 라벨 버전과 기존 데이터셋의 출처·라이선스·호환성·체크섬·분할 정책 관리
 - `GET /api/datasets/export`: 학습 누수 방지를 위한 설비 단위 분할과 manifest 메타데이터를
-  포함한 CSV 내보내기. XLSX는 후속 범위다.
+  포함한 내부 텔레메트리 CSV 내보내기. 등록된 외부 데이터셋은 원본 저장소에서 별도로
+  내보내며, XLSX는 후속 범위다.
 ### 이벤트 시각 PoC 범위
 
 이 PoC에서 `occurredAt`은 이벤트의 단일 기준 시각이며 브라우저는 이를 지역 시각으로

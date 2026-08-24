@@ -153,54 +153,29 @@ def render_page() -> str:
     }
 
     async function render() {
-  const requestGeneration = ++renderGeneration;
-  const site = selectedSite();
-  const assetId = $("assetSelect").value;
-  const periodHours = Number($("periodSelect").value);
-  const from = new Date(
-    Date.now() - periodHours * 60 * 60 * 1000
-  ).toISOString();
-
-  const [telem, summaries, eventPage] = await Promise.all([
-    api(
-      `/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`
-    ),
-    api("/api/dashboard/sites-summary"),
-    api(
-      `/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`
-    ),
-  ]);
-
-  if (requestGeneration !== renderGeneration) {
-    return;
-  }
-
-  siteSummaries = summaries;
-  events = eventPage.items;
-
-  if (!events.some(event => event.id === selectedEventId)) {
-    clearEventSelection();
-  }
-
-  $("siteCount").textContent = siteSummaries.length;
-  $("onlineCount").textContent = siteSummaries.reduce(
-    (total, item) => total + item.onlineDevices,
-    0
-  );
-  $("warningAssets").textContent = siteSummaries.reduce(
-    (total, item) => total + item.warningAssets,
-    0
-  );
-  $("criticalAssets").textContent = siteSummaries.reduce(
-    (total, item) => total + item.criticalAssets,
-    0
-  );
-
-  renderSiteRows();
-  renderEvents();
-  $("chartTitle").textContent = `${site.name} / ${assetId}`;
-  draw(telem.points, telem.units);
-}
+      const requestGeneration = ++renderGeneration;
+      const site = selectedSite();
+      const assetId = $("assetSelect").value;
+      const periodHours = Number($("periodSelect").value);
+      const from = new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString();
+      const [telem, summaries, eventPage] = await Promise.all([
+        api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
+        api("/api/dashboard/sites-summary"),
+        api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
+      ]);
+      if (requestGeneration !== renderGeneration) return;
+      siteSummaries = summaries;
+      events = eventPage.items;
+      if (!events.some(event => event.id === selectedEventId)) clearEventSelection();
+      $("siteCount").textContent = siteSummaries.length;
+      $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
+      $("warningAssets").textContent = siteSummaries.reduce((n, s) => n + s.warningAssets, 0);
+      $("criticalAssets").textContent = siteSummaries.reduce((n, s) => n + s.criticalAssets, 0);
+      renderSiteRows();
+      renderEvents();
+      $("chartTitle").textContent = `${site.name} / ${assetId}`;
+      draw(telem.points, telem.units);
+    }
 
     function setOptions(select, rows, valueOf, labelOf) {
       select.replaceChildren(...rows.map(row => {

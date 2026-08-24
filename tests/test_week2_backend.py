@@ -193,7 +193,11 @@ class Week2BackendTest(unittest.TestCase):
         ):
             with self.subTest(label=label):
                 reset_runtime_state()
-                review_event("EV-241", {"label": label, "note": "reviewed"})
+                review_event(
+                    self.user("admin", "admin123"),
+                    "EV-241",
+                    {"label": label, "note": "reviewed"},
+                )
                 summaries = dashboard_sites_summary(self.user("admin", "admin123"))
                 site = next(row for row in summaries if row["siteId"] == "SITE-01")
 
@@ -734,10 +738,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
             )
         )
         self.assertTrue(
-            all(
-                "occurredAt" in event
-                for event in filtered_events["items"]
-                )
+            all("occurredAt" in event for event in filtered_events["items"])
         )
         status, summary = self.request(
             "/api/dashboard/sites-summary", token=operator_token

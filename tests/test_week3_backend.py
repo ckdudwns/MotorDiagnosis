@@ -3,11 +3,129 @@ from __future__ import annotations
 import json
 import threading
 import unittest
+from datetime import timedelta
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from motor_diagnosis.data import reset_runtime_state
+from motor_diagnosis.data import (
+    EVENTS,
+    TELEMETRY_RECORDS,
+    authenticate,
+    create_environment_inspection,
+    current_user_for_token,
+    dataset_export_for,
+    event_detail_for,
+    format_rfc3339,
+    parse_rfc3339,
+    reset_runtime_state,
+    update_anomaly_rule,
+)
 from motor_diagnosis.server import create_server
+
+
+class Week3DataBoundaryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_runtime_state()
+        self.admin = self.user("admin", "admin123")
+        self.operator = self.user("operator", "operator123")
+
+    def user(self, username: str, password: str) -> dict:
+        login = authenticate({"username": username, "password": password})
+        return current_user_for_token(login["session"]["token"])
+
+    def telemetry_record(self, timestamp: str, sequence: int) -> dict[str, object]:
+        return {
+            "timestamp": timestamp,
+            "sequence": sequence,
+            "siteId": "SITE-01",
+            "assetId": "SITE-01-MOT-02",
+            "deviceId": "DEV-01-MOT-02",
+            "rpm": 1780.0,
+            "vibrationRmsRaw": 0.08,
+            "vibrationRmsMmS": None,
+            "acousticRmsRaw": 0.007,
+            "acousticDb": None,
+        }
+
+    def test_event_context_marks_raw_missing_when_stored_data_is_outside_window(
+        self,
+    ) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        TELEMETRY_RECORDS.append(
+            self.telemetry_record(format_rfc3339(event_time + timedelta(minutes=6)), 1)
+        )
+
+        detail = event_detail_for(self.operator, event["id"])
+
+        self.assertEqual(detail["context"]["points"], [])
+        self.assertEqual(detail["context"]["source"], "unavailable")
+        self.assertTrue(detail["context"]["rawDataMissing"])
+
+    def test_event_detail_keeps_the_rule_version_used_when_event_was_created(
+        self,
+    ) -> None:
+        updated = update_anomaly_rule(
+            self.admin,
+            "SITE-01-MOT-02",
+            {
+                "scoreThreshold": 82,
+                "durationSec": 20,
+                "hysteresis": 7,
+                "reason": "Boundary regression test",
+            },
+        )
+
+        detail = event_detail_for(self.operator, "EV-241")
+
+        self.assertEqual(updated["version"], "RULE-SITE-01-MOT-02-v2")
+        self.assertEqual(detail["event"]["thresholdVersion"], "RULE-SITE-01-MOT-02-v1")
+        self.assertEqual(detail["appliedRule"]["version"], "RULE-SITE-01-MOT-02-v1")
+        self.assertEqual(detail["appliedRule"]["scoreThreshold"], 75.0)
+
+    def test_all_not_checked_inspection_is_not_reported_as_ok(self) -> None:
+        inspection = create_environment_inspection(
+            self.admin,
+            "DEV-01-GEN-01",
+            {
+                "inspectedAt": "2026-08-24T03:00:00Z",
+                "dust": "not_checked",
+                "waterIngress": "not_checked",
+                "saltCorrosion": "not_checked",
+                "glandStatus": "not_checked",
+                "enclosureStatus": "not_checked",
+            },
+        )
+
+        self.assertEqual(inspection["overallStatus"], "not_checked")
+
+    def test_dataset_rows_only_link_events_covering_the_sample_timestamp(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        TELEMETRY_RECORDS.extend(
+            [
+                self.telemetry_record(
+                    format_rfc3339(event_time - timedelta(seconds=60)), 1
+                ),
+                self.telemetry_record(
+                    format_rfc3339(event_time + timedelta(seconds=10)), 2
+                ),
+            ]
+        )
+
+        exported = dataset_export_for(self.admin, "SITE-01", "SITE-01-MOT-02")
+        rows = {row["sequence"]: row for row in exported["rows"]}
+
+        self.assertIsNone(rows[1]["event_id"])
+        self.assertIsNone(rows[1]["event_label"])
+        self.assertEqual(rows[2]["event_id"], "EV-241")
+        self.assertEqual(rows[2]["event_label"], "needs_review")
+        self.assertEqual(exported["manifest"]["exportType"], "internal_telemetry")
+        self.assertEqual(exported["manifest"]["source"]["uri"], "api://telemetry")
+        self.assertEqual(
+            exported["manifest"]["source"]["checksum"],
+            exported["manifest"]["checksum"],
+        )
 
 
 class Week3HttpContractTest(unittest.TestCase):
@@ -154,6 +272,14 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertEqual(rule["durationSec"], 20)
         self.assertEqual(len(rule["history"]), 1)
 
+        status, event_detail = self.request(
+            "/api/anomaly/events/EV-241", token=self.operator_token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            event_detail["appliedRule"]["version"], "RULE-SITE-01-MOT-02-v1"
+        )
+
         status, readable_rule = self.request(
             "/api/anomaly/rules/SITE-01-MOT-02", token=self.operator_token
         )
@@ -182,7 +308,6 @@ class Week3HttpContractTest(unittest.TestCase):
                 "channels": ["web", "email"],
                 "recipients": ["operations", "maintenance"],
                 "cooldownSec": 600,
-                "reason": "Route critical alarms to maintenance",
             },
             token=self.admin_token,
         )
@@ -257,13 +382,29 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertEqual(inspection["overallStatus"], "attention")
         self.assertEqual(inspection["inspector"]["id"], "user-admin")
 
+        status, not_checked = self.request(
+            "/api/devices/DEV-01-GEN-01/environment-inspections",
+            method="POST",
+            payload={
+                "inspectedAt": "2026-08-24T03:30:00Z",
+                "dust": "not_checked",
+                "waterIngress": "not_checked",
+                "saltCorrosion": "not_checked",
+                "glandStatus": "not_checked",
+                "enclosureStatus": "not_checked",
+            },
+            token=self.admin_token,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(not_checked["overallStatus"], "not_checked")
+
         status, inspections = self.request(
             "/api/devices/DEV-01-GEN-01/environment-inspections",
             token=self.operator_token,
         )
         self.assertEqual(status, 200)
-        self.assertEqual(inspections["total"], 1)
-        self.assertEqual(inspections["latest"]["id"], inspection["id"])
+        self.assertEqual(inspections["total"], 2)
+        self.assertEqual(inspections["latest"]["id"], not_checked["id"])
 
         status, _ = self.request(
             "/api/devices/DEV-01-GEN-01",
@@ -368,9 +509,16 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(invalid_mapping["error"]["code"], "INVALID_LABEL_MAPPING")
 
-        status, csv_body, headers = self.request_raw(
+        status, source_mismatch = self.request(
             "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01"
             f"&datasetId={dataset['id']}&format=csv",
+            token=self.operator_token,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(source_mismatch["error"]["code"], "DATASET_SOURCE_MISMATCH")
+
+        status, csv_body, headers = self.request_raw(
+            "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01&format=csv",
             token=self.operator_token,
         )
         self.assertEqual(status, 200)
@@ -378,6 +526,8 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertIn("label_taxonomy_version", csv_text.splitlines()[0])
         self.assertIn("dataset_split", csv_text.splitlines()[0])
         self.assertIn("operating_conditions", csv_text.splitlines()[0])
+        self.assertIn("api://telemetry", csv_text)
+        self.assertNotIn(dataset_payload["source"]["uri"], csv_text)
         self.assertTrue(headers["x-dataset-checksum"].startswith("sha256:"))
         self.assertGreater(int(headers["x-dataset-record-count"]), 0)
 

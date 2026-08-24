@@ -643,6 +643,8 @@ class Week2HttpSmokeTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(telemetry["points"]), 1)
         self.assertIn("vibrationRmsRaw", telemetry["units"])
+        self.assertIn("anomalyScore", telemetry["points"][0])
+        self.assertIn("anomalyStatus", telemetry["points"][0])
 
         status, summary = self.request(
             "/api/dashboard/sites-summary", token=operator_token

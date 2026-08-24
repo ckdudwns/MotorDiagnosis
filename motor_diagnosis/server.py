@@ -9,6 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from ai.ai2.week2.anomaly_score import annotate_telemetry_points
+
 from .data import (
     ACOUSTIC_LABEL_TAXONOMY,
     DATA_PIPELINES,
@@ -355,17 +357,20 @@ class AppHandler(BaseHTTPRequestHandler):
             get_site(site_id)
             require_site_access(user, site_id)
             require_permission(user, "telemetry:read")
+            points = annotate_telemetry_points(
+                telemetry_for(
+                    site_id,
+                    asset_id,
+                    from_timestamp=query.get("from", [None])[0],
+                    to_timestamp=query.get("to", [None])[0],
+                )
+            )
             self.send_json(
                 {
                     "siteId": site_id,
                     "assetId": asset_id,
                     "units": telemetry_units(site_id, asset_id),
-                    "points": telemetry_for(
-                        site_id,
-                        asset_id,
-                        from_timestamp=query.get("from", [None])[0],
-                        to_timestamp=query.get("to", [None])[0],
-                    ),
+                    "points": points,
                 }
             )
             return
@@ -627,7 +632,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_csv(self, site_id: str, asset_id: str) -> None:
-        points = telemetry_for(site_id, asset_id)
+        points = annotate_telemetry_points(telemetry_for(site_id, asset_id))
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(

@@ -18,7 +18,7 @@ def render_page() -> str:
     main { padding:18px; display:grid; gap:14px; }
     .toolbar, .grid, .kpis, .login { display:grid; gap:10px; }
     .login { grid-template-columns:1fr 1fr 140px; align-items:end; }
-    .toolbar { grid-template-columns:repeat(5, minmax(150px, 1fr)); }
+    .toolbar { grid-template-columns:repeat(4, minmax(150px, 1fr)); }
     .grid { grid-template-columns:1fr 1.2fr; }
     .kpis { grid-template-columns:repeat(4, 1fr); }
     .panel, .kpi { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; box-shadow:0 14px 32px rgba(23,33,31,.07); }
@@ -47,7 +47,7 @@ def render_page() -> str:
 </head>
 <body>
   <header>
-    <div><h1>Bind Edge AI Motor Diagnosis</h1><span>Week 2 monitoring dashboard · raw-signal anomaly-score draft</span></div>
+    <div><h1>Bind Edge AI Motor Diagnosis</h1><span>Week 1 backend API prototype</span></div>
     <button class="secondary" id="exportBtn">Export CSV</button>
   </header>
   <main>
@@ -60,29 +60,23 @@ def render_page() -> str:
       <section class="toolbar panel">
         <label>Site<select id="siteSelect"></select></label>
         <label>Asset<select id="assetSelect"></select></label>
-        <label>Period<select id="periodSelect">
-          <option value="1">Last 1 hour</option>
-          <option value="6">Last 6 hours</option>
-          <option value="24" selected>Last 24 hours</option>
-        </select></label>
         <button id="refreshBtn">Refresh</button>
         <button class="danger" id="injectBtn">Inject Anomaly</button>
       </section>
       <section class="kpis">
         <div class="kpi"><span>Visible Sites</span><strong id="siteCount">-</strong></div>
         <div class="kpi"><span>Online Devices</span><strong id="onlineCount">-</strong></div>
-        <div class="kpi"><span>Warning Assets</span><strong id="warningAssets">-</strong></div>
-        <div class="kpi"><span>Critical Assets</span><strong id="criticalAssets">-</strong></div>
+        <div class="kpi"><span>Open Events</span><strong id="openEvents">-</strong></div>
+        <div class="kpi"><span>Network Types</span><strong id="networkTypes">-</strong></div>
       </section>
       <section class="grid">
         <article class="panel">
           <h2>Site Summary</h2>
-          <table><thead><tr><th>Site</th><th>Region</th><th>Status</th><th>Normal</th><th>Warning</th><th>Critical</th><th>Unreviewed</th><th>Last received</th><th>Devices</th></tr></thead><tbody id="siteRows"></tbody></table>
+          <table><thead><tr><th>Site</th><th>Network</th><th>Status</th><th>Devices</th></tr></thead><tbody id="siteRows"></tbody></table>
         </article>
         <article class="panel">
           <h2 id="chartTitle">Telemetry</h2>
           <canvas id="chart" width="900" height="280"></canvas>
-          <small id="chartHint">Hover the chart to inspect a timestamp and raw values.</small>
         </article>
         <article class="panel">
           <h2>Events</h2>
@@ -105,7 +99,7 @@ def render_page() -> str:
     </section>
   </main>
   <script>
-    let token = "", sites = [], events = [], siteSummaries = [], selectedEventId = null, latestPoints = [], latestUnits = {};
+    let token = "", sites = [], events = [], networkProfiles = [], selectedEventId = null;
     const $ = (id) => document.getElementById(id);
 
     async function api(path, options = {}) {
@@ -134,7 +128,9 @@ def render_page() -> str:
       const boot = await api("/api/bootstrap");
       sites = boot.sites;
       events = boot.events;
+      networkProfiles = boot.networkProfiles;
       setOptions($("siteSelect"), sites, item => item.id, item => item.name);
+      $("networkTypes").textContent = networkProfiles.length;
       await renderAssets();
       await render();
     }
@@ -152,19 +148,15 @@ def render_page() -> str:
     async function render() {
       const site = selectedSite();
       const assetId = $("assetSelect").value;
-      const periodHours = Number($("periodSelect").value);
-      const from = new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString();
-      const telem = await api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
-      siteSummaries = await api("/api/dashboard/sites-summary");
-      events = await api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
-      $("siteCount").textContent = siteSummaries.length;
-      $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
-      $("warningAssets").textContent = siteSummaries.reduce((n, s) => n + s.warningAssets, 0);
-      $("criticalAssets").textContent = siteSummaries.reduce((n, s) => n + s.criticalAssets, 0);
+      const telem = await api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}`);
+      events = await api("/api/events");
+      $("siteCount").textContent = sites.length;
+      $("onlineCount").textContent = sites.reduce((n, s) => n + s.onlineDevices, 0);
+      $("openEvents").textContent = events.filter(e => e.label === "needs_review").length;
       renderSiteRows();
       renderEvents();
       $("chartTitle").textContent = `${site.name} / ${assetId}`;
-      draw(telem.points, telem.units);
+      draw(telem.points);
     }
 
     function setOptions(select, rows, valueOf, labelOf) {
@@ -178,9 +170,9 @@ def render_page() -> str:
 
     function renderSiteRows() {
       const body = $("siteRows");
-      body.replaceChildren(...siteSummaries.slice(0, 12).map(site => {
+      body.replaceChildren(...sites.slice(0, 12).map(site => {
         const row = document.createElement("tr");
-        for (const value of [site.siteName, site.region, site.status, site.normalAssets, site.warningAssets, site.criticalAssets, site.unreviewedEvents, site.lastReceivedAt || "-", `${site.onlineDevices}/${site.totalDevices}`]) {
+        for (const value of [site.name, site.networkType || site.network, site.status, `${site.onlineDevices}/${site.totalDevices}`]) {
           const cell = document.createElement("td");
           cell.textContent = value;
           row.appendChild(cell);
@@ -207,57 +199,17 @@ def render_page() -> str:
       }));
     }
 
-    function finiteNumber(value) {
-      const number = Number(value);
-      return Number.isFinite(number) ? number : null;
-    }
-
-    function draw(points, units) {
-      latestPoints = points;
-      latestUnits = units;
+    function draw(points) {
       const c = $("chart"), ctx = c.getContext("2d"), w = c.width, h = c.height, pad = 34;
       ctx.clearRect(0,0,w,h); ctx.fillStyle = "#fff"; ctx.fillRect(0,0,w,h);
-      if (!points.length) {
-        ctx.fillStyle = "#66716d"; ctx.font = "16px Segoe UI";
-        ctx.fillText("No telemetry is available for the selected period.", pad, h / 2);
-        $("chartHint").textContent = "No telemetry is available for the selected site, asset, and period.";
-        return;
-      }
       ctx.strokeStyle = "#d8ded9"; ctx.lineWidth = 1;
       for (let i=0;i<=4;i++){ const y=pad+(h-pad*2)/4*i; ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(w-pad,y); ctx.stroke(); }
-      const series = [
-        ["anomaly score", "#c2413b", p => finiteNumber(p.anomalyScore ?? p.score), 0, 100],
-        [units.vibrationRmsRaw ? "vibration raw RMS" : "demo vibration (mm/s RMS)", "#14796f", p => finiteNumber(p.vibrationRmsRaw ?? p.vibration), null, null],
-        [units.acousticRmsRaw ? "acoustic raw RMS" : "demo acoustic (dB)", "#4453a8", p => finiteNumber(p.acousticRmsRaw ?? p.acoustic), null, null],
-        ["RPM", "#b7791f", p => finiteNumber(p.rpm), null, null],
-      ];
-      let legendX = pad;
-      for (const [name,color,map,fixedMin,fixedMax] of series) {
-        const values = points.map(map).filter(value => value !== null);
-        if (!values.length) continue;
-        const min = fixedMin ?? Math.min(...values);
-        const max = fixedMax ?? Math.max(...values);
-        const range = max - min || 1;
-        ctx.strokeStyle = color; ctx.lineWidth = name === "anomaly score" ? 3 : 2; ctx.beginPath();
-        let started = false;
-        points.forEach((p,i)=>{
-          const value = map(p);
-          if (value === null) { started = false; return; }
-          const x = pad + (w-pad*2)*i/Math.max(1, points.length-1);
-          const y = pad + (h-pad*2)*(1-(value-min)/range);
-          if (started) ctx.lineTo(x,y); else { ctx.moveTo(x,y); started = true; }
-        });
+      const series = [["score","#c2413b",p=>p.score],["vibration","#14796f",p=>Math.min(100,p.vibrationRmsMmS*22)],["acoustic","#4453a8",p=>Math.min(100,p.acousticDb*1.15)]];
+      for (const [name,color,map] of series) {
+        ctx.strokeStyle = color; ctx.lineWidth = name === "score" ? 3 : 2; ctx.beginPath();
+        points.forEach((p,i)=>{ const x=pad+(w-pad*2)*i/(points.length-1); const y=pad+(h-pad*2)*(1-map(p)/100); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
         ctx.stroke();
-        if (values.length === 1) {
-          const pointIndex = points.findIndex(point => map(point) !== null);
-          const value = map(points[pointIndex]);
-          const x = pad + (w-pad*2)*pointIndex/Math.max(1, points.length-1);
-          const y = pad + (h-pad*2)*(1-(value-min)/range);
-          ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
-        }
-        ctx.fillStyle = color; ctx.font = "12px Segoe UI"; ctx.fillText(name, legendX, 18); legendX += ctx.measureText(name).width + 16;
       }
-      $("chartHint").textContent = "Signals are independently scaled for comparison. Hover for raw values and score evidence.";
     }
 
     document.addEventListener("click", async (e) => {
@@ -277,7 +229,6 @@ def render_page() -> str:
     $("loginBtn").addEventListener("click", () => login().catch(error => alert(error.message)));
     $("siteSelect").addEventListener("change", async () => { await renderAssets(); await render(); });
     $("assetSelect").addEventListener("change", render);
-    $("periodSelect").addEventListener("change", render);
     $("refreshBtn").addEventListener("click", render);
     $("injectBtn").addEventListener("click", async () => {
       await api("/api/demo/inject-anomaly", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({siteId:$("siteSelect").value, assetId:$("assetSelect").value})});
@@ -298,20 +249,6 @@ def render_page() -> str:
       link.click();
       URL.revokeObjectURL(link.href);
     });
-    $("chart").addEventListener("mousemove", (event) => {
-      if (!latestPoints.length) return;
-      const bounds = $("chart").getBoundingClientRect();
-      const ratio = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
-      const index = Math.round(ratio * (latestPoints.length - 1));
-      const point = latestPoints[index];
-      const vibration = finiteNumber(point.vibrationRmsRaw ?? point.vibration);
-      const acoustic = finiteNumber(point.acousticRmsRaw ?? point.acoustic);
-      const score = finiteNumber(point.anomalyScore ?? point.score);
-      const vibrationLabel = latestUnits.vibrationRmsRaw ? "vibration raw RMS" : "demo vibration (mm/s RMS)";
-      const acousticLabel = latestUnits.acousticRmsRaw ? "acoustic raw RMS" : "demo acoustic (dB)";
-      $("chartHint").textContent = `${point.timestamp} · ${vibrationLabel}: ${vibration ?? "-"} · ${acousticLabel}: ${acoustic ?? "-"} · RPM: ${point.rpm ?? "-"} · score: ${score ?? "unavailable"} (${point.anomalyStatus ?? "-"})`;
-    });
-    setInterval(() => { if (token) render().catch(error => console.error(error)); }, 5000);
   </script>
 </body>
 </html>"""

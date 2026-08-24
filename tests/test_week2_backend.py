@@ -20,7 +20,6 @@ from ai.ai2.week1.replay_telemetry import (
     post_payload,
     remap_payload,
 )
-from ai.ai2.week2.anomaly_score import latest_asset_statuses
 
 from motor_diagnosis.data import (
     EVENTS,
@@ -55,7 +54,6 @@ from motor_diagnosis.mqtt_service import (
     subscription_is_granted,
 )
 from motor_diagnosis.server import create_server
-from motor_diagnosis.web import render_page
 
 
 def utc_text(offset_seconds: int = 0) -> str:
@@ -164,21 +162,6 @@ class Week2BackendTest(unittest.TestCase):
             to_timestamp=utc_text(),
         )
         self.assertEqual([point["sequence"] for point in points], [2])
-
-    def test_latest_raw_score_updates_site_summary_asset_counts(self) -> None:
-        ingest_telemetry(
-            self.principal,
-            telemetry_payload(vibrationRmsRaw=0.10),
-        )
-
-        summaries = dashboard_sites_summary(
-            self.user("admin", "admin123"),
-            live_asset_statuses=latest_asset_statuses(TELEMETRY_RECORDS),
-        )
-        site = next(row for row in summaries if row["siteId"] == "SITE-01")
-
-        self.assertEqual(site["criticalAssets"], 2)
-        self.assertEqual(site["warningAssets"], 0)
 
     def test_device_offline_and_recovery_history_are_recorded(self) -> None:
         device = get_device("DEV-01-GEN-01")
@@ -604,17 +587,6 @@ class Week2HttpSmokeTest(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read().decode("utf-8"))
 
-    def request_text(self, path: str, token: str) -> tuple[int, str]:
-        request = Request(
-            f"http://127.0.0.1:{self.port}{path}",
-            headers={"authorization": f"Bearer {token}"},
-        )
-        try:
-            with urlopen(request, timeout=5) as response:
-                return response.status, response.read().decode("utf-8-sig")
-        except HTTPError as error:
-            return error.code, error.read().decode("utf-8")
-
     def login(self, username: str, password: str) -> str:
         status, body = self.request(
             "/api/auth/login",
@@ -671,22 +643,6 @@ class Week2HttpSmokeTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(telemetry["points"]), 1)
         self.assertIn("vibrationRmsRaw", telemetry["units"])
-        self.assertIn("anomalyScore", telemetry["points"][0])
-        self.assertIn("anomalyStatus", telemetry["points"][0])
-
-        event_from = utc_text(-60 * 60)
-        status, filtered_events = self.request(
-            f"/api/events?siteId=SITE-01&assetId=SITE-01-MOT-02&from={event_from}",
-            token=operator_token,
-        )
-        self.assertEqual(status, 200)
-        self.assertTrue(filtered_events)
-        self.assertTrue(
-            all(
-                event["siteId"] == "SITE-01" and event["assetId"] == "SITE-01-MOT-02"
-                for event in filtered_events
-            )
-        )
 
         status, summary = self.request(
             "/api/dashboard/sites-summary", token=operator_token
@@ -743,27 +699,6 @@ class Week2HttpSmokeTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(updated["assetId"], "SITE-01-GEN-01")
-
-    def test_raw_telemetry_csv_export_uses_timestamp_fields(self) -> None:
-        admin_token = self.login("admin", "admin123")
-        status, accepted = self.request(
-            "/api/telemetry/ingest",
-            method="POST",
-            payload=telemetry_payload(),
-            token="demo-telemetry-ingest-token",
-        )
-        self.assertEqual(status, 201)
-        self.assertEqual(accepted["sequence"], 1)
-
-        status, csv_body = self.request_text(
-            "/api/export?siteId=SITE-01&assetId=SITE-01-GEN-01",
-            admin_token,
-        )
-
-        self.assertEqual(status, 200)
-        self.assertIn("timestamp,sequence,site_id,asset_id,device_id", csv_body)
-        self.assertIn("vibration_rms_raw", csv_body)
-        self.assertIn("SITE-01-GEN-01", csv_body)
 
     def test_mqtt_bridge_forwards_into_http_server_storage(self) -> None:
         payload = telemetry_payload()

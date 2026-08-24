@@ -30,6 +30,11 @@ TELEMETRY_MAX_FUTURE_SECONDS = 5 * 60
 CONNECTIVITY_TEST_PHASES = {"before", "after"}
 CONNECTIVITY_TEST_VERDICTS = {"pass", "warn", "fail"}
 HARDWARE_COMPONENTS = {"sensors", "board", "connectivity", "power", "enclosure"}
+NON_ASSET_ANOMALY_EVENT_LABELS = {
+    "normal_false_positive",
+    "repair_completed",
+    "sensor_issue",
+}
 
 NETWORK_PROFILES = [
     {
@@ -680,6 +685,7 @@ def build_events() -> list[dict[str, Any]]:
             "severity": "critical",
             "eventType": "asset_anomaly_candidate",
             "title": "Cooling pump motor bearing suspect",
+            "occurredAt": iso_seconds_ago(18 * 60),
             "time": "19:42:12",
             "duration": "48s",
             "score": 92,
@@ -693,6 +699,7 @@ def build_events() -> list[dict[str, Any]]:
             "severity": "warning",
             "eventType": "asset_anomaly_candidate",
             "title": "Generator acoustic spectrum drift",
+            "occurredAt": iso_seconds_ago(29 * 60),
             "time": "19:31:05",
             "duration": "31s",
             "score": 78,
@@ -706,6 +713,7 @@ def build_events() -> list[dict[str, Any]]:
             "severity": "device",
             "eventType": "sensor_fault_candidate",
             "title": "Acoustic sensor noise floor fault",
+            "occurredAt": iso_seconds_ago(40 * 60),
             "time": "19:20:44",
             "duration": "8m",
             "score": 64,
@@ -2221,21 +2229,36 @@ def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "isSynthetic must be a boolean.",
         )
 
+    vibration_rms_raw = telemetry_number(
+        payload, "vibrationRmsRaw", required=True, nullable=False
+    )
+    acoustic_rms_raw = telemetry_number(
+        payload, "acousticRmsRaw", required=False, nullable=True
+    )
+    if vibration_rms_raw < 0:
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "vibrationRmsRaw must be greater than or equal to zero.",
+        )
+    if acoustic_rms_raw is not None and acoustic_rms_raw < 0:
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "acousticRmsRaw must be greater than or equal to zero.",
+        )
+
     return {
         "timestamp": format_rfc3339(timestamp),
         "sequence": sequence,
         **identifiers,
         "rpm": telemetry_number(payload, "rpm", required=False, nullable=True),
-        "vibrationRmsRaw": telemetry_number(
-            payload, "vibrationRmsRaw", required=True, nullable=False
-        ),
+        "vibrationRmsRaw": vibration_rms_raw,
         "vibrationRmsMmS": None,
         "vibrationPeakHz": telemetry_number(
             payload, "vibrationPeakHz", required=True, nullable=False
         ),
-        "acousticRmsRaw": telemetry_number(
-            payload, "acousticRmsRaw", required=False, nullable=True
-        ),
+        "acousticRmsRaw": acoustic_rms_raw,
         "acousticDb": None,
         "acousticPeakHz": telemetry_number(
             payload, "acousticPeakHz", required=False, nullable=True
@@ -2393,6 +2416,7 @@ def recover_device_from_telemetry(device: dict[str, Any], received_at: str) -> N
                 "severity": "device",
                 "eventType": "device_recovered",
                 "title": f"{device['id']} telemetry recovered",
+                "occurredAt": received_at,
                 "time": received_at,
                 "duration": "recovered",
                 "score": 0,
@@ -2632,6 +2656,7 @@ def device_health_for(device_id: str) -> dict[str, Any]:
                 "severity": "device",
                 "eventType": "device_offline",
                 "title": f"{device['id']} telemetry offline",
+                "occurredAt": offline_since,
                 "time": offline_since,
                 "duration": f">{offline_threshold}s",
                 "score": 0,
@@ -2677,7 +2702,10 @@ def device_health_for(device_id: str) -> dict[str, Any]:
 
 
 def dashboard_sites_summary(
-    user: dict[str, Any], region: str = "", status: str = ""
+    user: dict[str, Any],
+    region: str = "",
+    status: str = "",
+    live_asset_statuses: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     require_permission(user, "dashboard:read")
     rows = []
@@ -2691,19 +2719,32 @@ def dashboard_sites_summary(
         )
         site_assets = [asset for asset in ASSETS if asset["siteId"] == site["id"]]
         site_events = [event for event in EVENTS if event["siteId"] == site["id"]]
+        asset_statuses = {asset["id"]: "normal" for asset in site_assets}
+        severity_rank = {"normal": 0, "warning": 1, "critical": 2}
+        for event in site_events:
+            if event.get("label") in NON_ASSET_ANOMALY_EVENT_LABELS:
+                continue
+            severity = str(event.get("severity") or "")
+            asset_id = event.get("assetId")
+            if asset_id in asset_statuses and severity in severity_rank:
+                if severity_rank[severity] > severity_rank[asset_statuses[asset_id]]:
+                    asset_statuses[asset_id] = severity
+        for asset_id, live_status in (live_asset_statuses or {}).items():
+            if asset_id in asset_statuses and live_status in severity_rank:
+                if severity_rank[live_status] > severity_rank[asset_statuses[asset_id]]:
+                    asset_statuses[asset_id] = live_status
         critical_asset_ids = {
-            event["assetId"]
-            for event in site_events
-            if event.get("severity") == "critical"
+            asset_id
+            for asset_id, asset_status in asset_statuses.items()
+            if asset_status == "critical"
         }
         warning_asset_ids = {
-            event["assetId"]
-            for event in site_events
-            if event.get("severity") == "warning"
-            and event["assetId"] not in critical_asset_ids
+            asset_id
+            for asset_id, asset_status in asset_statuses.items()
+            if asset_status == "warning"
         }
-        normal_assets = max(
-            0, len(site_assets) - len(critical_asset_ids) - len(warning_asset_ids)
+        normal_assets = sum(
+            1 for asset_status in asset_statuses.values() if asset_status == "normal"
         )
         summary_status = (
             "critical"
@@ -3087,6 +3128,7 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             "severity": "critical",
             "eventType": "asset_anomaly_candidate",
             "title": f"{asset['name']} anomaly injection event",
+            "occurredAt": now_iso(),
             "time": now_text(),
             "duration": "10s",
             "score": 94,

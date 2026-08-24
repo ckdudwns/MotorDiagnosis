@@ -8,6 +8,7 @@
 - [AI-1 1주차: 신호 전처리·라벨·데이터셋](./ai/ai1/week1/README.md)
 - [AI-1 2주차: EDGE_FEATURE_01 — 특징량 계산·정상 기준선·품질 검증](./ai/ai1/week2/README.md)
 - [AI-2 1주차: 분석/실시간 경로 분리·리플레이](./ai/ai2/week1/README.md)
+- [AI-2 2주차: 이상 점수 초안·관제 시각화](./ai/ai2/week2/README.md)
 
 AI-1의 공개 데이터 기반 합성 인계 파일을 AI-2가 분석 경로와 실시간 리플레이 경로로
 분리한다. 이 데이터는 실제 한 설비에서 동시에 측정한 데이터가 아니므로, 모델 성능이나
@@ -18,6 +19,9 @@ AI-1의 공개 데이터 기반 합성 인계 파일을 AI-2가 분석 경로와
 - `POST /api/telemetry/ingest`: 단건 수집, raw-only 스키마 검증,
   `(deviceId, sequence)` 멱등성, 오류 격리
 - `GET /api/telemetry`: 사이트·설비·기간별 수집 데이터 조회
+- `GET /api/events`: **2주차 이벤트 시각 조회 확장(PoC)**. 현재 배열 응답에
+  `occurredAt`(시간대 포함 RFC3339)을 추가해 UTC 최신순 정렬·기간 필터를 시연한다.
+  이는 공식 API v1.2의 `EVENT_LIST_01`(페이지네이션 포함) 구현이나 정식 호환 계약이 아니다.
 - `GET /api/dashboard/sites-summary`: 권한 범위 내 사이트 상태 요약
 - `GET /api/devices/{deviceId}/health`: 오프라인·복구·누락 구간과 장치 상태 조회
 - `GET /api/health/dependencies`: 수집·저장·분석·알림 의존성 상태와 오류율 조회
@@ -40,6 +44,13 @@ MQTT JSON·토픽은
 `POST /api/telemetry/quarantine`에 원문과 오류 사유가 저장된 뒤 ACK된다. 브로커 상태는
 `POST /api/health/dependencies/mqtt`에 보고하되, SUBACK 승인 QoS가 요청 QoS 이상일 때만
 `healthy`로 전환한다.
+
+### 이벤트 시각 PoC 범위
+
+이 PoC에서 `occurredAt`은 이벤트의 단일 기준 시각이며 브라우저는 이를 지역 시각으로
+변환해 표시한다. `time`은 과거 화면용 문자열로서 정렬·필터에 사용하지 않는다. 공식 API
+v1.2로 승격할 때는 `EVENT_LIST_01`의 `{items, page, size, total}` 응답, `time` 레거시
+호환 처리, 기존 이벤트의 RFC3339 이관 정책을 명세·서버·클라이언트에 함께 반영한다.
 
 ```bash
 python -m motor_diagnosis.mqtt_service \

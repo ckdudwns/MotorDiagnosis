@@ -19,6 +19,8 @@ AI-1의 공개 데이터 기반 합성 인계 파일을 AI-2가 분석 경로와
 - `POST /api/telemetry/ingest`: 단건 수집, raw-only 스키마 검증,
   `(deviceId, sequence)` 멱등성, 오류 격리
 - `GET /api/telemetry`: 사이트·설비·기간별 수집 데이터 조회
+- `GET /api/events`: 이벤트 조회. 반환 이벤트의 `occurredAt`은 시간대가 포함된 RFC3339
+  필수 필드이며, 파싱한 UTC 시각 기준 최신순으로 정렬·기간 필터링한다.
 - `GET /api/dashboard/sites-summary`: 권한 범위 내 사이트 상태 요약
 - `GET /api/devices/{deviceId}/health`: 오프라인·복구·누락 구간과 장치 상태 조회
 - `GET /api/health/dependencies`: 수집·저장·분석·알림 의존성 상태와 오류율 조회
@@ -41,6 +43,14 @@ MQTT JSON·토픽은
 `POST /api/telemetry/quarantine`에 원문과 오류 사유가 저장된 뒤 ACK된다. 브로커 상태는
 `POST /api/health/dependencies/mqtt`에 보고하되, SUBACK 승인 QoS가 요청 QoS 이상일 때만
 `healthy`로 전환한다.
+
+### 이벤트 시각 호환 정책
+
+`occurredAt`은 이벤트의 단일 기준 시각이다. 브라우저는 이를 지역 시각으로 변환해 표시하며,
+`time`은 과거 화면용 문자열로서 정렬·필터·표시에 사용하지 않는다. 기존 저장 이벤트에
+`occurredAt`이 없거나 RFC3339 형식이 아니면 날짜·시간대가 없어 정확한 순서를 복원할 수
+없으므로 API 목록에서 제외한다. 운영 데이터 이관 시에는 원본 시각과 시간대를 확인해
+RFC3339 `occurredAt`을 채운 뒤 제공해야 한다.
 
 ```bash
 python -m motor_diagnosis.mqtt_service \

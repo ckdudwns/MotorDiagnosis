@@ -30,7 +30,11 @@ TELEMETRY_MAX_FUTURE_SECONDS = 5 * 60
 CONNECTIVITY_TEST_PHASES = {"before", "after"}
 CONNECTIVITY_TEST_VERDICTS = {"pass", "warn", "fail"}
 HARDWARE_COMPONENTS = {"sensors", "board", "connectivity", "power", "enclosure"}
-RESOLVED_EVENT_LABELS = {"normal_false_positive", "repair_completed"}
+NON_ASSET_ANOMALY_EVENT_LABELS = {
+    "normal_false_positive",
+    "repair_completed",
+    "sensor_issue",
+}
 
 NETWORK_PROFILES = [
     {
@@ -2703,7 +2707,7 @@ def dashboard_sites_summary(
         asset_statuses = {asset["id"]: "normal" for asset in site_assets}
         severity_rank = {"normal": 0, "warning": 1, "critical": 2}
         for event in site_events:
-            if event.get("label") in RESOLVED_EVENT_LABELS:
+            if event.get("label") in NON_ASSET_ANOMALY_EVENT_LABELS:
                 continue
             severity = str(event.get("severity") or "")
             asset_id = event.get("assetId")

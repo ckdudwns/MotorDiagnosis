@@ -769,7 +769,7 @@ def authorized_events(
         rows = [event for event in rows if event["siteId"] == normalized_site_id]
     if normalized_asset_id:
         rows = [event for event in rows if event["assetId"] == normalized_asset_id]
-    filtered = []
+    filtered: list[tuple[Any, dict[str, Any]]] = []
     for event in rows:
         occurred_at = event.get("occurredAt")
         try:
@@ -780,13 +780,16 @@ def authorized_events(
             continue
         if to_value and occurred_value > to_value:
             continue
-        filtered.append(event)
+        filtered.append((occurred_value, event))
     return copy_payload(
-        sorted(
-            filtered,
-            key=lambda event: str(event.get("occurredAt") or ""),
-            reverse=True,
-        )
+        [
+            event
+            for _, event in sorted(
+                filtered,
+                key=lambda row: row[0],
+                reverse=True,
+            )
+        ]
     )
 
 

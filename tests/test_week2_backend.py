@@ -55,7 +55,7 @@ from motor_diagnosis.mqtt_service import (
     report_mqtt_status,
     subscription_is_granted,
 )
-from motor_diagnosis.server import create_server
+from motor_diagnosis.server import authorized_events, create_server
 from motor_diagnosis.web import render_page
 
 
@@ -181,8 +181,12 @@ class Week2BackendTest(unittest.TestCase):
         self.assertEqual(site["criticalAssets"], 2)
         self.assertEqual(site["warningAssets"], 0)
 
-    def test_resolved_or_false_positive_event_no_longer_sets_asset_status(self) -> None:
-        for label in ("normal_false_positive", "repair_completed"):
+    def test_non_asset_anomaly_event_no_longer_sets_asset_status(self) -> None:
+        for label in (
+            "normal_false_positive",
+            "repair_completed",
+            "sensor_issue",
+        ):
             with self.subTest(label=label):
                 reset_runtime_state()
                 review_event("EV-241", {"label": label, "note": "reviewed"})
@@ -191,6 +195,30 @@ class Week2BackendTest(unittest.TestCase):
 
                 self.assertEqual(site["criticalAssets"], 0)
                 self.assertEqual(site["unreviewedEvents"], 0)
+
+    def test_events_sort_by_parsed_rfc3339_time(self) -> None:
+        EVENTS.extend(
+            [
+                {
+                    "id": "EV-OFFSET",
+                    "siteId": "SITE-01",
+                    "assetId": "SITE-01-GEN-01",
+                    "occurredAt": "2026-08-24T10:00:00+09:00",
+                },
+                {
+                    "id": "EV-FRACTION",
+                    "siteId": "SITE-01",
+                    "assetId": "SITE-01-GEN-01",
+                    "occurredAt": "2026-08-24T02:00:00.500Z",
+                },
+            ]
+        )
+
+        event_ids = [
+            event["id"] for event in authorized_events(self.user("admin", "admin123"))
+        ]
+
+        self.assertLess(event_ids.index("EV-FRACTION"), event_ids.index("EV-OFFSET"))
 
     def test_device_offline_and_recovery_history_are_recorded(self) -> None:
         device = get_device("DEV-01-GEN-01")

@@ -24,9 +24,11 @@ sys.path.insert(0, _DATASETS_DIR)
 
 from register_dataset import (  # noqa: E402
     build_manifest,
-    stratified_split,
+    group_split,
+    compute_version_checksum,
     sha256_of_file,
     DATASET_LABEL_MAPPING,
+    InsufficientAssetGroupsError,
 )
 from export_dataset import export_dataset  # noqa: E402
 
@@ -38,38 +40,205 @@ def _cwru_data_available() -> bool:
 CWRU_SKIP_REASON = f"CWRU 실데이터 없음: {os.path.join(_CWRU_DATA_DIR, '97.mat')}"
 
 
-class TestStratifiedSplitSynthetic(unittest.TestCase):
-    """합성 레코드로 분할 로직만 검증 — 실데이터 불필요."""
+def _grouped_records(label: str, group_sizes: dict) -> list:
+    """label에 대해 {source_label: window_count} 형태로 합성 레코드를 만든다."""
+    records = []
+    for source_label, count in group_sizes.items():
+        records.extend(
+            {"label": label, "source_label": source_label} for _ in range(count)
+        )
+    return records
 
-    def test_split_counts_match_group_size_per_label(self):
-        records = [{"label": "NORMAL"} for _ in range(10)] + [
-            {"label": "BEARING_FAULT_INNER"} for _ in range(7)
-        ]
-        splits = stratified_split(records, seed=1)
+
+class TestGroupSplitSynthetic(unittest.TestCase):
+    """합성 레코드로 그룹 분할 로직만 검증 — 실데이터 불필요."""
+
+    def _groups_used_per_split(self, records, splits):
+        """split(train/validation/test)별로 등장한 source_label 집합을 모은다."""
+        by_split: dict = {"train": set(), "validation": set(), "test": set()}
+        for rec, split in zip(records, splits):
+            by_split[split].add(rec["source_label"])
+        return by_split
+
+    def test_no_group_appears_in_more_than_one_split(self):
+        records = _grouped_records(
+            "NORMAL", {"a.mat": 20, "b.mat": 15, "c.mat": 10, "d.mat": 5}
+        ) + _grouped_records(
+            "BEARING_FAULT_INNER", {"e.mat": 12, "f.mat": 9, "g.mat": 6}
+        )
+        splits = group_split(records, seed=1)
 
         self.assertEqual(len(splits), len(records))
+        self.assertTrue(set(splits) <= {"train", "validation", "test"})
 
-        normal_splits = splits[:10]
-        fault_splits = splits[10:]
-        self.assertEqual(len(normal_splits), 10)
-        self.assertEqual(len(fault_splits), 7)
-        for group in (normal_splits, fault_splits):
-            self.assertTrue(set(group) <= {"train", "validation", "test"})
+        by_split = self._groups_used_per_split(records, splits)
+        all_groups_seen = by_split["train"] | by_split["validation"] | by_split["test"]
+        # 각 그룹(source_label)은 정확히 하나의 split에서만 등장해야 한다 (누수 없음)
+        for group in all_groups_seen:
+            memberships = sum(group in s for s in by_split.values())
+            self.assertEqual(
+                memberships, 1, f"그룹 {group!r}이 두 개 이상의 split에 걸쳐 있습니다."
+            )
+
+    def test_every_required_split_gets_at_least_one_group_when_enough_groups_exist(self):
+        records = _grouped_records(
+            "NORMAL", {"a.mat": 20, "b.mat": 15, "c.mat": 10}
+        )
+        splits = group_split(records, seed=1)
+        by_split = self._groups_used_per_split(records, splits)
+        for split_name in ("train", "validation", "test"):
+            self.assertGreater(
+                len(by_split[split_name]), 0, f"{split_name} split에 그룹이 배정되지 않았습니다."
+            )
 
     def test_split_is_deterministic_given_seed(self):
-        records = [{"label": "NORMAL"} for _ in range(20)]
+        records = _grouped_records("NORMAL", {"a.mat": 10, "b.mat": 6, "c.mat": 4})
         self.assertEqual(
-            stratified_split(records, seed=7), stratified_split(records, seed=7)
+            group_split(records, seed=7), group_split(records, seed=7)
         )
+
+    def test_insufficient_groups_raises_instead_of_shuffling_windows(self):
+        """CWRU처럼 라벨당 그룹(자산)이 1개뿐이면, 윈도우를 섞는 대신
+        명시적으로 데이터 부족 오류를 내야 한다."""
+        records = _grouped_records("NORMAL", {"only.mat": 50})
+        with self.assertRaises(InsufficientAssetGroupsError):
+            group_split(records, seed=1)
+
+    def test_two_groups_is_still_insufficient_for_three_way_split(self):
+        records = _grouped_records("NORMAL", {"a.mat": 50, "b.mat": 50})
+        with self.assertRaises(InsufficientAssetGroupsError):
+            group_split(records, seed=1)
+
+    def test_train_only_ratio_succeeds_with_a_single_group(self):
+        records = _grouped_records("NORMAL", {"only.mat": 50})
+        splits = group_split(
+            records, ratios={"train": 1.0, "validation": 0.0, "test": 0.0}, seed=1
+        )
+        self.assertEqual(set(splits), {"train"})
+
+
+class TestComputeVersionChecksum(unittest.TestCase):
+    def _files(self):
+        return {"97.mat": {"sha256": "sha256:aaa", "label": "NORMAL"}}
+
+    def test_deterministic_given_same_inputs(self):
+        a = compute_version_checksum(self._files(), 2048, 2048, {"train": 1.0}, 42)
+        b = compute_version_checksum(self._files(), 2048, 2048, {"train": 1.0}, 42)
+        self.assertEqual(a, b)
+
+    def test_changes_when_window_size_changes(self):
+        base = compute_version_checksum(self._files(), 2048, 2048, {"train": 1.0}, 42)
+        changed = compute_version_checksum(self._files(), 4096, 2048, {"train": 1.0}, 42)
+        self.assertNotEqual(base, changed)
+
+    def test_changes_when_split_ratios_change(self):
+        base = compute_version_checksum(self._files(), 2048, 2048, {"train": 1.0}, 42)
+        changed = compute_version_checksum(
+            self._files(), 2048, 2048, {"train": 0.5, "test": 0.5}, 42
+        )
+        self.assertNotEqual(base, changed)
+
+
+class TestExportDatasetSynthetic(unittest.TestCase):
+    """CWRU 실데이터 없이도 openpyxl XLSX 내보내기 자체를 검증하는 합성 매니페스트 테스트."""
+
+    def _synthetic_manifest(self):
+        rows = [
+            {
+                "sample_id": "97_0000",
+                "source_file": "97.mat",
+                "known_label": "NORMAL",
+                "common_label": "NORMAL",
+                "split": "train",
+                "sample_rate_hz": 12000,
+                "rpm": 1797,
+                "rms_mean": 0.05,
+            },
+            {
+                "sample_id": "105_0000",
+                "source_file": "105.mat",
+                "known_label": "BEARING_FAULT_INNER",
+                "common_label": "ANOMALY",
+                "split": "test",
+                "sample_rate_hz": 12000,
+                "rpm": 1797,
+                "rms_mean": 0.42,
+            },
+        ]
+        return {
+            "id": "DS-CWRU-VIBRATION-19700101-deadbeefcafe",
+            "name": "cwru-bearing-vibration-v1",
+            "source": {
+                "type": "external",
+                "uri": "https://example.invalid/cwru",
+                "license": "test",
+                "checksum": "sha256:deadbeef",
+                "files": {"97.mat": {"sha256": "sha256:aaa", "label": "NORMAL"}},
+            },
+            "compatibility": {
+                "signalType": ["vibration"],
+                "samplingRateHz": 12000,
+                "units": {"vibration": "g"},
+                "operatingConditions": {"rpmRange": [1797, 1797], "load": "test"},
+            },
+            "labelTaxonomyVersion": "CWRU-FAULT-V1",
+            "labelMapping": DATASET_LABEL_MAPPING,
+            "split": {"train": 0.5, "validation": 0.0, "test": 0.5},
+            "splitStrategy": "test",
+            "status": "draft",
+            "reason": "synthetic test",
+            "createdAt": "1970-01-01T00:00:00+00:00",
+            "rowCount": len(rows),
+            "splitCounts": {"train": 1, "validation": 0, "test": 1},
+            "rows": rows,
+        }
+
+    def test_export_produces_xlsx_with_manifest_and_rows_sheets(self):
+        from openpyxl import load_workbook
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_synthetic_")
+        try:
+            result = export_dataset(manifest, tmp_dir)
+            self.assertTrue(os.path.exists(result["xlsx_path"]))
+
+            wb = load_workbook(result["xlsx_path"])
+            self.assertIn("manifest", wb.sheetnames)
+            self.assertIn("rows", wb.sheetnames)
+            self.assertEqual(wb["rows"].max_row - 1, manifest["rowCount"])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@unittest.skipUnless(_cwru_data_available(), CWRU_SKIP_REASON)
+class TestRegisterManifestRejectsLeakyDefaultSplit(unittest.TestCase):
+    """실제 CWRU 데이터는 라벨당 자산(원본 파일)이 1개뿐이라, 기본 3-way 비율로는
+    그룹을 쪼개지 않고 리크 없는 분할을 만들 수 없다 — build_manifest가 이를
+    조용히 window 셔플로 얼버무리지 않고 명시적으로 실패하는지 확인한다."""
+
+    def test_default_ratios_raise_insufficient_asset_groups(self):
+        from register_dataset import InsufficientAssetGroupsError
+
+        with self.assertRaises(InsufficientAssetGroupsError):
+            build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
 
 
 @unittest.skipUnless(_cwru_data_available(), CWRU_SKIP_REASON)
 class TestRegisterAndExportRealCwruData(unittest.TestCase):
-    """실제 CWRU 데이터로 매니페스트 생성 → CSV/XLSX 내보내기까지 전체 흐름을 검증."""
+    """실제 CWRU 데이터로 매니페스트 생성 → CSV/XLSX 내보내기까지 전체 흐름을 검증.
+
+    라벨당 자산이 1개뿐이라 validation/test로 쪼갤 독립 그룹이 없으므로,
+    여기서는 train 전용 비율로 파이프라인 자체(체크섬/라벨매핑/내보내기)를 검증한다.
+    실제 자산이 여러 개 확보되면 기본 3-way 비율로 전환한다.
+    """
 
     @classmethod
     def setUpClass(cls):
-        cls.manifest = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
+        cls.manifest = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
+            seed=42,
+        )
         cls.tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_")
         cls.export_result = export_dataset(cls.manifest, cls.tmp_dir)
 
@@ -89,6 +258,17 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
         for filename, info in self.manifest["source"]["files"].items():
             recomputed = sha256_of_file(os.path.join(_CWRU_DATA_DIR, filename))
             self.assertEqual(info["sha256"], recomputed)
+
+    def test_id_and_source_checksum_change_with_split_config(self):
+        other = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
+            seed=1,  # 다른 seed -> 다른 버전 체크섬/ID여야 함 (같은 날짜라도 충돌 없음)
+        )
+        self.assertIn("checksum", self.manifest["source"])
+        self.assertNotEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])
+        self.assertNotEqual(self.manifest["id"], other["id"])
+        self.assertIn(self.manifest["source"]["checksum"].split(":", 1)[1][:12], self.manifest["id"])
 
     def test_label_mapping_applied_to_every_row(self):
         for row in self.manifest["rows"]:

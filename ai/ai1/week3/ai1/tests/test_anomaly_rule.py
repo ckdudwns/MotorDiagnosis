@@ -116,6 +116,21 @@ class TestHysteresisSuppressesSingleSpike(unittest.TestCase):
         self.assertEqual(len(result["events"]), 1)
         self.assertIsNone(result["events"][0]["end_index"])
 
+    def test_entry_buildup_max_deviation_is_preserved_in_event(self):
+        """진입 대기 구간(consecutive_over)에서 관측된 최대 편차가 이벤트 생성 시
+        유실되면 안 된다 — 10sigma 다음 4sigma로 진입해도 이벤트의
+        max_deviation_sigma는 4가 아니라 10이어야 한다."""
+        baseline = _fake_baseline()
+        windows = [{"x": 0.0}] * 3 + [{"x": 10.0}, {"x": 4.0}] + [{"x": 0.0}] * 5
+        config = AnomalyRuleConfig(
+            sigma_enter=3.0, sigma_exit=2.0, min_consecutive_enter=2, min_consecutive_exit=2
+        )
+
+        result = evaluate_feature_stream(windows, baseline, config)
+        self.assertEqual(len(result["events"]), 1)
+        self.assertEqual(result["events"][0]["max_deviation_sigma"], 10.0)
+        self.assertEqual(result["events"][0]["start_index"], 3)
+
     def test_hysteresis_prevents_flicker_near_boundary(self):
         """진입(3sigma)과 복귀(2sigma) 임계값 사이(2.5sigma)를 오가는 값은,
         일단 이상에 진입하면 그 사이값만으로는 복귀하지 않아야 한다(깜빡임 방지).

@@ -107,45 +107,104 @@ def build_compatibility_block(records: list) -> dict:
     }
 
 
-def stratified_split(
-    records: list, ratios: dict = None, seed: int = 42
+class InsufficientAssetGroupsError(ValueError):
+    """라벨의 독립 그룹(source_file/자산) 수가 요청한 분할 수보다 적어,
+    그룹을 쪼개지 않고는(=리크 없이는) 분할을 만들 수 없을 때 발생한다."""
+
+
+def group_split(
+    records: list, ratios: dict = None, seed: int = 42, group_key: str = "source_label"
 ) -> list:
-    """라벨(known_label)별로 독립 셔플 후 비율 배분하는 층화 분할.
+    """라벨별로 `group_key`(기본: 원본 파일명) 단위 그룹을 통째로 하나의
+    split에만 배정하는 그룹 분할.
 
-    CWRU는 라벨당 실제 자산(파일)이 1개뿐이라 설비 단위(group) 분할을 쓰면
-    한쪽 split에 특정 라벨이 아예 사라진다. 그래서 윈도우 단위 층화 분할을
-    쓴다 (근거: dataset_manifest_format.md "분할 전략").
-    반올림 오차는 test 분할이 흡수해 각 라벨 그룹 크기와 정확히 합이 맞는다.
+    동일 그룹(예: 같은 원본 .mat 파일)의 윈도우가 train/validation/test에
+    나뉘어 들어가면 모델이 그룹 고유 특성(센서 개체차, 노이즈 지문 등)을
+    외워 검증 지표가 부풀려지는 데이터 누수가 생긴다. 그래서 윈도우를
+    섞지 않고 그룹 단위로만 분할한다.
 
-    TODO: 실제 현장 데이터처럼 라벨당 자산이 여러 대가 되면 설비 단위
-    group split으로 전환해야 한다 (동일 자산이 train/test에 동시에 들어가면 데이터 누수).
+    라벨 하나에 그룹이 비율 개수(예: train/validation/test 3개)보다 적으면
+    그룹을 쪼개지 않는 한 리크 없이 분할을 만들 수 없다 — 이 경우 조용히
+    윈도우 단위로 섞는 대신 `InsufficientAssetGroupsError`를 발생시켜
+    "데이터 부족" 상태를 명시적으로 드러낸다 (근거: dataset_manifest_format.md
+    "분할 전략"). CWRU는 현재 라벨당 자산이 1개뿐이라 기본 3-way 분할에서는
+    이 예외가 발생하는 것이 정상이며, 자산이 늘어나거나 train 전용 등
+    분할 비율을 조정해야 해소된다.
     """
     ratios = ratios or DEFAULT_SPLIT_RATIOS
-    by_label: dict = {}
+    required_splits = [
+        name for name in ("train", "validation", "test") if ratios.get(name, 0) > 0
+    ]
+
+    by_label_groups: dict = {}
     for idx, rec in enumerate(records):
-        by_label.setdefault(rec["label"], []).append(idx)
+        label_groups = by_label_groups.setdefault(rec["label"], {})
+        label_groups.setdefault(rec[group_key], []).append(idx)
 
     split_of_index = {}
-    for label, indices in by_label.items():
+    for label, groups in by_label_groups.items():
+        if len(groups) < len(required_splits):
+            raise InsufficientAssetGroupsError(
+                f"라벨 {label!r}: 독립 그룹이 {len(groups)}개({sorted(groups)})뿐이라 "
+                f"{required_splits} {len(required_splits)}-way 그룹 분할을 리크 없이 "
+                "만들 수 없습니다. 자산을 추가하거나 분할 비율(ratios)을 조정하세요."
+            )
+
         rng = random.Random(f"{seed}-{label}")
-        shuffled = list(indices)
-        rng.shuffle(shuffled)
+        group_ids = list(groups.keys())
+        rng.shuffle(group_ids)  # 동일 크기 그룹 간 배정 순서만 흔들어 결정성 유지
 
-        n = len(shuffled)
-        n_train = round(n * ratios["train"])
-        n_train = min(n_train, n)
-        n_val = round(n * ratios["validation"])
-        n_val = min(n_val, n - n_train)
-        n_test = n - n_train - n_val  # 잔여를 test가 흡수 -> 합이 항상 n과 일치
+        total = sum(len(indices) for indices in groups.values())
+        targets = {name: ratios[name] * total for name in required_splits}
+        assigned: dict = {name: [] for name in required_splits}
+        assigned_counts = {name: 0 for name in required_splits}
 
-        for i in shuffled[:n_train]:
-            split_of_index[i] = "train"
-        for i in shuffled[n_train : n_train + n_val]:
-            split_of_index[i] = "validation"
-        for i in shuffled[n_train + n_val :]:
-            split_of_index[i] = "test"
+        # 1단계: 그룹을 쪼개지 않고도 모든 필수 split이 최소 1개 그룹을 받도록
+        # 가장 비율이 작은 split부터 가장 작은 남은 그룹을 배정해 둔다.
+        remaining = sorted(group_ids, key=lambda g: len(groups[g]))
+        for name in sorted(required_splits, key=lambda n: ratios[n]):
+            group_id = remaining.pop(0)
+            assigned[name].append(group_id)
+            assigned_counts[name] += len(groups[group_id])
+
+        # 2단계: 남은 그룹은 목표 건수 대비 부족분(deficit)이 가장 큰 split에
+        # 큰 그룹부터 배정하는 그리디로 비율에 최대한 맞춘다.
+        remaining.sort(key=lambda g: -len(groups[g]))
+        for group_id in remaining:
+            best = max(required_splits, key=lambda n: targets[n] - assigned_counts[n])
+            assigned[best].append(group_id)
+            assigned_counts[best] += len(groups[group_id])
+
+        for name, group_list in assigned.items():
+            for group_id in group_list:
+                for idx in groups[group_id]:
+                    split_of_index[idx] = name
 
     return [split_of_index[i] for i in range(len(records))]
+
+
+def compute_version_checksum(
+    source_files: dict,
+    window_size: int,
+    hop_size: int,
+    split_ratios: dict,
+    seed: int,
+) -> str:
+    """원본 파일 체크섬 + 전처리/분할 설정으로 불변 버전 체크섬을 만든다.
+
+    입력 파일 구성, window/hop 크기, 분할 비율, seed 중 하나라도 달라지면
+    다른 체크섬이 나와야 같은 날짜에 생성된 서로 다른 데이터셋 버전이
+    동일 ID로 충돌하는 것을 막을 수 있다.
+    """
+    payload = {
+        "files": {name: info["sha256"] for name, info in sorted(source_files.items())},
+        "window_size": window_size,
+        "hop_size": hop_size,
+        "split_ratios": {name: split_ratios[name] for name in sorted(split_ratios)},
+        "seed": seed,
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def build_manifest(
@@ -163,8 +222,12 @@ def build_manifest(
         raise FileNotFoundError(f"{data_dir}에서 CWRU 레코드를 하나도 로드하지 못했습니다.")
 
     source = build_source_block(data_dir)
+    version_checksum = compute_version_checksum(
+        source["files"], window_size, hop_size, split_ratios, seed
+    )
+    source["checksum"] = version_checksum
     compatibility = build_compatibility_block(records)
-    splits = stratified_split(records, split_ratios, seed)
+    splits = group_split(records, split_ratios, seed)
 
     config = FeatureConfig(sample_rate=records[0]["sample_rate"])
     rows = []
@@ -188,8 +251,12 @@ def build_manifest(
     for split in splits:
         split_counts[split] += 1
 
+    version_short_hash = version_checksum.split(":", 1)[1][:12]
     return {
-        "id": f"DS-CWRU-VIBRATION-{datetime.now(timezone.utc).strftime('%Y%m%d')}",
+        "id": (
+            f"DS-CWRU-VIBRATION-{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+            f"-{version_short_hash}"
+        ),
         "name": "cwru-bearing-vibration-v1",
         "source": source,
         "compatibility": compatibility,
@@ -197,8 +264,8 @@ def build_manifest(
         "labelMapping": DATASET_LABEL_MAPPING,
         "split": split_ratios,
         "splitStrategy": (
-            "stratified_by_label (window-level; group-by-asset not applicable — "
-            "CWRU provides a single asset per fault label)"
+            "group_split_by_source_file (per-label; whole source_label groups are "
+            "assigned to a single split — never split at window level to avoid leakage)"
         ),
         "status": "draft",
         "reason": "3주차 기존 데이터셋 선정 및 정규화 — AI_FREQ_MODEL_01 선행학습 입력 준비",
@@ -218,6 +285,15 @@ if __name__ == "__main__":
     parser.add_argument("--hop-size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--train-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["train"]
+    )
+    parser.add_argument(
+        "--validation-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["validation"]
+    )
+    parser.add_argument(
+        "--test-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["test"]
+    )
+    parser.add_argument(
         "--output",
         default=os.path.normpath(
             os.path.join(_THIS_DIR, "..", "data", "handoff", "dataset_manifest_full.json")
@@ -225,10 +301,20 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # 기본 비율(0.7/0.2/0.1)은 라벨당 자산이 여러 개일 때를 전제로 한다. 지금처럼
+    # CWRU가 라벨당 자산 1개뿐이면 group_split이 InsufficientAssetGroupsError를
+    # 낸다 — 조용히 window 셔플로 우회하지 않고, 자산을 추가하거나
+    # --train-ratio 1 --validation-ratio 0 --test-ratio 0 처럼 명시적으로
+    # train 전용 비율을 지정해야 한다.
     manifest = build_manifest(
         data_dir=args.data_dir,
         window_size=args.window_size,
         hop_size=args.hop_size,
+        split_ratios={
+            "train": args.train_ratio,
+            "validation": args.validation_ratio,
+            "test": args.test_ratio,
+        },
         seed=args.seed,
     )
 

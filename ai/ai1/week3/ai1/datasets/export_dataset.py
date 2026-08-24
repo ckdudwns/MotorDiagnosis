@@ -17,7 +17,11 @@ import argparse
 
 from openpyxl import Workbook
 
-from register_dataset import build_manifest, _DEFAULT_DATA_DIR  # noqa: E402
+from register_dataset import (  # noqa: E402
+    build_manifest,
+    _DEFAULT_DATA_DIR,
+    DEFAULT_SPLIT_RATIOS,
+)
 
 
 def _manifest_without_rows(manifest: dict, artifact_refs: dict) -> dict:
@@ -52,6 +56,7 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
     manifest_sheet.append(["source.type", manifest["source"]["type"]])
     manifest_sheet.append(["source.uri", manifest["source"]["uri"]])
     manifest_sheet.append(["source.license", manifest["source"]["license"]])
+    manifest_sheet.append(["source.checksum", manifest["source"]["checksum"]])
     for filename, info in manifest["source"]["files"].items():
         manifest_sheet.append([f"source.files.{filename}.sha256", info["sha256"]])
         manifest_sheet.append([f"source.files.{filename}.label", info["label"]])
@@ -110,6 +115,11 @@ if __name__ == "__main__":
         description="CWRU 데이터셋 매니페스트를 CSV/XLSX로 내보내기"
     )
     parser.add_argument("--data-dir", default=_DEFAULT_DATA_DIR)
+    parser.add_argument("--train-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["train"])
+    parser.add_argument(
+        "--validation-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["validation"]
+    )
+    parser.add_argument("--test-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["test"])
     parser.add_argument(
         "--output-dir",
         default=os.path.normpath(
@@ -118,7 +128,16 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    manifest = build_manifest(data_dir=args.data_dir)
+    # 기본 비율은 라벨당 자산이 여러 개일 때를 전제로 한다 — CWRU처럼 자산이
+    # 1개뿐이면 build_manifest가 InsufficientAssetGroupsError를 낸다 (의도된 동작).
+    manifest = build_manifest(
+        data_dir=args.data_dir,
+        split_ratios={
+            "train": args.train_ratio,
+            "validation": args.validation_ratio,
+            "test": args.test_ratio,
+        },
+    )
     result = export_dataset(manifest, args.output_dir)
 
     print(f"{result['row_count']}행 내보내기 완료")

@@ -20,12 +20,13 @@ API 명세서 v1.2의 `09_보완API상세` 시트 `POST /api/datasets`(MVP-042) 
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
-| `id` | string | 데이터셋 버전 ID (`DS-CWRU-VIBRATION-<날짜>` 형식) |
+| `id` | string | 데이터셋 버전 ID (`DS-CWRU-VIBRATION-<날짜>-<버전체크섬 12자리>` 형식) — 같은 날짜라도 입력 파일/윈도우/분할 설정이 다르면 다른 ID가 나온다 |
 | `name` | string | 데이터셋 이름 (`cwru-bearing-vibration-v1`) |
 | `source.type` | string | `external` (외부 공개 데이터셋) |
 | `source.uri` | string | CWRU Bearing Data Center 공식 URL |
 | `source.license` | string | 라이선스/이용 조건 메모 (학술 공개, 재배포 시 출처 표기) |
 | `source.files` | object | 실제 배치된 원본 파일별 `{sha256, label}` — **체크섬으로 원본 추적** |
+| `source.checksum` | string | 원본 파일 체크섬들 + window/hop 크기 + 분할 비율 + seed로 만든 불변 버전 체크섬(`compute_version_checksum()`) — `id`의 접미사와 동일 값 |
 | `compatibility.signalType` | string[] | `["vibration"]` |
 | `compatibility.samplingRateHz` | number | `12000` (CWRU Drive-End 12kHz) |
 | `compatibility.units` | object | `{"vibration": "g (raw accelerometer output, uncalibrated)"}` |
@@ -60,15 +61,20 @@ CSV/XLSX 경로)로 구성한다 — `export_dataset.py`가 이 형태로 별도
 ## 분할 전략 (`splitStrategy`)
 
 `dataset/schema.md`(1주차)는 "동일 설비의 샘플이 train/test에 섞이지 않도록 설비 단위(group
-split)"를 권장한다. 하지만 CWRU는 **라벨 하나당 실제 자산(파일)이 1개뿐**이라(`97.mat` =
-NORMAL 자산 1대, `105/118/130.mat` = 결함 자산 각 1대) 파일 단위로 통째로 나누면 한쪽
-split에 특정 라벨이 아예 없어진다. 그래서 이번 등록은:
+split)"를 권장한다. `register_dataset.py`의 `group_split()`은 이를 그대로 따른다:
 
-- **윈도우 단위, 라벨별 층화(stratified) 무작위 분할**을 사용한다 (`seed` 고정, 라벨별로
-  독립적으로 셔플 후 비율 배분 → 반올림 오차는 test 분할이 흡수해 `train+val+test == 그룹 크기`를
-  항상 만족시킨다).
-- 실제 현장 데이터처럼 **동일 라벨 안에 자산이 여러 대** 있게 되면, 그때는 설비 단위 group
-  split으로 전환해야 한다 (`register_dataset.py`의 TODO 주석 참고).
+- **`source_label`(원본 `.mat` 파일) 단위로 그룹을 통째로 하나의 split에만 배정**한다.
+  동일 그룹의 윈도우가 여러 split에 나뉘어 들어가는 것을 원천적으로 막아 데이터 누수를
+  방지한다 (`seed` 고정, 라벨별로 독립적으로 그룹을 배정).
+- 라벨 하나의 독립 그룹 수가 요청한 분할 개수(기본 3: train/validation/test)보다 적으면
+  **그룹을 쪼개서 윈도우 단위로 섞는 대신 `InsufficientAssetGroupsError`를 발생시킨다.**
+  CWRU는 **라벨 하나당 실제 자산(파일)이 1개뿐**이라(`97.mat` = NORMAL 자산 1대,
+  `105/118/130.mat` = 결함 자산 각 1대) 기본 3-way 비율로는 이 예외가 항상 발생하는 것이
+  정상 동작이다.
+- 그래서 지금은 `--train-ratio 1 --validation-ratio 0 --test-ratio 0`처럼 **train 전용
+  비율을 명시적으로 지정**해 파이프라인(체크섬 추적/라벨 매핑/내보내기)을 검증한다.
+  실제 현장 데이터처럼 **동일 라벨 안에 자산이 여러 대** 확보되면 기본 3-way 비율로
+  전환하면 된다.
 
 ## 행(rows) 스키마 — CSV/XLSX로 내보내는 실제 컬럼
 
@@ -92,6 +98,7 @@ split에 특정 라벨이 아예 없어진다. 그래서 이번 등록은:
 ## TODO (실제 센서/추가 데이터셋 확보 후)
 
 - [ ] MIMII 음향 데이터가 배치되면 `modality: "acoustic"` 데이터셋 버전을 동일 스키마로 추가 등록
-- [ ] 라벨당 자산이 여러 개가 되면 분할 전략을 설비 단위 group split으로 전환
+- [ ] 라벨당 자산이 여러 개가 되면 기본 3-way 비율(`--train-ratio 0.7 --validation-ratio 0.2
+      --test-ratio 0.1`)로 전환 (분할 로직 자체는 이미 설비 단위 group split — 자산 부족 문제만 남음)
 - [ ] 실제 센서 채널 확보 후 이 CWRU 버전과 별도의 신규 데이터셋 버전으로 등록 (섞지 않음 —
       MVP 기획서 v1.2 "역할배정" 시트의 "대상 확정 후 보완" 항목)

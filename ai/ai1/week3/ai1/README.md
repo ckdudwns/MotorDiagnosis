@@ -53,18 +53,24 @@ MIMII 음향 데이터는 이 저장소에 실제 파일이 배치돼 있지 않
 `export_dataset.py`가 `dataset_manifest.json`(GET 응답 형태) + `dataset_rows.csv` +
 `dataset_export.xlsx`(manifest/rows 2개 시트)로 내보낸다.
 
-- 원본 파일별 SHA-256 체크섬을 매니페스트에 기록해 원본 추적 가능
-- CWRU는 라벨당 실제 자산이 1개뿐이라 설비 단위 대신 **라벨별 층화(stratified) 분할**
-  사용 (근거: `datasets/dataset_manifest_format.md`)
+- 원본 파일별 SHA-256 체크섬을 매니페스트에 기록해 원본 추적 가능 — 원본 체크섬들 +
+  window/hop 크기 + 분할 비율 + seed로 만든 불변 버전 체크섬(`source.checksum`)을 데이터셋
+  `id`에도 반영해, 같은 날짜에 입력·설정이 다른 버전이 같은 ID로 충돌하지 않도록 했다
+- **`source_label`(원본 파일) 단위 group split** — 동일 그룹의 윈도우가 여러 split에
+  나뉘지 않게 통째로 하나의 split에만 배정한다. 라벨의 독립 그룹 수가 요청한 분할 수보다
+  적으면(현재 CWRU는 라벨당 자산 1개뿐) 윈도우를 섞는 대신 `InsufficientAssetGroupsError`로
+  데이터 부족 상태를 명시적으로 드러낸다 (근거: `datasets/dataset_manifest_format.md`)
 - 특징값 계산은 week2 `extract_all_features()`를 그대로 재사용
 
-**실행 결과 (실제 CWRU 4개 파일, seed=42 기준):** 총 296행(NORMAL 119 + 결함 177)을
-`train 206 / validation 60 / test 30`으로 분할했다. 변환 전후 건수(296==296)와 분할
-합계(206+60+30==296)가 정확히 일치하고, 체크섬 재계산 값이 매니페스트 기록과 일치함을
-테스트로 확인했다.
+**실행 결과 (실제 CWRU 4개 파일, seed=42 기준):** 라벨당 자산이 1개뿐이라 기본 3-way
+비율은 `InsufficientAssetGroupsError`를 낸다(의도된 동작 — 테스트로 확인). 그래서
+`--train-ratio 1 --validation-ratio 0 --test-ratio 0`으로 실행해 총 296행(NORMAL 119 +
+결함 177) 전부를 train으로 등록했다. 변환 전후 건수(296==296)가 정확히 일치하고, 체크섬
+재계산 값이 매니페스트 기록과 일치함을 테스트로 확인했다. 실제 자산이 여러 개 확보되면
+기본 3-way 비율로 전환하면 된다.
 
 ```bash
-python ai/ai1/week3/ai1/datasets/export_dataset.py
+python ai/ai1/week3/ai1/datasets/export_dataset.py --train-ratio 1 --validation-ratio 0 --test-ratio 0
 # 결과: ai/ai1/week3/ai1/data/handoff/{dataset_manifest.json, dataset_rows.csv, dataset_export.xlsx}
 ```
 
@@ -140,7 +146,9 @@ CWRU 실데이터(`ai/ai1/week1/ai1/data/external/cwru/*.mat`)가 없는 환경�
 
 - MIMII 음향 데이터가 배치되면 `DATA_EXPORT_01`에 `modality: "acoustic"` 데이터셋
   버전을 같은 스키마로 추가 등록
-- 라벨당 자산이 여러 개가 되면 `DATA_EXPORT_01`의 분할 전략을 설비 단위 group split으로 전환
+- 라벨당 자산이 여러 개가 되면 `DATA_EXPORT_01`을 기본 3-way 비율(`--train-ratio 0.7
+  --validation-ratio 0.2 --test-ratio 0.1`)로 전환 (group split 로직 자체는 이미 구현됨 —
+  자산 부족 문제만 남음)
 - `sigma_enter`/`sigma_exit`/`min_consecutive_*`는 실측 정상·이상 분포로 재보정 필요
 - `EVENT_DETAIL_01`의 장치 상태 스냅샷 연동, `ANOMALY_RULE_01`의 음향·RPM 임계값 추가는
   해당 데이터 확보 후 진행

@@ -116,6 +116,46 @@ class TestBuildEventDetailSynthetic(unittest.TestCase):
                 window_duration_sec=0.2,
             )
 
+    def test_event_index_equal_to_length_raises(self):
+        """event_index == len(ordered_windows)는 실제 이벤트 윈도우가 없는
+        상태이므로 허용되면 안 된다."""
+        windows = _fixture_windows([0.0] * 3)
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=windows,
+                event_index=len(windows),
+                window_seconds=0.2,
+                window_duration_sec=0.2,
+            )
+
+    def test_empty_ordered_windows_raises(self):
+        with self.assertRaises(ValueError):
+            build_event_detail(
+                event=_sample_event(),
+                ordered_windows=[],
+                event_index=0,
+                window_seconds=0.2,
+                window_duration_sec=0.2,
+            )
+
+    def test_requested_window_seconds_is_always_covered_via_ceil(self):
+        """round()라면 window_seconds/window_duration_sec=4.1 -> 4로 내려가
+        요청 구간(0.82s)보다 짧은 0.8s만 반환된다. ceil을 쓰면 5윈도우(1.0s)로
+        요청 구간을 항상 포함해야 한다."""
+        windows = _fixture_windows([0.0] * 10 + [5.0] * 10)
+        detail = build_event_detail(
+            event=_sample_event(),
+            ordered_windows=windows,
+            event_index=10,
+            window_seconds=0.82,
+            window_duration_sec=0.2,
+        )
+        self.assertEqual(detail["before"]["window_count_requested"], 5)
+        self.assertGreaterEqual(
+            detail["before"]["window_count_requested"] * 0.2, 0.82
+        )
+
 
 @unittest.skipUnless(
     os.path.exists(os.path.join(_CWRU_DATA_DIR, "97.mat")),

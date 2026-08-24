@@ -121,6 +121,7 @@ def evaluate_feature_stream(
     consecutive_over = 0
     consecutive_under = 0
     current_event = None
+    pending_max_dev = 0.0  # 진입 대기(consecutive_over) 구간에서 관측된 최대 편차 누적
 
     for i, features in enumerate(feature_windows):
         max_dev = _max_deviation_sigma(features, baseline)
@@ -133,17 +134,23 @@ def evaluate_feature_stream(
         ]
 
         if state == "NORMAL":
-            consecutive_over = consecutive_over + 1 if over_enter else 0
+            if over_enter:
+                consecutive_over += 1
+                pending_max_dev = max(pending_max_dev, max_dev)
+            else:
+                consecutive_over = 0
+                pending_max_dev = 0.0
             if consecutive_over >= config.min_consecutive_enter:
                 state = "ANOMALY"
                 current_event = {
                     "start_index": i - config.min_consecutive_enter + 1,
                     "end_index": None,
-                    "max_deviation_sigma": max_dev,
+                    "max_deviation_sigma": pending_max_dev,
                     "baseline_version": baseline_version,
                     "config_version": config.version,
                 }
                 consecutive_under = 0
+                pending_max_dev = 0.0
         else:  # state == "ANOMALY"
             current_event["max_deviation_sigma"] = max(
                 current_event["max_deviation_sigma"], max_dev

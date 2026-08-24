@@ -9,6 +9,7 @@ event_index만 주어지면 되므로, 이번 주에는 합성 이벤트(예: CW
 지점)로 화면 데이터 구조를 먼저 검증한다.
 """
 
+import math
 import statistics
 
 
@@ -70,12 +71,15 @@ def build_event_detail(
     """이벤트 전후 구간을 비교하는 EVENT_DETAIL_01 응답 dict를 만든다."""
     if window_duration_sec <= 0:
         raise ValueError("window_duration_sec은 0보다 커야 합니다.")
-    if not (0 <= event_index <= len(ordered_windows)):
+    if not ordered_windows or not (0 <= event_index < len(ordered_windows)):
         raise ValueError(
-            f"event_index({event_index})가 ordered_windows 범위(0~{len(ordered_windows)})를 벗어났습니다."
+            f"event_index({event_index})가 ordered_windows 범위(0~{len(ordered_windows) - 1})를 "
+            "벗어났습니다 (실제 이벤트 윈도우가 있어야 합니다)."
         )
 
-    n_windows = max(1, round(window_seconds / window_duration_sec))
+    # round()는 요청한 구간(window_seconds)보다 짧은 윈도우 수를 반환할 수 있으므로
+    # (예: 4.1 -> 4) 요청 구간을 항상 포함하도록 ceil을 쓴다.
+    n_windows = max(1, math.ceil(window_seconds / window_duration_sec))
 
     before_slice = ordered_windows[max(0, event_index - n_windows) : event_index]
     after_slice = ordered_windows[event_index : event_index + n_windows]

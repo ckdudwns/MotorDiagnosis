@@ -58,6 +58,11 @@ def apply_label_change(
             f"허용되지 않은 라벨입니다: {new_label!r} "
             f"(허용값: {sorted(EVENT_REVIEW_LABELS)})"
         )
+    if not isinstance(changed_by, str) or not changed_by.strip():
+        raise ValueError(
+            "changed_by는 공백이 아닌 문자열이어야 합니다 (감사 추적을 위해 변경자를 "
+            "식별할 수 있어야 함)."
+        )
     if not reason or not reason.strip():
         raise ValueError("reason은 필수입니다 (빈 문자열/공백만 있는 값은 허용하지 않음).")
     if new_note is not None:

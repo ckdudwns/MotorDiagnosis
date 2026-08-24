@@ -39,9 +39,17 @@ class Week2DashboardTest(unittest.TestCase):
         self.assertIn("function formatLocalTime(timestamp)", page)
         self.assertNotIn("event.time", page)
 
-    def test_event_selection_is_cleared_when_filter_removes_it(self) -> None:
+    def test_filter_change_immediately_clears_selection_and_disables_save(self) -> None:
         page = render_page()
 
-        self.assertIn("if (!events.some(event => event.id === selectedEventId))", page)
         self.assertIn("function clearEventSelection()", page)
         self.assertIn('$("saveReview").disabled = true', page)
+        self.assertIn('$("assetSelect").addEventListener("change", async () => {', page)
+        self.assertIn("clearEventSelection();\n      renderGeneration += 1;", page)
+
+    def test_latest_render_wins_when_responses_finish_out_of_order(self) -> None:
+        page = render_page()
+
+        self.assertIn("const requestGeneration = ++renderGeneration;", page)
+        self.assertIn("await Promise.all([", page)
+        self.assertIn("if (requestGeneration !== renderGeneration) return;", page)

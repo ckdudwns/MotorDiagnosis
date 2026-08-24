@@ -58,13 +58,13 @@ class AnomalyScoreTest(unittest.TestCase):
         self.assertIsNone(result["anomalyScore"])
         self.assertEqual(result["anomalyStatus"], "unavailable")
 
-    def test_same_timestamp_uses_later_sequence_for_latest_asset_status(self) -> None:
+    def test_same_timestamp_uses_higher_sequence_before_received_at(self) -> None:
         statuses = latest_asset_statuses(
             [
                 {
                     "assetId": "SITE-01-GEN-01",
                     "timestamp": "2026-08-24T00:00:00.000Z",
-                    "receivedAt": "2026-08-24T00:00:01.000Z",
+                    "receivedAt": "2026-08-24T00:00:02.000Z",
                     "sequence": 1,
                     "vibrationRmsRaw": 16.0,
                 },

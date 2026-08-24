@@ -105,7 +105,7 @@ def render_page() -> str:
     </section>
   </main>
   <script>
-    let token = "", sites = [], events = [], siteSummaries = [], selectedEventId = null, latestPoints = [], latestUnits = {};
+    let token = "", sites = [], events = [], siteSummaries = [], selectedEventId = null, latestPoints = [], latestUnits = {}, renderGeneration = 0;
     const $ = (id) => document.getElementById(id);
 
     async function api(path, options = {}) {
@@ -150,13 +150,19 @@ def render_page() -> str:
     }
 
     async function render() {
+      const requestGeneration = ++renderGeneration;
       const site = selectedSite();
       const assetId = $("assetSelect").value;
       const periodHours = Number($("periodSelect").value);
       const from = new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString();
-      const telem = await api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
-      siteSummaries = await api("/api/dashboard/sites-summary");
-      events = await api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
+      const [telem, summaries, eventRows] = await Promise.all([
+        api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
+        api("/api/dashboard/sites-summary"),
+        api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
+      ]);
+      if (requestGeneration !== renderGeneration) return;
+      siteSummaries = summaries;
+      events = eventRows;
       if (!events.some(event => event.id === selectedEventId)) clearEventSelection();
       $("siteCount").textContent = siteSummaries.length;
       $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
@@ -298,9 +304,22 @@ def render_page() -> str:
     });
 
     $("loginBtn").addEventListener("click", () => login().catch(error => alert(error.message)));
-    $("siteSelect").addEventListener("change", async () => { await renderAssets(); await render(); });
-    $("assetSelect").addEventListener("change", render);
-    $("periodSelect").addEventListener("change", render);
+    $("siteSelect").addEventListener("change", async () => {
+      clearEventSelection();
+      renderGeneration += 1;
+      await renderAssets();
+      await render();
+    });
+    $("assetSelect").addEventListener("change", async () => {
+      clearEventSelection();
+      renderGeneration += 1;
+      await render();
+    });
+    $("periodSelect").addEventListener("change", async () => {
+      clearEventSelection();
+      renderGeneration += 1;
+      await render();
+    });
     $("refreshBtn").addEventListener("click", render);
     $("injectBtn").addEventListener("click", async () => {
       await api("/api/demo/inject-anomaly", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({siteId:$("siteSelect").value, assetId:$("assetSelect").value})});

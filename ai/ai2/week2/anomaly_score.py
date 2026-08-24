@@ -141,21 +141,21 @@ def latest_asset_statuses(
         received_at = point.get("receivedAt")
         point_key = (
             timestamp,
-            received_at if isinstance(received_at, str) else timestamp,
             point.get("sequence") if isinstance(point.get("sequence"), int) else -1,
+            received_at if isinstance(received_at, str) else timestamp,
         )
         existing_received_at = existing.get("receivedAt") if existing else None
         existing_key = (
             str(existing.get("timestamp")) if existing else "",
             (
-                existing_received_at
-                if isinstance(existing_received_at, str)
-                else str(existing.get("timestamp")) if existing else ""
-            ),
-            (
                 existing.get("sequence")
                 if existing and isinstance(existing.get("sequence"), int)
                 else -1
+            ),
+            (
+                existing_received_at
+                if isinstance(existing_received_at, str)
+                else str(existing.get("timestamp")) if existing else ""
             ),
         )
         if existing is None or point_key > existing_key:

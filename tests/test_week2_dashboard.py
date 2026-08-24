@@ -53,3 +53,15 @@ class Week2DashboardTest(unittest.TestCase):
         self.assertIn("const requestGeneration = ++renderGeneration;", page)
         self.assertIn("await Promise.all([", page)
         self.assertIn("if (requestGeneration !== renderGeneration) return;", page)
+
+    def test_stale_site_asset_response_cannot_replace_current_site_assets(self) -> None:
+        page = render_page()
+
+        self.assertIn(
+            "async function renderAssets(requestGeneration = renderGeneration)", page
+        )
+        self.assertIn(
+            "if (requestGeneration !== renderGeneration || siteId !== selectedSite().id) return false;",
+            page,
+        )
+        self.assertIn("if (!await renderAssets(requestGeneration)) return;", page)

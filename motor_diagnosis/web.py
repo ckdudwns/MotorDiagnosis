@@ -143,10 +143,13 @@ def render_page() -> str:
       return sites.find(s => s.id === $("siteSelect").value) || sites[0];
     }
 
-    async function renderAssets() {
+    async function renderAssets(requestGeneration = renderGeneration) {
       const site = selectedSite();
+      const siteId = site.id;
       const assets = await api(`/api/sites/${site.id}/assets`);
+      if (requestGeneration !== renderGeneration || siteId !== selectedSite().id) return false;
       setOptions($("assetSelect"), assets, item => item.id, item => item.name);
+      return true;
     }
 
     async function render() {
@@ -306,8 +309,8 @@ def render_page() -> str:
     $("loginBtn").addEventListener("click", () => login().catch(error => alert(error.message)));
     $("siteSelect").addEventListener("change", async () => {
       clearEventSelection();
-      renderGeneration += 1;
-      await renderAssets();
+      const requestGeneration = ++renderGeneration;
+      if (!await renderAssets(requestGeneration)) return;
       await render();
     });
     $("assetSelect").addEventListener("change", async () => {

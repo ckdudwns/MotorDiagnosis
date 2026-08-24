@@ -138,27 +138,38 @@ def latest_asset_statuses(
         if not isinstance(asset_id, str) or not isinstance(timestamp, str):
             continue
         existing = latest_by_asset.get(asset_id)
+        if existing is None:
+            latest_by_asset[asset_id] = point
+            continue
+        existing_timestamp = str(existing.get("timestamp"))
+        if timestamp > existing_timestamp:
+            latest_by_asset[asset_id] = point
+            continue
+        if timestamp < existing_timestamp:
+            continue
+
+        device_id = point.get("deviceId")
+        existing_device_id = existing.get("deviceId")
         received_at = point.get("receivedAt")
-        point_key = (
-            timestamp,
-            point.get("sequence") if isinstance(point.get("sequence"), int) else -1,
-            received_at if isinstance(received_at, str) else timestamp,
+        existing_received_at = existing.get("receivedAt")
+        point_received_at = received_at if isinstance(received_at, str) else timestamp
+        existing_received_key = (
+            existing_received_at
+            if isinstance(existing_received_at, str)
+            else existing_timestamp
         )
-        existing_received_at = existing.get("receivedAt") if existing else None
-        existing_key = (
-            str(existing.get("timestamp")) if existing else "",
-            (
-                existing.get("sequence")
-                if existing and isinstance(existing.get("sequence"), int)
-                else -1
-            ),
-            (
-                existing_received_at
-                if isinstance(existing_received_at, str)
-                else str(existing.get("timestamp")) if existing else ""
-            ),
-        )
-        if existing is None or point_key > existing_key:
+        if (
+            isinstance(device_id, str)
+            and device_id == existing_device_id
+            and isinstance(point.get("sequence"), int)
+            and isinstance(existing.get("sequence"), int)
+        ):
+            point_key = (point["sequence"], point_received_at)
+            existing_key = (existing["sequence"], existing_received_key)
+        else:
+            point_key = (point_received_at,)
+            existing_key = (existing_received_key,)
+        if point_key > existing_key:
             latest_by_asset[asset_id] = point
     return {
         asset_id: score_telemetry_point(point, baseline)["anomalyStatus"]

@@ -63,6 +63,7 @@ class AnomalyScoreTest(unittest.TestCase):
             [
                 {
                     "assetId": "SITE-01-GEN-01",
+                    "deviceId": "DEV-01-GEN-01",
                     "timestamp": "2026-08-24T00:00:00.000Z",
                     "receivedAt": "2026-08-24T00:00:02.000Z",
                     "sequence": 1,
@@ -70,9 +71,35 @@ class AnomalyScoreTest(unittest.TestCase):
                 },
                 {
                     "assetId": "SITE-01-GEN-01",
+                    "deviceId": "DEV-01-GEN-01",
                     "timestamp": "2026-08-24T00:00:00.000Z",
                     "receivedAt": "2026-08-24T00:00:01.000Z",
                     "sequence": 2,
+                    "vibrationRmsRaw": 22.0,
+                },
+            ],
+            BASELINE,
+        )
+
+        self.assertEqual(statuses["SITE-01-GEN-01"], "critical")
+
+    def test_same_timestamp_uses_received_at_when_device_changes(self) -> None:
+        statuses = latest_asset_statuses(
+            [
+                {
+                    "assetId": "SITE-01-GEN-01",
+                    "deviceId": "DEV-OLD",
+                    "timestamp": "2026-08-24T00:00:00.000Z",
+                    "receivedAt": "2026-08-24T00:00:01.000Z",
+                    "sequence": 500,
+                    "vibrationRmsRaw": 16.0,
+                },
+                {
+                    "assetId": "SITE-01-GEN-01",
+                    "deviceId": "DEV-REPLACEMENT",
+                    "timestamp": "2026-08-24T00:00:00.000Z",
+                    "receivedAt": "2026-08-24T00:00:02.000Z",
+                    "sequence": 1,
                     "vibrationRmsRaw": 22.0,
                 },
             ],

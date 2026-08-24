@@ -4386,7 +4386,7 @@ def _dataset_source_filters(payload: dict[str, Any]) -> dict[str, Any] | None:
         if plural_key not in source_filters:
             continue
         values = string_list(source_filters, plural_key, required=True, uppercase=True)
-        normalized[plural_key] = values
+        normalized[plural_key] = sorted(values)
 
     for singular_key, plural_key in (("siteId", "siteIds"), ("assetId", "assetIds")):
         if (
@@ -4419,6 +4419,37 @@ def _dataset_source_filters(payload: dict[str, Any]) -> dict[str, Any] | None:
     return normalized
 
 
+def _dataset_version_fingerprint(
+    source: dict[str, Any],
+    compatibility: dict[str, Any],
+    source_filters: dict[str, Any] | None,
+    label_taxonomy_version: str,
+    label_mapping: dict[str, str],
+    split: dict[str, float],
+) -> str:
+    canonical_compatibility = copy_payload(compatibility)
+    canonical_compatibility["signalType"] = sorted(
+        canonical_compatibility.get("signalType", [])
+    )
+    canonical_definition = {
+        "source": copy_payload(source),
+        "compatibility": canonical_compatibility,
+        "sourceFilters": copy_payload(source_filters),
+        "labelTaxonomyVersion": label_taxonomy_version,
+        "labelMapping": {key.casefold(): value for key, value in label_mapping.items()},
+        "split": copy_payload(split),
+        "splitPolicy": "asset_or_operating_condition_grouped",
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            canonical_definition,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
 def create_dataset_version(
     user: dict[str, Any], payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -4433,15 +4464,26 @@ def create_dataset_version(
         raise ApiError(
             400, "INVALID_LABEL_MAPPING", "labelMapping must be a non-empty object."
         )
-    normalized_mapping = {
-        str(key).strip(): str(value).strip().upper()
-        for key, value in label_mapping.items()
-        if str(key).strip() and str(value).strip()
-    }
-    if len(normalized_mapping) != len(label_mapping):
-        raise ApiError(
-            400, "INVALID_LABEL_MAPPING", "labelMapping entries must be non-empty."
-        )
+    normalized_mapping = {}
+    normalized_mapping_keys = set()
+    for raw_key, raw_value in label_mapping.items():
+        key = str(raw_key).strip()
+        value = str(raw_value).strip().upper()
+        if not key or not value:
+            raise ApiError(
+                400,
+                "INVALID_LABEL_MAPPING",
+                "labelMapping entries must be non-empty.",
+            )
+        normalized_key = key.casefold()
+        if normalized_key in normalized_mapping_keys:
+            raise ApiError(
+                400,
+                "INVALID_LABEL_MAPPING",
+                "labelMapping keys must be unique ignoring letter case.",
+            )
+        normalized_mapping_keys.add(normalized_key)
+        normalized_mapping[key] = value
     taxonomy_codes = {str(item["code"]).strip().upper() for item in taxonomy["labels"]}
     unknown_codes = sorted(set(normalized_mapping.values()) - taxonomy_codes)
     if unknown_codes:
@@ -4458,15 +4500,23 @@ def create_dataset_version(
             400, "REASON_TOO_LONG", "reason must be 1000 characters or less."
         )
     source_filters = _dataset_source_filters(payload)
+    version_fingerprint = _dataset_version_fingerprint(
+        source,
+        compatibility,
+        source_filters,
+        label_taxonomy_version,
+        normalized_mapping,
+        split,
+    )
     with STORE_LOCK:
         if any(
-            item["source"]["checksum"] == source["checksum"]
+            item.get("versionFingerprint") == version_fingerprint
             for item in DATASET_VERSIONS
         ):
             raise ApiError(
                 409,
-                "DATASET_CHECKSUM_EXISTS",
-                "A dataset version with the same checksum is already registered.",
+                "DATASET_VERSION_EXISTS",
+                "An identical normalized dataset version is already registered.",
             )
         created_at = now_iso()
         record = {
@@ -4486,6 +4536,7 @@ def create_dataset_version(
             "frozenAt": created_at,
             "snapshotRecordCount": None,
             "snapshotChecksum": None,
+            "versionFingerprint": version_fingerprint,
             "createdBy": user["id"],
         }
         if (
@@ -4496,6 +4547,12 @@ def create_dataset_version(
             snapshot_rows = [
                 row for scope_key in sorted(snapshot) for row in snapshot[scope_key]
             ]
+            if not snapshot_rows:
+                raise ApiError(
+                    400,
+                    "EMPTY_DATASET_SNAPSHOT",
+                    "The selected sourceFilters contain no telemetry records.",
+                )
             snapshot_checksum = hashlib.sha256(
                 json.dumps(snapshot_rows, sort_keys=True, separators=(",", ":")).encode(
                     "utf-8"
@@ -4556,6 +4613,18 @@ def _dataset_export_window(
     from_timestamp: str | None,
     to_timestamp: str | None,
 ) -> tuple[str | None, str | None]:
+    requested_from = (
+        parse_rfc3339("from", from_timestamp) if from_timestamp is not None else None
+    )
+    requested_to = (
+        parse_rfc3339("to", to_timestamp) if to_timestamp is not None else None
+    )
+    if requested_from and requested_to and requested_from > requested_to:
+        raise ApiError(
+            400,
+            "INVALID_TIME_RANGE",
+            "from must be earlier than or equal to to.",
+        )
     source_filters = dataset.get("sourceFilters") if dataset else None
     if not source_filters:
         return from_timestamp, to_timestamp
@@ -4579,12 +4648,6 @@ def _dataset_export_window(
             "The requested asset is outside the dataset sourceFilters.",
         )
 
-    requested_from = (
-        parse_rfc3339("from", from_timestamp) if from_timestamp is not None else None
-    )
-    requested_to = (
-        parse_rfc3339("to", to_timestamp) if to_timestamp is not None else None
-    )
     filter_from = (
         parse_rfc3339("sourceFilters.from", source_filters["from"])
         if source_filters.get("from")
@@ -4660,6 +4723,12 @@ def _dataset_scope_assets(
     for asset_id in asset_ids:
         asset = get_asset_by_id(asset_id)
         require_site_access(user, asset["siteId"])
+        if site_ids and asset["siteId"] not in site_ids:
+            raise ApiError(
+                400,
+                "INVALID_SOURCE_FILTERS",
+                f"sourceFilters assetId {asset_id} is outside the selected siteIds.",
+            )
 
     allowed_site_ids = user.get("allowedSiteIds", [])
     assets = [
@@ -4756,6 +4825,12 @@ def _rows_in_time_range(
 ) -> list[dict[str, Any]]:
     from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
     to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
+    if from_value and to_value and from_value > to_value:
+        raise ApiError(
+            400,
+            "INVALID_TIME_RANGE",
+            "from must be earlier than or equal to to.",
+        )
     return [
         copy_payload(row)
         for row in rows
@@ -4817,6 +4892,7 @@ def dataset_export_for(
                 "The requested asset was not part of the frozen dataset snapshot.",
             )
         rows = _rows_in_time_range(snapshot[snapshot_key], from_timestamp, to_timestamp)
+        source_record_count = len(rows)
     else:
         points = telemetry_for(
             site["id"],
@@ -4825,6 +4901,10 @@ def dataset_export_for(
             to_timestamp=to_timestamp,
         )
         rows = _dataset_rows_for_points(None, site["id"], asset["id"], points)
+        source_record_count = len(points)
+    split_counts = {name: 0 for name in ("train", "validation", "test")}
+    for row in rows:
+        split_counts[row["dataset_split"]] += 1
     checksum = hashlib.sha256(
         json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -4862,6 +4942,9 @@ def dataset_export_for(
         "siteId": site["id"],
         "assetId": asset["id"],
         "recordCount": len(rows),
+        "sourceRecordCount": source_record_count,
+        "normalizedRecordCount": len(rows),
+        "splitCounts": split_counts,
         "split": split,
         "splitPolicy": "asset_grouped",
         "assignedSplit": group_split,

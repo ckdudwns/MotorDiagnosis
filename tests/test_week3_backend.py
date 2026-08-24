@@ -223,6 +223,93 @@ class Week3DataBoundaryTest(unittest.TestCase):
             exported["manifest"]["sourceFilters"],
             {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"},
         )
+        self.assertEqual(exported["manifest"]["sourceRecordCount"], 1)
+        self.assertEqual(exported["manifest"]["normalizedRecordCount"], 1)
+        self.assertEqual(sum(exported["manifest"]["splitCounts"].values()), 1)
+        self.assertEqual(
+            exported["manifest"]["splitCounts"][exported["manifest"]["assignedSplit"]],
+            1,
+        )
+
+    def test_label_mapping_rejects_casefold_key_collisions(self) -> None:
+        payload = self.dataset_payload(
+            checksum="sha256:casefold-label-collision",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+            },
+            label_mapping={
+                "needs_review": "NORMAL",
+                "NEEDS_REVIEW": "BEARING_SUSPECT",
+            },
+        )
+
+        with self.assertRaises(ApiError) as collision:
+            create_dataset_version(self.admin, payload)
+
+        self.assertEqual(collision.exception.status, 400)
+        self.assertEqual(collision.exception.code, "INVALID_LABEL_MAPPING")
+
+    def test_same_source_checksum_allows_a_new_normalized_version(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        TELEMETRY_RECORDS.append(
+            self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=10)), 1)
+        )
+        first_payload = self.dataset_payload(
+            checksum="sha256:shared-raw-source",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+            },
+            label_mapping={"needs_review": "NORMAL"},
+        )
+        second_payload = json.loads(json.dumps(first_payload))
+        second_payload["labelMapping"] = {"needs_review": "BEARING_SUSPECT"}
+
+        first = create_dataset_version(self.admin, first_payload)
+        second = create_dataset_version(self.admin, second_payload)
+
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(first["source"]["checksum"], second["source"]["checksum"])
+        self.assertNotEqual(first["versionFingerprint"], second["versionFingerprint"])
+        with self.assertRaises(ApiError) as duplicate:
+            create_dataset_version(self.admin, second_payload)
+        self.assertEqual(duplicate.exception.code, "DATASET_VERSION_EXISTS")
+
+    def test_empty_internal_snapshot_is_not_registered_as_frozen(self) -> None:
+        payload = self.dataset_payload(
+            checksum="sha256:empty-future-window",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+                "from": "2099-01-01T00:00:00Z",
+                "to": "2099-01-01T01:00:00Z",
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+
+        with self.assertRaises(ApiError) as empty_snapshot:
+            create_dataset_version(self.admin, payload)
+
+        self.assertEqual(empty_snapshot.exception.status, 400)
+        self.assertEqual(empty_snapshot.exception.code, "EMPTY_DATASET_SNAPSHOT")
+
+    def test_source_filter_assets_must_belong_to_selected_sites(self) -> None:
+        payload = self.dataset_payload(
+            checksum="sha256:cross-site-filter-mismatch",
+            source_filters={
+                "siteIds": ["SITE-01"],
+                "assetIds": ["SITE-01-MOT-02", "SITE-02-GEN-01"],
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+
+        with self.assertRaises(ApiError) as mismatch:
+            create_dataset_version(self.admin, payload)
+
+        self.assertEqual(mismatch.exception.status, 400)
+        self.assertEqual(mismatch.exception.code, "INVALID_SOURCE_FILTERS")
 
     def test_frozen_dataset_export_is_unchanged_after_new_telemetry(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
@@ -659,7 +746,7 @@ class Week3HttpContractTest(unittest.TestCase):
             token=self.admin_token,
         )
         self.assertEqual(status, 409)
-        self.assertEqual(duplicate["error"]["code"], "DATASET_CHECKSUM_EXISTS")
+        self.assertEqual(duplicate["error"]["code"], "DATASET_VERSION_EXISTS")
 
         invalid_mapping_payload = json.loads(json.dumps(dataset_payload))
         invalid_mapping_payload["source"]["checksum"] = "sha256:invalid-label-map"
@@ -732,6 +819,42 @@ class Week3HttpContractTest(unittest.TestCase):
             json.loads(first_row["source_filters"]),
             internal_payload["sourceFilters"],
         )
+        self.assertIn("source_record_count", reader.fieldnames or [])
+        self.assertIn("normalized_record_count", reader.fieldnames or [])
+        self.assertIn("split_counts", reader.fieldnames or [])
+        self.assertEqual(
+            int(first_row["source_record_count"]),
+            int(first_row["normalized_record_count"]),
+        )
+        self.assertEqual(
+            sum(json.loads(first_row["split_counts"]).values()),
+            int(first_row["normalized_record_count"]),
+        )
+
+        unfiltered_payload = json.loads(json.dumps(internal_payload))
+        unfiltered_payload["name"] = "internal-unfiltered-telemetry-v1"
+        unfiltered_payload["source"]["checksum"] = "sha256:week3-internal-unfiltered-v1"
+        unfiltered_payload.pop("sourceFilters")
+        unfiltered_payload["labelMapping"] = {
+            "needs_review": "BEARING_SUSPECT",
+            "sensor_issue": "SENSOR_NOISE",
+        }
+        status, unfiltered_dataset = self.request(
+            "/api/datasets",
+            method="POST",
+            payload=unfiltered_payload,
+            token=self.admin_token,
+        )
+        self.assertEqual(status, 201)
+
+        status, reversed_range = self.request(
+            "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01"
+            f"&datasetId={unfiltered_dataset['id']}"
+            "&from=2026-08-25T01:00:00Z&to=2026-08-25T00:00:00Z&format=csv",
+            token=self.operator_token,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(reversed_range["error"]["code"], "INVALID_TIME_RANGE")
 
         status, not_implemented = self.request(
             "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01&format=xlsx",

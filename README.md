@@ -19,8 +19,9 @@ AI-1의 공개 데이터 기반 합성 인계 파일을 AI-2가 분석 경로와
 - `POST /api/telemetry/ingest`: 단건 수집, raw-only 스키마 검증,
   `(deviceId, sequence)` 멱등성, 오류 격리
 - `GET /api/telemetry`: 사이트·설비·기간별 수집 데이터 조회
-- `GET /api/events`: 이벤트 조회. 반환 이벤트의 `occurredAt`은 시간대가 포함된 RFC3339
-  필수 필드이며, 파싱한 UTC 시각 기준 최신순으로 정렬·기간 필터링한다.
+- `GET /api/events`: API v1.2 이벤트 조회. 반환 이벤트는 `occurredAt`(시간대가 포함된
+  RFC3339, 필수)과 `time`(레거시 화면 문자열, 선택)을 제공하며, 파싱한 UTC 시각 기준
+  최신순으로 정렬·기간 필터링한다.
 - `GET /api/dashboard/sites-summary`: 권한 범위 내 사이트 상태 요약
 - `GET /api/devices/{deviceId}/health`: 오프라인·복구·누락 구간과 장치 상태 조회
 - `GET /api/health/dependencies`: 수집·저장·분석·알림 의존성 상태와 오류율 조회

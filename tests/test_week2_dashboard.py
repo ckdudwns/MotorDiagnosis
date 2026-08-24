@@ -38,3 +38,10 @@ class Week2DashboardTest(unittest.TestCase):
         self.assertIn("formatLocalTime(event.occurredAt)", page)
         self.assertIn("function formatLocalTime(timestamp)", page)
         self.assertNotIn("event.time", page)
+
+    def test_event_selection_is_cleared_when_filter_removes_it(self) -> None:
+        page = render_page()
+
+        self.assertIn("if (!events.some(event => event.id === selectedEventId))", page)
+        self.assertIn("function clearEventSelection()", page)
+        self.assertIn('$("saveReview").disabled = true', page)

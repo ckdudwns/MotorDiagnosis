@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from ai.ai2.week2.anomaly_score import score_telemetry_point
+from ai.ai2.week2.anomaly_score import latest_asset_statuses, score_telemetry_point
 
 
 BASELINE = {
@@ -51,3 +51,32 @@ class AnomalyScoreTest(unittest.TestCase):
 
         self.assertIsNone(result["anomalyScore"])
         self.assertEqual(result["anomalyStatus"], "unavailable")
+
+    def test_negative_rms_keeps_score_unavailable(self) -> None:
+        result = score_telemetry_point({"vibrationRmsRaw": -0.1}, BASELINE)
+
+        self.assertIsNone(result["anomalyScore"])
+        self.assertEqual(result["anomalyStatus"], "unavailable")
+
+    def test_same_timestamp_uses_later_sequence_for_latest_asset_status(self) -> None:
+        statuses = latest_asset_statuses(
+            [
+                {
+                    "assetId": "SITE-01-GEN-01",
+                    "timestamp": "2026-08-24T00:00:00.000Z",
+                    "receivedAt": "2026-08-24T00:00:01.000Z",
+                    "sequence": 1,
+                    "vibrationRmsRaw": 16.0,
+                },
+                {
+                    "assetId": "SITE-01-GEN-01",
+                    "timestamp": "2026-08-24T00:00:00.000Z",
+                    "receivedAt": "2026-08-24T00:00:01.000Z",
+                    "sequence": 2,
+                    "vibrationRmsRaw": 22.0,
+                },
+            ],
+            BASELINE,
+        )
+
+        self.assertEqual(statuses["SITE-01-GEN-01"], "critical")

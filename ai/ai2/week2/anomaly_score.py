@@ -72,6 +72,13 @@ def score_telemetry_point(
             "anomalyModel": MODEL_ID,
             "anomalyEvidence": [],
         }
+    if value < 0:
+        return {
+            "anomalyScore": None,
+            "anomalyStatus": "unavailable",
+            "anomalyModel": MODEL_ID,
+            "anomalyEvidence": [],
+        }
 
     stats = baseline["features"][FEATURE_NAME]
     mean = finite_number(stats.get("mean"))
@@ -131,7 +138,27 @@ def latest_asset_statuses(
         if not isinstance(asset_id, str) or not isinstance(timestamp, str):
             continue
         existing = latest_by_asset.get(asset_id)
-        if existing is None or timestamp > str(existing.get("timestamp")):
+        received_at = point.get("receivedAt")
+        point_key = (
+            timestamp,
+            received_at if isinstance(received_at, str) else timestamp,
+            point.get("sequence") if isinstance(point.get("sequence"), int) else -1,
+        )
+        existing_received_at = existing.get("receivedAt") if existing else None
+        existing_key = (
+            str(existing.get("timestamp")) if existing else "",
+            (
+                existing_received_at
+                if isinstance(existing_received_at, str)
+                else str(existing.get("timestamp")) if existing else ""
+            ),
+            (
+                existing.get("sequence")
+                if existing and isinstance(existing.get("sequence"), int)
+                else -1
+            ),
+        )
+        if existing is None or point_key > existing_key:
             latest_by_asset[asset_id] = point
     return {
         asset_id: score_telemetry_point(point, baseline)["anomalyStatus"]

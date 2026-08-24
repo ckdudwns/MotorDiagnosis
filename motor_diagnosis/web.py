@@ -99,7 +99,7 @@ def render_page() -> str:
             <option value="repair_completed">Repair completed</option>
           </select></label>
           <label>Note<textarea id="noteInput"></textarea></label>
-          <button id="saveReview">Save Review</button>
+          <button id="saveReview" disabled>Save Review</button>
         </article>
       </section>
     </section>
@@ -157,6 +157,7 @@ def render_page() -> str:
       const telem = await api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
       siteSummaries = await api("/api/dashboard/sites-summary");
       events = await api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`);
+      if (!events.some(event => event.id === selectedEventId)) clearEventSelection();
       $("siteCount").textContent = siteSummaries.length;
       $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
       $("warningAssets").textContent = siteSummaries.reduce((n, s) => n + s.warningAssets, 0);
@@ -205,6 +206,14 @@ def render_page() -> str:
         button.append(title, document.createElement("br"), meta);
         return button;
       }));
+    }
+
+    function clearEventSelection() {
+      selectedEventId = null;
+      $("eventDetail").textContent = "Select an event.";
+      $("labelSelect").value = "needs_review";
+      $("noteInput").value = "";
+      $("saveReview").disabled = true;
     }
 
     function formatLocalTime(timestamp) {
@@ -274,6 +283,10 @@ def render_page() -> str:
       if (!row) return;
       selectedEventId = row.dataset.id;
       const event = events.find(item => item.id === selectedEventId);
+      if (!event) {
+        clearEventSelection();
+        return;
+      }
       const detail = $("eventDetail");
       detail.replaceChildren();
       const title = document.createElement("b");
@@ -281,6 +294,7 @@ def render_page() -> str:
       detail.append(title, document.createElement("br"), `${formatLocalTime(event.occurredAt)} · ${event.duration} - ${event.score}`, document.createElement("br"), event.note);
       $("labelSelect").value = event.label;
       $("noteInput").value = event.note;
+      $("saveReview").disabled = false;
     });
 
     $("loginBtn").addEventListener("click", () => login().catch(error => alert(error.message)));

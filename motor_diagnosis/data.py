@@ -2229,21 +2229,36 @@ def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "isSynthetic must be a boolean.",
         )
 
+    vibration_rms_raw = telemetry_number(
+        payload, "vibrationRmsRaw", required=True, nullable=False
+    )
+    acoustic_rms_raw = telemetry_number(
+        payload, "acousticRmsRaw", required=False, nullable=True
+    )
+    if vibration_rms_raw < 0:
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "vibrationRmsRaw must be greater than or equal to zero.",
+        )
+    if acoustic_rms_raw is not None and acoustic_rms_raw < 0:
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "acousticRmsRaw must be greater than or equal to zero.",
+        )
+
     return {
         "timestamp": format_rfc3339(timestamp),
         "sequence": sequence,
         **identifiers,
         "rpm": telemetry_number(payload, "rpm", required=False, nullable=True),
-        "vibrationRmsRaw": telemetry_number(
-            payload, "vibrationRmsRaw", required=True, nullable=False
-        ),
+        "vibrationRmsRaw": vibration_rms_raw,
         "vibrationRmsMmS": None,
         "vibrationPeakHz": telemetry_number(
             payload, "vibrationPeakHz", required=True, nullable=False
         ),
-        "acousticRmsRaw": telemetry_number(
-            payload, "acousticRmsRaw", required=False, nullable=True
-        ),
+        "acousticRmsRaw": acoustic_rms_raw,
         "acousticDb": None,
         "acousticPeakHz": telemetry_number(
             payload, "acousticPeakHz", required=False, nullable=True

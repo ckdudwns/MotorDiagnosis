@@ -139,6 +139,10 @@ class Week2BackendTest(unittest.TestCase):
                 telemetry_payload(vibrationRmsRaw=float("inf")),
                 "INVALID_TELEMETRY_PAYLOAD",
             ),
+            (
+                telemetry_payload(vibrationRmsRaw=-0.01),
+                "INVALID_TELEMETRY_PAYLOAD",
+            ),
         ]
         for payload, error_code in invalid_payloads:
             with self.subTest(error_code=error_code):
@@ -146,7 +150,7 @@ class Week2BackendTest(unittest.TestCase):
                     ingest_telemetry(self.principal, payload)
                 self.assertEqual(context.exception.code, error_code)
         self.assertEqual(len(TELEMETRY_RECORDS), 0)
-        self.assertEqual(len(QUARANTINED_DEVICE_MESSAGES), 4)
+        self.assertEqual(len(QUARANTINED_DEVICE_MESSAGES), 5)
 
     def test_telemetry_query_supports_a_shared_time_range(self) -> None:
         old_timestamp = utc_text(-120)

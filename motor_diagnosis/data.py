@@ -3551,6 +3551,19 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
         if threshold_version
         else None
     )
+    feature_snapshot = (
+        min(
+            points,
+            key=lambda point: abs(
+                (
+                    parse_rfc3339("telemetry.timestamp", point["timestamp"])
+                    - occurred_at
+                ).total_seconds()
+            ),
+        )
+        if points
+        else None
+    )
     return {
         "event": copy_payload(event),
         "context": {
@@ -3561,7 +3574,7 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
             "source": context_source,
             "rawDataMissing": not has_stored_raw,
         },
-        "featureSnapshot": copy_payload(points[-1]) if points else None,
+        "featureSnapshot": copy_payload(feature_snapshot),
         "appliedRule": applied_rule,
         "modelVersion": event.get("modelVersion"),
         "deviceSnapshot": copy_payload(device) if device else None,
@@ -4334,6 +4347,76 @@ def _dataset_split(payload: dict[str, Any]) -> dict[str, float]:
     return result
 
 
+def _dataset_source_filters(payload: dict[str, Any]) -> dict[str, Any] | None:
+    source_filters = payload.get("sourceFilters")
+    if source_filters is None:
+        return None
+    if not isinstance(source_filters, dict) or not source_filters:
+        raise ApiError(
+            400,
+            "INVALID_SOURCE_FILTERS",
+            "sourceFilters must be a non-empty object when provided.",
+        )
+
+    allowed_fields = {"siteId", "siteIds", "assetId", "assetIds", "from", "to"}
+    unsupported = sorted(set(source_filters) - allowed_fields)
+    if unsupported:
+        raise ApiError(
+            400,
+            "INVALID_SOURCE_FILTERS",
+            "Unsupported sourceFilters fields: " + ", ".join(unsupported),
+        )
+
+    normalized: dict[str, Any] = {}
+    for singular_key in ("siteId", "assetId"):
+        if singular_key not in source_filters:
+            continue
+        value = source_filters[singular_key]
+        if not isinstance(value, str) or not value.strip():
+            raise ApiError(
+                400,
+                "INVALID_SOURCE_FILTERS",
+                f"sourceFilters.{singular_key} must be a non-empty string.",
+            )
+        normalized[singular_key] = value.strip().upper()
+
+    for plural_key in ("siteIds", "assetIds"):
+        if plural_key not in source_filters:
+            continue
+        values = string_list(source_filters, plural_key, required=True, uppercase=True)
+        normalized[plural_key] = values
+
+    for singular_key, plural_key in (("siteId", "siteIds"), ("assetId", "assetIds")):
+        if (
+            singular_key in normalized
+            and plural_key in normalized
+            and normalized[singular_key] not in normalized[plural_key]
+        ):
+            raise ApiError(
+                400,
+                "INVALID_SOURCE_FILTERS",
+                f"sourceFilters.{singular_key} must be included in {plural_key}.",
+            )
+
+    for timestamp_key in ("from", "to"):
+        if timestamp_key not in source_filters:
+            continue
+        value = source_filters[timestamp_key]
+        parsed = parse_rfc3339(f"sourceFilters.{timestamp_key}", value)
+        normalized[timestamp_key] = format_rfc3339(parsed)
+
+    if "from" in normalized and "to" in normalized:
+        if parse_rfc3339("sourceFilters.from", normalized["from"]) > parse_rfc3339(
+            "sourceFilters.to", normalized["to"]
+        ):
+            raise ApiError(
+                400,
+                "INVALID_SOURCE_FILTERS",
+                "sourceFilters.from must not be later than sourceFilters.to.",
+            )
+    return normalized
+
+
 def create_dataset_version(
     user: dict[str, Any], payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -4372,11 +4455,7 @@ def create_dataset_version(
         raise ApiError(
             400, "REASON_TOO_LONG", "reason must be 1000 characters or less."
         )
-    source_filters = payload.get("sourceFilters")
-    if source_filters is not None and not isinstance(source_filters, dict):
-        raise ApiError(
-            400, "INVALID_SOURCE_FILTERS", "sourceFilters must be an object."
-        )
+    source_filters = _dataset_source_filters(payload)
     with STORE_LOCK:
         if any(
             item["source"]["checksum"] == source["checksum"]
@@ -4392,7 +4471,7 @@ def create_dataset_version(
             "name": name,
             "source": source,
             "compatibility": compatibility,
-            "sourceFilters": copy_payload(source_filters) if source_filters else None,
+            "sourceFilters": copy_payload(source_filters),
             "labelTaxonomyVersion": label_taxonomy_version,
             "labelMapping": normalized_mapping,
             "split": split,
@@ -4448,6 +4527,96 @@ def _event_for_dataset_point(
     return None
 
 
+def _dataset_export_window(
+    dataset: dict[str, Any] | None,
+    site_id: str,
+    asset_id: str,
+    from_timestamp: str | None,
+    to_timestamp: str | None,
+) -> tuple[str | None, str | None]:
+    source_filters = dataset.get("sourceFilters") if dataset else None
+    if not source_filters:
+        return from_timestamp, to_timestamp
+
+    allowed_site_ids = set(source_filters.get("siteIds", []))
+    if source_filters.get("siteId"):
+        allowed_site_ids.add(source_filters["siteId"])
+    allowed_asset_ids = set(source_filters.get("assetIds", []))
+    if source_filters.get("assetId"):
+        allowed_asset_ids.add(source_filters["assetId"])
+    if allowed_site_ids and site_id not in allowed_site_ids:
+        raise ApiError(
+            409,
+            "DATASET_SOURCE_FILTER_MISMATCH",
+            "The requested site is outside the dataset sourceFilters.",
+        )
+    if allowed_asset_ids and asset_id not in allowed_asset_ids:
+        raise ApiError(
+            409,
+            "DATASET_SOURCE_FILTER_MISMATCH",
+            "The requested asset is outside the dataset sourceFilters.",
+        )
+
+    requested_from = (
+        parse_rfc3339("from", from_timestamp) if from_timestamp is not None else None
+    )
+    requested_to = (
+        parse_rfc3339("to", to_timestamp) if to_timestamp is not None else None
+    )
+    filter_from = (
+        parse_rfc3339("sourceFilters.from", source_filters["from"])
+        if source_filters.get("from")
+        else None
+    )
+    filter_to = (
+        parse_rfc3339("sourceFilters.to", source_filters["to"])
+        if source_filters.get("to")
+        else None
+    )
+    effective_from = max(
+        (value for value in (requested_from, filter_from) if value is not None),
+        default=None,
+    )
+    effective_to = min(
+        (value for value in (requested_to, filter_to) if value is not None),
+        default=None,
+    )
+    if effective_from and effective_to and effective_from > effective_to:
+        raise ApiError(
+            409,
+            "DATASET_SOURCE_FILTER_MISMATCH",
+            "The requested time range is outside the dataset sourceFilters.",
+        )
+    return (
+        format_rfc3339(effective_from) if effective_from else None,
+        format_rfc3339(effective_to) if effective_to else None,
+    )
+
+
+def _dataset_label_for_event(
+    dataset: dict[str, Any] | None, event: dict[str, Any] | None
+) -> tuple[str | None, str | None]:
+    if not event:
+        return None, None
+    source_label = str(event.get("label") or "").strip()
+    if not source_label:
+        return None, None
+    if not dataset:
+        return source_label, None
+    label_mapping = {
+        str(key).strip().casefold(): str(value).strip()
+        for key, value in dataset.get("labelMapping", {}).items()
+    }
+    mapped_label = label_mapping.get(source_label.casefold())
+    if not mapped_label:
+        raise ApiError(
+            409,
+            "DATASET_LABEL_MAPPING_MISSING",
+            f"No labelMapping entry exists for event label '{source_label}'.",
+        )
+    return mapped_label, dataset["labelTaxonomyVersion"]
+
+
 def dataset_export_for(
     user: dict[str, Any],
     site_id: str,
@@ -4472,6 +4641,13 @@ def dataset_export_for(
             "DATASET_SOURCE_MISMATCH",
             "External dataset metadata cannot be used to export internal telemetry.",
         )
+    from_timestamp, to_timestamp = _dataset_export_window(
+        dataset,
+        site["id"],
+        asset["id"],
+        from_timestamp,
+        to_timestamp,
+    )
     split = (
         dataset["split"] if dataset else {"train": 0.7, "validation": 0.2, "test": 0.1}
     )
@@ -4490,6 +4666,9 @@ def dataset_export_for(
     rows = []
     for point in points:
         matching_event = _event_for_dataset_point(asset_events, point.get("timestamp"))
+        event_label, label_taxonomy_version = _dataset_label_for_event(
+            dataset, matching_event
+        )
         rows.append(
             {
                 "site_id": site["id"],
@@ -4503,10 +4682,8 @@ def dataset_export_for(
                 "acoustic_db": point.get("acousticDb"),
                 "rpm": point.get("rpm"),
                 "event_id": matching_event.get("id") if matching_event else None,
-                "event_label": matching_event.get("label") if matching_event else None,
-                "label_taxonomy_version": (
-                    dataset["labelTaxonomyVersion"] if dataset else "ACOUSTIC-V1"
-                ),
+                "event_label": event_label,
+                "label_taxonomy_version": label_taxonomy_version,
                 "dataset_split": group_split,
             }
         )
@@ -4541,10 +4718,9 @@ def dataset_export_for(
                 },
             }
         ),
-        "labelTaxonomyVersion": (
-            dataset["labelTaxonomyVersion"] if dataset else "ACOUSTIC-V1"
-        ),
+        "labelTaxonomyVersion": dataset["labelTaxonomyVersion"] if dataset else None,
         "labelMapping": dataset["labelMapping"] if dataset else {},
+        "sourceFilters": copy_payload(dataset["sourceFilters"]) if dataset else None,
         "siteId": site["id"],
         "assetId": asset["id"],
         "recordCount": len(rows),

@@ -8,9 +8,11 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from motor_diagnosis.data import (
+    ApiError,
     EVENTS,
     TELEMETRY_RECORDS,
     authenticate,
+    create_dataset_version,
     create_environment_inspection,
     current_user_for_token,
     dataset_export_for,
@@ -45,6 +47,37 @@ class Week3DataBoundaryTest(unittest.TestCase):
             "vibrationRmsMmS": None,
             "acousticRmsRaw": 0.007,
             "acousticDb": None,
+        }
+
+    def dataset_payload(
+        self,
+        *,
+        checksum: str,
+        source_filters: dict[str, object],
+        label_mapping: dict[str, str],
+    ) -> dict[str, object]:
+        return {
+            "name": "internal-week3-training-export",
+            "source": {
+                "type": "internal",
+                "uri": "api://telemetry",
+                "license": "project-internal",
+                "checksum": checksum,
+            },
+            "compatibility": {
+                "signalType": ["vibration", "acoustic"],
+                "samplingRateHz": 12000,
+                "units": {"vibration": "g", "acoustic": "raw-rms"},
+                "operatingConditions": {
+                    "rpmRange": [1700, 1800],
+                    "load": "mixed",
+                },
+            },
+            "sourceFilters": source_filters,
+            "labelTaxonomyVersion": "ACOUSTIC-V1",
+            "labelMapping": label_mapping,
+            "split": {"train": 0.7, "validation": 0.2, "test": 0.1},
+            "reason": "Week 3 dataset boundary regression test",
         }
 
     def test_event_context_marks_raw_missing_when_stored_data_is_outside_window(
@@ -83,6 +116,31 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(detail["appliedRule"]["version"], "RULE-SITE-01-MOT-02-v1")
         self.assertEqual(detail["appliedRule"]["scoreThreshold"], 75.0)
 
+    def test_event_feature_snapshot_is_closest_to_the_event_time(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        TELEMETRY_RECORDS.extend(
+            [
+                self.telemetry_record(
+                    format_rfc3339(event_time - timedelta(seconds=60)), 1
+                ),
+                self.telemetry_record(
+                    format_rfc3339(event_time + timedelta(seconds=5)), 2
+                ),
+                self.telemetry_record(
+                    format_rfc3339(event_time + timedelta(seconds=240)), 3
+                ),
+            ]
+        )
+
+        detail = event_detail_for(self.operator, event["id"])
+
+        self.assertEqual(detail["featureSnapshot"]["sequence"], 2)
+        self.assertEqual(
+            detail["featureSnapshot"]["timestamp"],
+            format_rfc3339(event_time + timedelta(seconds=5)),
+        )
+
     def test_all_not_checked_inspection_is_not_reported_as_ok(self) -> None:
         inspection = create_environment_inspection(
             self.admin,
@@ -120,12 +178,74 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertIsNone(rows[1]["event_label"])
         self.assertEqual(rows[2]["event_id"], "EV-241")
         self.assertEqual(rows[2]["event_label"], "needs_review")
+        self.assertIsNone(rows[2]["label_taxonomy_version"])
+        self.assertIsNone(exported["manifest"]["labelTaxonomyVersion"])
         self.assertEqual(exported["manifest"]["exportType"], "internal_telemetry")
         self.assertEqual(exported["manifest"]["source"]["uri"], "api://telemetry")
         self.assertEqual(
             exported["manifest"]["source"]["checksum"],
             exported["manifest"]["checksum"],
         )
+
+    def test_dataset_export_applies_registered_label_mapping(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        TELEMETRY_RECORDS.append(
+            self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=10)), 1)
+        )
+        dataset = create_dataset_version(
+            self.admin,
+            self.dataset_payload(
+                checksum="sha256:internal-label-mapping",
+                source_filters={
+                    "siteId": "SITE-01",
+                    "assetId": "SITE-01-MOT-02",
+                },
+                label_mapping={"needs_review": "BEARING_SUSPECT"},
+            ),
+        )
+
+        exported = dataset_export_for(
+            self.admin,
+            "SITE-01",
+            "SITE-01-MOT-02",
+            dataset_id=dataset["id"],
+        )
+
+        self.assertEqual(exported["rows"][0]["event_label"], "BEARING_SUSPECT")
+        self.assertEqual(exported["rows"][0]["label_taxonomy_version"], "ACOUSTIC-V1")
+        self.assertEqual(
+            exported["manifest"]["labelMapping"]["needs_review"],
+            "BEARING_SUSPECT",
+        )
+        self.assertEqual(
+            exported["manifest"]["sourceFilters"],
+            {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"},
+        )
+
+    def test_dataset_export_rejects_site_outside_source_filters(self) -> None:
+        dataset = create_dataset_version(
+            self.admin,
+            self.dataset_payload(
+                checksum="sha256:site-02-only",
+                source_filters={
+                    "siteId": "SITE-02",
+                    "assetId": "SITE-02-GEN-01",
+                },
+                label_mapping={"needs_review": "BEARING_SUSPECT"},
+            ),
+        )
+
+        with self.assertRaises(ApiError) as mismatch:
+            dataset_export_for(
+                self.admin,
+                "SITE-01",
+                "SITE-01-MOT-02",
+                dataset_id=dataset["id"],
+            )
+
+        self.assertEqual(mismatch.exception.status, 409)
+        self.assertEqual(mismatch.exception.code, "DATASET_SOURCE_FILTER_MISMATCH")
 
 
 class Week3HttpContractTest(unittest.TestCase):

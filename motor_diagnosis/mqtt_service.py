@@ -187,6 +187,7 @@ def quarantine_local_mqtt_message(
     message: bytes | str,
     error: MqttBridgeError,
     *,
+    idempotency_key: str | None = None,
     timeout: float = 10,
 ) -> tuple[dict[str, Any], int]:
     raw_payload = (
@@ -195,15 +196,18 @@ def quarantine_local_mqtt_message(
         else str(message)
     )
     raw_payload = _mqtt_text_for_storage(raw_payload)
+    quarantine_payload = {
+        "topic": _mqtt_text_for_storage(topic),
+        "payload": raw_payload,
+        "reason": error.code,
+        "message": error.message,
+    }
+    if idempotency_key is not None:
+        quarantine_payload["idempotencyKey"] = idempotency_key
     return post_json(
         endpoint,
         token,
-        {
-            "topic": _mqtt_text_for_storage(topic),
-            "payload": raw_payload,
-            "reason": error.code,
-            "message": error.message,
-        },
+        quarantine_payload,
         timeout=timeout,
     )
 
@@ -236,6 +240,7 @@ class RetryMessage:
     mid: int
     qos: int
     dup: bool
+    session_epoch: str
 
 
 class MqttRetryQueue:
@@ -252,7 +257,9 @@ class MqttRetryQueue:
         max_delay: float = 120.0,
         poll_interval: float = 0.5,
         database_timeout: float = 0.25,
+        migration_timeout: float = 5.0,
         lease_seconds: float = 60.0,
+        session_ready: bool = True,
     ) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,8 +270,14 @@ class MqttRetryQueue:
         self.max_delay = max(self.initial_delay, max_delay)
         self.poll_interval = max(0.05, poll_interval)
         self.database_timeout = max(0.05, database_timeout)
+        self.migration_timeout = max(self.database_timeout, migration_timeout)
         self.lease_seconds = max(1.0, lease_seconds)
         self._claim_owner = secrets.token_hex(16)
+        self._session_epoch = ""
+        self._session_lock = threading.Lock()
+        self._session_ready = threading.Event()
+        if session_ready:
+            self._session_ready.set()
         self._ack_targets: dict[str, tuple[Any, RetryMessage]] = {}
         self._target_lock = threading.Lock()
         self._processing_lock = threading.Lock()
@@ -274,17 +287,19 @@ class MqttRetryQueue:
         self._worker: threading.Thread | None = None
         self._initialize_database()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, *, timeout: float | None = None) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.database_path,
-            timeout=self.database_timeout,
+            timeout=self.database_timeout if timeout is None else timeout,
         )
         connection.row_factory = sqlite3.Row
         return connection
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
+    def _connection(
+        self, *, timeout: float | None = None
+    ) -> Iterator[sqlite3.Connection]:
+        connection = self._connect(timeout=timeout)
         try:
             yield connection
             connection.commit()
@@ -295,7 +310,7 @@ class MqttRetryQueue:
             connection.close()
 
     def _initialize_database(self) -> None:
-        with self._connection() as connection:
+        with self._connection(timeout=self.migration_timeout) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
@@ -315,7 +330,9 @@ class MqttRetryQueue:
                     delivery_completed INTEGER NOT NULL DEFAULT 0,
                     delivery_outcome TEXT NOT NULL DEFAULT '',
                     claim_owner TEXT NOT NULL DEFAULT '',
+                    claim_token INTEGER NOT NULL DEFAULT 0,
                     claim_until REAL NOT NULL DEFAULT 0,
+                    session_epoch TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL
                 )
                 """
@@ -332,7 +349,9 @@ class MqttRetryQueue:
                 "delivery_completed": "INTEGER NOT NULL DEFAULT 0",
                 "delivery_outcome": "TEXT NOT NULL DEFAULT ''",
                 "claim_owner": "TEXT NOT NULL DEFAULT ''",
+                "claim_token": "INTEGER NOT NULL DEFAULT 0",
                 "claim_until": "REAL NOT NULL DEFAULT 0",
+                "session_epoch": "TEXT NOT NULL DEFAULT ''",
             }
             for column, definition in migrations.items():
                 if column not in columns:
@@ -353,24 +372,126 @@ class MqttRetryQueue:
                 WHERE last_error_message = ''
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mqtt_retry_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO mqtt_retry_state (key, value)
+                VALUES ('session_epoch', ?)
+                """,
+                (secrets.token_hex(16),),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO mqtt_retry_state (key, value)
+                VALUES ('claim_sequence', '0')
+                """
+            )
+            session_epoch = str(
+                connection.execute(
+                    "SELECT value FROM mqtt_retry_state WHERE key = 'session_epoch'"
+                ).fetchone()["value"]
+            )
+            connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET session_epoch = ?
+                WHERE session_epoch = ''
+                """,
+                (session_epoch,),
+            )
+        with self._session_lock:
+            self._session_epoch = session_epoch
 
-    @staticmethod
-    def _snapshot(message: Any) -> RetryMessage:
+    def begin_session(self, *, session_present: bool) -> str:
+        """Persist the broker session generation used to identify packet IDs."""
+        reset_ack_targets = False
+        with self._connection(timeout=self.migration_timeout) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if session_present:
+                session_epoch = str(
+                    connection.execute(
+                        "SELECT value FROM mqtt_retry_state WHERE key = 'session_epoch'"
+                    ).fetchone()["value"]
+                )
+            else:
+                reset_ack_targets = True
+                session_epoch = secrets.token_hex(16)
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_state
+                    SET value = ?
+                    WHERE key = 'session_epoch'
+                    """,
+                    (session_epoch,),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM mqtt_retry_queue
+                    WHERE session_epoch != ? AND delivery_completed = 1
+                    """,
+                    (session_epoch,),
+                )
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_queue
+                    SET qos = 0
+                    WHERE session_epoch != ?
+                    """,
+                    (session_epoch,),
+                )
+        with self._session_lock:
+            self._session_epoch = session_epoch
+        if reset_ack_targets:
+            with self._target_lock:
+                self._ack_targets.clear()
+        self._session_ready.set()
+        LOGGER.info(
+            "mqtt_session_epoch session_present=%s epoch=%s",
+            session_present,
+            session_epoch,
+        )
+        return session_epoch
+
+    def _snapshot(self, message: Any) -> RetryMessage:
         payload = message.payload
         if isinstance(payload, str):
             payload_bytes = _mqtt_text_for_storage(payload).encode("utf-8")
         else:
             payload_bytes = bytes(payload)
+        with self._session_lock:
+            session_epoch = self._session_epoch
         return RetryMessage(
             topic=_mqtt_text_for_storage(str(message.topic)),
             payload=payload_bytes,
             mid=int(message.mid),
             qos=int(message.qos),
             dup=bool(getattr(message, "dup", False)),
+            session_epoch=session_epoch,
         )
 
     @staticmethod
     def _message_key(operation: str, message: RetryMessage) -> str:
+        digest = hashlib.sha256()
+        digest.update(message.session_epoch.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(operation.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(message.topic.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(message.payload)
+        digest.update(b"\0")
+        digest.update(str(message.mid).encode("ascii"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _pre_epoch_message_key(operation: str, message: RetryMessage) -> str:
         digest = hashlib.sha256()
         digest.update(operation.encode("utf-8"))
         digest.update(b"\0")
@@ -380,6 +501,9 @@ class MqttRetryQueue:
         digest.update(b"\0")
         digest.update(str(message.mid).encode("ascii"))
         return digest.hexdigest()
+
+    def delivery_idempotency_key(self, message: Any, operation: str) -> str:
+        return self._message_key(operation, self._snapshot(message))
 
     @staticmethod
     def _legacy_message_key(operation: str, message: RetryMessage) -> str:
@@ -445,6 +569,7 @@ class MqttRetryQueue:
                 delivery_completed = excluded.delivery_completed,
                 delivery_outcome = excluded.delivery_outcome,
                 claim_owner = '',
+                claim_token = 0,
                 claim_until = 0,
                 created_at = excluded.created_at
             """
@@ -456,8 +581,8 @@ class MqttRetryQueue:
                         message_key, operation, topic, payload, mid, qos,
                         attempts, next_attempt_at, error_code, error_message,
                         last_error_code, last_error_message, delivery_completed,
-                        delivery_outcome, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                        delivery_outcome, session_epoch, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(message_key) DO UPDATE SET
                         {conflict_action}
                     """,
@@ -475,6 +600,7 @@ class MqttRetryQueue:
                         error.message,
                         int(delivery_completed),
                         delivery_outcome,
+                        retry_message.session_epoch,
                         now,
                     ),
                 )
@@ -511,6 +637,10 @@ class MqttRetryQueue:
             self._legacy_message_key(operation, retry_message)
             for operation in ("quarantine", "ingest")
         )
+        pre_epoch_message_keys = tuple(
+            self._pre_epoch_message_key(operation, retry_message)
+            for operation in ("quarantine", "ingest")
+        )
         try:
             with self._processing_lock:
                 with self._connection() as connection:
@@ -527,11 +657,17 @@ class MqttRetryQueue:
                         row = connection.execute(
                             """
                             SELECT * FROM mqtt_retry_queue
-                            WHERE message_key IN (?, ?) AND mid = ?
+                            WHERE message_key IN (?, ?, ?, ?)
+                                AND mid = ? AND session_epoch = ?
                             ORDER BY delivery_completed DESC, created_at
                             LIMIT 1
                             """,
-                            (*legacy_message_keys, retry_message.mid),
+                            (
+                                *pre_epoch_message_keys,
+                                *legacy_message_keys,
+                                retry_message.mid,
+                                retry_message.session_epoch,
+                            ),
                         ).fetchone()
                     if row is None:
                         return None
@@ -589,7 +725,7 @@ class MqttRetryQueue:
                 UPDATE mqtt_retry_queue
                 SET attempts = ?, next_attempt_at = ?,
                     last_error_code = ?, last_error_message = ?,
-                    claim_owner = '', claim_until = 0
+                    claim_owner = '', claim_token = 0, claim_until = 0
                 WHERE message_key = ?
                 """,
                 (
@@ -626,7 +762,8 @@ class MqttRetryQueue:
             connection.execute(
                 """
                 UPDATE mqtt_retry_queue
-                SET next_attempt_at = ?, claim_owner = '', claim_until = 0
+                SET next_attempt_at = ?, claim_owner = '',
+                    claim_token = 0, claim_until = 0
                 WHERE message_key = ?
                 """,
                 (time.time() + delay, row["message_key"]),
@@ -688,15 +825,43 @@ class MqttRetryQueue:
                 if row is None:
                     return None
                 message_key = str(row["message_key"])
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_state
+                    SET value = CAST(value AS INTEGER) + 1
+                    WHERE key = 'claim_sequence'
+                    """
+                )
+                claim_token = int(
+                    connection.execute(
+                        "SELECT value FROM mqtt_retry_state "
+                        "WHERE key = 'claim_sequence'"
+                    ).fetchone()["value"]
+                )
                 claimed = connection.execute(
                     """
                     UPDATE mqtt_retry_queue
-                    SET claim_owner = ?, claim_until = ?
+                    SET claim_owner = ?, claim_token = ?, claim_until = ?
                     WHERE message_key = ? AND claim_until <= ?
                     """,
-                    (self._claim_owner, claim_until, message_key, claimed_at),
+                    (
+                        self._claim_owner,
+                        claim_token,
+                        claim_until,
+                        message_key,
+                        claimed_at,
+                    ),
                 )
                 if claimed.rowcount != 1:
+                    return None
+                row = connection.execute(
+                    """
+                    SELECT * FROM mqtt_retry_queue
+                    WHERE message_key = ? AND claim_owner = ? AND claim_token = ?
+                    """,
+                    (message_key, self._claim_owner, claim_token),
+                ).fetchone()
+                if row is None:
                     return None
             self._inflight_message_keys.add(message_key)
             return row
@@ -709,10 +874,11 @@ class MqttRetryQueue:
                     connection.execute(
                         """
                         UPDATE mqtt_retry_queue
-                        SET claim_owner = '', claim_until = 0
+                        SET claim_owner = '', claim_token = 0, claim_until = 0
                         WHERE message_key = ? AND claim_owner = ?
+                            AND claim_token = ?
                         """,
-                        (message_key, self._claim_owner),
+                        (message_key, self._claim_owner, int(row["claim_token"])),
                     )
             except sqlite3.Error as error:
                 LOGGER.warning(
@@ -728,12 +894,13 @@ class MqttRetryQueue:
                 """
                 UPDATE mqtt_retry_queue
                 SET claim_until = ?
-                WHERE message_key = ? AND claim_owner = ?
+                WHERE message_key = ? AND claim_owner = ? AND claim_token = ?
                 """,
                 (
                     time.time() + self.lease_seconds,
                     row["message_key"],
                     self._claim_owner,
+                    int(row["claim_token"]),
                 ),
             )
         return renewed.rowcount == 1
@@ -756,32 +923,164 @@ class MqttRetryQueue:
                     error,
                 )
 
-    def _claim_is_owned(self, row: sqlite3.Row) -> bool:
-        with self._connection() as connection:
-            current = connection.execute(
-                """
-                SELECT 1 FROM mqtt_retry_queue
-                WHERE message_key = ? AND claim_owner = ?
-                """,
-                (row["message_key"], self._claim_owner),
-            ).fetchone()
-        return current is not None
-
     def _complete_claimed(self, row: sqlite3.Row, outcome: str) -> str:
         with self._processing_lock:
             try:
-                if not self._claim_is_owned(row):
-                    return "retry"
-                return self._complete(row, outcome)
+                message_key = str(row["message_key"])
+                claim_token = int(row["claim_token"])
+                with self._connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = connection.execute(
+                        """
+                        SELECT * FROM mqtt_retry_queue
+                        WHERE message_key = ? AND claim_owner = ?
+                            AND claim_token = ?
+                        """,
+                        (message_key, self._claim_owner, claim_token),
+                    ).fetchone()
+                    if current is None:
+                        return "retry"
+                    if not bool(current["delivery_completed"]) or not str(
+                        current["delivery_outcome"]
+                    ):
+                        completed = connection.execute(
+                            """
+                            UPDATE mqtt_retry_queue
+                            SET delivery_completed = 1, delivery_outcome = ?
+                            WHERE message_key = ? AND claim_owner = ?
+                                AND claim_token = ?
+                            """,
+                            (
+                                outcome,
+                                message_key,
+                                self._claim_owner,
+                                claim_token,
+                            ),
+                        )
+                        if completed.rowcount != 1:
+                            return "retry"
+                    with self._target_lock:
+                        target = self._ack_targets.get(message_key)
+                    if target is None and int(current["qos"]) > 0:
+                        delay = max(0.5, self.poll_interval, self.initial_delay)
+                        deferred = connection.execute(
+                            """
+                            UPDATE mqtt_retry_queue
+                            SET next_attempt_at = ?, claim_owner = '',
+                                claim_token = 0, claim_until = 0
+                            WHERE message_key = ? AND claim_owner = ?
+                                AND claim_token = ?
+                            """,
+                            (
+                                time.time() + delay,
+                                message_key,
+                                self._claim_owner,
+                                claim_token,
+                            ),
+                        )
+                        if deferred.rowcount != 1:
+                            return "retry"
+                        LOGGER.info(
+                            "mqtt_retry_awaiting_ack_target operation=%s "
+                            "topic=%s qos=%s",
+                            current["operation"],
+                            current["topic"],
+                            current["qos"],
+                        )
+                        return "awaiting_ack"
+                    if target is not None:
+                        client, message = target
+                        if not acknowledge_message(client, message):
+                            attempts = int(current["attempts"]) + 1
+                            delay = min(
+                                self.max_delay,
+                                self.initial_delay
+                                * (2 ** min(max(0, attempts - 1), 10)),
+                            )
+                            rescheduled = connection.execute(
+                                """
+                                UPDATE mqtt_retry_queue
+                                SET attempts = ?, next_attempt_at = ?,
+                                    last_error_code = 'MQTT_ACK_FAILED',
+                                    last_error_message = 'MQTT ACK failed.',
+                                    claim_owner = '', claim_token = 0,
+                                    claim_until = 0
+                                WHERE message_key = ? AND claim_owner = ?
+                                    AND claim_token = ?
+                                """,
+                                (
+                                    attempts,
+                                    time.time() + delay,
+                                    message_key,
+                                    self._claim_owner,
+                                    claim_token,
+                                ),
+                            )
+                            if rescheduled.rowcount != 1:
+                                return "retry"
+                            return "retry"
+                    deleted = connection.execute(
+                        """
+                        DELETE FROM mqtt_retry_queue
+                        WHERE message_key = ? AND claim_owner = ?
+                            AND claim_token = ?
+                        """,
+                        (message_key, self._claim_owner, claim_token),
+                    )
+                    if deleted.rowcount != 1:
+                        return "retry"
+                with self._target_lock:
+                    self._ack_targets.pop(message_key, None)
+                LOGGER.info(
+                    "mqtt_retry_completed operation=%s topic=%s outcome=%s",
+                    row["operation"],
+                    row["topic"],
+                    outcome,
+                )
+                return outcome
             finally:
                 self._inflight_message_keys.discard(str(row["message_key"]))
 
     def _reschedule_claimed(self, row: sqlite3.Row, error: MqttBridgeError) -> str:
         with self._processing_lock:
             try:
-                if not self._claim_is_owned(row):
-                    return "retry"
-                self._reschedule(row, error)
+                attempts = int(row["attempts"]) + 1
+                delay = min(
+                    self.max_delay,
+                    self.initial_delay * (2 ** min(max(0, attempts - 1), 10)),
+                )
+                with self._connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    updated = connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue
+                        SET attempts = ?, next_attempt_at = ?,
+                            last_error_code = ?, last_error_message = ?,
+                            claim_owner = '', claim_token = 0, claim_until = 0
+                        WHERE message_key = ? AND claim_owner = ?
+                            AND claim_token = ?
+                        """,
+                        (
+                            attempts,
+                            time.time() + delay,
+                            error.code,
+                            error.message,
+                            row["message_key"],
+                            self._claim_owner,
+                            int(row["claim_token"]),
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        return "retry"
+                LOGGER.warning(
+                    "mqtt_retry_scheduled operation=%s topic=%s attempt=%s "
+                    "delay=%.1f code=%s",
+                    row["operation"],
+                    row["topic"],
+                    attempts,
+                    delay,
+                    error.code,
+                )
                 return "retry"
             finally:
                 self._inflight_message_keys.discard(str(row["message_key"]))
@@ -813,6 +1112,7 @@ class MqttRetryQueue:
                         str(row["error_message"]),
                         local=True,
                     ),
+                    idempotency_key=str(row["message_key"]),
                 )
                 return self._complete_claimed(row, "quarantined")
 
@@ -833,6 +1133,8 @@ class MqttRetryQueue:
             self._release_claim(row)
 
     def process_due_once(self, *, now: float | None = None) -> str:
+        if not self._session_ready.is_set():
+            return "idle"
         row = self._claim_next_due(time.time() if now is None else now)
         if row is None:
             return "idle"
@@ -896,12 +1198,18 @@ def process_mqtt_message(
                             "QUARANTINE_ENDPOINT_UNAVAILABLE",
                             "A quarantine endpoint is required before MQTT ACK.",
                         )
+                    idempotency_key = (
+                        retry_queue.delivery_idempotency_key(message, "quarantine")
+                        if retry_queue
+                        else None
+                    )
                     quarantine_local_mqtt_message(
                         quarantine_endpoint,
                         token,
                         message.topic,
                         message.payload,
                         error,
+                        idempotency_key=idempotency_key,
                     )
                 except MqttBridgeError as quarantine_error:
                     queued = bool(
@@ -1071,6 +1379,14 @@ def mqtt_reason_value(reason_code: Any) -> int | None:
         return None
 
 
+def mqtt_session_present(connect_flags: Any) -> bool:
+    if isinstance(connect_flags, dict):
+        return bool(
+            connect_flags.get("session_present") or connect_flags.get("session present")
+        )
+    return bool(getattr(connect_flags, "session_present", False))
+
+
 def subscription_reason_meets_qos(reason_code: Any, requested_qos: int) -> bool:
     granted_qos = mqtt_reason_value(reason_code)
     if granted_qos is None:
@@ -1104,7 +1420,7 @@ def configure_mqtt_callbacks(
         )
     pending_subscriptions: set[int] = set()
 
-    def on_connect(client, _userdata, _flags, reason_code, _properties) -> None:
+    def on_connect(client, _userdata, flags, reason_code, _properties) -> None:
         if mqtt_reason_failed(reason_code):
             LOGGER.error("mqtt_connect_failed reason=%s", reason_code)
             report_mqtt_status_safely(
@@ -1113,6 +1429,18 @@ def configure_mqtt_callbacks(
                 status="degraded",
                 detail=f"Broker connection refused: {reason_code}",
                 error_code="MQTT_CONNECT_REFUSED",
+            )
+            return
+        try:
+            retry_queue.begin_session(session_present=mqtt_session_present(flags))
+        except sqlite3.Error as error:
+            LOGGER.error("mqtt_session_epoch_failed error=%s", error)
+            report_mqtt_status_safely(
+                endpoint=args.health_endpoint,
+                token=args.ingest_token,
+                status="degraded",
+                detail=f"MQTT retry session state failed: {error}",
+                error_code="MQTT_RETRY_STATE_FAILED",
             )
             return
         result, mid = client.subscribe(args.topic, qos=args.qos)
@@ -1269,6 +1597,7 @@ def main() -> None:
         ingest_endpoint=args.ingest_endpoint,
         quarantine_endpoint=args.quarantine_endpoint,
         token=args.ingest_token,
+        session_ready=False,
     )
     configure_mqtt_callbacks(client, args, retry_queue)
     retry_queue.start()

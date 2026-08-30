@@ -916,6 +916,7 @@ INSTALL_POINTS = copy_payload(BASE_INSTALL_POINTS)
 ANOMALY_RULES = copy_payload(BASE_ANOMALY_RULES)
 ALERT_POLICIES = copy_payload(BASE_ALERT_POLICIES)
 QUARANTINED_DEVICE_MESSAGES: list[dict[str, Any]] = []
+MQTT_QUARANTINE_IDEMPOTENCY: dict[str, dict[str, Any]] = {}
 TELEMETRY_RECORDS: list[dict[str, Any]] = []
 TELEMETRY_IDEMPOTENCY: dict[tuple[str, int], dict[str, str]] = {}
 TELEMETRY_METRICS: dict[str, int | float | str | None] = {
@@ -964,6 +965,7 @@ def reset_runtime_state() -> None:
         PARAMETERS.clear()
         PARAMETERS.update(copy_payload(BASE_PARAMETERS))
         QUARANTINED_DEVICE_MESSAGES.clear()
+        MQTT_QUARANTINE_IDEMPOTENCY.clear()
         TELEMETRY_RECORDS.clear()
         TELEMETRY_IDEMPOTENCY.clear()
         TELEMETRY_METRICS.update(
@@ -2657,6 +2659,22 @@ def quarantine_mqtt_message(
             "INVALID_QUARANTINE_PAYLOAD",
             "payload must contain the original MQTT message as text.",
         )
+    idempotency_key_value = payload.get("idempotencyKey")
+    idempotency_key = None
+    if idempotency_key_value is not None:
+        if not isinstance(idempotency_key_value, str):
+            raise ApiError(
+                400,
+                "INVALID_IDEMPOTENCY_KEY",
+                "idempotencyKey must be a non-empty string.",
+            )
+        idempotency_key = idempotency_key_value.strip()
+        if not idempotency_key or len(idempotency_key) > 200:
+            raise ApiError(
+                400,
+                "INVALID_IDEMPOTENCY_KEY",
+                "idempotencyKey must contain 1 to 200 characters.",
+            )
 
     topic_parts = [part for part in topic.strip("/").split("/") if part]
     device_id = None
@@ -2668,6 +2686,29 @@ def quarantine_mqtt_message(
         device_id = topic_parts[1].strip().upper() or None
 
     with STORE_LOCK:
+        request_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "topic": topic,
+                    "payload": raw_payload,
+                    "reason": reason,
+                    "message": message,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if idempotency_key is not None:
+            existing = MQTT_QUARANTINE_IDEMPOTENCY.get(idempotency_key)
+            if existing is not None:
+                if existing["fingerprint"] != request_fingerprint:
+                    raise ApiError(
+                        409,
+                        "QUARANTINE_IDEMPOTENCY_CONFLICT",
+                        "idempotencyKey was already used for another MQTT message.",
+                    )
+                return copy_payload(existing["record"])
         TELEMETRY_METRICS["requests"] = int(TELEMETRY_METRICS["requests"]) + 1
         TELEMETRY_METRICS["rejected"] = int(TELEMETRY_METRICS["rejected"]) + 1
         TELEMETRY_METRICS["localRejected"] = int(TELEMETRY_METRICS["localRejected"]) + 1
@@ -2680,8 +2721,14 @@ def quarantine_mqtt_message(
             "message": message,
             "receivedAt": now_iso(),
             "payload": raw_payload,
+            "idempotencyKey": idempotency_key,
         }
         QUARANTINED_DEVICE_MESSAGES.append(record)
+        if idempotency_key is not None:
+            MQTT_QUARANTINE_IDEMPOTENCY[idempotency_key] = {
+                "fingerprint": request_fingerprint,
+                "record": copy_payload(record),
+            }
         return copy_payload(record)
 
 

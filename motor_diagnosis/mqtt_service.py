@@ -264,6 +264,8 @@ class MqttRetryQueue:
         lease_seconds: float = 60.0,
         generation_retention_seconds: float = 86400.0,
         max_delivery_generations: int = 65535,
+        generation_gc_interval: float = 60.0,
+        generation_gc_batch_size: int = 1000,
         session_ready: bool = True,
     ) -> None:
         self.database_path = Path(database_path)
@@ -279,15 +281,20 @@ class MqttRetryQueue:
         self.lease_seconds = max(1.0, lease_seconds)
         self.generation_retention_seconds = max(0.0, generation_retention_seconds)
         self.max_delivery_generations = max(1, int(max_delivery_generations))
+        self.generation_gc_interval = max(0.0, generation_gc_interval)
+        self.generation_gc_batch_size = max(1, int(generation_gc_batch_size))
         self._claim_owner = secrets.token_hex(16)
         self._session_epoch = ""
         self._session_lock = threading.Lock()
+        self._session_fence_lock = threading.Lock()
         self._session_ready = threading.Event()
         if session_ready:
             self._session_ready.set()
         self._ack_targets: dict[str, tuple[Any, RetryMessage]] = {}
         self._target_lock = threading.Lock()
         self._processing_lock = threading.Lock()
+        self._generation_gc_lock = threading.Lock()
+        self._next_generation_gc_at = 0.0
         self._inflight_message_keys: set[str] = set()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -357,6 +364,7 @@ class MqttRetryQueue:
                     last_error_message TEXT NOT NULL,
                     delivery_completed INTEGER NOT NULL DEFAULT 0,
                     delivery_outcome TEXT NOT NULL DEFAULT '',
+                    acknowledged INTEGER NOT NULL DEFAULT 0,
                     claim_owner TEXT NOT NULL DEFAULT '',
                     claim_token INTEGER NOT NULL DEFAULT 0,
                     claim_until REAL NOT NULL DEFAULT 0,
@@ -376,6 +384,7 @@ class MqttRetryQueue:
                 "last_error_message": "TEXT NOT NULL DEFAULT ''",
                 "delivery_completed": "INTEGER NOT NULL DEFAULT 0",
                 "delivery_outcome": "TEXT NOT NULL DEFAULT ''",
+                "acknowledged": "INTEGER NOT NULL DEFAULT 0",
                 "claim_owner": "TEXT NOT NULL DEFAULT ''",
                 "claim_token": "INTEGER NOT NULL DEFAULT 0",
                 "claim_until": "REAL NOT NULL DEFAULT 0",
@@ -451,6 +460,14 @@ class MqttRetryQueue:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS mqtt_delivery_generation_gc
+                ON mqtt_delivery_generations (
+                    active_identity, state, updated_at, created_at, delivery_id
+                )
+                """
+            )
+            connection.execute(
+                """
                 INSERT OR IGNORE INTO mqtt_retry_state (key, value)
                 VALUES ('session_epoch', ?)
                 """,
@@ -481,6 +498,10 @@ class MqttRetryQueue:
 
     def begin_session(self, *, session_present: bool) -> str:
         """Persist the broker session generation used to identify packet IDs."""
+        with self._session_fence_lock:
+            return self._begin_session(session_present=session_present)
+
+    def _begin_session(self, *, session_present: bool) -> str:
         reset_ack_targets = False
         with self._connection(timeout=self.migration_timeout) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -524,7 +545,7 @@ class MqttRetryQueue:
                     """,
                     (time.time(), session_epoch),
                 )
-            self._prune_delivery_generations(connection)
+            self._prune_delivery_generations(connection, force=True)
         with self._session_lock:
             self._session_epoch = session_epoch
         if reset_ack_targets:
@@ -543,6 +564,9 @@ class MqttRetryQueue:
         with self._target_lock:
             self._ack_targets.clear()
 
+    def resume_session(self) -> None:
+        self._session_ready.set()
+
     @staticmethod
     def _payload_hash(topic: str, payload: bytes) -> str:
         digest = hashlib.sha256()
@@ -552,10 +576,33 @@ class MqttRetryQueue:
         return digest.hexdigest()
 
     def _prune_delivery_generations(
-        self, connection: sqlite3.Connection, *, now: float | None = None
+        self,
+        connection: sqlite3.Connection,
+        *,
+        now: float | None = None,
+        force: bool = False,
     ) -> None:
-        """Bound inactive delivery history without removing live MQTT identity."""
+        """Run bounded, periodic GC without removing live MQTT identity."""
         current_time = time.time() if now is None else now
+        gc_clock = time.monotonic()
+        if not force and gc_clock < self._next_generation_gc_at:
+            return
+        if not self._generation_gc_lock.acquire(blocking=False):
+            return
+        try:
+            if not force and gc_clock < self._next_generation_gc_at:
+                return
+            self._run_generation_gc(connection, current_time=current_time)
+            self._next_generation_gc_at = gc_clock + self.generation_gc_interval
+        except Exception:
+            self._next_generation_gc_at = 0.0
+            raise
+        finally:
+            self._generation_gc_lock.release()
+
+    def _run_generation_gc(
+        self, connection: sqlite3.Connection, *, current_time: float
+    ) -> None:
         unreferenced = """
             NOT EXISTS (
                 SELECT 1 FROM mqtt_retry_queue AS retry
@@ -565,41 +612,54 @@ class MqttRetryQueue:
                 )
             )
         """
+        active_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM mqtt_delivery_generations
+                WHERE active_identity = 1
+                """
+            ).fetchone()[0]
+        )
+        inactive_limit = max(0, self.max_delivery_generations - active_count)
         connection.execute(
             f"""
-            DELETE FROM mqtt_delivery_generations
-            WHERE active_identity = 0 AND state != 'acked' AND {unreferenced}
-            """
+            DELETE FROM mqtt_delivery_generations WHERE delivery_id IN (
+                SELECT delivery_id FROM mqtt_delivery_generations
+                WHERE active_identity = 0 AND state != 'acked' AND {unreferenced}
+                ORDER BY updated_at, created_at, delivery_id
+                LIMIT ?
+            )
+            """,
+            (self.generation_gc_batch_size,),
         )
         if self.generation_retention_seconds > 0:
             connection.execute(
                 f"""
-                DELETE FROM mqtt_delivery_generations
-                WHERE active_identity = 0 AND state = 'acked'
-                    AND updated_at < ? AND {unreferenced}
-                """,
-                (current_time - self.generation_retention_seconds,),
-            )
-        count = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM mqtt_delivery_generations"
-            ).fetchone()[0]
-        )
-        excess = count - self.max_delivery_generations
-        if excess > 0:
-            connection.execute(
-                f"""
-                DELETE FROM mqtt_delivery_generations
-                WHERE delivery_id IN (
+                DELETE FROM mqtt_delivery_generations WHERE delivery_id IN (
                     SELECT delivery_id FROM mqtt_delivery_generations
                     WHERE active_identity = 0 AND state = 'acked'
-                        AND {unreferenced}
+                        AND updated_at < ? AND {unreferenced}
                     ORDER BY updated_at, created_at, delivery_id
                     LIMIT ?
                 )
                 """,
-                (excess,),
+                (
+                    current_time - self.generation_retention_seconds,
+                    self.generation_gc_batch_size,
+                ),
             )
+        connection.execute(
+            f"""
+            DELETE FROM mqtt_delivery_generations WHERE delivery_id IN (
+                SELECT delivery_id FROM mqtt_delivery_generations
+                WHERE active_identity = 0 AND state = 'acked'
+                    AND {unreferenced}
+                ORDER BY updated_at DESC, created_at DESC, delivery_id DESC
+                LIMIT ? OFFSET ?
+            )
+            """,
+            (self.generation_gc_batch_size, inactive_limit),
+        )
 
     def _snapshot(
         self,
@@ -757,6 +817,41 @@ class MqttRetryQueue:
         if updated.rowcount != 1:
             raise sqlite3.OperationalError("MQTT delivery generation is unavailable")
 
+    def _delivery_is_current(
+        self, delivery_id: str, session_epoch: str, retry_message: RetryMessage
+    ) -> bool:
+        if (
+            not delivery_id
+            or retry_message.delivery_id != delivery_id
+            or retry_message.session_epoch != session_epoch
+        ):
+            return False
+        with self._session_lock:
+            if session_epoch != self._session_epoch:
+                return False
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM mqtt_delivery_generations
+                WHERE delivery_id = ? AND session_epoch = ?
+                    AND active_identity = 1
+                """,
+                (delivery_id, session_epoch),
+            ).fetchone()
+        return row is not None
+
+    def _mark_acknowledged(self, message_key: str) -> bool:
+        with self._connection(timeout=self.migration_timeout) as connection:
+            updated = connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET acknowledged = 1
+                WHERE message_key = ?
+                """,
+                (message_key,),
+            )
+        return updated.rowcount == 1
+
     def _delete_delivery_rows(self, delivery_id: str) -> None:
         if not delivery_id:
             return
@@ -873,7 +968,11 @@ class MqttRetryQueue:
                     WHEN mqtt_retry_queue.delivery_completed = 1
                     THEN mqtt_retry_queue.delivery_outcome
                     ELSE excluded.delivery_outcome
-                END
+                END,
+                acknowledged = MAX(
+                    mqtt_retry_queue.acknowledged,
+                    excluded.acknowledged
+                )
             """
         else:
             conflict_action = """
@@ -887,6 +986,7 @@ class MqttRetryQueue:
                 last_error_message = excluded.last_error_message,
                 delivery_completed = excluded.delivery_completed,
                 delivery_outcome = excluded.delivery_outcome,
+                acknowledged = excluded.acknowledged,
                 claim_owner = '',
                 claim_token = 0,
                 claim_until = 0,
@@ -904,8 +1004,8 @@ class MqttRetryQueue:
                         message_key, operation, topic, payload, mid, qos,
                         attempts, next_attempt_at, error_code, error_message,
                         last_error_code, last_error_message, delivery_completed,
-                        delivery_outcome, session_epoch, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        delivery_outcome, acknowledged, session_epoch, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                     ON CONFLICT(message_key) DO UPDATE SET
                         {conflict_action}
                     """,
@@ -1174,6 +1274,29 @@ class MqttRetryQueue:
             self._mark_delivery_completed(row, outcome)
         with self._target_lock:
             target = self._ack_targets.get(message_key)
+        if bool(row["acknowledged"]):
+            try:
+                with self._connection() as connection:
+                    connection.execute(
+                        "DELETE FROM mqtt_retry_queue WHERE message_key = ?",
+                        (message_key,),
+                    )
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_retry_terminal_cleanup_failed key=%s error=%s",
+                    message_key,
+                    error,
+                )
+            if delivery_id:
+                try:
+                    self._set_delivery_state(delivery_id, "acked", outcome)
+                except sqlite3.Error as error:
+                    LOGGER.warning(
+                        "mqtt_delivery_ack_state_recovery_failed delivery=%s error=%s",
+                        delivery_id,
+                        error,
+                    )
+            return outcome
         if target is None and int(row["qos"]) > 0:
             if delivery_state is None or delivery_state[0] != "acked":
                 self._defer_until_ack_target(row)
@@ -1197,6 +1320,15 @@ class MqttRetryQueue:
                 self._reschedule(
                     row,
                     MqttBridgeError(503, "MQTT_ACK_FAILED", "MQTT ACK failed."),
+                )
+                return "retry"
+            try:
+                self._mark_acknowledged(message_key)
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_retry_ack_marker_failed key=%s error=%s",
+                    message_key,
+                    error,
                 )
                 return "retry"
         try:
@@ -1396,6 +1528,22 @@ class MqttRetryQueue:
                         return "retry"
                 with self._target_lock:
                     target = self._ack_targets.get(message_key)
+                if bool(current["acknowledged"]):
+                    if delivery_id:
+                        try:
+                            self._set_delivery_state(delivery_id, "acked", outcome)
+                        except sqlite3.Error as error:
+                            LOGGER.warning(
+                                "mqtt_delivery_ack_state_recovery_failed "
+                                "delivery=%s error=%s",
+                                delivery_id,
+                                error,
+                            )
+                    if not self._delete_claimed_row(message_key, claim_token):
+                        return "retry"
+                    with self._target_lock:
+                        self._ack_targets.pop(message_key, None)
+                    return outcome
                 if target is None:
                     if int(current["qos"]) > 0 and (
                         delivery_state is None or delivery_state[0] != "acked"
@@ -1448,7 +1596,22 @@ class MqttRetryQueue:
                 if fenced.rowcount != 1:
                     return "retry"
                 client, message = target
-                if not acknowledge_message(client, message):
+                retry_message = target[1]
+                with self._session_fence_lock:
+                    if delivery_id and not self._delivery_is_current(
+                        delivery_id, str(current["session_epoch"]), retry_message
+                    ):
+                        deleted = self._delete_claimed_row(message_key, claim_token)
+                        with self._target_lock:
+                            self._ack_targets.pop(message_key, None)
+                        LOGGER.info(
+                            "mqtt_retry_stale_session_ack_skipped key=%s epoch=%s",
+                            message_key,
+                            current["session_epoch"],
+                        )
+                        return outcome if deleted else "retry"
+                    acknowledged = acknowledge_message(client, message)
+                if not acknowledged:
                     attempts = int(current["attempts"]) + 1
                     delay = min(
                         self.max_delay,
@@ -1477,6 +1640,17 @@ class MqttRetryQueue:
                     if rescheduled.rowcount != 1:
                         return "retry"
                     return "retry"
+                try:
+                    ack_recorded = self._mark_acknowledged(message_key)
+                except sqlite3.Error as error:
+                    LOGGER.warning(
+                        "mqtt_retry_ack_marker_failed key=%s error=%s",
+                        message_key,
+                        error,
+                    )
+                    return "retry"
+                with self._target_lock:
+                    self._ack_targets.pop(message_key, None)
                 if delivery_id:
                     try:
                         self._set_delivery_state(delivery_id, "acked", outcome)
@@ -1486,7 +1660,8 @@ class MqttRetryQueue:
                             delivery_id,
                             error,
                         )
-                        return "retry"
+                        if ack_recorded:
+                            return outcome
                 try:
                     deleted = self._delete_claimed_row(message_key, claim_token)
                 except sqlite3.Error as error:
@@ -1498,8 +1673,6 @@ class MqttRetryQueue:
                     )
                 if not deleted and not delivery_id:
                     return "retry"
-                with self._target_lock:
-                    self._ack_targets.pop(message_key, None)
                 if not deleted:
                     LOGGER.info("mqtt_retry_ack_cleanup_deferred key=%s", message_key)
                 LOGGER.info(
@@ -2021,6 +2194,7 @@ def configure_mqtt_callbacks(
                 )
                 return
             if not subscription_is_granted(reason_codes, args.qos):
+                retry_queue.pause_session()
                 reasons = ", ".join(str(code) for code in reason_codes)
                 broker_rejected = not reason_codes or any(
                     mqtt_reason_failed(code) for code in reason_codes
@@ -2060,6 +2234,7 @@ def configure_mqtt_callbacks(
                     error_code=error_code,
                 )
                 return
+            retry_queue.resume_session()
             report_mqtt_status_safely(
                 endpoint=args.health_endpoint,
                 token=args.ingest_token,

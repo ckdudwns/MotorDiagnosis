@@ -1104,6 +1104,7 @@ class Week2BackendTest(unittest.TestCase):
                 client.on_subscribe(client, None, 31, [1], None)
                 self.assertEqual(pending, set())
                 self.assertEqual(report.call_args.kwargs["status"], "healthy")
+                self.assertTrue(retry_queue._session_ready.is_set())
 
                 report.reset_mock()
                 client.on_connect(client, None, None, 0, None)
@@ -1126,6 +1127,16 @@ class Week2BackendTest(unittest.TestCase):
                     report.call_args.kwargs["error_code"],
                     "MQTT_SUBSCRIBE_QOS_DOWNGRADED",
                 )
+                self.assertFalse(retry_queue._session_ready.is_set())
+                downgraded_message = SimpleNamespace(
+                    topic="devices/DEV-QOS-DOWNGRADE/telemetry",
+                    payload=b'{"sequence": 33}',
+                    mid=33,
+                    qos=1,
+                    dup=False,
+                )
+                with self.assertRaisesRegex(sqlite3.OperationalError, "not ready"):
+                    retry_queue.prepare_delivery(downgraded_message)
 
     def test_session_activation_retries_and_disconnect_pauses_queue(self) -> None:
         class FakeClient:
@@ -1490,6 +1501,7 @@ class Week2BackendTest(unittest.TestCase):
                     )
 
                 with retry_queue._connection() as connection:
+                    retry_queue._prune_delivery_generations(connection, force=True)
                     generation_count = connection.execute(
                         "SELECT COUNT(*) FROM mqtt_delivery_generations"
                     ).fetchone()[0]
@@ -1583,6 +1595,7 @@ class Week2BackendTest(unittest.TestCase):
                     retry_queue._prune_delivery_generations(
                         connection,
                         now=retry_queue.generation_retention_seconds + 1,
+                        force=True,
                     )
                     active_count = connection.execute(
                         """
@@ -1671,6 +1684,209 @@ class Week2BackendTest(unittest.TestCase):
             )
             self.assertEqual(second_queue.pending_count(), 0)
             self.assertEqual(client.ack_calls, [(120, 1)])
+
+    def test_old_session_worker_cannot_ack_reused_mid_in_new_session(self) -> None:
+        class AckClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        old_client = AckClient()
+        new_client = AckClient()
+        old_message = SimpleNamespace(
+            topic="devices/DEV-SESSION-FENCE/telemetry",
+            payload=b'{"sequence": 121}',
+            mid=121,
+            qos=1,
+            dup=False,
+        )
+        new_message = SimpleNamespace(**vars(old_message))
+        with tempfile.TemporaryDirectory() as directory:
+            retry_queue = MqttRetryQueue(
+                database_path=Path(directory) / "session-ack-fence.sqlite3",
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+                initial_delay=0,
+            )
+            self.assertTrue(
+                retry_queue.enqueue(
+                    old_client,
+                    old_message,
+                    MqttBridgeError(503, "HTTP_SERVICE_UNAVAILABLE", "temporary"),
+                )
+            )
+            old_claim = retry_queue._claim_next_due(float("inf"))
+            self.assertIsNotNone(old_claim)
+            old_delivery_id = retry_queue._delivery_id_from_key(
+                str(old_claim["message_key"])
+            )
+            old_retry_message = retry_queue._snapshot(
+                old_message, delivery_id=old_delivery_id
+            )
+
+            retry_queue.begin_session(session_present=False)
+            new_retry_message = retry_queue.prepare_delivery(new_message)
+            self.assertTrue(
+                retry_queue.enqueue(
+                    new_client,
+                    new_message,
+                    MqttBridgeError(503, "HTTP_SERVICE_UNAVAILABLE", "temporary"),
+                    retry_message=new_retry_message,
+                )
+            )
+            with retry_queue._target_lock:
+                retry_queue._ack_targets[str(old_claim["message_key"])] = (
+                    old_client,
+                    old_retry_message,
+                )
+
+            self.assertEqual(
+                retry_queue._complete_claimed(old_claim, "accepted"), "accepted"
+            )
+            self.assertEqual(old_client.ack_calls, [])
+            self.assertEqual(new_client.ack_calls, [])
+            self.assertEqual(retry_queue.pending_count(), 1)
+
+    def test_ack_marker_recovers_when_generation_state_write_fails(self) -> None:
+        class AckClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        client = AckClient()
+        message = SimpleNamespace(
+            topic="devices/DEV-ACK-MARKER/telemetry",
+            payload=b'{"sequence": 122}',
+            mid=122,
+            qos=1,
+            dup=False,
+        )
+        temporary = MqttBridgeError(503, "HTTP_SERVICE_UNAVAILABLE", "temporary")
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "ack-marker.sqlite3"
+            retry_queue = MqttRetryQueue(
+                database_path=database_path,
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+                initial_delay=0,
+            )
+            self.assertTrue(retry_queue.enqueue(client, message, temporary))
+            original_set_state = retry_queue._set_delivery_state
+
+            def fail_acked_state(
+                delivery_id: str, state: str, outcome: str = ""
+            ) -> None:
+                if state == "acked":
+                    raise sqlite3.OperationalError("simulated ack state failure")
+                original_set_state(delivery_id, state, outcome)
+
+            with (
+                patch(
+                    "motor_diagnosis.mqtt_service.forward_mqtt_message",
+                    return_value=(
+                        {"deviceId": "DEV-ACK-MARKER", "sequence": 122},
+                        201,
+                    ),
+                ) as forward,
+                patch.object(
+                    retry_queue, "_set_delivery_state", side_effect=fail_acked_state
+                ),
+            ):
+                self.assertEqual(
+                    retry_queue.process_due_once(now=float("inf")), "accepted"
+                )
+            self.assertEqual(client.ack_calls, [(122, 1)])
+            self.assertEqual(retry_queue.pending_count(), 1)
+            with retry_queue._connection() as connection:
+                acknowledged = connection.execute(
+                    "SELECT acknowledged FROM mqtt_retry_queue"
+                ).fetchone()["acknowledged"]
+            self.assertEqual(acknowledged, 1)
+
+            restarted_queue = MqttRetryQueue(
+                database_path=database_path,
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+                initial_delay=0,
+            )
+            self.assertEqual(
+                restarted_queue.process_due_once(now=float("inf")), "accepted"
+            )
+            self.assertEqual(forward.call_count, 1)
+            self.assertEqual(client.ack_calls, [(122, 1)])
+            self.assertEqual(restarted_queue.pending_count(), 0)
+
+    def test_generation_gc_is_throttled_and_indexed(self) -> None:
+        class AckClient:
+            def ack(self, _mid: int, _qos: int) -> int:
+                return 0
+
+        client = AckClient()
+        with tempfile.TemporaryDirectory() as directory:
+            retry_queue = MqttRetryQueue(
+                database_path=Path(directory) / "generation-gc.sqlite3",
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+                generation_gc_interval=3600,
+            )
+            with (
+                patch.object(
+                    retry_queue,
+                    "_run_generation_gc",
+                    wraps=retry_queue._run_generation_gc,
+                ) as generation_gc,
+                patch(
+                    "motor_diagnosis.mqtt_service.forward_mqtt_message",
+                    return_value=(
+                        {
+                            "deviceId": "DEV-GC-THROTTLE",
+                            "sequence": 123,
+                            "duplicate": False,
+                        },
+                        201,
+                    ),
+                ),
+            ):
+                for sequence in range(123, 133):
+                    message = SimpleNamespace(
+                        topic="devices/DEV-GC-THROTTLE/telemetry",
+                        payload=f'{{"sequence": {sequence}}}'.encode(),
+                        mid=sequence,
+                        qos=1,
+                        dup=False,
+                    )
+                    self.assertEqual(
+                        process_mqtt_message(
+                            client,
+                            message,
+                            endpoint="http://backend/api/telemetry/ingest",
+                            quarantine_endpoint=(
+                                "http://backend/api/telemetry/quarantine"
+                            ),
+                            token="token",
+                            retry_queue=retry_queue,
+                        ),
+                        "accepted",
+                    )
+            self.assertEqual(generation_gc.call_count, 1)
+            with retry_queue._connection() as connection:
+                indexes = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        "PRAGMA index_list(mqtt_delivery_generations)"
+                    ).fetchall()
+                }
+            self.assertIn("mqtt_delivery_generation_gc", indexes)
 
 
 class Week2HttpSmokeTest(unittest.TestCase):

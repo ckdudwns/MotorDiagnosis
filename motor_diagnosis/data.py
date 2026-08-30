@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-
 MAX_LOGIN_FAILURES = 5
 LOCK_SECONDS = 15 * 60
 SESSION_SECONDS = 60 * 60
@@ -3836,14 +3835,14 @@ def update_anomaly_rule(
     user: dict[str, Any], asset_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
     require_permission(user, "anomaly-rule:write")
-    asset = get_asset_by_id(asset_id)
-    require_site_access(user, asset["siteId"])
     reason = required_text(payload, "reason")
     if len(reason) > MAX_REASON_LENGTH:
         raise ApiError(
             400, "REASON_TOO_LONG", "reason must be 1000 characters or less."
         )
     with STORE_LOCK:
+        asset = get_asset_by_id(asset_id)
+        require_site_access(user, asset["siteId"])
         rule = next(
             (item for item in ANOMALY_RULES if item["assetId"] == asset["id"]),
             None,

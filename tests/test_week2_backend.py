@@ -52,6 +52,7 @@ from motor_diagnosis.mqtt_service import (
     forward_mqtt_message,
     is_permanent_ingest_error,
     process_mqtt_message,
+    quarantine_local_mqtt_message,
     report_mqtt_status,
     subscription_is_granted,
 )
@@ -1021,30 +1022,114 @@ class Week2HttpSmokeTest(unittest.TestCase):
         queued_client = AckClient()
         queued_message = SimpleNamespace(**{**vars(message), "mid": 55})
         with tempfile.TemporaryDirectory() as directory:
+            quarantine_endpoint = (
+                f"http://127.0.0.1:{self.port}/api/telemetry/quarantine"
+            )
             retry_queue = MqttRetryQueue(
                 database_path=Path(directory) / "raw-str-retry.sqlite3",
                 ingest_endpoint="http://backend/api/telemetry/ingest",
-                quarantine_endpoint="http://backend/api/telemetry/quarantine",
-                token="token",
+                quarantine_endpoint=quarantine_endpoint,
+                token="demo-mqtt-ingest-token",
+                initial_delay=0,
             )
+
+            failures_remaining = 2
+
+            def flaky_quarantine(*args, **kwargs):
+                nonlocal failures_remaining
+                if failures_remaining:
+                    failures_remaining -= 1
+                    raise MqttBridgeError(503, "HTTP_SERVICE_UNAVAILABLE", "temporary")
+                return quarantine_local_mqtt_message(*args, **kwargs)
+
             with patch(
                 "motor_diagnosis.mqtt_service.quarantine_local_mqtt_message",
-                side_effect=MqttBridgeError(
-                    503, "HTTP_SERVICE_UNAVAILABLE", "temporary"
-                ),
-            ):
+                side_effect=flaky_quarantine,
+            ) as quarantine:
                 queued_delivery = process_mqtt_message(
                     queued_client,
                     queued_message,
                     endpoint="http://backend/api/telemetry/ingest",
-                    quarantine_endpoint="http://backend/api/telemetry/quarantine",
-                    token="token",
+                    quarantine_endpoint=quarantine_endpoint,
+                    token="demo-mqtt-ingest-token",
                     retry_queue=retry_queue,
                 )
+                self.assertEqual(queued_delivery, "retry")
+                self.assertEqual(retry_queue.pending_count(), 1)
+                self.assertEqual(
+                    retry_queue.process_due_once(now=float("inf")), "retry"
+                )
+                with retry_queue._connection() as connection:
+                    pending = connection.execute(
+                        "SELECT * FROM mqtt_retry_queue"
+                    ).fetchone()
+                self.assertEqual(pending["error_code"], "INVALID_JSON")
+                self.assertEqual(pending["last_error_code"], "HTTP_SERVICE_UNAVAILABLE")
+                self.assertEqual(
+                    retry_queue.process_due_once(now=float("inf")), "quarantined"
+                )
 
-            self.assertEqual(queued_delivery, "retry")
-            self.assertEqual(retry_queue.pending_count(), 1)
-            self.assertEqual(queued_client.ack_calls, [])
+            self.assertEqual(quarantine.call_count, 3)
+            self.assertEqual(quarantine.call_args_list[-1].args[4].code, "INVALID_JSON")
+            self.assertEqual(QUARANTINED_DEVICE_MESSAGES[-1]["reason"], "INVALID_JSON")
+            self.assertEqual(retry_queue.pending_count(), 0)
+            self.assertEqual(queued_client.ack_calls, [(55, 1)])
+
+    def test_quarantine_ack_failure_retries_ack_without_duplicate_storage(self) -> None:
+        class FlakyAckClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+                self.results = iter((1, 0))
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return next(self.results)
+
+        message = SimpleNamespace(
+            topic="devices/DEV-01-GEN-01/telemetry",
+            payload="{invalid-json",
+            mid=56,
+            qos=1,
+        )
+        client = FlakyAckClient()
+        initial_records = len(QUARANTINED_DEVICE_MESSAGES)
+        initial_rejected = int(TELEMETRY_METRICS["rejected"])
+        initial_local_rejected = int(TELEMETRY_METRICS["localRejected"])
+        quarantine_endpoint = f"http://127.0.0.1:{self.port}/api/telemetry/quarantine"
+
+        with tempfile.TemporaryDirectory() as directory:
+            retry_queue = MqttRetryQueue(
+                database_path=Path(directory) / "ack-only-retry.sqlite3",
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint=quarantine_endpoint,
+                token="demo-mqtt-ingest-token",
+                initial_delay=0,
+            )
+            with patch(
+                "motor_diagnosis.mqtt_service.quarantine_local_mqtt_message",
+                wraps=quarantine_local_mqtt_message,
+            ) as quarantine:
+                delivery = process_mqtt_message(
+                    client,
+                    message,
+                    endpoint="http://backend/api/telemetry/ingest",
+                    quarantine_endpoint=quarantine_endpoint,
+                    token="demo-mqtt-ingest-token",
+                    retry_queue=retry_queue,
+                )
+                self.assertEqual(delivery, "retry")
+                self.assertEqual(retry_queue.pending_count(), 1)
+                self.assertEqual(
+                    retry_queue.process_due_once(now=float("inf")), "quarantined"
+                )
+
+            self.assertEqual(quarantine.call_count, 1)
+            self.assertEqual(retry_queue.pending_count(), 0)
+
+        self.assertEqual(client.ack_calls, [(56, 1), (56, 1)])
+        self.assertEqual(len(QUARANTINED_DEVICE_MESSAGES), initial_records + 1)
+        self.assertEqual(TELEMETRY_METRICS["rejected"], initial_rejected + 1)
+        self.assertEqual(TELEMETRY_METRICS["localRejected"], initial_local_rejected + 1)
 
     def test_actual_ai2_replay_output_is_accepted_and_queryable(self) -> None:
         source_asset_id = "SYN-ASSET-01"

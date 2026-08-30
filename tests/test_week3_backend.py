@@ -12,6 +12,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from motor_diagnosis.data import (
+    ANOMALY_RULES,
+    ASSETS,
     ApiError,
     DATASET_SNAPSHOTS,
     DATASET_VERSIONS,
@@ -39,6 +41,7 @@ from motor_diagnosis.data import (
     event_reviews_for,
     environment_inspections_for,
     format_rfc3339,
+    get_asset_by_id,
     get_device,
     parse_rfc3339,
     reset_runtime_state,
@@ -314,6 +317,78 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
         self.assertEqual(updated["version"], f"RULE-{asset['id']}-v2")
         self.assertEqual(updated["scoreThreshold"], 80)
+
+    def test_anomaly_rule_update_and_asset_delete_are_atomic(self) -> None:
+        asset = create_asset(
+            self.admin,
+            "SITE-01",
+            {
+                "assetCode": "RACE-01",
+                "name": "Concurrent rule target",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
+        )
+        lookup_started = threading.Event()
+        delete_attempted = threading.Event()
+        deletion_finished = threading.Event()
+        outcomes: dict[str, object] = {}
+
+        def synchronized_get_asset(asset_id: str) -> dict:
+            selected = get_asset_by_id(asset_id)
+            if threading.current_thread().name == "anomaly-rule-writer":
+                owns_store_lock = STORE_LOCK._is_owned()
+                lookup_started.set()
+                if not delete_attempted.wait(timeout=2):
+                    raise AssertionError("asset deletion was not attempted")
+                if not owns_store_lock and not deletion_finished.wait(timeout=2):
+                    raise AssertionError("asset deletion did not finish")
+            return selected
+
+        def update_worker() -> None:
+            try:
+                outcomes["update"] = update_anomaly_rule(
+                    self.admin,
+                    asset["id"],
+                    {
+                        "scoreThreshold": 81,
+                        "reason": "Concurrent update boundary test",
+                    },
+                )
+            except Exception as exc:  # pragma: no cover - asserted below
+                outcomes["update_error"] = exc
+
+        def deletion_worker() -> None:
+            delete_attempted.set()
+            try:
+                outcomes["deletion"] = delete_asset(self.admin, "SITE-01", asset["id"])
+            except Exception as exc:  # pragma: no cover - asserted below
+                outcomes["deletion_error"] = exc
+            finally:
+                deletion_finished.set()
+
+        with patch(
+            "motor_diagnosis.data.get_asset_by_id",
+            side_effect=synchronized_get_asset,
+        ):
+            update_thread = threading.Thread(
+                target=update_worker, name="anomaly-rule-writer"
+            )
+            update_thread.start()
+            self.assertTrue(lookup_started.wait(timeout=2))
+            deletion_thread = threading.Thread(
+                target=deletion_worker, name="asset-deleter"
+            )
+            deletion_thread.start()
+            update_thread.join(timeout=2)
+            deletion_thread.join(timeout=2)
+
+        self.assertFalse(update_thread.is_alive())
+        self.assertFalse(deletion_thread.is_alive())
+        self.assertNotIn("update_error", outcomes)
+        self.assertNotIn("deletion_error", outcomes)
+        self.assertFalse(any(item["id"] == asset["id"] for item in ASSETS))
+        self.assertFalse(any(item["assetId"] == asset["id"] for item in ANOMALY_RULES))
 
     def test_alert_policy_asset_scope_protects_policy_and_audit_details(self) -> None:
         updated = update_alert_policy(

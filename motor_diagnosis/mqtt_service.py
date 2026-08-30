@@ -18,7 +18,6 @@ from urllib.request import Request, urlopen
 
 from .json_validation import loads_strict_json
 
-
 LOGGER = logging.getLogger("motor_diagnosis.mqtt")
 RETRYABLE_HTTP_STATUSES = {408, 425, 429}
 BACKEND_QUARANTINED_INGEST_ERRORS = frozenset(
@@ -297,8 +296,43 @@ class MqttRetryQueue:
                     next_attempt_at REAL NOT NULL,
                     error_code TEXT NOT NULL,
                     error_message TEXT NOT NULL,
+                    last_error_code TEXT NOT NULL,
+                    last_error_message TEXT NOT NULL,
+                    delivery_completed INTEGER NOT NULL DEFAULT 0,
+                    delivery_outcome TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL
                 )
+                """
+            )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(mqtt_retry_queue)"
+                ).fetchall()
+            }
+            migrations = {
+                "last_error_code": "TEXT NOT NULL DEFAULT ''",
+                "last_error_message": "TEXT NOT NULL DEFAULT ''",
+                "delivery_completed": "INTEGER NOT NULL DEFAULT 0",
+                "delivery_outcome": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in migrations.items():
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE mqtt_retry_queue ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET last_error_code = error_code
+                WHERE last_error_code = ''
+                """
+            )
+            connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET last_error_message = error_message
+                WHERE last_error_message = ''
                 """
             )
 
@@ -333,12 +367,18 @@ class MqttRetryQueue:
         error: MqttBridgeError,
         *,
         operation: str = "ingest",
+        delivery_completed: bool = False,
     ) -> bool:
         if operation not in {"ingest", "quarantine"}:
             raise ValueError(f"Unsupported retry operation: {operation}")
         retry_message = self._snapshot(message)
         message_key = self._message_key(operation, retry_message)
         now = time.time()
+        delivery_outcome = (
+            ("quarantined" if operation == "quarantine" else "accepted")
+            if delivery_completed
+            else ""
+        )
         with self._target_lock:
             self._ack_targets[message_key] = (client, retry_message)
         try:
@@ -348,8 +388,9 @@ class MqttRetryQueue:
                     INSERT INTO mqtt_retry_queue (
                         message_key, operation, topic, payload, mid, qos,
                         attempts, next_attempt_at, error_code, error_message,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                        last_error_code, last_error_message, delivery_completed,
+                        delivery_outcome, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(message_key) DO UPDATE SET
                         mid = excluded.mid,
                         qos = excluded.qos,
@@ -357,8 +398,17 @@ class MqttRetryQueue:
                             mqtt_retry_queue.next_attempt_at,
                             excluded.next_attempt_at
                         ),
-                        error_code = excluded.error_code,
-                        error_message = excluded.error_message
+                        last_error_code = excluded.last_error_code,
+                        last_error_message = excluded.last_error_message,
+                        delivery_completed = MAX(
+                            mqtt_retry_queue.delivery_completed,
+                            excluded.delivery_completed
+                        ),
+                        delivery_outcome = CASE
+                            WHEN mqtt_retry_queue.delivery_completed = 1
+                            THEN mqtt_retry_queue.delivery_outcome
+                            ELSE excluded.delivery_outcome
+                        END
                     """,
                     (
                         message_key,
@@ -370,6 +420,10 @@ class MqttRetryQueue:
                         now + self.initial_delay,
                         error.code,
                         error.message,
+                        error.code,
+                        error.message,
+                        int(delivery_completed),
+                        delivery_outcome,
                         now,
                     ),
                 )
@@ -417,7 +471,7 @@ class MqttRetryQueue:
                 """
                 UPDATE mqtt_retry_queue
                 SET attempts = ?, next_attempt_at = ?,
-                    error_code = ?, error_message = ?
+                    last_error_code = ?, last_error_message = ?
                 WHERE message_key = ?
                 """,
                 (
@@ -437,8 +491,21 @@ class MqttRetryQueue:
             error.code,
         )
 
+    def _mark_delivery_completed(self, row: sqlite3.Row, outcome: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET delivery_completed = 1, delivery_outcome = ?
+                WHERE message_key = ?
+                """,
+                (outcome, row["message_key"]),
+            )
+
     def _complete(self, row: sqlite3.Row, outcome: str) -> str:
         message_key = str(row["message_key"])
+        if not bool(row["delivery_completed"]) or not str(row["delivery_outcome"]):
+            self._mark_delivery_completed(row, outcome)
         with self._target_lock:
             target = self._ack_targets.get(message_key)
         if target is not None:
@@ -469,6 +536,11 @@ class MqttRetryQueue:
         if row is None:
             return "idle"
         try:
+            if bool(row["delivery_completed"]):
+                outcome = str(row["delivery_outcome"]) or (
+                    "quarantined" if row["operation"] == "quarantine" else "accepted"
+                )
+                return self._complete(row, outcome)
             if row["operation"] == "quarantine":
                 quarantine_local_mqtt_message(
                     self.quarantine_endpoint,
@@ -577,6 +649,14 @@ def process_mqtt_message(
                     )
                     return "retry"
             acknowledged = acknowledge_message(client, message)
+            if not acknowledged and retry_queue:
+                retry_queue.enqueue(
+                    client,
+                    message,
+                    error,
+                    operation="quarantine",
+                    delivery_completed=True,
+                )
             LOGGER.warning(
                 "mqtt_ingest_quarantined topic=%s status=%s code=%s message=%s",
                 message.topic,
@@ -597,6 +677,13 @@ def process_mqtt_message(
         return "retry"
 
     if not acknowledge_message(client, message):
+        if retry_queue:
+            retry_queue.enqueue(
+                client,
+                message,
+                MqttBridgeError(503, "MQTT_ACK_FAILED", "MQTT ACK failed."),
+                delivery_completed=True,
+            )
         return "retry"
     LOGGER.info(
         "mqtt_ingest status=%s device=%s sequence=%s duplicate=%s",

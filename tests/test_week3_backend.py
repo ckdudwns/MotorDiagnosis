@@ -16,6 +16,7 @@ from motor_diagnosis.data import (
     DATASET_VERSIONS,
     DEVICES,
     EVENTS,
+    EVENT_EVIDENCE_SNAPSHOTS,
     EVENT_REVIEW_HISTORY,
     TELEMETRY_RECORDS,
     alert_policies_for,
@@ -30,9 +31,11 @@ from motor_diagnosis.data import (
     delete_asset,
     event_detail_for,
     event_reviews_for,
+    environment_inspections_for,
     format_rfc3339,
     parse_rfc3339,
     reset_runtime_state,
+    recover_device_from_telemetry,
     review_event,
     sensor_faults_for_device,
     update_acoustic_taxonomy,
@@ -170,9 +173,14 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(detail["appliedRule"]["version"], "RULE-SITE-01-MOT-02-v1")
         self.assertEqual(detail["appliedRule"]["scoreThreshold"], 75.0)
 
-    def test_event_feature_snapshot_is_closest_to_the_event_time(self) -> None:
+    def test_base_event_feature_snapshot_is_frozen_before_the_first_detail_read(
+        self,
+    ) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
         event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        frozen_snapshot = json.loads(
+            json.dumps(EVENT_EVIDENCE_SNAPSHOTS[event["id"]]["featureSnapshot"])
+        )
         TELEMETRY_RECORDS.extend(
             [
                 self.telemetry_record(
@@ -189,15 +197,16 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
         detail = event_detail_for(self.operator, event["id"])
 
-        self.assertEqual(detail["featureSnapshot"]["sequence"], 2)
-        self.assertEqual(
-            detail["featureSnapshot"]["timestamp"],
-            format_rfc3339(event_time + timedelta(seconds=5)),
-        )
+        self.assertIsNotNone(frozen_snapshot)
+        self.assertEqual(detail["featureSnapshot"], frozen_snapshot)
+        self.assertNotEqual(detail["featureSnapshot"].get("sequence"), 2)
 
     def test_event_evidence_snapshots_do_not_change_after_late_updates(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
         event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        frozen_feature = json.loads(
+            json.dumps(EVENT_EVIDENCE_SNAPSHOTS[event["id"]]["featureSnapshot"])
+        )
         TELEMETRY_RECORDS.append(
             self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=20)), 1)
         )
@@ -215,7 +224,23 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(after["deviceSnapshot"], before["deviceSnapshot"])
         self.assertEqual(after["featureSnapshot"], before["featureSnapshot"])
         self.assertNotEqual(after["deviceSnapshot"]["firmware"], device["firmware"])
-        self.assertEqual(after["featureSnapshot"]["sequence"], 1)
+        self.assertEqual(after["featureSnapshot"], frozen_feature)
+
+    def test_recovery_event_freezes_the_recovered_device_state(self) -> None:
+        device = next(item for item in DEVICES if item["id"] == "DEV-01-GEN-01")
+        device["health"] = "offline"
+        device["offlineSince"] = "2026-08-24T02:50:00Z"
+
+        recover_device_from_telemetry(device, "2026-08-24T03:00:00Z")
+
+        recovery_event = EVENTS[0]
+        evidence = EVENT_EVIDENCE_SNAPSHOTS[recovery_event["id"]]
+        self.assertEqual(recovery_event["eventType"], "device_recovered")
+        self.assertEqual(evidence["deviceSnapshot"]["health"], "online")
+        self.assertIsNone(evidence["deviceSnapshot"]["offlineSince"])
+        self.assertEqual(
+            evidence["deviceSnapshot"]["lastReceivedAt"], "2026-08-24T03:00:00Z"
+        )
 
     def test_reviews_with_same_timestamp_return_newest_id_first(self) -> None:
         first = review_event(
@@ -309,6 +334,47 @@ class Week3DataBoundaryTest(unittest.TestCase):
         )
         self.assertEqual(policy_audit["siteIds"], ["SITE-05"])
 
+    def test_deleted_policy_asset_scope_remains_readable_and_can_be_recovered(
+        self,
+    ) -> None:
+        asset = create_asset(
+            self.admin,
+            "SITE-01",
+            {
+                "id": "LEGACY-ASSET",
+                "assetCode": "LEGACY-01",
+                "name": "Legacy policy target",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
+        )
+        scoped = update_alert_policy(
+            self.admin,
+            "ALERT-POLICY-DEFAULT",
+            {
+                "siteIds": [],
+                "assetIds": [asset["id"]],
+                "reason": "Store the resolved site scope",
+            },
+        )
+        self.assertEqual(scoped["scopeSiteIds"], ["SITE-01"])
+
+        delete_asset(self.admin, "SITE-01", asset["id"])
+
+        visible = alert_policies_for(self.admin)
+        self.assertEqual(visible[0]["scopeSiteIds"], ["SITE-01"])
+        recovered = update_alert_policy(
+            self.admin,
+            "ALERT-POLICY-DEFAULT",
+            {
+                "siteIds": [],
+                "assetIds": [],
+                "reason": "Remove the deleted asset from policy scope",
+            },
+        )
+        self.assertEqual(recovered["assetIds"], [])
+        self.assertEqual(recovered["scopeSiteIds"], [])
+
     def test_older_environment_inspection_does_not_replace_current_status(self) -> None:
         device = next(item for item in DEVICES if item["id"] == "DEV-01-GEN-01")
         common = {
@@ -330,6 +396,32 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
         self.assertEqual(device["environmentStatus"], "critical")
         self.assertEqual(device["lastEnvironmentInspectionAt"], "2026-08-20T00:00:00Z")
+
+    def test_environment_inspections_use_id_as_same_timestamp_tiebreaker(self) -> None:
+        common = {
+            "inspectedAt": "2026-08-24T03:00:00Z",
+            "waterIngress": "ok",
+            "saltCorrosion": "ok",
+            "glandStatus": "ok",
+            "enclosureStatus": "ok",
+        }
+        first = create_environment_inspection(
+            self.admin,
+            "DEV-01-GEN-01",
+            {"dust": "attention", **common},
+        )
+        second = create_environment_inspection(
+            self.admin,
+            "DEV-01-GEN-01",
+            {"dust": "critical", **common},
+        )
+
+        page = environment_inspections_for(self.admin, "DEV-01-GEN-01", page=1, size=10)
+
+        self.assertEqual(page["latest"]["id"], second["id"])
+        self.assertEqual(
+            [item["id"] for item in page["items"]], [second["id"], first["id"]]
+        )
 
     def test_no_signal_fault_uses_last_received_at_without_health_api_call(
         self,
@@ -542,6 +634,27 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
         self.assertEqual(DATASET_VERSIONS, [])
 
+    def test_dataset_source_rejects_null_contract_fields(self) -> None:
+        payload = self.dataset_payload(
+            checksum="source-null",
+            source_filters={"siteId": "SITE-01"},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/source-null.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("source-null"),
+        }
+
+        for field in ("type", "uri", "license", "checksum"):
+            invalid_payload = json.loads(json.dumps(payload))
+            invalid_payload["source"][field] = None
+            with self.subTest(field=field):
+                with self.assertRaises(ApiError) as invalid:
+                    create_dataset_version(self.admin, invalid_payload)
+                self.assertEqual(invalid.exception.code, "INVALID_DATASET_SOURCE")
+
     def test_dataset_units_reject_non_string_values(self) -> None:
         payload = self.dataset_payload(
             checksum="units-null",
@@ -560,6 +673,68 @@ class Week3DataBoundaryTest(unittest.TestCase):
             create_dataset_version(self.admin, payload)
 
         self.assertEqual(invalid.exception.code, "INVALID_DATASET_UNITS")
+
+    def test_dataset_units_reject_normalized_key_collisions(self) -> None:
+        payload = self.dataset_payload(
+            checksum="unit-key-collision",
+            source_filters={"siteId": "SITE-01"},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/unit-key-collision.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("unit-key-collision"),
+        }
+        payload["compatibility"]["units"] = {
+            "vibration": "g",
+            " VIBRATION ": "mm/s",
+        }
+
+        with self.assertRaises(ApiError) as invalid:
+            create_dataset_version(self.admin, payload)
+
+        self.assertEqual(invalid.exception.code, "INVALID_DATASET_UNITS")
+
+    def test_operating_conditions_are_validated_and_normalized(self) -> None:
+        payload = self.dataset_payload(
+            checksum="normalized-operating-conditions",
+            source_filters={"siteId": "SITE-01"},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/normalized-operating-conditions.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("normalized-operating-conditions"),
+        }
+        payload["compatibility"]["operatingConditions"] = {
+            " rpmRange ": [1700.0, 1800.0],
+            " load ": " mixed ",
+        }
+
+        dataset = create_dataset_version(self.admin, payload)
+
+        self.assertEqual(
+            dataset["compatibility"]["operatingConditions"],
+            {"rpmRange": [1700, 1800], "load": "mixed"},
+        )
+
+        for invalid_conditions in (
+            {"rpmRange": [1800, 1700]},
+            {"rpmRange": [1700, float("inf")]},
+            {"load": None},
+            {"load": "mixed", " LOAD ": "full"},
+        ):
+            invalid_payload = json.loads(json.dumps(payload))
+            invalid_payload["source"]["checksum"] = checksum_for(
+                repr(invalid_conditions)
+            )
+            invalid_payload["compatibility"]["operatingConditions"] = invalid_conditions
+            with self.subTest(conditions=invalid_conditions):
+                with self.assertRaises(ApiError) as invalid:
+                    create_dataset_version(self.admin, invalid_payload)
+                self.assertEqual(invalid.exception.code, "INVALID_OPERATING_CONDITIONS")
 
     def test_negative_zero_split_cannot_create_a_duplicate_version(self) -> None:
         payload = self.dataset_payload(
@@ -628,9 +803,61 @@ class Week3DataBoundaryTest(unittest.TestCase):
         with self.assertRaises(ApiError) as referenced:
             delete_asset(self.admin, "SITE-01", "SITE-01-MOT-02")
 
-        self.assertEqual(
-            referenced.exception.code, "ASSET_REFERENCED_BY_FROZEN_DATASET"
+        self.assertEqual(referenced.exception.code, "ASSET_HAS_IMMUTABLE_REFERENCES")
+
+    def test_external_dataset_reference_prevents_asset_deletion(self) -> None:
+        asset = create_asset(
+            self.admin,
+            "SITE-01",
+            {
+                "assetCode": "EXT-REF-01",
+                "name": "External dataset reference",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
         )
+        payload = self.dataset_payload(
+            checksum="external-delete-guard",
+            source_filters={"siteId": "SITE-01", "assetId": asset["id"]},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/external-delete-guard.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("external-delete-guard"),
+        }
+        create_dataset_version(self.admin, payload)
+
+        with self.assertRaises(ApiError) as referenced:
+            delete_asset(self.admin, "SITE-01", asset["id"])
+
+        self.assertEqual(referenced.exception.code, "ASSET_HAS_IMMUTABLE_REFERENCES")
+
+    def test_event_reference_prevents_asset_deletion(self) -> None:
+        asset = create_asset(
+            self.admin,
+            "SITE-01",
+            {
+                "assetCode": "EVENT-REF-01",
+                "name": "Event reference",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
+        )
+        EVENTS.append(
+            {
+                "id": "EV-DELETE-GUARD",
+                "siteId": "SITE-01",
+                "assetId": asset["id"],
+                "occurredAt": "2026-08-24T03:00:00Z",
+            }
+        )
+
+        with self.assertRaises(ApiError) as referenced:
+            delete_asset(self.admin, "SITE-01", asset["id"])
+
+        self.assertEqual(referenced.exception.code, "ASSET_HAS_IMMUTABLE_REFERENCES")
 
     def test_internal_version_fingerprint_tracks_the_canonical_snapshot(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
@@ -697,10 +924,10 @@ class Week3DataBoundaryTest(unittest.TestCase):
                 "acousticPeakHz": 216.4,
                 "scenarioLabel": "normal",
                 "knownVibrationLabel": "NORMAL",
-                "knownAcousticLabel": None,
-                "source": "CWRU_only_synthetic",
+                "knownAcousticLabel": "=1+1",
+                "source": "@CWRU_only_synthetic",
                 "isSynthetic": True,
-                "vibrationUnitNote": "raw accelerometer output; not mm/s",
+                "vibrationUnitNote": "+raw accelerometer output; not mm/s",
                 "acousticUnitNote": "raw waveform RMS; not dB SPL",
             }
         )
@@ -732,12 +959,21 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(row["ground_truth_source"], "known_vibration_label")
         self.assertEqual(row["target_label"], "NORMAL")
         self.assertEqual(row["target_label_taxonomy_version"], "ACOUSTIC-V1")
-        self.assertEqual(row["telemetry_source"], "CWRU_only_synthetic")
+        self.assertEqual(row["known_acoustic_label"], "'=1+1")
+        self.assertEqual(row["telemetry_source"], "'@CWRU_only_synthetic")
         self.assertTrue(row["is_synthetic"])
         self.assertEqual(row["vibration_peak_hz"], 1037.11)
         self.assertEqual(row["acoustic_peak_hz"], 216.4)
         self.assertEqual(
-            row["vibration_unit_note"], "raw accelerometer output; not mm/s"
+            row["vibration_unit_note"], "'+raw accelerometer output; not mm/s"
+        )
+        canonical_checksum = hashlib.sha256(
+            json.dumps(exported["rows"], sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        self.assertEqual(
+            exported["manifest"]["checksum"], f"sha256:{canonical_checksum}"
         )
         self.assertEqual(
             exported["manifest"]["labelPriority"],

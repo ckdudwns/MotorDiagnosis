@@ -25,10 +25,13 @@ from motor_diagnosis.data import (
     create_asset,
     create_dataset_version,
     create_environment_inspection,
+    create_site,
     current_user_for_token,
     dataset_export_for,
     dataset_version_for,
     delete_asset,
+    delete_device,
+    delete_site,
     event_detail_for,
     event_reviews_for,
     environment_inspections_for,
@@ -375,6 +378,34 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(recovered["assetIds"], [])
         self.assertEqual(recovered["scopeSiteIds"], [])
 
+    def test_deleted_policy_asset_uses_frozen_scope_before_id_prefix(self) -> None:
+        asset = create_asset(
+            self.admin,
+            "SITE-01",
+            {
+                "id": "SITE-02-LEGACY-POLICY-ASSET",
+                "assetCode": "PREFIX-COLLISION",
+                "name": "Cross-prefix policy target",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
+        )
+        update_alert_policy(
+            self.admin,
+            "ALERT-POLICY-DEFAULT",
+            {
+                "siteIds": [],
+                "assetIds": [asset["id"]],
+                "reason": "Freeze the actual site 01 policy scope",
+            },
+        )
+        delete_asset(self.admin, "SITE-01", asset["id"])
+        site_01_operator = {**self.operator, "allowedSiteIds": ["SITE-01"]}
+        site_02_operator = {**self.operator, "allowedSiteIds": ["SITE-02"]}
+
+        self.assertEqual(len(alert_policies_for(site_01_operator)), 1)
+        self.assertEqual(alert_policies_for(site_02_operator), [])
+
     def test_older_environment_inspection_does_not_replace_current_status(self) -> None:
         device = next(item for item in DEVICES if item["id"] == "DEV-01-GEN-01")
         common = {
@@ -422,6 +453,28 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(
             [item["id"] for item in page["items"]], [second["id"], first["id"]]
         )
+
+    def test_device_with_environment_inspections_cannot_be_deleted(self) -> None:
+        create_environment_inspection(
+            self.admin,
+            "DEV-01-GEN-01",
+            {
+                "inspectedAt": "2026-08-24T03:00:00Z",
+                "dust": "ok",
+                "waterIngress": "ok",
+                "saltCorrosion": "ok",
+                "glandStatus": "ok",
+                "enclosureStatus": "ok",
+            },
+        )
+
+        with self.assertRaises(ApiError) as referenced:
+            delete_device(self.admin, "DEV-01-GEN-01")
+
+        self.assertEqual(
+            referenced.exception.code, "DEVICE_HAS_ENVIRONMENT_INSPECTIONS"
+        )
+        self.assertTrue(any(item["id"] == "DEV-01-GEN-01" for item in DEVICES))
 
     def test_no_signal_fault_uses_last_received_at_without_health_api_call(
         self,
@@ -735,6 +788,135 @@ class Week3DataBoundaryTest(unittest.TestCase):
                 with self.assertRaises(ApiError) as invalid:
                     create_dataset_version(self.admin, invalid_payload)
                 self.assertEqual(invalid.exception.code, "INVALID_OPERATING_CONDITIONS")
+
+    def test_operating_conditions_preserve_large_integers_and_limit_depth(
+        self,
+    ) -> None:
+        large_integer = 2**80 + 123
+        payload = self.dataset_payload(
+            checksum="large-operating-integer",
+            source_filters={"siteId": "SITE-01"},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/large-operating-integer.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("large-operating-integer"),
+        }
+        payload["compatibility"]["operatingConditions"] = {"cycleCount": large_integer}
+
+        dataset = create_dataset_version(self.admin, payload)
+
+        self.assertEqual(
+            dataset["compatibility"]["operatingConditions"]["cycleCount"],
+            large_integer,
+        )
+
+        nested: object = "leaf"
+        for index in range(12):
+            nested = {f"level{index}": nested}
+        deep_payload = json.loads(json.dumps(payload))
+        deep_payload["source"]["checksum"] = checksum_for("deep-operating-input")
+        deep_payload["compatibility"]["operatingConditions"] = {"nested": nested}
+
+        with self.assertRaises(ApiError) as invalid:
+            create_dataset_version(self.admin, deep_payload)
+
+        self.assertEqual(invalid.exception.code, "INVALID_OPERATING_CONDITIONS")
+
+    def test_compatibility_key_casing_has_one_version_fingerprint(self) -> None:
+        payload = self.dataset_payload(
+            checksum="compatibility-key-casing",
+            source_filters={"siteId": "SITE-01"},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/compatibility-key-casing.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("compatibility-key-casing"),
+        }
+        first = create_dataset_version(self.admin, payload)
+        duplicate = json.loads(json.dumps(payload))
+        duplicate["compatibility"]["signalType"] = ["VIBRATION", "ACOUSTIC"]
+        duplicate["compatibility"]["units"] = {
+            "VIBRATION": "g",
+            "ACOUSTIC": "raw-rms",
+        }
+        duplicate["compatibility"]["operatingConditions"] = {
+            "RPMRANGE": [1700, 1800],
+            "LOAD": "mixed",
+        }
+
+        with self.assertRaises(ApiError) as exists:
+            create_dataset_version(self.admin, duplicate)
+
+        self.assertTrue(first["versionFingerprint"].startswith("sha256:"))
+        self.assertEqual(exists.exception.code, "DATASET_VERSION_EXISTS")
+
+    def test_external_dataset_validates_the_assets_actual_site(self) -> None:
+        misleading_asset = create_asset(
+            self.admin,
+            "SITE-02",
+            {
+                "id": "SITE-01-MISLEADING-ASSET",
+                "assetCode": "MISLEADING-01",
+                "name": "Actual site 02 asset",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
+        )
+        payload = self.dataset_payload(
+            checksum="external-actual-asset-site",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": misleading_asset["id"],
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/external-actual-asset-site.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("external-actual-asset-site"),
+        }
+
+        with self.assertRaises(ApiError) as mismatch:
+            create_dataset_version(self.admin, payload)
+
+        self.assertEqual(mismatch.exception.code, "INVALID_SOURCE_FILTERS")
+
+    def test_site_only_frozen_dataset_prevents_site_deletion(self) -> None:
+        site = create_site(
+            self.admin,
+            {
+                "id": "SITE-DATASET-LIFE",
+                "code": "DATASET-LIFE",
+                "name": "Dataset lifecycle site",
+                "networkType": "D",
+            },
+        )
+        payload = self.dataset_payload(
+            checksum="site-only-frozen-dataset",
+            source_filters={"siteId": site["id"]},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/site-only-frozen-dataset.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("site-only-frozen-dataset"),
+        }
+        dataset = create_dataset_version(self.admin, payload)
+
+        with self.assertRaises(ApiError) as referenced:
+            delete_site(self.admin, site["id"])
+
+        self.assertEqual(referenced.exception.code, "SITE_HAS_IMMUTABLE_REFERENCES")
+        self.assertEqual(
+            dataset_version_for(self.admin, dataset["id"])["id"], dataset["id"]
+        )
 
     def test_negative_zero_split_cannot_create_a_duplicate_version(self) -> None:
         payload = self.dataset_payload(
@@ -1141,6 +1323,16 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(dataset_audit["siteIds"], ["SITE-01"])
 
     def test_external_dataset_source_filters_enforce_site_scope(self) -> None:
+        create_asset(
+            self.admin,
+            "SITE-05",
+            {
+                "assetCode": "FAN-03",
+                "name": "Restricted site fan",
+                "assetType": "fan",
+                "ratedRpm": 1800,
+            },
+        )
         payload = self.dataset_payload(
             checksum="sha256:external-site-05",
             source_filters={
@@ -1596,6 +1788,89 @@ class Week3HttpContractTest(unittest.TestCase):
         )
         self.assertEqual(status, 403)
         self.assertEqual(forbidden["error"]["code"], "FORBIDDEN")
+
+    def test_dataset_list_get_returns_authorized_paginated_versions(self) -> None:
+        payload = {
+            "name": "dataset-list-contract",
+            "source": {
+                "type": "external",
+                "uri": "s3://training/dataset-list-contract.csv",
+                "license": "verified-for-mvp",
+                "checksum": checksum_for("dataset-list-contract"),
+            },
+            "compatibility": {
+                "signalType": ["vibration", "acoustic"],
+                "samplingRateHz": 12000,
+                "units": {"vibration": "g", "acoustic": "raw-rms"},
+                "operatingConditions": {
+                    "rpmRange": [1700, 1800],
+                    "load": "mixed",
+                },
+            },
+            "sourceFilters": {
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+            },
+            "labelTaxonomyVersion": "ACOUSTIC-V1",
+            "labelMapping": {"needs_review": "BEARING_SUSPECT"},
+            "split": {"train": 1.0, "validation": 0.0, "test": 0.0},
+            "reason": "Verify documented dataset list route",
+        }
+        status, created = self.request(
+            "/api/datasets",
+            method="POST",
+            payload=payload,
+            token=self.admin_token,
+        )
+        self.assertEqual(status, 201)
+
+        status, listing = self.request(
+            "/api/datasets?page=1&size=10", token=self.operator_token
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["page"], 1)
+        self.assertEqual(listing["size"], 10)
+        self.assertEqual(listing["total"], 1)
+        self.assertEqual(listing["items"][0]["id"], created["id"])
+
+    def test_deep_operating_conditions_return_400_instead_of_500(self) -> None:
+        nested: object = "leaf"
+        for index in range(600):
+            nested = {f"level{index}": nested}
+        payload = {
+            "name": "deep-operating-conditions",
+            "source": {
+                "type": "external",
+                "uri": "s3://training/deep-operating-conditions.csv",
+                "license": "verified-for-mvp",
+                "checksum": checksum_for("deep-operating-conditions"),
+            },
+            "compatibility": {
+                "signalType": ["vibration"],
+                "samplingRateHz": 12000,
+                "units": {"vibration": "g"},
+                "operatingConditions": {"nested": nested},
+            },
+            "sourceFilters": {"siteId": "SITE-01"},
+            "labelTaxonomyVersion": "ACOUSTIC-V1",
+            "labelMapping": {"needs_review": "BEARING_SUSPECT"},
+            "split": {"train": 1.0, "validation": 0.0, "test": 0.0},
+            "reason": "Reject pathological nesting safely",
+        }
+
+        status, response = self.request(
+            "/api/datasets",
+            method="POST",
+            payload=payload,
+            token=self.admin_token,
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn(
+            response["error"]["code"],
+            {"INVALID_OPERATING_CONDITIONS", "INVALID_JSON"},
+        )
 
     def test_dataset_registry_taxonomy_and_csv_export_contract(self) -> None:
         status, taxonomies = self.request(

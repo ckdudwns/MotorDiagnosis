@@ -41,6 +41,7 @@ from .data import (
     current_user_for_token,
     dataset_export_for,
     dataset_version_for,
+    dataset_versions_for,
     dashboard_sites_summary,
     deactivate_site,
     delete_asset,
@@ -448,6 +449,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if segments == ["api", "datasets"]:
+            page = positive_query_int(query, "page", 1)
+            size = positive_query_int(query, "size", 50, maximum=200)
+            self.send_json(dataset_versions_for(user, page=page, size=size))
+            return
         if (
             len(segments) == 3
             and segments[:2] == ["api", "datasets"]
@@ -777,7 +783,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 "UNSUPPORTED_MEDIA_TYPE",
                 "Only application/json requests are supported.",
             )
-        data = json.loads(self.rfile.read(length).decode("utf-8"))
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+        except RecursionError as exc:
+            raise ApiError(
+                400, "INVALID_JSON", "Request body nesting is too deep."
+            ) from exc
         if not isinstance(data, dict):
             raise ApiError(400, "INVALID_JSON_BODY", "JSON body must be an object.")
         return data

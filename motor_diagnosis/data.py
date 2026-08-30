@@ -18,6 +18,7 @@ LOCK_SECONDS = 15 * 60
 SESSION_SECONDS = 60 * 60
 MAX_REVIEW_NOTE_LENGTH = 2000
 MAX_REASON_LENGTH = 1000
+MAX_OPERATING_CONDITION_DEPTH = 8
 DEVICE_CERTIFICATE_STATUSES = {"pending", "registered", "revoked", "expired"}
 DEVICE_MAPPING_STATUSES = {"active", "inactive"}
 TELEMETRY_SCENARIOS = {
@@ -1660,6 +1661,24 @@ def delete_site(user: dict[str, Any], site_id: str) -> dict[str, Any]:
             raise ApiError(
                 400, "SITE_HAS_ASSETS", "A site with assets cannot be deleted."
             )
+        dataset_references = []
+        for dataset in DATASET_VERSIONS:
+            source_filters = dataset.get("sourceFilters") or {}
+            referenced_site_ids = set(source_filters.get("siteIds", []))
+            if source_filters.get("siteId"):
+                referenced_site_ids.add(source_filters["siteId"])
+            snapshot_references_site = any(
+                snapshot_key.startswith(f"{site_id}:")
+                for snapshot_key in DATASET_SNAPSHOTS.get(dataset["id"], {})
+            )
+            if site_id in referenced_site_ids or snapshot_references_site:
+                dataset_references.append(dataset["id"])
+        if dataset_references:
+            raise ApiError(
+                409,
+                "SITE_HAS_IMMUTABLE_REFERENCES",
+                "A site referenced by a frozen dataset cannot be deleted.",
+            )
         SITES[:] = [site for site in SITES if site["id"] != site_id]
         ROLLOUT_PLAN_RECORDS[:] = [
             record for record in ROLLOUT_PLAN_RECORDS if record["siteId"] != site_id
@@ -2249,6 +2268,15 @@ def delete_device(user: dict[str, Any], device_id: str) -> dict[str, Any]:
     with STORE_LOCK:
         device = get_device(device_id)
         require_site_access(user, device["siteId"])
+        if any(
+            inspection["deviceId"] == device_id
+            for inspection in ENVIRONMENT_INSPECTIONS
+        ):
+            raise ApiError(
+                409,
+                "DEVICE_HAS_ENVIRONMENT_INSPECTIONS",
+                "A device with environment inspection history cannot be deleted.",
+            )
         DEVICES[:] = [item for item in DEVICES if item["id"] != device_id]
         site = get_site(device["siteId"])
         site["totalDevices"] = max(0, int(site["totalDevices"]) - 1)
@@ -3872,6 +3900,9 @@ def _alert_policy_site_ids(policy: dict[str, Any]) -> list[str]:
         if asset:
             site_ids.add(asset["siteId"])
             continue
+        if stored_site_ids:
+            site_ids.update(stored_site_ids)
+            continue
         matching_site = next(
             (
                 site["id"]
@@ -3881,9 +3912,6 @@ def _alert_policy_site_ids(policy: dict[str, Any]) -> list[str]:
             None,
         )
         if not matching_site:
-            if stored_site_ids:
-                site_ids.update(stored_site_ids)
-                continue
             raise ApiError(
                 400,
                 "INVALID_ALERT_POLICY_SCOPE",
@@ -4570,7 +4598,13 @@ def _dataset_source(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _normalized_operating_condition_value(field: str, value: Any) -> Any:
+def _normalized_operating_condition_value(field: str, value: Any, *, depth: int) -> Any:
+    if depth > MAX_OPERATING_CONDITION_DEPTH:
+        raise ApiError(
+            400,
+            "INVALID_OPERATING_CONDITIONS",
+            "compatibility.operatingConditions is nested too deeply.",
+        )
     if value is None:
         raise ApiError(
             400,
@@ -4579,15 +4613,16 @@ def _normalized_operating_condition_value(field: str, value: Any) -> Any:
         )
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
-        parsed = float(value)
-        if not math.isfinite(parsed):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
             raise ApiError(
                 400,
                 "INVALID_OPERATING_CONDITIONS",
                 f"{field} must be a finite number.",
             )
-        return int(parsed) if parsed.is_integer() else parsed
+        return int(value) if value.is_integer() else value
     if isinstance(value, str):
         normalized = value.strip()
         if not normalized:
@@ -4605,11 +4640,13 @@ def _normalized_operating_condition_value(field: str, value: Any) -> Any:
                 f"{field} must not be an empty list.",
             )
         return [
-            _normalized_operating_condition_value(f"{field}[{index}]", item)
+            _normalized_operating_condition_value(
+                f"{field}[{index}]", item, depth=depth + 1
+            )
             for index, item in enumerate(value)
         ]
     if isinstance(value, dict):
-        return _normalized_operating_conditions(value, field=field)
+        return _normalized_operating_conditions(value, field=field, depth=depth)
     raise ApiError(
         400,
         "INVALID_OPERATING_CONDITIONS",
@@ -4618,8 +4655,17 @@ def _normalized_operating_condition_value(field: str, value: Any) -> Any:
 
 
 def _normalized_operating_conditions(
-    operating_conditions: dict[str, Any], *, field: str = "operatingConditions"
+    operating_conditions: dict[str, Any],
+    *,
+    field: str = "operatingConditions",
+    depth: int = 0,
 ) -> dict[str, Any]:
+    if depth > MAX_OPERATING_CONDITION_DEPTH:
+        raise ApiError(
+            400,
+            "INVALID_OPERATING_CONDITIONS",
+            "compatibility.operatingConditions is nested too deeply.",
+        )
     if not operating_conditions:
         raise ApiError(
             400,
@@ -4653,27 +4699,22 @@ def _normalized_operating_conditions(
                 )
             bounds = []
             for index, bound in enumerate(raw_value):
-                if isinstance(bound, bool):
+                if isinstance(bound, bool) or not isinstance(bound, (int, float)):
                     raise ApiError(
                         400,
                         "INVALID_OPERATING_CONDITIONS",
                         f"{field}.{key}[{index}] must be a finite number.",
                     )
-                try:
-                    parsed = float(bound)
-                except (TypeError, ValueError, OverflowError) as exc:
-                    raise ApiError(
-                        400,
-                        "INVALID_OPERATING_CONDITIONS",
-                        f"{field}.{key}[{index}] must be a finite number.",
-                    ) from exc
-                if not math.isfinite(parsed):
+                if isinstance(bound, float) and not math.isfinite(bound):
                     raise ApiError(
                         400,
                         "INVALID_OPERATING_CONDITIONS",
                         f"{field}.{key}[{index}] must be a finite number.",
                     )
-                bounds.append(int(parsed) if parsed.is_integer() else parsed)
+                if isinstance(bound, int):
+                    bounds.append(bound)
+                else:
+                    bounds.append(int(bound) if bound.is_integer() else bound)
             if bounds[0] > bounds[1]:
                 raise ApiError(
                     400,
@@ -4683,7 +4724,7 @@ def _normalized_operating_conditions(
             normalized[key] = bounds
             continue
         normalized[key] = _normalized_operating_condition_value(
-            f"{field}.{key}", raw_value
+            f"{field}.{key}", raw_value, depth=depth + 1
         )
     return normalized
 
@@ -4854,6 +4895,17 @@ def _canonical_dataset_source_filters(
     return canonical
 
 
+def _canonical_casefold_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key).strip().casefold(): _canonical_casefold_keys(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_canonical_casefold_keys(item) for item in value]
+    return value
+
+
 def _dataset_version_fingerprint(
     source: dict[str, Any],
     compatibility: dict[str, Any],
@@ -4863,10 +4915,17 @@ def _dataset_version_fingerprint(
     split: dict[str, float],
     snapshot_checksum: str | None = None,
 ) -> str:
-    canonical_compatibility = copy_payload(compatibility)
-    canonical_compatibility["signalType"] = sorted(
-        canonical_compatibility.get("signalType", [])
-    )
+    canonical_compatibility = {
+        "signalType": sorted(
+            str(value).strip().casefold()
+            for value in compatibility.get("signalType", [])
+        ),
+        "samplingRateHz": compatibility.get("samplingRateHz"),
+        "units": _canonical_casefold_keys(compatibility.get("units", {})),
+        "operatingConditions": _canonical_casefold_keys(
+            compatibility.get("operatingConditions", {})
+        ),
+    }
     canonical_source = copy_payload(source)
     if snapshot_checksum:
         canonical_source.pop("checksum", None)
@@ -5029,6 +5088,33 @@ def dataset_version_for(user: dict[str, Any], dataset_id: str) -> dict[str, Any]
     for site_id in _dataset_site_ids(record):
         require_site_access(user, site_id)
     return copy_payload(record)
+
+
+def dataset_versions_for(
+    user: dict[str, Any], *, page: int = 1, size: int = 50
+) -> dict[str, Any]:
+    require_permission(user, "dataset:read")
+    allowed_site_ids = set(user.get("allowedSiteIds", []))
+    rows = []
+    for record in DATASET_VERSIONS:
+        site_ids = set(_dataset_site_ids(record))
+        if "*" in allowed_site_ids or site_ids.issubset(allowed_site_ids):
+            rows.append(copy_payload(record))
+    rows.sort(
+        key=lambda item: (
+            parse_rfc3339("dataset.createdAt", item["createdAt"]),
+            item["id"],
+        ),
+        reverse=True,
+    )
+    total = len(rows)
+    start = (page - 1) * size
+    return {
+        "items": rows[start : start + size],
+        "page": page,
+        "size": size,
+        "total": total,
+    }
 
 
 def _split_for_group(group_id: str, split: dict[str, float]) -> str:
@@ -5371,19 +5457,10 @@ def _dataset_site_ids(
     for site_id in explicit_site_ids:
         get_site(site_id)
     site_ids = set(explicit_site_ids)
-    is_internal = dataset.get("source", {}).get("type") == "internal"
     for asset_id in [
         *source_filters.get("assetIds", []),
         *([source_filters["assetId"]] if source_filters.get("assetId") else []),
     ]:
-        if not is_internal and explicit_site_ids:
-            if any(asset_id.startswith(f"{site_id}-") for site_id in explicit_site_ids):
-                continue
-            raise ApiError(
-                400,
-                "INVALID_SOURCE_FILTERS",
-                f"sourceFilters assetId {asset_id} is outside the selected siteIds.",
-            )
         asset = get_asset_by_id(asset_id)
         if explicit_site_ids and asset["siteId"] not in explicit_site_ids:
             raise ApiError(
@@ -5392,7 +5469,7 @@ def _dataset_site_ids(
                 f"sourceFilters assetId {asset_id} is outside the selected siteIds.",
             )
         site_ids.add(asset["siteId"])
-    if is_internal:
+    if dataset.get("source", {}).get("type") == "internal":
         snapshot = (
             snapshot_override
             if snapshot_override is not None

@@ -1131,6 +1131,93 @@ class Week2HttpSmokeTest(unittest.TestCase):
         self.assertEqual(TELEMETRY_METRICS["rejected"], initial_rejected + 1)
         self.assertEqual(TELEMETRY_METRICS["localRejected"], initial_local_rejected + 1)
 
+    def test_completed_quarantine_survives_restart_until_redelivery(self) -> None:
+        class FailingAckClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 1
+
+        class SuccessfulAckClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        message = SimpleNamespace(
+            topic="devices/DEV-01-GEN-01/telemetry",
+            payload="{restart-invalid-json",
+            mid=57,
+            qos=1,
+        )
+        failing_client = FailingAckClient()
+        initial_records = len(QUARANTINED_DEVICE_MESSAGES)
+        initial_rejected = int(TELEMETRY_METRICS["rejected"])
+        initial_local_rejected = int(TELEMETRY_METRICS["localRejected"])
+        quarantine_endpoint = f"http://127.0.0.1:{self.port}/api/telemetry/quarantine"
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "restart-ack-retry.sqlite3"
+            retry_queue = MqttRetryQueue(
+                database_path=database_path,
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint=quarantine_endpoint,
+                token="demo-mqtt-ingest-token",
+                initial_delay=0,
+            )
+            with patch(
+                "motor_diagnosis.mqtt_service.quarantine_local_mqtt_message",
+                wraps=quarantine_local_mqtt_message,
+            ) as quarantine:
+                delivery = process_mqtt_message(
+                    failing_client,
+                    message,
+                    endpoint="http://backend/api/telemetry/ingest",
+                    quarantine_endpoint=quarantine_endpoint,
+                    token="demo-mqtt-ingest-token",
+                    retry_queue=retry_queue,
+                )
+                self.assertEqual(delivery, "retry")
+                self.assertEqual(retry_queue.pending_count(), 1)
+
+                restarted_queue = MqttRetryQueue(
+                    database_path=database_path,
+                    ingest_endpoint="http://backend/api/telemetry/ingest",
+                    quarantine_endpoint=quarantine_endpoint,
+                    token="demo-mqtt-ingest-token",
+                    initial_delay=0,
+                )
+                self.assertEqual(
+                    restarted_queue.process_due_once(now=float("inf")),
+                    "awaiting_ack",
+                )
+                self.assertEqual(restarted_queue.pending_count(), 1)
+
+                redelivery_client = SuccessfulAckClient()
+                redelivered_message = SimpleNamespace(**{**vars(message), "mid": 58})
+                resumed = process_mqtt_message(
+                    redelivery_client,
+                    redelivered_message,
+                    endpoint="http://backend/api/telemetry/ingest",
+                    quarantine_endpoint=quarantine_endpoint,
+                    token="demo-mqtt-ingest-token",
+                    retry_queue=restarted_queue,
+                )
+
+            self.assertEqual(resumed, "quarantined")
+            self.assertEqual(quarantine.call_count, 1)
+            self.assertEqual(restarted_queue.pending_count(), 0)
+
+        self.assertEqual(failing_client.ack_calls, [(57, 1)])
+        self.assertEqual(redelivery_client.ack_calls, [(58, 1)])
+        self.assertEqual(len(QUARANTINED_DEVICE_MESSAGES), initial_records + 1)
+        self.assertEqual(TELEMETRY_METRICS["rejected"], initial_rejected + 1)
+        self.assertEqual(TELEMETRY_METRICS["localRejected"], initial_local_rejected + 1)
+
     def test_actual_ai2_replay_output_is_accepted_and_queryable(self) -> None:
         source_asset_id = "SYN-ASSET-01"
         generated = build_replay_record(

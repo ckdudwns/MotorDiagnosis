@@ -259,6 +259,7 @@ class MqttRetryQueue:
         self.poll_interval = max(0.05, poll_interval)
         self._ack_targets: dict[str, tuple[Any, RetryMessage]] = {}
         self._target_lock = threading.Lock()
+        self._processing_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._worker: threading.Thread | None = None
@@ -460,6 +461,55 @@ class MqttRetryQueue:
                 (now,),
             ).fetchone()
 
+    def resume_pending_message(self, client: Any, message: Any) -> str | None:
+        retry_message = self._snapshot(message)
+        message_keys = tuple(
+            self._message_key(operation, retry_message)
+            for operation in ("quarantine", "ingest")
+        )
+        with self._processing_lock:
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT * FROM mqtt_retry_queue
+                    WHERE message_key IN (?, ?)
+                    ORDER BY delivery_completed DESC, created_at
+                    LIMIT 1
+                    """,
+                    message_keys,
+                ).fetchone()
+                if row is None:
+                    return None
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_queue
+                    SET mid = ?, qos = ?, next_attempt_at = ?
+                    WHERE message_key = ?
+                    """,
+                    (
+                        retry_message.mid,
+                        retry_message.qos,
+                        time.time(),
+                        row["message_key"],
+                    ),
+                )
+            with self._target_lock:
+                self._ack_targets[str(row["message_key"])] = (client, retry_message)
+            self._wake_event.set()
+            if bool(row["delivery_completed"]):
+                outcome = str(row["delivery_outcome"]) or (
+                    "quarantined" if row["operation"] == "quarantine" else "accepted"
+                )
+                return self._complete(row, outcome)
+            LOGGER.info(
+                "mqtt_retry_reconnected operation=%s topic=%s mid=%s qos=%s",
+                row["operation"],
+                retry_message.topic,
+                retry_message.mid,
+                retry_message.qos,
+            )
+            return "retry"
+
     def _reschedule(self, row: sqlite3.Row, error: MqttBridgeError) -> None:
         attempts = int(row["attempts"]) + 1
         delay = min(
@@ -502,12 +552,33 @@ class MqttRetryQueue:
                 (outcome, row["message_key"]),
             )
 
+    def _defer_until_ack_target(self, row: sqlite3.Row) -> None:
+        delay = max(0.5, self.poll_interval, self.initial_delay)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET next_attempt_at = ?
+                WHERE message_key = ?
+                """,
+                (time.time() + delay, row["message_key"]),
+            )
+        LOGGER.info(
+            "mqtt_retry_awaiting_ack_target operation=%s topic=%s qos=%s",
+            row["operation"],
+            row["topic"],
+            row["qos"],
+        )
+
     def _complete(self, row: sqlite3.Row, outcome: str) -> str:
         message_key = str(row["message_key"])
         if not bool(row["delivery_completed"]) or not str(row["delivery_outcome"]):
             self._mark_delivery_completed(row, outcome)
         with self._target_lock:
             target = self._ack_targets.get(message_key)
+        if target is None and int(row["qos"]) > 0:
+            self._defer_until_ack_target(row)
+            return "awaiting_ack"
         if target is not None:
             client, message = target
             if not acknowledge_message(client, message):
@@ -531,7 +602,7 @@ class MqttRetryQueue:
         )
         return outcome
 
-    def process_due_once(self, *, now: float | None = None) -> str:
+    def _process_due_once(self, *, now: float | None = None) -> str:
         row = self._next_due(time.time() if now is None else now)
         if row is None:
             return "idle"
@@ -568,6 +639,10 @@ class MqttRetryQueue:
                 return self._complete(row, "quarantined")
             self._reschedule(row, error)
             return "retry"
+
+    def process_due_once(self, *, now: float | None = None) -> str:
+        with self._processing_lock:
+            return self._process_due_once(now=now)
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -606,6 +681,10 @@ def process_mqtt_message(
     retry_queue: MqttRetryQueue | None = None,
 ) -> str:
     """Return accepted, quarantined, or retry based on HTTP processing outcome."""
+    if retry_queue:
+        resumed = retry_queue.resume_pending_message(client, message)
+        if resumed is not None:
+            return resumed
     try:
         response, status = forward_mqtt_message(
             message.topic,

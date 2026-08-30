@@ -102,6 +102,26 @@ LOGGER = logging.getLogger("motor_diagnosis")
 MAX_JSON_BODY_BYTES = 64 * 1024
 
 
+def _validate_json_unicode(value: Any) -> None:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in current):
+                raise ApiError(
+                    400,
+                    "INVALID_JSON",
+                    "JSON strings must contain valid Unicode scalar values.",
+                )
+            continue
+        if isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+            continue
+        if isinstance(current, list):
+            pending.extend(current)
+
+
 def _safe_csv_cell(value: Any) -> Any:
     if not isinstance(value, str) or not value:
         return value
@@ -799,6 +819,7 @@ class AppHandler(BaseHTTPRequestHandler):
             ) from exc
         if not isinstance(data, dict):
             raise ApiError(400, "INVALID_JSON_BODY", "JSON body must be an object.")
+        _validate_json_unicode(data)
         return data
 
     def send_json(self, payload: Any, status: int = 200) -> None:

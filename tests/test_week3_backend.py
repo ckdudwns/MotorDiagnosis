@@ -19,6 +19,7 @@ from motor_diagnosis.data import (
     EVENTS,
     EVENT_EVIDENCE_SNAPSHOTS,
     EVENT_REVIEW_HISTORY,
+    TELEMETRY_IDEMPOTENCY,
     TELEMETRY_RECORDS,
     alert_policies_for,
     audit_logs_for,
@@ -549,6 +550,61 @@ class Week3DataBoundaryTest(unittest.TestCase):
             delete_asset(self.admin, "SITE-01", device["assetId"])
 
         self.assertEqual(referenced.exception.code, "ASSET_HAS_DEVICE")
+
+    def test_asset_with_telemetry_history_cannot_be_deleted(self) -> None:
+        asset = create_asset(
+            self.admin,
+            "SITE-01",
+            {
+                "assetCode": "TELEMETRY-HISTORY-01",
+                "name": "Telemetry history asset",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
+        )
+        TELEMETRY_RECORDS.append(
+            self.telemetry_record(
+                "2026-08-24T03:00:00Z",
+                1,
+                asset_id=asset["id"],
+                device_id="DELETED-TELEMETRY-DEVICE",
+            )
+        )
+
+        with self.assertRaises(ApiError) as referenced:
+            delete_asset(self.admin, "SITE-01", asset["id"])
+
+        self.assertEqual(referenced.exception.code, "ASSET_HAS_IMMUTABLE_REFERENCES")
+
+    def test_device_telemetry_and_idempotency_history_prevent_deletion(self) -> None:
+        device_id = "DEV-01-GEN-01"
+        TELEMETRY_RECORDS.append(
+            self.telemetry_record(
+                "2026-08-24T03:00:00Z",
+                1,
+                asset_id="SITE-01-GEN-01",
+                device_id=device_id,
+            )
+        )
+
+        with self.assertRaises(ApiError) as telemetry_reference:
+            delete_device(self.admin, device_id)
+
+        self.assertEqual(
+            telemetry_reference.exception.code, "DEVICE_HAS_TELEMETRY_HISTORY"
+        )
+        TELEMETRY_RECORDS.clear()
+        TELEMETRY_IDEMPOTENCY[(device_id, 1)] = {
+            "payloadHash": "stored-payload-hash",
+            "receivedAt": "2026-08-24T03:00:00Z",
+        }
+
+        with self.assertRaises(ApiError) as idempotency_reference:
+            delete_device(self.admin, device_id)
+
+        self.assertEqual(
+            idempotency_reference.exception.code, "DEVICE_HAS_TELEMETRY_HISTORY"
+        )
 
     def test_environment_inspection_and_device_delete_are_atomic(self) -> None:
         lookup_started = threading.Event()
@@ -1717,6 +1773,34 @@ class Week3HttpContractTest(unittest.TestCase):
                 response = json.loads(body.decode("utf-8"))
                 self.assertEqual(status, 400)
                 self.assertEqual(response["error"]["code"], "INVALID_JSON")
+
+    def test_lone_surrogate_is_rejected_before_event_review_state_changes(self) -> None:
+        status, response = self.request(
+            "/api/events/EV-241/review",
+            method="POST",
+            payload={
+                "label": "normal_false_positive",
+                "note": "\ud800",
+                "reason": "Reject invalid Unicode before mutation",
+            },
+            token=self.operator_token,
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(response["error"]["code"], "INVALID_JSON")
+
+        status, event_detail = self.request(
+            "/api/anomaly/events/EV-241", token=self.operator_token
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(event_detail["event"]["reviewed"])
+        self.assertEqual(event_detail["event"]["label"], "needs_review")
+
+        status, history = self.request(
+            "/api/events/EV-241/reviews", token=self.operator_token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(history["total"], 0)
 
     def test_event_lookup_detail_review_and_history(self) -> None:
         status, page = self.request(

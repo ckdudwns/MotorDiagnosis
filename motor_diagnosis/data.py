@@ -1809,11 +1809,21 @@ def delete_asset(user: dict[str, Any], site_id: str, asset_id: str) -> dict[str,
             for inspection in ENVIRONMENT_INSPECTIONS
             if inspection.get("assetId") == asset_id
         ]
-        if dataset_references or event_references or inspection_references:
+        telemetry_references = [
+            record
+            for record in TELEMETRY_RECORDS
+            if record.get("siteId") == site_id and record.get("assetId") == asset_id
+        ]
+        if (
+            dataset_references
+            or event_references
+            or inspection_references
+            or telemetry_references
+        ):
             raise ApiError(
                 409,
                 "ASSET_HAS_IMMUTABLE_REFERENCES",
-                "An asset referenced by a frozen dataset, event, or inspection cannot be deleted.",
+                "An asset referenced by telemetry, a frozen dataset, event, or inspection cannot be deleted.",
             )
         if any(device["assetId"] == asset_id for device in DEVICES):
             raise ApiError(
@@ -2270,6 +2280,18 @@ def delete_device(user: dict[str, Any], device_id: str) -> dict[str, Any]:
     with STORE_LOCK:
         device = get_device(device_id)
         require_site_access(user, device["siteId"])
+        has_telemetry_history = any(
+            record.get("deviceId") == device_id for record in TELEMETRY_RECORDS
+        )
+        has_idempotency_history = any(
+            key[0] == device_id for key in TELEMETRY_IDEMPOTENCY
+        )
+        if has_telemetry_history or has_idempotency_history:
+            raise ApiError(
+                409,
+                "DEVICE_HAS_TELEMETRY_HISTORY",
+                "A device with telemetry or idempotency history cannot be deleted.",
+            )
         if any(record["deviceId"] == device_id for record in CONNECTIVITY_TEST_RECORDS):
             raise ApiError(
                 409,

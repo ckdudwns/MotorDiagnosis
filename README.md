@@ -44,7 +44,15 @@ MQTT 구독은 프로세스 재시작 후에도 브로커 재전송을 안전하
 MQTT JSON·토픽은
 `POST /api/telemetry/quarantine`에 원문과 오류 사유가 저장된 뒤 ACK된다. 브로커 상태는
 `POST /api/health/dependencies/mqtt`에 보고하되, SUBACK 승인 QoS가 요청 QoS 이상일 때만
-`healthy`로 전환한다.
+`healthy`로 전환하고 수집·재시도 작업자를 재개한다. CONNACK 수신이나 세션 epoch
+저장만으로 수집을 재개하지 않는다.
+
+재시도 ACK 전에는 처리 완료 generation과 ACK 시도 의도를 먼저 저장한다. PUBACK 이후
+DB 쓰기가 실패해 ACK 성공 여부가 불확실한 채 재시작하더라도 retry 행은 정리할 수 있으며,
+동일 세션의 활성 generation은 보존한다. 브로커가 DUP를 다시 보내면 이 완료 기록을 사용해
+HTTP 수집·격리를 반복하지 않고 ACK한다. SQLite와 MQTT가 하나의 원자적 트랜잭션이라는
+보장은 하지 않는다. Paho 2.x worker ACK는 콜백 mutex를 비차단으로 먼저 확보한 뒤
+동기 `loop_write`가 아닌 패킷 큐 경로를 사용한다.
 
 ## 3주차 백엔드 범위
 

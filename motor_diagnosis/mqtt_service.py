@@ -296,6 +296,7 @@ class MqttRetryQueue:
 
     def _initialize_database(self) -> None:
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mqtt_retry_queue (
@@ -411,10 +412,46 @@ class MqttRetryQueue:
         )
         with self._target_lock:
             self._ack_targets[message_key] = (client, retry_message)
+        if retry_message.dup:
+            conflict_action = """
+                mid = excluded.mid,
+                qos = excluded.qos,
+                next_attempt_at = MIN(
+                    mqtt_retry_queue.next_attempt_at,
+                    excluded.next_attempt_at
+                ),
+                last_error_code = excluded.last_error_code,
+                last_error_message = excluded.last_error_message,
+                delivery_completed = MAX(
+                    mqtt_retry_queue.delivery_completed,
+                    excluded.delivery_completed
+                ),
+                delivery_outcome = CASE
+                    WHEN mqtt_retry_queue.delivery_completed = 1
+                    THEN mqtt_retry_queue.delivery_outcome
+                    ELSE excluded.delivery_outcome
+                END
+            """
+        else:
+            conflict_action = """
+                mid = excluded.mid,
+                qos = excluded.qos,
+                attempts = 0,
+                next_attempt_at = excluded.next_attempt_at,
+                error_code = excluded.error_code,
+                error_message = excluded.error_message,
+                last_error_code = excluded.last_error_code,
+                last_error_message = excluded.last_error_message,
+                delivery_completed = excluded.delivery_completed,
+                delivery_outcome = excluded.delivery_outcome,
+                claim_owner = '',
+                claim_until = 0,
+                created_at = excluded.created_at
+            """
         try:
             with self._connection() as connection:
                 connection.execute(
-                    """
+                    f"""
                     INSERT INTO mqtt_retry_queue (
                         message_key, operation, topic, payload, mid, qos,
                         attempts, next_attempt_at, error_code, error_message,
@@ -422,23 +459,7 @@ class MqttRetryQueue:
                         delivery_outcome, created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(message_key) DO UPDATE SET
-                        mid = excluded.mid,
-                        qos = excluded.qos,
-                        next_attempt_at = MIN(
-                            mqtt_retry_queue.next_attempt_at,
-                            excluded.next_attempt_at
-                        ),
-                        last_error_code = excluded.last_error_code,
-                        last_error_message = excluded.last_error_message,
-                        delivery_completed = MAX(
-                            mqtt_retry_queue.delivery_completed,
-                            excluded.delivery_completed
-                        ),
-                        delivery_outcome = CASE
-                            WHEN mqtt_retry_queue.delivery_completed = 1
-                            THEN mqtt_retry_queue.delivery_outcome
-                            ELSE excluded.delivery_outcome
-                        END
+                        {conflict_action}
                     """,
                     (
                         message_key,
@@ -701,9 +722,56 @@ class MqttRetryQueue:
                 )
             self._inflight_message_keys.discard(message_key)
 
+    def _renew_claim(self, row: sqlite3.Row) -> bool:
+        with self._connection() as connection:
+            renewed = connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET claim_until = ?
+                WHERE message_key = ? AND claim_owner = ?
+                """,
+                (
+                    time.time() + self.lease_seconds,
+                    row["message_key"],
+                    self._claim_owner,
+                ),
+            )
+        return renewed.rowcount == 1
+
+    def _keep_claim_alive(self, row: sqlite3.Row, stop_event: threading.Event) -> None:
+        interval = max(0.1, min(5.0, self.lease_seconds / 4))
+        while not stop_event.wait(interval):
+            try:
+                if not self._renew_claim(row):
+                    LOGGER.warning(
+                        "mqtt_retry_claim_lost key=%s owner=%s",
+                        row["message_key"],
+                        self._claim_owner,
+                    )
+                    return
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_retry_claim_renew_failed key=%s error=%s",
+                    row["message_key"],
+                    error,
+                )
+
+    def _claim_is_owned(self, row: sqlite3.Row) -> bool:
+        with self._connection() as connection:
+            current = connection.execute(
+                """
+                SELECT 1 FROM mqtt_retry_queue
+                WHERE message_key = ? AND claim_owner = ?
+                """,
+                (row["message_key"], self._claim_owner),
+            ).fetchone()
+        return current is not None
+
     def _complete_claimed(self, row: sqlite3.Row, outcome: str) -> str:
         with self._processing_lock:
             try:
+                if not self._claim_is_owned(row):
+                    return "retry"
                 return self._complete(row, outcome)
             finally:
                 self._inflight_message_keys.discard(str(row["message_key"]))
@@ -711,12 +779,22 @@ class MqttRetryQueue:
     def _reschedule_claimed(self, row: sqlite3.Row, error: MqttBridgeError) -> str:
         with self._processing_lock:
             try:
+                if not self._claim_is_owned(row):
+                    return "retry"
                 self._reschedule(row, error)
                 return "retry"
             finally:
                 self._inflight_message_keys.discard(str(row["message_key"]))
 
     def _process_due_once(self, row: sqlite3.Row) -> str:
+        lease_stop = threading.Event()
+        lease_worker = threading.Thread(
+            target=self._keep_claim_alive,
+            args=(row, lease_stop),
+            name="mqtt-retry-lease",
+            daemon=True,
+        )
+        lease_worker.start()
         try:
             if bool(row["delivery_completed"]):
                 outcome = str(row["delivery_outcome"]) or (
@@ -750,6 +828,8 @@ class MqttRetryQueue:
                 return self._complete_claimed(row, "quarantined")
             return self._reschedule_claimed(row, error)
         finally:
+            lease_stop.set()
+            lease_worker.join(timeout=1)
             self._release_claim(row)
 
     def process_due_once(self, *, now: float | None = None) -> str:

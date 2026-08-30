@@ -1506,6 +1506,8 @@ def rated_rpm_field(payload: dict[str, Any], *, default: int = 0) -> int:
     if field is None:
         return default
     raw_value = payload[field]
+    if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+        raise ApiError(400, "INVALID_NUMBER", f"{field} must be an integer.")
     if (
         isinstance(raw_value, bool)
         or (

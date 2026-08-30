@@ -548,6 +548,80 @@ class Week2BackendTest(unittest.TestCase):
                 self.assertEqual(client.ack_calls, [(21, 1)])
                 self.assertEqual(retry_queue.pending_count(), 0)
 
+    def test_concurrent_legacy_retry_database_migration_is_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "legacy-retry.sqlite3"
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE mqtt_retry_queue (
+                        message_key TEXT PRIMARY KEY,
+                        operation TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        payload BLOB NOT NULL,
+                        mid INTEGER NOT NULL,
+                        qos INTEGER NOT NULL,
+                        attempts INTEGER NOT NULL,
+                        next_attempt_at REAL NOT NULL,
+                        error_code TEXT NOT NULL,
+                        error_message TEXT NOT NULL,
+                        last_error_code TEXT NOT NULL DEFAULT '',
+                        last_error_message TEXT NOT NULL DEFAULT '',
+                        delivery_completed INTEGER NOT NULL DEFAULT 0,
+                        delivery_outcome TEXT NOT NULL DEFAULT '',
+                        created_at REAL NOT NULL
+                    )
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            start = threading.Barrier(3)
+            queues: list[MqttRetryQueue] = []
+            errors: list[BaseException] = []
+
+            def open_queue() -> None:
+                start.wait()
+                try:
+                    queues.append(
+                        MqttRetryQueue(
+                            database_path=database_path,
+                            ingest_endpoint="http://backend/api/telemetry/ingest",
+                            quarantine_endpoint=(
+                                "http://backend/api/telemetry/quarantine"
+                            ),
+                            token="token",
+                            database_timeout=2,
+                        )
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            workers = [threading.Thread(target=open_queue) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            start.wait()
+            for worker in workers:
+                worker.join(timeout=3)
+
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(queues), 2)
+            connection = sqlite3.connect(database_path)
+            try:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(mqtt_retry_queue)"
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+            self.assertIn("claim_owner", columns)
+            self.assertIn("claim_until", columns)
+
     def test_retry_db_lock_does_not_block_a_new_non_dup_message(self) -> None:
         class FakeClient:
             def __init__(self) -> None:
@@ -738,6 +812,82 @@ class Week2BackendTest(unittest.TestCase):
                 retry_queue.process_due_once(now=float("inf")), "accepted"
             )
             self.assertEqual(client.ack_calls, [(102, 1), (101, 1)])
+            self.assertEqual(retry_queue.pending_count(), 0)
+
+    def test_non_dup_mid_reuse_resets_a_completed_retry_row(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        old_client = FakeClient()
+        new_client = FakeClient()
+        old_message = SimpleNamespace(
+            topic="devices/DEV-SESSION/telemetry",
+            payload=b'{"deviceId":"DEV-SESSION","sequence":701}',
+            mid=77,
+            qos=1,
+            dup=False,
+        )
+        new_session_message = SimpleNamespace(**vars(old_message))
+        accepted = {
+            "deviceId": "DEV-SESSION",
+            "sequence": 701,
+            "duplicate": False,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            retry_queue = MqttRetryQueue(
+                database_path=Path(directory) / "session-reuse-retry.sqlite3",
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+                initial_delay=0,
+            )
+            self.assertTrue(
+                retry_queue.enqueue(
+                    old_client,
+                    old_message,
+                    MqttBridgeError(503, "MQTT_ACK_FAILED", "ACK failed"),
+                    delivery_completed=True,
+                )
+            )
+
+            with patch(
+                "motor_diagnosis.mqtt_service.forward_mqtt_message",
+                side_effect=[
+                    MqttBridgeError(503, "INGEST_UNAVAILABLE", "temporary"),
+                    (accepted, 201),
+                ],
+            ) as forward:
+                self.assertEqual(
+                    process_mqtt_message(
+                        new_client,
+                        new_session_message,
+                        endpoint="http://backend/api/telemetry/ingest",
+                        quarantine_endpoint=(
+                            "http://backend/api/telemetry/quarantine"
+                        ),
+                        token="token",
+                        retry_queue=retry_queue,
+                    ),
+                    "retry",
+                )
+                with retry_queue._connection() as connection:
+                    row = connection.execute(
+                        "SELECT * FROM mqtt_retry_queue"
+                    ).fetchone()
+                self.assertFalse(bool(row["delivery_completed"]))
+                self.assertEqual(
+                    retry_queue.process_due_once(now=float("inf")), "accepted"
+                )
+
+            self.assertEqual(forward.call_count, 2)
+            self.assertEqual(old_client.ack_calls, [])
+            self.assertEqual(new_client.ack_calls, [(77, 1)])
             self.assertEqual(retry_queue.pending_count(), 0)
 
     def test_mqtt_health_waits_for_successful_suback(self) -> None:
@@ -1565,6 +1715,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
                 quarantine_endpoint="http://backend/api/telemetry/quarantine",
                 token="token",
                 initial_delay=0,
+                lease_seconds=1,
             )
             second_queue = MqttRetryQueue(
                 database_path=database_path,
@@ -1572,6 +1723,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
                 quarantine_endpoint="http://backend/api/telemetry/quarantine",
                 token="token",
                 initial_delay=0,
+                lease_seconds=1,
             )
             self.assertTrue(
                 first_queue.enqueue(
@@ -1584,10 +1736,18 @@ class Week2HttpSmokeTest(unittest.TestCase):
                 )
             )
 
+            delivery_call_count = 0
+            delivery_call_lock = threading.Lock()
+
             def delayed_quarantine(*_args, **_kwargs) -> None:
-                delivery_started.set()
-                if not release_delivery.wait(5):
-                    raise AssertionError("quarantine delivery was not released")
+                nonlocal delivery_call_count
+                with delivery_call_lock:
+                    delivery_call_count += 1
+                    current_call = delivery_call_count
+                if current_call == 1:
+                    delivery_started.set()
+                    if not release_delivery.wait(5):
+                        raise AssertionError("quarantine delivery was not released")
 
             def run_first_queue() -> None:
                 try:
@@ -1602,11 +1762,14 @@ class Week2HttpSmokeTest(unittest.TestCase):
                 first_thread = threading.Thread(target=run_first_queue)
                 first_thread.start()
                 self.assertTrue(delivery_started.wait(1))
-                self.assertEqual(
-                    second_queue.process_due_once(now=float("inf")), "idle"
-                )
-                release_delivery.set()
-                first_thread.join(timeout=2)
+                time.sleep(1.15)
+                try:
+                    self.assertEqual(
+                        second_queue.process_due_once(now=float("inf")), "idle"
+                    )
+                finally:
+                    release_delivery.set()
+                    first_thread.join(timeout=2)
 
             self.assertFalse(first_thread.is_alive())
             self.assertEqual(errors, [])

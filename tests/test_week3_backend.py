@@ -447,6 +447,33 @@ class Week3DataBoundaryTest(unittest.TestCase):
                 self.assertEqual(invalid_update.exception.code, "INVALID_NUMBER")
                 self.assertEqual(get_asset_by_id(asset["id"])["ratedRpm"], 1800)
 
+        for rpm_field in ("ratedRpm", "rpm"):
+            with self.subTest(create_empty_rpm_field=rpm_field):
+                with self.assertRaises(ApiError) as empty_create:
+                    create_asset(
+                        self.admin,
+                        "SITE-01",
+                        {
+                            "assetCode": f"RPM-EMPTY-{rpm_field.upper()}",
+                            "name": "Empty RPM motor",
+                            "assetType": "motor",
+                            rpm_field: "",
+                        },
+                    )
+                self.assertEqual(empty_create.exception.code, "INVALID_NUMBER")
+
+            before_update = get_asset_by_id(asset["id"])
+            with self.subTest(update_empty_rpm_field=rpm_field):
+                with self.assertRaises(ApiError) as empty_update:
+                    update_asset(
+                        self.admin,
+                        "SITE-01",
+                        asset["id"],
+                        {rpm_field: ""},
+                    )
+                self.assertEqual(empty_update.exception.code, "INVALID_NUMBER")
+                self.assertEqual(get_asset_by_id(asset["id"]), before_update)
+
     def test_dataset_event_labels_sort_rfc3339_values_by_instant(self) -> None:
         asset_id = "SITE-01-MOT-02"
         older = {

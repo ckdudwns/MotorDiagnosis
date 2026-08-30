@@ -3672,10 +3672,10 @@ def baseline_payload(
 
 
 def required_text(payload: dict[str, Any], key: str) -> str:
-    value = str(payload.get(key, "")).strip()
-    if not value:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
         raise ApiError(400, "MISSING_FIELD", f"{key} is required.")
-    return value
+    return value.strip()
 
 
 def get_event(event_id: str) -> dict[str, Any]:
@@ -3898,7 +3898,11 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
 def _bounded_number(
     field: str, value: Any, minimum: float, maximum: float, *, integer: bool = False
 ) -> int | float:
-    if isinstance(value, bool):
+    if (
+        value is None
+        or isinstance(value, bool)
+        or (isinstance(value, str) and not value.strip())
+    ):
         raise ApiError(400, "INVALID_NUMBER", f"{field} must be a valid number.")
     parsed = parse_float_value(field, value)
     if parsed < minimum or parsed > maximum:

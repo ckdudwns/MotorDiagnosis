@@ -152,6 +152,40 @@ class Week3DataBoundaryTest(unittest.TestCase):
             "reason": "Week 3 dataset boundary regression test",
         }
 
+    def test_dataset_rejects_explicit_null_numbers_and_required_text(self) -> None:
+        base_payload = self.dataset_payload(
+            checksum="dataset-null-boundaries",
+            source_filters={"siteIds": ["SITE-01"]},
+            label_mapping={"needs_review": "NORMAL"},
+        )
+        initial_count = len(DATASET_VERSIONS)
+
+        numeric_paths = [
+            ("compatibility", "samplingRateHz"),
+            ("split", "train"),
+            ("split", "validation"),
+            ("split", "test"),
+        ]
+        for parent, field in numeric_paths:
+            with self.subTest(null_number=f"{parent}.{field}"):
+                payload = json.loads(json.dumps(base_payload))
+                payload[parent][field] = None
+                with self.assertRaises(ApiError) as invalid_number:
+                    create_dataset_version(self.admin, payload)
+                self.assertEqual(invalid_number.exception.status, 400)
+                self.assertEqual(invalid_number.exception.code, "INVALID_NUMBER")
+
+        for field in ("name", "labelTaxonomyVersion", "reason"):
+            with self.subTest(null_text=field):
+                payload = json.loads(json.dumps(base_payload))
+                payload[field] = None
+                with self.assertRaises(ApiError) as missing_text:
+                    create_dataset_version(self.admin, payload)
+                self.assertEqual(missing_text.exception.status, 400)
+                self.assertEqual(missing_text.exception.code, "MISSING_FIELD")
+
+        self.assertEqual(len(DATASET_VERSIONS), initial_count)
+
     def test_event_context_marks_raw_missing_when_stored_data_is_outside_window(
         self,
     ) -> None:

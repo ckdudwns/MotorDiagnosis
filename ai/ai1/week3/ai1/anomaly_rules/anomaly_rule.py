@@ -57,6 +57,45 @@ class AnomalyRuleConfig:
             )
 
 
+def _validate_baseline(baseline: dict) -> None:
+    """baseline의 구조와 통계값을 등록 시점에 검증한다.
+
+    check_outliers()는 mean/std가 NaN이면 정상범위(low/high)도 NaN이 되고,
+    NaN과의 모든 비교는 False이므로 `value < low or value > high`가 항상
+    False가 되어 어떤 값도 이상치로 잡히지 않는다 — 즉 손상된 baseline이
+    등록되면 판정 로직이 예외 없이 조용히 fail-open(전부 NORMAL)된다.
+    등록 시점에 막아야 판정 단계에서 이 실패가 소리 없이 퍼지지 않는다.
+    """
+    if not isinstance(baseline, dict):
+        raise ValueError(f"baseline은 dict여야 합니다: {baseline!r}")
+
+    features = baseline.get("features")
+    if not isinstance(features, dict) or not features:
+        raise ValueError(
+            f"baseline['features']는 비어 있지 않은 dict여야 합니다: {features!r}"
+        )
+
+    for name, stats in features.items():
+        if not isinstance(stats, dict):
+            raise ValueError(f"baseline['features'][{name!r}]는 dict여야 합니다: {stats!r}")
+        for key in ("mean", "std"):
+            if key not in stats:
+                raise ValueError(f"baseline['features'][{name!r}]에 {key!r}가 없습니다.")
+            value = stats[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"baseline['features'][{name!r}][{key!r}]는 숫자여야 합니다: {value!r}"
+                )
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"baseline['features'][{name!r}][{key!r}]는 유한해야 합니다: {value!r}"
+                )
+        if stats["std"] < 0:
+            raise ValueError(
+                f"baseline['features'][{name!r}]['std']는 0 이상이어야 합니다: {stats['std']!r}"
+            )
+
+
 class AssetBaselineRegistry:
     """설비(asset_id) 또는 설비유형(asset_type)별 baseline/설정 레지스트리.
 
@@ -79,6 +118,7 @@ class AssetBaselineRegistry:
         asset_type: str = None,
         is_default: bool = False,
     ) -> None:
+        _validate_baseline(baseline)
         entry = {"baseline": baseline, "config": config or AnomalyRuleConfig()}
         if asset_id:
             self._by_asset_id[asset_id] = entry

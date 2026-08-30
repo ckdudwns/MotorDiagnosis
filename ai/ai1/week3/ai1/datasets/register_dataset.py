@@ -18,6 +18,7 @@ import math
 import random
 import hashlib
 import argparse
+import importlib.util
 from datetime import datetime, timezone
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,7 +38,35 @@ sys.path.insert(0, _WEEK1_SCRIPTS_DIR)
 sys.path.insert(0, _WEEK2_FEATURE_DIR)
 
 from load_cwru_vibration import load_cwru_dataset, FILE_LABEL_MAP  # noqa: E402
-from extract_features import extract_all_features, FeatureConfig  # noqa: E402
+
+
+def _import_module_from_path(module_name: str, file_path: str):
+    """모듈 이름이 아니라 파일 경로로 정확히 특정해 import한다.
+
+    week1(`week1/ai1/feature_extraction/`)과 week2(`week2/ai1/feature_extraction/`)
+    모두 `extract_features.py`라는 동일한 이름의 모듈을 갖고 있다. 같은
+    프로세스에서 week1 쪽이 먼저 평범한 `from extract_features import ...`로
+    import되면(예: week1 테스트가 먼저 수집·실행됨) "extract_features"라는
+    이름이 sys.modules에 캐시되고, 이후 여기서 week2 디렉터리를 sys.path
+    앞쪽에 넣고 같은 이름으로 import해도 그 캐시된 week1 모듈이 조용히
+    재사용된다 — sys.path 순서는 sys.modules 캐시에 이미 있는 이름에는
+    영향을 주지 못한다. 그 결과 week2 전용 특징(kurtosis 등)이 빠진
+    week1 버전이 실제 판정에 쓰이는데도 아무 오류가 나지 않는다. 고유한
+    이름으로 파일 경로를 직접 지정해 로드하면 이 충돌을 원천적으로 피한다.
+    """
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_week2_extract_features = _import_module_from_path(
+    "ai1_week3_register_dataset.week2_extract_features",
+    os.path.join(_WEEK2_FEATURE_DIR, "extract_features.py"),
+)
+extract_all_features = _week2_extract_features.extract_all_features
+FeatureConfig = _week2_extract_features.FeatureConfig
 
 CWRU_SOURCE_URI = "https://engineering.case.edu/bearingdatacenter/welcome"
 CWRU_LICENSE_NOTE = (
@@ -162,21 +191,28 @@ def validate_split_ratios(ratios: dict) -> None:
 def group_split(
     records: list, ratios: dict = None, seed: int = 42, group_key: str = "source_label"
 ) -> list:
-    """라벨별로 `group_key`(기본: 원본 파일명) 단위 그룹을 통째로 하나의
-    split에만 배정하는 그룹 분할.
+    """`group_key`(기본: 원본 파일명) 단위 그룹을 통째로 하나의 split에만
+    배정하는 그룹 분할.
 
     동일 그룹(예: 같은 원본 .mat 파일)의 윈도우가 train/validation/test에
     나뉘어 들어가면 모델이 그룹 고유 특성(센서 개체차, 노이즈 지문 등)을
     외워 검증 지표가 부풀려지는 데이터 누수가 생긴다. 그래서 윈도우를
     섞지 않고 그룹 단위로만 분할한다.
 
-    라벨 하나에 그룹이 비율 개수(예: train/validation/test 3개)보다 적으면
-    그룹을 쪼개지 않는 한 리크 없이 분할을 만들 수 없다 — 이 경우 조용히
-    윈도우 단위로 섞는 대신 `InsufficientAssetGroupsError`를 발생시켜
-    "데이터 부족" 상태를 명시적으로 드러낸다 (근거: dataset_manifest_format.md
-    "분할 전략"). CWRU는 현재 라벨당 자산이 1개뿐이라 기본 3-way 분할에서는
-    이 예외가 발생하는 것이 정상이며, 자산이 늘어나거나 train 전용 등
-    분할 비율을 조정해야 해소된다.
+    그룹은 **라벨과 무관하게** 전역으로 묶는다 — 같은 자산(group_key)이
+    라벨이 다른 레코드를 함께 갖고 있어도(예: 한 설비의 NORMAL 구간과
+    ANOMALY 구간) 그 자산 전체가 하나의 split에만 배정돼야 하기 때문이다.
+    라벨별로 그룹을 따로 만들면 같은 자산이 라벨에 따라 서로 다른 split에
+    배정될 수 있어(예: NORMAL은 train, ANOMALY는 test) 위와 동일한 데이터
+    누수가 생긴다.
+
+    라벨 하나에 그 라벨을 포함하는 독립 그룹이 비율 개수(예:
+    train/validation/test 3개)보다 적으면 그룹을 쪼개지 않는 한 리크 없이
+    분할을 만들 수 없다 — 이 경우 조용히 윈도우 단위로 섞는 대신
+    `InsufficientAssetGroupsError`를 발생시켜 "데이터 부족" 상태를 명시적으로
+    드러낸다 (근거: dataset_manifest_format.md "분할 전략"). CWRU는 현재
+    라벨당 자산이 1개뿐이라 기본 3-way 분할에서는 이 예외가 발생하는 것이
+    정상이며, 자산이 늘어나거나 train 전용 등 분할 비율을 조정해야 해소된다.
     """
     ratios = DEFAULT_SPLIT_RATIOS if ratios is None else ratios
     validate_split_ratios(ratios)
@@ -184,49 +220,95 @@ def group_split(
         name for name in ("train", "validation", "test") if ratios.get(name, 0) > 0
     ]
 
-    by_label_groups: dict = {}
-    for idx, rec in enumerate(records):
-        label_groups = by_label_groups.setdefault(rec["label"], {})
-        label_groups.setdefault(rec[group_key], []).append(idx)
+    groups: dict = {}  # group_id -> [record idx, ...] (라벨 무관, 전역)
+    group_label_counts: dict = {}  # group_id -> {label: count}
+    label_group_ids: dict = {}  # label -> {group_id, ...}
+    label_totals: dict = {}  # label -> 전체 레코드 수
 
-    split_of_index = {}
-    for label, groups in by_label_groups.items():
-        if len(groups) < len(required_splits):
+    for idx, rec in enumerate(records):
+        group_id, label = rec[group_key], rec["label"]
+        groups.setdefault(group_id, []).append(idx)
+        label_counts = group_label_counts.setdefault(group_id, {})
+        label_counts[label] = label_counts.get(label, 0) + 1
+        label_group_ids.setdefault(label, set()).add(group_id)
+        label_totals[label] = label_totals.get(label, 0) + 1
+
+    for label, group_ids in label_group_ids.items():
+        if len(group_ids) < len(required_splits):
             raise InsufficientAssetGroupsError(
-                f"라벨 {label!r}: 독립 그룹이 {len(groups)}개({sorted(groups)})뿐이라 "
+                f"라벨 {label!r}: 독립 그룹이 {len(group_ids)}개({sorted(group_ids)})뿐이라 "
                 f"{required_splits} {len(required_splits)}-way 그룹 분할을 리크 없이 "
                 "만들 수 없습니다. 자산을 추가하거나 분할 비율(ratios)을 조정하세요."
             )
 
-        rng = random.Random(f"{seed}-{label}")
-        group_ids = list(groups.keys())
-        rng.shuffle(group_ids)  # 동일 크기 그룹 간 배정 순서만 흔들어 결정성 유지
+    targets = {
+        label: {name: ratios[name] * total for name in required_splits}
+        for label, total in label_totals.items()
+    }
+    assigned_counts = {
+        label: {name: 0 for name in required_splits} for label in label_totals
+    }
+    split_of_group: dict = {}
 
-        total = sum(len(indices) for indices in groups.values())
-        targets = {name: ratios[name] * total for name in required_splits}
-        assigned: dict = {name: [] for name in required_splits}
-        assigned_counts = {name: 0 for name in required_splits}
+    def assign(group_id: str, split_name: str) -> None:
+        split_of_group[group_id] = split_name
+        for label, count in group_label_counts[group_id].items():
+            assigned_counts[label][split_name] += count
 
-        # 1단계: 그룹을 쪼개지 않고도 모든 필수 split이 최소 1개 그룹을 받도록
-        # 가장 비율이 작은 split부터 가장 작은 남은 그룹을 배정해 둔다.
-        remaining = sorted(group_ids, key=lambda g: len(groups[g]))
-        for name in sorted(required_splits, key=lambda n: ratios[n]):
-            group_id = remaining.pop(0)
-            assigned[name].append(group_id)
-            assigned_counts[name] += len(groups[group_id])
+    # 1단계: 그룹을 쪼개지 않고도 모든 (라벨, 필수 split) 조합이 최소 1개
+    # 그룹을 받도록, 비율이 작은 split부터 그 라벨을 포함한 가장 작은 미배정
+    # 그룹을 배정한다. 이미 배정된 그룹이 해당 라벨을 포함하면(공유 그룹)
+    # 그 조합은 이미 충족된 것으로 보고 건너뛴다.
+    coverage_pairs = [
+        (label, name) for label in label_group_ids for name in required_splits
+    ]
+    coverage_pairs.sort(key=lambda pair: ratios[pair[1]])
 
-        # 2단계: 남은 그룹은 목표 건수 대비 부족분(deficit)이 가장 큰 split에
-        # 큰 그룹부터 배정하는 그리디로 비율에 최대한 맞춘다.
-        remaining.sort(key=lambda g: -len(groups[g]))
-        for group_id in remaining:
-            best = max(required_splits, key=lambda n: targets[n] - assigned_counts[n])
-            assigned[best].append(group_id)
-            assigned_counts[best] += len(groups[group_id])
+    for label, name in coverage_pairs:
+        if any(split_of_group.get(gid) == name for gid in label_group_ids[label]):
+            continue
+        candidates = [
+            gid for gid in label_group_ids[label] if gid not in split_of_group
+        ]
+        if not candidates:
+            # 그룹 수 자체는 충분해도, 공유 그룹이 다른 라벨의 커버리지
+            # 요구를 이미 흡수해 버리면 이 라벨에는 배정할 그룹이 남지 않을
+            # 수 있다 — 조용히 건너뛰지 않고 명시적으로 알린다.
+            raise InsufficientAssetGroupsError(
+                f"라벨 {label!r}: split {name!r}에 배정할 독립 그룹이 부족합니다 "
+                "(다른 라벨과 공유하는 그룹이 이미 다른 split의 커버리지에 쓰였습니다)."
+            )
+        # 여러 라벨이 공유하는 그룹을 먼저 커버리지에 써버리면 그 그룹을
+        # 필요로 하는 다른 라벨의 커버리지가 나중에 그룹 부족으로 막힐 수
+        # 있다. 그래서 이 라벨 전용(비공유) 그룹을 먼저, 그중에서도 가장
+        # 작은 것부터 쓰고 공유 그룹은 다른 선택지가 없을 때만 쓴다.
+        candidates.sort(
+            key=lambda gid: (len(group_label_counts[gid]) > 1, len(groups[gid]))
+        )
+        assign(candidates[0], name)
 
-        for name, group_list in assigned.items():
-            for group_id in group_list:
-                for idx in groups[group_id]:
-                    split_of_index[idx] = name
+    # 2단계: 남은 그룹은 그 그룹이 걸친 모든 라벨의 목표 건수 대비 부족분
+    # 합이 가장 큰 split에 큰 그룹부터 배정하는 그리디로 비율에 최대한
+    # 맞춘다.
+    rng = random.Random(seed)
+    remaining = [gid for gid in groups if gid not in split_of_group]
+    rng.shuffle(remaining)  # 동일 크기 그룹 간 배정 순서만 흔들어 결정성 유지
+    remaining.sort(key=lambda gid: -len(groups[gid]))
+
+    for group_id in remaining:
+        def deficit(split_name: str, group_id: str = group_id) -> float:
+            return sum(
+                targets[label][split_name] - assigned_counts[label][split_name]
+                for label in group_label_counts[group_id]
+            )
+
+        best = max(required_splits, key=deficit)
+        assign(group_id, best)
+
+    split_of_index = {}
+    for group_id, split_name in split_of_group.items():
+        for idx in groups[group_id]:
+            split_of_index[idx] = split_name
 
     return [split_of_index[i] for i in range(len(records))]
 

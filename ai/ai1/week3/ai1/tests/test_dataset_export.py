@@ -35,6 +35,7 @@ from register_dataset import (  # noqa: E402
     compute_feature_output_fingerprint,
     validate_split_ratios,
     sha256_of_file,
+    extract_all_features,
     DATASET_LABEL_MAPPING,
     LABEL_TAXONOMY_VERSION,
     FEATURE_PIPELINE_VERSION,
@@ -127,6 +128,38 @@ class TestGroupSplitSynthetic(unittest.TestCase):
             records, ratios={"train": 1.0, "validation": 0.0, "test": 0.0}, seed=1
         )
         self.assertEqual(set(splits), {"train"})
+
+    def test_mixed_label_group_is_not_split_across_labels(self):
+        """같은 자산(source_label)이 NORMAL과 ANOMALY 레코드를 함께 가지고
+        있으면, 라벨별로 그룹을 따로 만드는 예전 로직에서는 같은 자산이
+        라벨에 따라 서로 다른 split에 배정될 수 있었다(예: NORMAL은 train,
+        ANOMALY는 test). 자산은 라벨과 무관하게 하나의 split에만 속해야
+        한다."""
+        # 그룹별 크기를 라벨마다 반대 순서로 둬서, 라벨별로 그룹을 따로
+        # 묶는 예전 로직이라면 shared.mat이 NORMAL 기준으로는 가장 큰 그룹(->
+        # train), ANOMALY 기준으로는 가장 작은 그룹(-> test)이 되어 실제로
+        # 서로 다른 split에 배정되는 상황을 재현한다.
+        shared = [{"label": "NORMAL", "source_label": "shared.mat"} for _ in range(20)]
+        shared += [
+            {"label": "ANOMALY", "source_label": "shared.mat"} for _ in range(20)
+        ]
+        records = (
+            shared
+            + _grouped_records("NORMAL", {"b.mat": 5, "c.mat": 5})
+            + _grouped_records("ANOMALY", {"e.mat": 50, "f.mat": 50})
+        )
+        splits = group_split(records, seed=0)
+
+        shared_splits = {
+            split
+            for rec, split in zip(records, splits)
+            if rec["source_label"] == "shared.mat"
+        }
+        self.assertEqual(
+            len(shared_splits),
+            1,
+            f"공유 자산 shared.mat이 여러 split에 걸쳐 있습니다: {shared_splits}",
+        )
 
 
 class TestComputeVersionChecksum(unittest.TestCase):
@@ -240,6 +273,56 @@ class TestMfccFallbackWarningIsEncodingSafe(unittest.TestCase):
             with contextlib.redirect_stdout(cp949_stream):
                 mfcc = compute_mfcc(np.zeros(4096), FeatureConfig())
         self.assertTrue(np.all(mfcc == 0.0))
+
+
+class TestWeek2ExtractFeaturesModuleIsolation(unittest.TestCase):
+    """week1과 week2가 둘 다 `extract_features.py`라는 같은 이름의 모듈을
+    갖고 있다. 같은 프로세스에서 week1의 extract_features가 먼저 평범한
+    이름("extract_features")으로 import되면 sys.modules 캐시 때문에,
+    이후 register_dataset이 week2 디렉터리를 sys.path 앞쪽에 넣고 같은
+    이름으로 import해도 캐시된 week1 모듈이 재사용될 수 있다 — 이 경우
+    week2 전용 kurtosis 특징이 조용히 빠진다."""
+
+    def test_week2_kurtosis_feature_present_even_if_week1_module_cached_first(self):
+        week1_extract_features_path = os.path.normpath(
+            os.path.join(
+                _THIS_DIR,
+                "..",
+                "..",
+                "..",
+                "week1",
+                "ai1",
+                "feature_extraction",
+                "extract_features.py",
+            )
+        )
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "extract_features", week1_extract_features_path
+        )
+        week1_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(week1_module)
+
+        # week1의 extract_features가 먼저 "extract_features"라는 이름으로
+        # sys.modules에 캐시된 상황을 재현한다 (예: week1 테스트가 먼저
+        # 수집·실행된 경우).
+        previous = sys.modules.get("extract_features")
+        sys.modules["extract_features"] = week1_module
+        try:
+            t = np.linspace(0, 1, 12000, endpoint=False)
+            signal = np.sin(2 * np.pi * 100 * t)
+            features = extract_all_features(signal, FeatureConfig(sample_rate=12000))
+            self.assertIn(
+                "kurtosis_mean",
+                features,
+                "week1 모듈 이름 충돌 때문에 week2 전용 kurtosis 특징이 빠졌습니다",
+            )
+        finally:
+            if previous is None:
+                sys.modules.pop("extract_features", None)
+            else:
+                sys.modules["extract_features"] = previous
 
 
 class TestValidateSplitRatios(unittest.TestCase):
@@ -397,6 +480,52 @@ class TestExportDatasetSynthetic(unittest.TestCase):
             self.assertIn("manifest", wb.sheetnames)
             self.assertIn("rows", wb.sheetnames)
             self.assertEqual(wb["rows"].max_row - 1, manifest["rowCount"])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_failed_export_does_not_corrupt_previous_version(self):
+        """CSV/XLSX/manifest를 output_dir에 바로 순차 기록하면, 뒤쪽 파일
+        생성이 실패했을 때 앞서 이미 덮어쓴 파일만 새 버전이고 나머지는
+        이전 버전으로 남아 서로 다른 버전이 섞인다. XLSX 저장이 실패해도
+        output_dir의 세 파일이 실패 이전(v1) 상태 그대로여야 한다."""
+        manifest_v1 = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_atomic_")
+        try:
+            result_v1 = export_dataset(manifest_v1, tmp_dir)
+            with open(result_v1["csv_path"], "rb") as f:
+                csv_before = f.read()
+            with open(result_v1["xlsx_path"], "rb") as f:
+                xlsx_before = f.read()
+            with open(result_v1["manifest_path"], "rb") as f:
+                manifest_before = f.read()
+
+            manifest_v2 = self._synthetic_manifest()
+            manifest_v2["id"] = "DS-CWRU-VIBRATION-19700102-deadbeefcafe"
+            manifest_v2["rows"][0]["rms_mean"] = 0.99  # v1과 구분되는 값
+
+            with mock.patch(
+                "export_dataset.Workbook.save", side_effect=RuntimeError("disk full")
+            ):
+                with self.assertRaises(RuntimeError):
+                    export_dataset(manifest_v2, tmp_dir)
+
+            with open(result_v1["csv_path"], "rb") as f:
+                self.assertEqual(f.read(), csv_before, "실패한 내보내기가 CSV를 건드렸습니다")
+            with open(result_v1["xlsx_path"], "rb") as f:
+                self.assertEqual(f.read(), xlsx_before, "실패한 내보내기가 XLSX를 건드렸습니다")
+            with open(result_v1["manifest_path"], "rb") as f:
+                self.assertEqual(
+                    f.read(), manifest_before, "실패한 내보내기가 manifest를 건드렸습니다"
+                )
+
+            leftovers = [
+                name
+                for name in os.listdir(tmp_dir)
+                if name.startswith(".dataset_export_staging-")
+            ]
+            self.assertEqual(
+                leftovers, [], f"스테이징 디렉터리가 정리되지 않았습니다: {leftovers}"
+            )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 

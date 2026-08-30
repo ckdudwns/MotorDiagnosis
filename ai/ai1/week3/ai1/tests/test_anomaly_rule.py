@@ -85,9 +85,12 @@ class TestAnomalyRuleConfig(unittest.TestCase):
 class TestAssetBaselineRegistry(unittest.TestCase):
     def test_resolve_prefers_asset_id_over_asset_type_over_default(self):
         registry = AssetBaselineRegistry()
-        default_baseline = {"tag": "default"}
-        motor_baseline = {"tag": "MOTOR"}
-        specific_baseline = {"tag": "SITE-01-MOT-02"}
+        default_baseline = {"tag": "default", "features": {"x": {"mean": 0.0, "std": 1.0}}}
+        motor_baseline = {"tag": "MOTOR", "features": {"x": {"mean": 0.0, "std": 1.0}}}
+        specific_baseline = {
+            "tag": "SITE-01-MOT-02",
+            "features": {"x": {"mean": 0.0, "std": 1.0}},
+        }
 
         registry.register(default_baseline, is_default=True)
         registry.register(motor_baseline, asset_type="MOTOR")
@@ -110,6 +113,64 @@ class TestAssetBaselineRegistry(unittest.TestCase):
         registry = AssetBaselineRegistry()
         with self.assertRaises(KeyError):
             registry.resolve(asset_id="X")
+
+    def test_register_rejects_nan_mean(self):
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": float("nan"), "std": 1.0}}}
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+    def test_register_rejects_nan_std(self):
+        """NaN std는 check_outliers()의 low/high도 NaN으로 만들어, 어떤 값과
+        비교해도 False가 되므로 모든 윈도우가 조용히 NORMAL 처리된다 —
+        등록 시점에 막아야 한다."""
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": float("nan")}}}
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+    def test_register_rejects_infinite_std(self):
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": float("inf")}}}
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+    def test_register_rejects_negative_std(self):
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": -1.0}}}
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+    def test_register_rejects_empty_features(self):
+        registry = AssetBaselineRegistry()
+        with self.assertRaises(ValueError):
+            registry.register({"features": {}}, is_default=True)
+
+    def test_register_rejects_missing_features_key(self):
+        registry = AssetBaselineRegistry()
+        with self.assertRaises(ValueError):
+            registry.register({}, is_default=True)
+
+    def test_register_rejects_non_numeric_mean(self):
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": "0.0", "std": 1.0}}}
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+    def test_corrupted_baseline_would_have_masked_extreme_values(self):
+        """등록 검증이 없다면 NaN std baseline은 극단값 윈도우도 전부
+        NORMAL로 판정한다는 것을 직접 재현해, 검증이 실제 탐지 실패를
+        막는다는 것을 보여준다."""
+        baseline = {"features": {"x": {"mean": 0.0, "std": float("nan")}}}
+        registry = AssetBaselineRegistry()
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+        # 레지스트리를 우회해 evaluate_feature_stream에 직접 손상된 baseline을
+        # 넘기면(검증이 없다면 실제로 벌어졌을 상황) 극단값도 NORMAL로 잡힌다.
+        windows = [{"x": 1e9}] * 5
+        result = evaluate_feature_stream(windows, baseline, AnomalyRuleConfig())
+        self.assertEqual(result["events"], [], "NaN std baseline은 fail-open으로 이어진다")
 
 
 class TestHysteresisSuppressesSingleSpike(unittest.TestCase):

@@ -8,6 +8,7 @@ EVENT_DETAIL_01 테스트 — 이벤트 전후 특징량 비교 데이터 구조
 
 import os
 import sys
+import math
 import unittest
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +54,38 @@ class TestSummarizeWindowFeatures(unittest.TestCase):
         self.assertEqual(summary["rms_mean"]["min"], 1.0)
         self.assertEqual(summary["rms_mean"]["max"], 3.0)
         self.assertEqual(summary["rms_mean"]["n"], 3)
+
+    def test_nan_values_excluded_from_stats(self):
+        """NaN이 mean/min/max에 섞이면 이후 계산 전체가 NaN으로 오염되고
+        strict JSON 직렬화도 실패한다 — 통계에서 제외해야 한다."""
+        summary = summarize_window_features(
+            [{"x": 1.0}, {"x": float("nan")}, {"x": 3.0}]
+        )
+        self.assertAlmostEqual(summary["x"]["mean"], 2.0)
+        self.assertEqual(summary["x"]["n"], 2)
+        self.assertEqual(summary["x"]["n_invalid"], 1)
+        self.assertTrue(math.isfinite(summary["x"]["mean"]))
+
+    def test_inf_values_excluded_from_stats(self):
+        summary = summarize_window_features(
+            [{"x": 1.0}, {"x": float("inf")}, {"x": 3.0}]
+        )
+        self.assertAlmostEqual(summary["x"]["mean"], 2.0)
+        self.assertEqual(summary["x"]["n_invalid"], 1)
+
+    def test_none_and_non_numeric_values_excluded_from_stats(self):
+        summary = summarize_window_features(
+            [{"x": 1.0}, {"x": None}, {"x": "oops"}, {"x": True}, {"x": 3.0}]
+        )
+        self.assertAlmostEqual(summary["x"]["mean"], 2.0)
+        self.assertEqual(summary["x"]["n"], 2)
+        self.assertEqual(summary["x"]["n_invalid"], 3)
+
+    def test_feature_entirely_invalid_is_excluded_from_summary(self):
+        summary = summarize_window_features(
+            [{"x": float("nan")}, {"x": float("inf")}, {"x": None}]
+        )
+        self.assertNotIn("x", summary)
 
 
 class TestBuildEventDetailSynthetic(unittest.TestCase):
@@ -247,6 +280,73 @@ class TestBuildEventDetailSynthetic(unittest.TestCase):
                 window_seconds=1.0,
                 window_duration_sec="0.2",
             )
+
+    def test_nan_feature_value_does_not_break_strict_json_serialization(self):
+        """NaN/Inf가 mean/delta/pct_change로 전파되면 data_missing=false인
+        채로 strict JSON(allow_nan=False) 직렬화가 실패한다 — 응답 전체가
+        strict 직렬화 가능해야 한다."""
+        import json
+
+        windows = _fixture_windows([0.0] * 3 + [float("nan")] * 2 + [5.0] * 5)
+        detail = build_event_detail(
+            event=_sample_event(),
+            ordered_windows=windows,
+            event_index=5,
+            window_seconds=5 * 0.2,
+            window_duration_sec=0.2,
+        )
+        json.dumps(detail, allow_nan=False)  # 실패하면 예외 발생
+
+    def test_applied_model_version_from_explicit_argument_is_preserved(self):
+        windows = _fixture_windows([0.0] * 5)
+        detail = build_event_detail(
+            event=_sample_event(),
+            ordered_windows=windows,
+            event_index=2,
+            window_seconds=0.2,
+            window_duration_sec=0.2,
+            applied_model_version="freq-ae-v1",
+        )
+        self.assertEqual(detail["applied_model_version"], "freq-ae-v1")
+
+    def test_applied_model_version_falls_back_to_event_field(self):
+        """EVENT_DETAIL_01 기능정의는 적용 임계값/모델 버전을 반환해야 하는데,
+        판정 당시 이벤트에 modelVersion이 실려 있어도 명시적 인자를 안 넘기면
+        상세 응답에서 유실되면 안 된다."""
+        event = {"id": "EV-241", "assetId": "SITE-01-MOT-02", "modelVersion": "freq-ae-v2"}
+        windows = _fixture_windows([0.0] * 5)
+        detail = build_event_detail(
+            event=event,
+            ordered_windows=windows,
+            event_index=2,
+            window_seconds=0.2,
+            window_duration_sec=0.2,
+        )
+        self.assertEqual(detail["applied_model_version"], "freq-ae-v2")
+
+    def test_applied_model_version_explicit_argument_overrides_event_field(self):
+        event = {"id": "EV-241", "assetId": "SITE-01-MOT-02", "modelVersion": "freq-ae-v2"}
+        windows = _fixture_windows([0.0] * 5)
+        detail = build_event_detail(
+            event=event,
+            ordered_windows=windows,
+            event_index=2,
+            window_seconds=0.2,
+            window_duration_sec=0.2,
+            applied_model_version="freq-ae-v3",
+        )
+        self.assertEqual(detail["applied_model_version"], "freq-ae-v3")
+
+    def test_applied_model_version_defaults_to_none(self):
+        windows = _fixture_windows([0.0] * 5)
+        detail = build_event_detail(
+            event=_sample_event(),
+            ordered_windows=windows,
+            event_index=2,
+            window_seconds=0.2,
+            window_duration_sec=0.2,
+        )
+        self.assertIsNone(detail["applied_model_version"])
 
     def test_empty_ordered_windows_raises(self):
         with self.assertRaises(ValueError):

@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import ssl
 import threading
@@ -251,6 +252,7 @@ class MqttRetryQueue:
         max_delay: float = 120.0,
         poll_interval: float = 0.5,
         database_timeout: float = 0.25,
+        lease_seconds: float = 60.0,
     ) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,6 +263,8 @@ class MqttRetryQueue:
         self.max_delay = max(self.initial_delay, max_delay)
         self.poll_interval = max(0.05, poll_interval)
         self.database_timeout = max(0.05, database_timeout)
+        self.lease_seconds = max(1.0, lease_seconds)
+        self._claim_owner = secrets.token_hex(16)
         self._ack_targets: dict[str, tuple[Any, RetryMessage]] = {}
         self._target_lock = threading.Lock()
         self._processing_lock = threading.Lock()
@@ -309,6 +313,8 @@ class MqttRetryQueue:
                     last_error_message TEXT NOT NULL,
                     delivery_completed INTEGER NOT NULL DEFAULT 0,
                     delivery_outcome TEXT NOT NULL DEFAULT '',
+                    claim_owner TEXT NOT NULL DEFAULT '',
+                    claim_until REAL NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL
                 )
                 """
@@ -324,6 +330,8 @@ class MqttRetryQueue:
                 "last_error_message": "TEXT NOT NULL DEFAULT ''",
                 "delivery_completed": "INTEGER NOT NULL DEFAULT 0",
                 "delivery_outcome": "TEXT NOT NULL DEFAULT ''",
+                "claim_owner": "TEXT NOT NULL DEFAULT ''",
+                "claim_until": "REAL NOT NULL DEFAULT 0",
             }
             for column, definition in migrations.items():
                 if column not in columns:
@@ -370,6 +378,16 @@ class MqttRetryQueue:
         digest.update(message.payload)
         digest.update(b"\0")
         digest.update(str(message.mid).encode("ascii"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _legacy_message_key(operation: str, message: RetryMessage) -> str:
+        digest = hashlib.sha256()
+        digest.update(operation.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(message.topic.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(message.payload)
         return digest.hexdigest()
 
     def enqueue(
@@ -460,22 +478,16 @@ class MqttRetryQueue:
             ).fetchone()
         return int(row["count"])
 
-    def _next_due(self, now: float) -> sqlite3.Row | None:
-        with self._connection() as connection:
-            return connection.execute(
-                """
-                SELECT * FROM mqtt_retry_queue
-                WHERE next_attempt_at <= ?
-                ORDER BY next_attempt_at, created_at
-                LIMIT 1
-                """,
-                (now,),
-            ).fetchone()
-
     def resume_pending_message(self, client: Any, message: Any) -> str | None:
         retry_message = self._snapshot(message)
+        if not retry_message.dup:
+            return None
         message_keys = tuple(
             self._message_key(operation, retry_message)
+            for operation in ("quarantine", "ingest")
+        )
+        legacy_message_keys = tuple(
+            self._legacy_message_key(operation, retry_message)
             for operation in ("quarantine", "ingest")
         )
         try:
@@ -490,30 +502,25 @@ class MqttRetryQueue:
                         """,
                         message_keys,
                     ).fetchone()
-                    if row is None and retry_message.dup:
+                    if row is None:
                         row = connection.execute(
                             """
                             SELECT * FROM mqtt_retry_queue
-                            WHERE operation IN ('quarantine', 'ingest')
-                              AND topic = ? AND payload = ?
+                            WHERE message_key IN (?, ?) AND mid = ?
                             ORDER BY delivery_completed DESC, created_at
                             LIMIT 1
                             """,
-                            (
-                                retry_message.topic,
-                                sqlite3.Binary(retry_message.payload),
-                            ),
+                            (*legacy_message_keys, retry_message.mid),
                         ).fetchone()
                     if row is None:
                         return None
                     connection.execute(
                         """
                         UPDATE mqtt_retry_queue
-                        SET mid = ?, qos = ?, next_attempt_at = ?
+                        SET qos = ?, next_attempt_at = ?
                         WHERE message_key = ?
                         """,
                         (
-                            retry_message.mid,
                             retry_message.qos,
                             time.time(),
                             row["message_key"],
@@ -560,7 +567,8 @@ class MqttRetryQueue:
                 """
                 UPDATE mqtt_retry_queue
                 SET attempts = ?, next_attempt_at = ?,
-                    last_error_code = ?, last_error_message = ?
+                    last_error_code = ?, last_error_message = ?,
+                    claim_owner = '', claim_until = 0
                 WHERE message_key = ?
                 """,
                 (
@@ -597,7 +605,7 @@ class MqttRetryQueue:
             connection.execute(
                 """
                 UPDATE mqtt_retry_queue
-                SET next_attempt_at = ?
+                SET next_attempt_at = ?, claim_owner = '', claim_until = 0
                 WHERE message_key = ?
                 """,
                 (time.time() + delay, row["message_key"]),
@@ -642,19 +650,56 @@ class MqttRetryQueue:
         return outcome
 
     def _claim_next_due(self, now: float) -> sqlite3.Row | None:
+        claimed_at = time.time()
+        claim_until = claimed_at + self.lease_seconds
         with self._processing_lock:
-            row = self._next_due(now)
-            if row is None:
-                return None
-            message_key = str(row["message_key"])
-            if message_key in self._inflight_message_keys:
-                return None
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT * FROM mqtt_retry_queue
+                    WHERE next_attempt_at <= ? AND claim_until <= ?
+                    ORDER BY next_attempt_at, created_at, message_key
+                    LIMIT 1
+                    """,
+                    (now, claimed_at),
+                ).fetchone()
+                if row is None:
+                    return None
+                message_key = str(row["message_key"])
+                claimed = connection.execute(
+                    """
+                    UPDATE mqtt_retry_queue
+                    SET claim_owner = ?, claim_until = ?
+                    WHERE message_key = ? AND claim_until <= ?
+                    """,
+                    (self._claim_owner, claim_until, message_key, claimed_at),
+                )
+                if claimed.rowcount != 1:
+                    return None
             self._inflight_message_keys.add(message_key)
             return row
 
     def _release_claim(self, row: sqlite3.Row) -> None:
         with self._processing_lock:
-            self._inflight_message_keys.discard(str(row["message_key"]))
+            message_key = str(row["message_key"])
+            try:
+                with self._connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue
+                        SET claim_owner = '', claim_until = 0
+                        WHERE message_key = ? AND claim_owner = ?
+                        """,
+                        (message_key, self._claim_owner),
+                    )
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_retry_claim_release_failed key=%s error=%s",
+                    message_key,
+                    error,
+                )
+            self._inflight_message_keys.discard(message_key)
 
     def _complete_claimed(self, row: sqlite3.Row, outcome: str) -> str:
         with self._processing_lock:

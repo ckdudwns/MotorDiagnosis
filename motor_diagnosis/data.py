@@ -1502,9 +1502,21 @@ def parse_int_field(payload: dict[str, Any], *keys: str, default: int = 0) -> in
 
 
 def rated_rpm_field(payload: dict[str, Any], *, default: int = 0) -> int:
-    provided = any(key in payload for key in ("ratedRpm", "rpm"))
-    value = parse_int_field(payload, "ratedRpm", "rpm", default=default)
-    if provided and not MIN_RATED_RPM <= value <= MAX_RATED_RPM:
+    field = next((key for key in ("ratedRpm", "rpm") if key in payload), None)
+    if field is None:
+        return default
+    raw_value = payload[field]
+    if (
+        isinstance(raw_value, bool)
+        or (
+            isinstance(raw_value, float)
+            and (not math.isfinite(raw_value) or not raw_value.is_integer())
+        )
+        or not isinstance(raw_value, (int, float, str))
+    ):
+        raise ApiError(400, "INVALID_NUMBER", f"{field} must be an integer.")
+    value = parse_int_value(field, raw_value, default)
+    if not MIN_RATED_RPM <= value <= MAX_RATED_RPM:
         raise ApiError(
             400,
             "VALUE_OUT_OF_RANGE",

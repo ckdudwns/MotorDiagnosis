@@ -421,6 +421,32 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(get_asset_by_id(asset["id"])["ratedRpm"], 1800)
         self.assertTrue(telemetry_for("SITE-01", asset["id"]))
 
+        for invalid_rpm in (True, 1800.9, 120000.9):
+            with self.subTest(create_invalid_rpm=invalid_rpm):
+                with self.assertRaises(ApiError) as invalid_create:
+                    create_asset(
+                        self.admin,
+                        "SITE-01",
+                        {
+                            "assetCode": "RPM-NON-INTEGER",
+                            "name": "Invalid RPM motor",
+                            "assetType": "motor",
+                            "ratedRpm": invalid_rpm,
+                        },
+                    )
+                self.assertEqual(invalid_create.exception.code, "INVALID_NUMBER")
+
+            with self.subTest(update_invalid_rpm=invalid_rpm):
+                with self.assertRaises(ApiError) as invalid_update:
+                    update_asset(
+                        self.admin,
+                        "SITE-01",
+                        asset["id"],
+                        {"ratedRpm": invalid_rpm},
+                    )
+                self.assertEqual(invalid_update.exception.code, "INVALID_NUMBER")
+                self.assertEqual(get_asset_by_id(asset["id"])["ratedRpm"], 1800)
+
     def test_dataset_event_labels_sort_rfc3339_values_by_instant(self) -> None:
         asset_id = "SITE-01-MOT-02"
         older = {

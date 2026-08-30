@@ -548,7 +548,7 @@ class Week2BackendTest(unittest.TestCase):
                 self.assertEqual(client.ack_calls, [(21, 1)])
                 self.assertEqual(retry_queue.pending_count(), 0)
 
-    def test_retry_db_lock_returns_quick_retry_without_forward_or_ack(self) -> None:
+    def test_retry_db_lock_does_not_block_a_new_non_dup_message(self) -> None:
         class FakeClient:
             def __init__(self) -> None:
                 self.ack_calls: list[tuple[int, int]] = []
@@ -579,7 +579,15 @@ class Week2BackendTest(unittest.TestCase):
             locking_connection.execute("BEGIN EXCLUSIVE")
             try:
                 with patch(
-                    "motor_diagnosis.mqtt_service.forward_mqtt_message"
+                    "motor_diagnosis.mqtt_service.forward_mqtt_message",
+                    return_value=(
+                        {
+                            "deviceId": "DEV-LOCKED",
+                            "sequence": 301,
+                            "duplicate": False,
+                        },
+                        201,
+                    ),
                 ) as forward:
                     started = time.perf_counter()
                     result = process_mqtt_message(
@@ -595,10 +603,10 @@ class Week2BackendTest(unittest.TestCase):
                 locking_connection.rollback()
                 locking_connection.close()
 
-            self.assertEqual(result, "retry")
+            self.assertEqual(result, "accepted")
             self.assertLess(elapsed, 1.0)
-            self.assertEqual(client.ack_calls, [])
-            forward.assert_not_called()
+            self.assertEqual(client.ack_calls, [(301, 1)])
+            forward.assert_called_once()
             self.assertEqual(retry_queue.pending_count(), 0)
 
     def test_equal_payload_packets_keep_separate_retry_ack_targets(self) -> None:
@@ -667,6 +675,69 @@ class Week2BackendTest(unittest.TestCase):
 
             self.assertEqual(forward.call_count, 4)
             self.assertCountEqual(client.ack_calls, [(401, 1), (402, 1)])
+            self.assertEqual(retry_queue.pending_count(), 0)
+
+    def test_different_mid_dup_packet_does_not_resume_completed_row(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        client = FakeClient()
+        payload = b'{"deviceId":"DEV-DUP","sequence":501}'
+        completed_message = SimpleNamespace(
+            topic="devices/DEV-DUP/telemetry",
+            payload=payload,
+            mid=101,
+            qos=1,
+            dup=False,
+        )
+        different_packet = SimpleNamespace(
+            **{**vars(completed_message), "mid": 102, "dup": True}
+        )
+        accepted = {"deviceId": "DEV-DUP", "sequence": 501, "duplicate": False}
+
+        with tempfile.TemporaryDirectory() as directory:
+            retry_queue = MqttRetryQueue(
+                database_path=Path(directory) / "dup-mid-retry.sqlite3",
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+                initial_delay=0,
+            )
+            self.assertTrue(
+                retry_queue.enqueue(
+                    client,
+                    completed_message,
+                    MqttBridgeError(503, "MQTT_ACK_FAILED", "ACK failed"),
+                    delivery_completed=True,
+                )
+            )
+
+            with patch(
+                "motor_diagnosis.mqtt_service.forward_mqtt_message",
+                return_value=(accepted, 201),
+            ) as forward:
+                outcome = process_mqtt_message(
+                    client,
+                    different_packet,
+                    endpoint="http://backend/api/telemetry/ingest",
+                    quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                    token="token",
+                    retry_queue=retry_queue,
+                )
+
+            self.assertEqual(outcome, "accepted")
+            forward.assert_called_once()
+            self.assertEqual(client.ack_calls, [(102, 1)])
+            self.assertEqual(retry_queue.pending_count(), 1)
+            self.assertEqual(
+                retry_queue.process_due_once(now=float("inf")), "accepted"
+            )
+            self.assertEqual(client.ack_calls, [(102, 1), (101, 1)])
             self.assertEqual(retry_queue.pending_count(), 0)
 
     def test_mqtt_health_waits_for_successful_suback(self) -> None:
@@ -1335,7 +1406,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
 
                 redelivery_client = SuccessfulAckClient()
                 redelivered_message = SimpleNamespace(
-                    **{**vars(message), "mid": 58, "dup": True}
+                    **{**vars(message), "dup": True}
                 )
                 resumed = process_mqtt_message(
                     redelivery_client,
@@ -1351,7 +1422,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
             self.assertEqual(restarted_queue.pending_count(), 0)
 
         self.assertEqual(failing_client.ack_calls, [(57, 1)])
-        self.assertEqual(redelivery_client.ack_calls, [(58, 1)])
+        self.assertEqual(redelivery_client.ack_calls, [(57, 1)])
         self.assertEqual(len(QUARANTINED_DEVICE_MESSAGES), initial_records + 1)
         self.assertEqual(TELEMETRY_METRICS["rejected"], initial_rejected + 1)
         self.assertEqual(TELEMETRY_METRICS["localRejected"], initial_local_rejected + 1)
@@ -1463,6 +1534,86 @@ class Week2HttpSmokeTest(unittest.TestCase):
             self.assertEqual(fresh_client.ack_calls, [(202, 1)])
             self.assertEqual(retry_client.ack_calls, [(201, 1)])
             self.assertEqual(retry_queue.pending_count(), 0)
+
+    def test_two_retry_queue_instances_claim_each_row_only_once(self) -> None:
+        class AckClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        client = AckClient()
+        message = SimpleNamespace(
+            topic="devices/DEV-CLAIM/telemetry",
+            payload=b'{"invalid":true}',
+            mid=601,
+            qos=1,
+            dup=False,
+        )
+        delivery_started = threading.Event()
+        release_delivery = threading.Event()
+        results: list[str] = []
+        errors: list[BaseException] = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "shared-retry.sqlite3"
+            first_queue = MqttRetryQueue(
+                database_path=database_path,
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+                initial_delay=0,
+            )
+            second_queue = MqttRetryQueue(
+                database_path=database_path,
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+                initial_delay=0,
+            )
+            self.assertTrue(
+                first_queue.enqueue(
+                    client,
+                    message,
+                    MqttBridgeError(
+                        400, "INVALID_JSON", "Invalid MQTT JSON.", local=True
+                    ),
+                    operation="quarantine",
+                )
+            )
+
+            def delayed_quarantine(*_args, **_kwargs) -> None:
+                delivery_started.set()
+                if not release_delivery.wait(5):
+                    raise AssertionError("quarantine delivery was not released")
+
+            def run_first_queue() -> None:
+                try:
+                    results.append(first_queue.process_due_once(now=float("inf")))
+                except BaseException as error:
+                    errors.append(error)
+
+            with patch(
+                "motor_diagnosis.mqtt_service.quarantine_local_mqtt_message",
+                side_effect=delayed_quarantine,
+            ) as quarantine:
+                first_thread = threading.Thread(target=run_first_queue)
+                first_thread.start()
+                self.assertTrue(delivery_started.wait(1))
+                self.assertEqual(
+                    second_queue.process_due_once(now=float("inf")), "idle"
+                )
+                release_delivery.set()
+                first_thread.join(timeout=2)
+
+            self.assertFalse(first_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results, ["quarantined"])
+            quarantine.assert_called_once()
+            self.assertEqual(client.ack_calls, [(601, 1)])
+            self.assertEqual(first_queue.pending_count(), 0)
 
     def test_actual_ai2_replay_output_is_accepted_and_queryable(self) -> None:
         source_asset_id = "SYN-ASSET-01"

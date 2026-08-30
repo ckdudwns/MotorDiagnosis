@@ -16,6 +16,8 @@ from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .json_validation import loads_strict_json
+
 
 LOGGER = logging.getLogger("motor_diagnosis.mqtt")
 RETRYABLE_HTTP_STATUSES = {408, 425, 429}
@@ -51,10 +53,10 @@ def decode_mqtt_payload(topic: str, message: bytes | str) -> dict[str, Any]:
             local=True,
         )
     try:
-        payload = json.loads(
+        payload = loads_strict_json(
             message.decode("utf-8") if isinstance(message, bytes) else message
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise MqttBridgeError(
             400,
             "INVALID_JSON",

@@ -949,6 +949,40 @@ class Week2HttpSmokeTest(unittest.TestCase):
         self.assertEqual(forbidden_status, 403)
         self.assertEqual(forbidden["error"]["code"], "TELEMETRY_QUARANTINE_FORBIDDEN")
 
+    def test_mqtt_lone_surrogate_is_quarantined_before_ack(self) -> None:
+        class AckClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        client = AckClient()
+        payload = telemetry_payload(sequence=53, source="\ud800")
+        message = SimpleNamespace(
+            topic="devices/DEV-01-GEN-01/telemetry",
+            payload=json.dumps(payload).encode("utf-8"),
+            mid=53,
+            qos=1,
+        )
+
+        delivery = process_mqtt_message(
+            client,
+            message,
+            endpoint=f"http://127.0.0.1:{self.port}/api/telemetry/ingest",
+            quarantine_endpoint=(
+                f"http://127.0.0.1:{self.port}/api/telemetry/quarantine"
+            ),
+            token="demo-mqtt-ingest-token",
+        )
+
+        self.assertEqual(delivery, "quarantined")
+        self.assertEqual(client.ack_calls, [(53, 1)])
+        self.assertEqual(QUARANTINED_DEVICE_MESSAGES[-1]["reason"], "INVALID_JSON")
+        self.assertEqual(TELEMETRY_METRICS["localRejected"], 1)
+        self.assertEqual(TELEMETRY_METRICS["rejected"], 1)
+
     def test_actual_ai2_replay_output_is_accepted_and_queryable(self) -> None:
         source_asset_id = "SYN-ASSET-01"
         generated = build_replay_record(

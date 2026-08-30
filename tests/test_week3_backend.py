@@ -1802,6 +1802,28 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(history["total"], 0)
 
+    def test_non_finite_json_numbers_are_rejected_before_site_changes(self) -> None:
+        status, sites_before = self.request("/api/sites", token=self.operator_token)
+        self.assertEqual(status, 200)
+        site_before = next(site for site in sites_before if site["id"] == "SITE-01")
+
+        for number_literal in (b"NaN", b"Infinity", b"-Infinity", b"1e9999"):
+            with self.subTest(number_literal=number_literal):
+                status, body, _ = self.request_raw(
+                    "/api/sites/SITE-01",
+                    method="PATCH",
+                    raw_body=b'{"status":' + number_literal + b"}",
+                    token=self.admin_token,
+                )
+                response = json.loads(body.decode("utf-8"))
+                self.assertEqual(status, 400)
+                self.assertEqual(response["error"]["code"], "INVALID_JSON")
+
+        status, sites_after = self.request("/api/sites", token=self.operator_token)
+        self.assertEqual(status, 200)
+        site_after = next(site for site in sites_after if site["id"] == "SITE-01")
+        self.assertEqual(site_after["status"], site_before["status"])
+
     def test_event_lookup_detail_review_and_history(self) -> None:
         status, page = self.request(
             "/api/events?siteId=SITE-01&page=1&size=1",

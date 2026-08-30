@@ -95,31 +95,12 @@ from .data import (
     connectivity_tests_for_device,
     parameters_for,
 )
+from .json_validation import loads_strict_json
 from .web import render_page
 
 
 LOGGER = logging.getLogger("motor_diagnosis")
 MAX_JSON_BODY_BYTES = 64 * 1024
-
-
-def _validate_json_unicode(value: Any) -> None:
-    pending = [value]
-    while pending:
-        current = pending.pop()
-        if isinstance(current, str):
-            if any(0xD800 <= ord(character) <= 0xDFFF for character in current):
-                raise ApiError(
-                    400,
-                    "INVALID_JSON",
-                    "JSON strings must contain valid Unicode scalar values.",
-                )
-            continue
-        if isinstance(current, dict):
-            pending.extend(current.keys())
-            pending.extend(current.values())
-            continue
-        if isinstance(current, list):
-            pending.extend(current)
 
 
 def _safe_csv_cell(value: Any) -> Any:
@@ -804,7 +785,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 "Only application/json requests are supported.",
             )
         try:
-            data = json.loads(self.rfile.read(length).decode("utf-8"))
+            data = loads_strict_json(self.rfile.read(length).decode("utf-8"))
         except UnicodeDecodeError as exc:
             raise ApiError(
                 400, "INVALID_JSON", "Request body must be valid UTF-8 JSON."
@@ -819,7 +800,6 @@ class AppHandler(BaseHTTPRequestHandler):
             ) from exc
         if not isinstance(data, dict):
             raise ApiError(400, "INVALID_JSON_BODY", "JSON body must be an object.")
-        _validate_json_unicode(data)
         return data
 
     def send_json(self, payload: Any, status: int = 200) -> None:

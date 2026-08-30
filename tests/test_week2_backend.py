@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -546,6 +548,127 @@ class Week2BackendTest(unittest.TestCase):
                 self.assertEqual(client.ack_calls, [(21, 1)])
                 self.assertEqual(retry_queue.pending_count(), 0)
 
+    def test_retry_db_lock_returns_quick_retry_without_forward_or_ack(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        message = SimpleNamespace(
+            topic="devices/DEV-LOCKED/telemetry",
+            payload=b'{"sequence": 301}',
+            mid=301,
+            qos=1,
+            dup=False,
+        )
+        client = FakeClient()
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "locked-retry.sqlite3"
+            retry_queue = MqttRetryQueue(
+                database_path=database_path,
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+                database_timeout=0.1,
+            )
+            locking_connection = sqlite3.connect(database_path, timeout=0.1)
+            locking_connection.execute("BEGIN EXCLUSIVE")
+            try:
+                with patch(
+                    "motor_diagnosis.mqtt_service.forward_mqtt_message"
+                ) as forward:
+                    started = time.perf_counter()
+                    result = process_mqtt_message(
+                        client,
+                        message,
+                        endpoint="http://backend/api/telemetry/ingest",
+                        quarantine_endpoint=("http://backend/api/telemetry/quarantine"),
+                        token="token",
+                        retry_queue=retry_queue,
+                    )
+                    elapsed = time.perf_counter() - started
+            finally:
+                locking_connection.rollback()
+                locking_connection.close()
+
+            self.assertEqual(result, "retry")
+            self.assertLess(elapsed, 1.0)
+            self.assertEqual(client.ack_calls, [])
+            forward.assert_not_called()
+            self.assertEqual(retry_queue.pending_count(), 0)
+
+    def test_equal_payload_packets_keep_separate_retry_ack_targets(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        client = FakeClient()
+        payload = b'{"deviceId":"DEV-SAME","sequence":401}'
+        first = SimpleNamespace(
+            topic="devices/DEV-SAME/telemetry",
+            payload=payload,
+            mid=401,
+            qos=1,
+            dup=False,
+        )
+        second = SimpleNamespace(**{**vars(first), "mid": 402})
+        accepted = {"deviceId": "DEV-SAME", "sequence": 401, "duplicate": False}
+        temporary = MqttBridgeError(503, "INGEST_UNAVAILABLE", "temporary")
+
+        with tempfile.TemporaryDirectory() as directory:
+            retry_queue = MqttRetryQueue(
+                database_path=Path(directory) / "packet-retry.sqlite3",
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+                initial_delay=0,
+            )
+            with patch(
+                "motor_diagnosis.mqtt_service.forward_mqtt_message",
+                side_effect=[temporary, temporary, (accepted, 201), (accepted, 201)],
+            ) as forward:
+                self.assertEqual(
+                    process_mqtt_message(
+                        client,
+                        first,
+                        endpoint="http://backend/api/telemetry/ingest",
+                        quarantine_endpoint=("http://backend/api/telemetry/quarantine"),
+                        token="token",
+                        retry_queue=retry_queue,
+                    ),
+                    "retry",
+                )
+                self.assertEqual(
+                    process_mqtt_message(
+                        client,
+                        second,
+                        endpoint="http://backend/api/telemetry/ingest",
+                        quarantine_endpoint=("http://backend/api/telemetry/quarantine"),
+                        token="token",
+                        retry_queue=retry_queue,
+                    ),
+                    "retry",
+                )
+                self.assertEqual(retry_queue.pending_count(), 2)
+                self.assertEqual(
+                    retry_queue.process_due_once(now=float("inf")), "accepted"
+                )
+                self.assertEqual(
+                    retry_queue.process_due_once(now=float("inf")), "accepted"
+                )
+
+            self.assertEqual(forward.call_count, 4)
+            self.assertCountEqual(client.ack_calls, [(401, 1), (402, 1)])
+            self.assertEqual(retry_queue.pending_count(), 0)
+
     def test_mqtt_health_waits_for_successful_suback(self) -> None:
         class FakeClient:
             def __init__(self) -> None:
@@ -566,10 +689,23 @@ class Week2BackendTest(unittest.TestCase):
         self.assertTrue(subscription_is_granted([1], requested_qos=1))
         self.assertTrue(subscription_is_granted([2], requested_qos=1))
         self.assertFalse(subscription_is_granted([0], requested_qos=1))
-        self.assertTrue(subscription_is_granted([2], requested_qos=2))
+        self.assertFalse(subscription_is_granted([2], requested_qos=2))
         self.assertFalse(subscription_is_granted([1], requested_qos=2))
         self.assertFalse(subscription_is_granted([128], requested_qos=1))
         self.assertFalse(subscription_is_granted([], requested_qos=1))
+
+        unsupported_args = SimpleNamespace(**{**vars(args), "qos": 2})
+        with tempfile.TemporaryDirectory() as directory:
+            unsupported_queue = MqttRetryQueue(
+                database_path=Path(directory) / "unsupported-qos.sqlite3",
+                ingest_endpoint=args.ingest_endpoint,
+                quarantine_endpoint=args.quarantine_endpoint,
+                token=args.ingest_token,
+            )
+            with self.assertRaisesRegex(ValueError, "Only MQTT QoS 1"):
+                configure_mqtt_callbacks(
+                    FakeClient(), unsupported_args, unsupported_queue
+                )
 
         with tempfile.TemporaryDirectory() as directory:
             retry_queue = MqttRetryQueue(
@@ -1198,7 +1334,9 @@ class Week2HttpSmokeTest(unittest.TestCase):
                 self.assertEqual(restarted_queue.pending_count(), 1)
 
                 redelivery_client = SuccessfulAckClient()
-                redelivered_message = SimpleNamespace(**{**vars(message), "mid": 58})
+                redelivered_message = SimpleNamespace(
+                    **{**vars(message), "mid": 58, "dup": True}
+                )
                 resumed = process_mqtt_message(
                     redelivery_client,
                     redelivered_message,

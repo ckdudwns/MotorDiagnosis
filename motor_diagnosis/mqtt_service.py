@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 from .json_validation import loads_strict_json
 
 LOGGER = logging.getLogger("motor_diagnosis.mqtt")
+SUPPORTED_SUBSCRIPTION_QOS = 1
 RETRYABLE_HTTP_STATUSES = {408, 425, 429}
 BACKEND_QUARANTINED_INGEST_ERRORS = frozenset(
     {
@@ -233,6 +234,7 @@ class RetryMessage:
     payload: bytes
     mid: int
     qos: int
+    dup: bool
 
 
 class MqttRetryQueue:
@@ -248,6 +250,7 @@ class MqttRetryQueue:
         initial_delay: float = 1.0,
         max_delay: float = 120.0,
         poll_interval: float = 0.5,
+        database_timeout: float = 0.25,
     ) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,6 +260,7 @@ class MqttRetryQueue:
         self.initial_delay = max(0.0, initial_delay)
         self.max_delay = max(self.initial_delay, max_delay)
         self.poll_interval = max(0.05, poll_interval)
+        self.database_timeout = max(0.05, database_timeout)
         self._ack_targets: dict[str, tuple[Any, RetryMessage]] = {}
         self._target_lock = threading.Lock()
         self._processing_lock = threading.Lock()
@@ -267,7 +271,10 @@ class MqttRetryQueue:
         self._initialize_database()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=self.database_timeout,
+        )
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -350,6 +357,7 @@ class MqttRetryQueue:
             payload=payload_bytes,
             mid=int(message.mid),
             qos=int(message.qos),
+            dup=bool(getattr(message, "dup", False)),
         )
 
     @staticmethod
@@ -360,6 +368,8 @@ class MqttRetryQueue:
         digest.update(message.topic.encode("utf-8"))
         digest.update(b"\0")
         digest.update(message.payload)
+        digest.update(b"\0")
+        digest.update(str(message.mid).encode("ascii"))
         return digest.hexdigest()
 
     def enqueue(
@@ -468,49 +478,74 @@ class MqttRetryQueue:
             self._message_key(operation, retry_message)
             for operation in ("quarantine", "ingest")
         )
-        with self._processing_lock:
-            with self._connection() as connection:
-                row = connection.execute(
-                    """
-                    SELECT * FROM mqtt_retry_queue
-                    WHERE message_key IN (?, ?)
-                    ORDER BY delivery_completed DESC, created_at
-                    LIMIT 1
-                    """,
-                    message_keys,
-                ).fetchone()
-                if row is None:
-                    return None
-                connection.execute(
-                    """
-                    UPDATE mqtt_retry_queue
-                    SET mid = ?, qos = ?, next_attempt_at = ?
-                    WHERE message_key = ?
-                    """,
-                    (
-                        retry_message.mid,
-                        retry_message.qos,
-                        time.time(),
-                        row["message_key"],
-                    ),
+        try:
+            with self._processing_lock:
+                with self._connection() as connection:
+                    row = connection.execute(
+                        """
+                        SELECT * FROM mqtt_retry_queue
+                        WHERE message_key IN (?, ?)
+                        ORDER BY delivery_completed DESC, created_at
+                        LIMIT 1
+                        """,
+                        message_keys,
+                    ).fetchone()
+                    if row is None and retry_message.dup:
+                        row = connection.execute(
+                            """
+                            SELECT * FROM mqtt_retry_queue
+                            WHERE operation IN ('quarantine', 'ingest')
+                              AND topic = ? AND payload = ?
+                            ORDER BY delivery_completed DESC, created_at
+                            LIMIT 1
+                            """,
+                            (
+                                retry_message.topic,
+                                sqlite3.Binary(retry_message.payload),
+                            ),
+                        ).fetchone()
+                    if row is None:
+                        return None
+                    connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue
+                        SET mid = ?, qos = ?, next_attempt_at = ?
+                        WHERE message_key = ?
+                        """,
+                        (
+                            retry_message.mid,
+                            retry_message.qos,
+                            time.time(),
+                            row["message_key"],
+                        ),
+                    )
+                with self._target_lock:
+                    message_key = str(row["message_key"])
+                    self._ack_targets[message_key] = (client, retry_message)
+                self._wake_event.set()
+                if bool(row["delivery_completed"]):
+                    if message_key in self._inflight_message_keys:
+                        return "retry"
+                    outcome = str(row["delivery_outcome"]) or (
+                        "quarantined"
+                        if row["operation"] == "quarantine"
+                        else "accepted"
+                    )
+                    return self._complete(row, outcome)
+                LOGGER.info(
+                    "mqtt_retry_reconnected operation=%s topic=%s mid=%s qos=%s",
+                    row["operation"],
+                    retry_message.topic,
+                    retry_message.mid,
+                    retry_message.qos,
                 )
-            with self._target_lock:
-                message_key = str(row["message_key"])
-                self._ack_targets[message_key] = (client, retry_message)
-            self._wake_event.set()
-            if bool(row["delivery_completed"]):
-                if message_key in self._inflight_message_keys:
-                    return "retry"
-                outcome = str(row["delivery_outcome"]) or (
-                    "quarantined" if row["operation"] == "quarantine" else "accepted"
-                )
-                return self._complete(row, outcome)
-            LOGGER.info(
-                "mqtt_retry_reconnected operation=%s topic=%s mid=%s qos=%s",
-                row["operation"],
+                return "retry"
+        except sqlite3.Error as error:
+            LOGGER.warning(
+                "mqtt_retry_lookup_failed topic=%s mid=%s error=%s",
                 retry_message.topic,
                 retry_message.mid,
-                retry_message.qos,
+                error,
             )
             return "retry"
 
@@ -842,7 +877,13 @@ def parse_args() -> argparse.Namespace:
         "--port", type=int, default=int(os.environ.get("MQTT_PORT", "8883"))
     )
     parser.add_argument("--topic", default="devices/+/telemetry")
-    parser.add_argument("--qos", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--qos",
+        type=int,
+        choices=(SUPPORTED_SUBSCRIPTION_QOS,),
+        default=SUPPORTED_SUBSCRIPTION_QOS,
+        help="Subscription QoS. Only QoS 1 is supported across process restarts.",
+    )
     parser.add_argument("--client-id", default="bind-edge-ai-backend")
     parser.add_argument("--username", default=os.environ.get("MQTT_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("MQTT_PASSWORD"))
@@ -917,6 +958,8 @@ def subscription_reason_meets_qos(reason_code: Any, requested_qos: int) -> bool:
 
 
 def subscription_is_granted(reason_code_list: Any, requested_qos: int) -> bool:
+    if requested_qos != SUPPORTED_SUBSCRIPTION_QOS:
+        return False
     reason_codes = list(reason_code_list or [])
     return bool(reason_codes) and all(
         subscription_reason_meets_qos(reason_code, requested_qos)
@@ -929,6 +972,11 @@ def configure_mqtt_callbacks(
     args: argparse.Namespace,
     retry_queue: MqttRetryQueue,
 ) -> set[int]:
+    if int(args.qos) != SUPPORTED_SUBSCRIPTION_QOS:
+        raise ValueError(
+            "Only MQTT QoS 1 is supported because inbound QoS 2 state is not "
+            "durable across process restarts."
+        )
     pending_subscriptions: set[int] = set()
 
     def on_connect(client, _userdata, _flags, reason_code, _properties) -> None:

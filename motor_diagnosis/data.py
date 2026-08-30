@@ -18,6 +18,8 @@ SESSION_SECONDS = 60 * 60
 MAX_REVIEW_NOTE_LENGTH = 2000
 MAX_REASON_LENGTH = 1000
 MAX_OPERATING_CONDITION_DEPTH = 8
+MIN_RATED_RPM = 1
+MAX_RATED_RPM = 120_000
 DEVICE_CERTIFICATE_STATUSES = {"pending", "registered", "revoked", "expired"}
 DEVICE_MAPPING_STATUSES = {"active", "inactive"}
 TELEMETRY_SCENARIOS = {
@@ -1499,6 +1501,18 @@ def parse_int_field(payload: dict[str, Any], *keys: str, default: int = 0) -> in
     return default
 
 
+def rated_rpm_field(payload: dict[str, Any], *, default: int = 0) -> int:
+    provided = any(key in payload for key in ("ratedRpm", "rpm"))
+    value = parse_int_field(payload, "ratedRpm", "rpm", default=default)
+    if provided and not MIN_RATED_RPM <= value <= MAX_RATED_RPM:
+        raise ApiError(
+            400,
+            "VALUE_OUT_OF_RANGE",
+            f"ratedRpm must be between {MIN_RATED_RPM} and {MAX_RATED_RPM}.",
+        )
+    return value
+
+
 def boolean_field(
     payload: dict[str, Any], key: str, default: bool | None = None
 ) -> bool:
@@ -1710,6 +1724,7 @@ def create_asset(
                 400, "ASSET_CODE_DUPLICATED", "Asset code must be unique within a site."
             )
         baseline = baseline_payload(payload)
+        rated_rpm = rated_rpm_field(payload)
         timestamp = now_iso()
         asset = {
             "id": asset_id,
@@ -1720,8 +1735,8 @@ def create_asset(
             "assetType": str(
                 payload.get("assetType") or payload.get("type") or "motor"
             ),
-            "ratedRpm": parse_int_field(payload, "ratedRpm", "rpm", default=0),
-            "rpm": parse_int_field(payload, "ratedRpm", "rpm", default=0),
+            "ratedRpm": rated_rpm,
+            "rpm": rated_rpm,
             "operationStatus": str(payload.get("operationStatus") or "active"),
             "installLocation": str(payload.get("installLocation") or ""),
             "baselineStatus": baseline["status"],
@@ -1771,8 +1786,9 @@ def update_asset(
             )
             candidate["type"] = candidate["assetType"]
         if "ratedRpm" in payload or "rpm" in payload:
-            candidate["ratedRpm"] = parse_int_field(
-                payload, "ratedRpm", "rpm", default=candidate["ratedRpm"]
+            candidate["ratedRpm"] = rated_rpm_field(
+                payload,
+                default=candidate["ratedRpm"],
             )
             candidate["rpm"] = candidate["ratedRpm"]
         if "baseline" in payload or any(key.startswith("baseline") for key in payload):
@@ -3757,7 +3773,8 @@ def _freeze_event_evidence(
 
 def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
     require_permission(user, "event:read")
-    event = get_event(event_id)
+    with STORE_LOCK:
+        event = copy_payload(get_event(event_id))
     require_site_access(user, event["siteId"])
     occurred_at = parse_rfc3339("event.occurredAt", event["occurredAt"])
     context_from = format_rfc3339(occurred_at - timedelta(minutes=5))
@@ -3779,36 +3796,41 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
         for record in TELEMETRY_RECORDS
     )
     context_source = "stored" if has_stored_raw else "demo" if points else "unavailable"
-    evidence = _freeze_event_evidence(event, points)
-    latest_review = next(
-        (
-            item
-            for item in reversed(EVENT_REVIEW_HISTORY)
-            if item["eventId"] == event["id"]
-        ),
-        None,
-    )
-    threshold_version = str(event.get("thresholdVersion") or "").strip()
+    _freeze_event_evidence(event, points)
+    with STORE_LOCK:
+        event_snapshot = copy_payload(get_event(event_id))
+        latest_review = next(
+            (
+                copy_payload(item)
+                for item in reversed(EVENT_REVIEW_HISTORY)
+                if item["eventId"] == event_snapshot["id"]
+            ),
+            None,
+        )
+        evidence_snapshot = copy_payload(EVENT_EVIDENCE_SNAPSHOTS[event_snapshot["id"]])
+    threshold_version = str(event_snapshot.get("thresholdVersion") or "").strip()
     applied_rule = (
-        anomaly_rule_version_for(event["assetId"], threshold_version)
+        anomaly_rule_version_for(event_snapshot["assetId"], threshold_version)
         if threshold_version
         else None
     )
     return {
-        "event": copy_payload(event),
+        "event": event_snapshot,
         "context": {
             "from": context_from,
             "to": context_to,
             "points": copy_payload(points),
-            "units": telemetry_units(event["siteId"], event["assetId"]),
+            "units": telemetry_units(
+                event_snapshot["siteId"], event_snapshot["assetId"]
+            ),
             "source": context_source,
             "rawDataMissing": not has_stored_raw,
         },
-        "featureSnapshot": evidence["featureSnapshot"],
+        "featureSnapshot": evidence_snapshot["featureSnapshot"],
         "appliedRule": applied_rule,
-        "modelVersion": event.get("modelVersion"),
-        "deviceSnapshot": evidence["deviceSnapshot"],
-        "latestReview": copy_payload(latest_review) if latest_review else None,
+        "modelVersion": event_snapshot.get("modelVersion"),
+        "deviceSnapshot": evidence_snapshot["deviceSnapshot"],
+        "latestReview": latest_review,
     }
 
 
@@ -3847,11 +3869,11 @@ def update_anomaly_rule(
             (item for item in ANOMALY_RULES if item["assetId"] == asset["id"]),
             None,
         )
+        new_rule = rule is None
         if rule is None:
             rule = build_anomaly_rules([asset])[0]
             rule["reason"] = "Initial anomaly rule for existing asset"
             rule["updatedAt"] = now_iso()
-            ANOMALY_RULES.append(rule)
         before = copy_payload(
             {key: value for key, value in rule.items() if key != "history"}
         )
@@ -3881,6 +3903,7 @@ def update_anomaly_rule(
             3600,
             integer=True,
         )
+        active = boolean_field(payload, "active", default=rule["active"])
         if hysteresis >= score_threshold:
             raise ApiError(
                 400,
@@ -3895,11 +3918,13 @@ def update_anomaly_rule(
                 "durationSec": duration_sec,
                 "hysteresis": hysteresis,
                 "mergeWindowSec": merge_window_sec,
-                "active": boolean_field(payload, "active", default=rule["active"]),
+                "active": active,
                 "reason": reason,
                 "updatedAt": now_iso(),
             }
         )
+        if new_rule:
+            ANOMALY_RULES.append(rule)
         after = copy_payload(
             {key: value for key, value in rule.items() if key != "history"}
         )
@@ -5582,7 +5607,10 @@ def _dataset_rows_for_points(
 ) -> list[dict[str, Any]]:
     asset_events = sorted(
         (item for item in EVENTS if item["assetId"] == asset_id),
-        key=lambda item: item["occurredAt"],
+        key=lambda item: (
+            parse_rfc3339("event.occurredAt", item["occurredAt"]),
+            item["id"],
+        ),
         reverse=True,
     )
     rows = []

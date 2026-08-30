@@ -52,6 +52,10 @@ from motor_diagnosis.data import (
     update_acoustic_taxonomy,
     update_alert_policy,
     update_anomaly_rule,
+    update_asset,
+    telemetry_for,
+    anomaly_rule_version_for,
+    _dataset_rows_for_points,
 )
 from motor_diagnosis.server import create_server, paginated_events
 
@@ -183,6 +187,34 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(detail["event"]["thresholdVersion"], "RULE-SITE-01-MOT-02-v1")
         self.assertEqual(detail["appliedRule"]["version"], "RULE-SITE-01-MOT-02-v1")
         self.assertEqual(detail["appliedRule"]["scoreThreshold"], 75.0)
+
+    def test_event_detail_event_and_latest_review_share_one_snapshot(self) -> None:
+        original_rule_lookup = anomaly_rule_version_for
+
+        def review_during_rule_lookup(asset_id: str, version: str):
+            rule = original_rule_lookup(asset_id, version)
+            review_event(
+                self.operator,
+                "EV-241",
+                {
+                    "label": "confirmed_anomaly",
+                    "reason": "Concurrent detail snapshot regression",
+                },
+            )
+            return rule
+
+        with patch(
+            "motor_diagnosis.data.anomaly_rule_version_for",
+            side_effect=review_during_rule_lookup,
+        ):
+            detail = event_detail_for(self.operator, "EV-241")
+
+        self.assertFalse(detail["event"]["reviewed"])
+        self.assertIsNone(detail["latestReview"])
+        self.assertTrue(
+            next(item for item in EVENTS if item["id"] == "EV-241")["reviewed"]
+        )
+        self.assertEqual(len(EVENT_REVIEW_HISTORY), 1)
 
     def test_base_event_feature_snapshot_is_frozen_before_the_first_detail_read(
         self,
@@ -317,6 +349,109 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
         self.assertEqual(updated["version"], f"RULE-{asset['id']}-v2")
         self.assertEqual(updated["scoreThreshold"], 80)
+
+    def test_rejected_anomaly_rule_update_does_not_change_history_or_version(
+        self,
+    ) -> None:
+        rule = next(
+            item for item in ANOMALY_RULES if item["assetId"] == "SITE-01-MOT-02"
+        )
+        before = json.loads(json.dumps(rule))
+
+        with self.assertRaises(ApiError) as invalid:
+            update_anomaly_rule(
+                self.admin,
+                "SITE-01-MOT-02",
+                {
+                    "scoreThreshold": 81,
+                    "active": "false",
+                    "reason": "Invalid boolean must not mutate state",
+                },
+            )
+
+        self.assertEqual(invalid.exception.status, 400)
+        self.assertEqual(invalid.exception.code, "INVALID_BOOLEAN")
+        self.assertEqual(rule, before)
+
+        updated = update_anomaly_rule(
+            self.admin,
+            "SITE-01-MOT-02",
+            {
+                "scoreThreshold": 81,
+                "active": False,
+                "reason": "Valid update after rejected request",
+            },
+        )
+        self.assertEqual(updated["version"], "RULE-SITE-01-MOT-02-v2")
+        self.assertEqual(len(updated["history"]), 1)
+
+    def test_rated_rpm_rejects_values_that_cannot_be_used_by_telemetry(self) -> None:
+        oversized_rpm = 10**400
+        with self.assertRaises(ApiError) as create_error:
+            create_asset(
+                self.admin,
+                "SITE-01",
+                {
+                    "assetCode": "RPM-HUGE",
+                    "name": "Oversized RPM motor",
+                    "assetType": "motor",
+                    "ratedRpm": oversized_rpm,
+                },
+            )
+        self.assertEqual(create_error.exception.code, "VALUE_OUT_OF_RANGE")
+
+        asset = create_asset(
+            self.admin,
+            "SITE-01",
+            {
+                "assetCode": "RPM-SAFE",
+                "name": "Safe RPM motor",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
+        )
+        with self.assertRaises(ApiError) as update_error:
+            update_asset(
+                self.admin,
+                "SITE-01",
+                asset["id"],
+                {"ratedRpm": oversized_rpm},
+            )
+        self.assertEqual(update_error.exception.code, "VALUE_OUT_OF_RANGE")
+        self.assertEqual(get_asset_by_id(asset["id"])["ratedRpm"], 1800)
+        self.assertTrue(telemetry_for("SITE-01", asset["id"]))
+
+    def test_dataset_event_labels_sort_rfc3339_values_by_instant(self) -> None:
+        asset_id = "SITE-01-MOT-02"
+        older = {
+            "id": "EV-OFFSET-OLDER",
+            "siteId": "SITE-01",
+            "assetId": asset_id,
+            "occurredAt": "2026-08-24T01:00:00+09:00",
+            "durationSec": 7200,
+            "label": "needs_review",
+            "reviewed": False,
+        }
+        newer = {
+            "id": "EV-UTC-NEWER",
+            "siteId": "SITE-01",
+            "assetId": asset_id,
+            "occurredAt": "2026-08-23T17:00:00Z",
+            "durationSec": 3600,
+            "label": "confirmed_anomaly",
+            "reviewed": True,
+        }
+        EVENTS.extend([older, newer])
+
+        rows = _dataset_rows_for_points(
+            None,
+            "SITE-01",
+            asset_id,
+            [{"timestamp": "2026-08-23T17:00:30Z", "sequence": 1}],
+        )
+
+        self.assertEqual(rows[0]["event_id"], newer["id"])
+        self.assertEqual(rows[0]["event_label"], newer["label"])
 
     def test_anomaly_rule_update_and_asset_delete_are_atomic(self) -> None:
         asset = create_asset(

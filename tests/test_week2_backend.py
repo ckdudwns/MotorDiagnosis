@@ -983,6 +983,69 @@ class Week2HttpSmokeTest(unittest.TestCase):
         self.assertEqual(TELEMETRY_METRICS["localRejected"], 1)
         self.assertEqual(TELEMETRY_METRICS["rejected"], 1)
 
+    def test_raw_str_surrogate_is_safely_quarantined_or_queued(self) -> None:
+        class AckClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        raw_payload = json.dumps(
+            telemetry_payload(sequence=54, source="\ud800"), ensure_ascii=False
+        )
+        message = SimpleNamespace(
+            topic="devices/DEV-01-GEN-01/telemetry",
+            payload=raw_payload,
+            mid=54,
+            qos=1,
+        )
+        client = AckClient()
+
+        delivery = process_mqtt_message(
+            client,
+            message,
+            endpoint=f"http://127.0.0.1:{self.port}/api/telemetry/ingest",
+            quarantine_endpoint=(
+                f"http://127.0.0.1:{self.port}/api/telemetry/quarantine"
+            ),
+            token="demo-mqtt-ingest-token",
+        )
+
+        self.assertEqual(delivery, "quarantined")
+        self.assertEqual(client.ack_calls, [(54, 1)])
+        self.assertEqual(QUARANTINED_DEVICE_MESSAGES[-1]["reason"], "INVALID_JSON")
+        self.assertIn("\\ud800", QUARANTINED_DEVICE_MESSAGES[-1]["payload"])
+
+        queued_client = AckClient()
+        queued_message = SimpleNamespace(**{**vars(message), "mid": 55})
+        with tempfile.TemporaryDirectory() as directory:
+            retry_queue = MqttRetryQueue(
+                database_path=Path(directory) / "raw-str-retry.sqlite3",
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="token",
+            )
+            with patch(
+                "motor_diagnosis.mqtt_service.quarantine_local_mqtt_message",
+                side_effect=MqttBridgeError(
+                    503, "HTTP_SERVICE_UNAVAILABLE", "temporary"
+                ),
+            ):
+                queued_delivery = process_mqtt_message(
+                    queued_client,
+                    queued_message,
+                    endpoint="http://backend/api/telemetry/ingest",
+                    quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                    token="token",
+                    retry_queue=retry_queue,
+                )
+
+            self.assertEqual(queued_delivery, "retry")
+            self.assertEqual(retry_queue.pending_count(), 1)
+            self.assertEqual(queued_client.ack_calls, [])
+
     def test_actual_ai2_replay_output_is_accepted_and_queryable(self) -> None:
         source_asset_id = "SYN-ASSET-01"
         generated = build_replay_record(

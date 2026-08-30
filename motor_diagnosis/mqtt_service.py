@@ -43,6 +43,10 @@ class MqttBridgeError(Exception):
     local: bool = False
 
 
+def _mqtt_text_for_storage(value: str) -> str:
+    return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
 def decode_mqtt_payload(topic: str, message: bytes | str) -> dict[str, Any]:
     parts = [part for part in topic.strip("/").split("/") if part]
     if len(parts) != 3 or parts[0] != "devices" or parts[2] != "telemetry":
@@ -89,9 +93,19 @@ def post_json(
     *,
     timeout: float,
 ) -> tuple[dict[str, Any], int]:
+    try:
+        request_body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(
+            "utf-8"
+        )
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise MqttBridgeError(
+            400,
+            "INVALID_JSON",
+            "Outbound JSON payload contains invalid Unicode or numeric values.",
+        ) from exc
     request = Request(
         endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        data=request_body,
         method="POST",
         headers={
             "Content-Type": "application/json",
@@ -179,11 +193,12 @@ def quarantine_local_mqtt_message(
         if isinstance(message, bytes)
         else str(message)
     )
+    raw_payload = _mqtt_text_for_storage(raw_payload)
     return post_json(
         endpoint,
         token,
         {
-            "topic": topic,
+            "topic": _mqtt_text_for_storage(topic),
             "payload": raw_payload,
             "reason": error.code,
             "message": error.message,
@@ -291,11 +306,11 @@ class MqttRetryQueue:
     def _snapshot(message: Any) -> RetryMessage:
         payload = message.payload
         if isinstance(payload, str):
-            payload_bytes = payload.encode("utf-8")
+            payload_bytes = _mqtt_text_for_storage(payload).encode("utf-8")
         else:
             payload_bytes = bytes(payload)
         return RetryMessage(
-            topic=str(message.topic),
+            topic=_mqtt_text_for_storage(str(message.topic)),
             payload=payload_bytes,
             mid=int(message.mid),
             qos=int(message.qos),

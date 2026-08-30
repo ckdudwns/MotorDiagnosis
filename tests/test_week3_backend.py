@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import threading
 import unittest
 from collections import Counter
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -13,23 +14,39 @@ from motor_diagnosis.data import (
     ApiError,
     DATASET_SNAPSHOTS,
     DATASET_VERSIONS,
+    DEVICES,
     EVENTS,
+    EVENT_REVIEW_HISTORY,
     TELEMETRY_RECORDS,
+    alert_policies_for,
     audit_logs_for,
     authenticate,
+    create_asset,
     create_dataset_version,
     create_environment_inspection,
     current_user_for_token,
     dataset_export_for,
     dataset_version_for,
+    delete_asset,
     event_detail_for,
+    event_reviews_for,
     format_rfc3339,
     parse_rfc3339,
     reset_runtime_state,
+    review_event,
+    sensor_faults_for_device,
     update_acoustic_taxonomy,
+    update_alert_policy,
     update_anomaly_rule,
 )
-from motor_diagnosis.server import create_server
+from motor_diagnosis.server import create_server, paginated_events
+
+
+def checksum_for(label: str) -> str:
+    value = label.removeprefix("sha256:")
+    if len(value) == 64 and all(character in "0123456789abcdef" for character in value):
+        return f"sha256:{value}"
+    return f"sha256:{hashlib.sha256(label.encode('utf-8')).hexdigest()}"
 
 
 class Week3DataBoundaryTest(unittest.TestCase):
@@ -99,7 +116,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
                 "type": "internal",
                 "uri": "api://telemetry",
                 "license": "project-internal",
-                "checksum": checksum,
+                "checksum": checksum_for(checksum),
             },
             "compatibility": {
                 "signalType": ["vibration", "acoustic"],
@@ -177,6 +194,156 @@ class Week3DataBoundaryTest(unittest.TestCase):
             detail["featureSnapshot"]["timestamp"],
             format_rfc3339(event_time + timedelta(seconds=5)),
         )
+
+    def test_event_evidence_snapshots_do_not_change_after_late_updates(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        TELEMETRY_RECORDS.append(
+            self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=20)), 1)
+        )
+        before = event_detail_for(self.operator, event["id"])
+
+        device = next(item for item in DEVICES if item["id"] == "DEV-01-MOT-02")
+        device["firmware"] = "edge-9.9.9"
+        device["firmwareVersion"] = "edge-9.9.9"
+        TELEMETRY_RECORDS.append(
+            self.telemetry_record(format_rfc3339(event_time + timedelta(seconds=1)), 2)
+        )
+
+        after = event_detail_for(self.operator, event["id"])
+
+        self.assertEqual(after["deviceSnapshot"], before["deviceSnapshot"])
+        self.assertEqual(after["featureSnapshot"], before["featureSnapshot"])
+        self.assertNotEqual(after["deviceSnapshot"]["firmware"], device["firmware"])
+        self.assertEqual(after["featureSnapshot"]["sequence"], 1)
+
+    def test_reviews_with_same_timestamp_return_newest_id_first(self) -> None:
+        first = review_event(
+            self.operator,
+            "EV-241",
+            {"label": "needs_review", "reason": "First same-time review"},
+        )["review"]
+        second = review_event(
+            self.operator,
+            "EV-241",
+            {"label": "confirmed_anomaly", "reason": "Second same-time review"},
+        )["review"]
+        for review in EVENT_REVIEW_HISTORY:
+            review["changedAt"] = "2026-08-24T03:00:00.000Z"
+
+        history = event_reviews_for(self.operator, "EV-241", page=1, size=10)
+
+        self.assertEqual(
+            [item["id"] for item in history["items"]], [second["id"], first["id"]]
+        )
+
+    def test_event_pagination_sorts_rfc3339_values_by_instant(self) -> None:
+        first = next(item for item in EVENTS if item["id"] == "EV-241")
+        second = next(item for item in EVENTS if item["id"] == "EV-238")
+        first["occurredAt"] = "2026-08-24T10:00:00+09:00"
+        second["occurredAt"] = "2026-08-24T02:00:00.500Z"
+        first["reviewed"] = False
+        second["reviewed"] = False
+
+        descending = paginated_events(
+            self.admin, {"sort": ["occurredAt_desc"], "page": ["1"], "size": ["50"]}
+        )
+        unreviewed = paginated_events(
+            self.admin, {"sort": ["unreviewed_desc"], "page": ["1"], "size": ["50"]}
+        )
+
+        self.assertLess(
+            [item["id"] for item in descending["items"]].index(second["id"]),
+            [item["id"] for item in descending["items"]].index(first["id"]),
+        )
+        self.assertLess(
+            [item["id"] for item in unreviewed["items"]].index(second["id"]),
+            [item["id"] for item in unreviewed["items"]].index(first["id"]),
+        )
+
+    def test_new_asset_has_an_updatable_default_anomaly_rule(self) -> None:
+        asset = create_asset(
+            self.admin,
+            "SITE-01",
+            {
+                "assetCode": "NEW-99",
+                "name": "New test motor",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
+        )
+
+        updated = update_anomaly_rule(
+            self.admin,
+            asset["id"],
+            {"scoreThreshold": 80, "reason": "Initialize the new asset rule"},
+        )
+
+        self.assertEqual(updated["version"], f"RULE-{asset['id']}-v2")
+        self.assertEqual(updated["scoreThreshold"], 80)
+
+    def test_alert_policy_asset_scope_protects_policy_and_audit_details(self) -> None:
+        updated = update_alert_policy(
+            self.admin,
+            "ALERT-POLICY-DEFAULT",
+            {
+                "siteIds": [],
+                "assetIds": ["SITE-05-MOT-02"],
+                "recipients": ["site-05-secret-recipient"],
+                "reason": "Scope the policy to site 05",
+            },
+        )
+
+        self.assertEqual(updated["assetIds"], ["SITE-05-MOT-02"])
+        self.assertEqual(alert_policies_for(self.operator), [])
+        operator_audits = audit_logs_for(self.operator, page=1, size=50)
+        self.assertNotIn(
+            "alert-policy.update",
+            {item["action"] for item in operator_audits["items"]},
+        )
+        admin_audits = audit_logs_for(self.admin, page=1, size=50)
+        policy_audit = next(
+            item
+            for item in admin_audits["items"]
+            if item["action"] == "alert-policy.update"
+        )
+        self.assertEqual(policy_audit["siteIds"], ["SITE-05"])
+
+    def test_older_environment_inspection_does_not_replace_current_status(self) -> None:
+        device = next(item for item in DEVICES if item["id"] == "DEV-01-GEN-01")
+        common = {
+            "waterIngress": "ok",
+            "saltCorrosion": "ok",
+            "glandStatus": "ok",
+            "enclosureStatus": "ok",
+        }
+        create_environment_inspection(
+            self.admin,
+            device["id"],
+            {"inspectedAt": "2026-08-20T00:00:00Z", "dust": "critical", **common},
+        )
+        create_environment_inspection(
+            self.admin,
+            device["id"],
+            {"inspectedAt": "2026-08-01T00:00:00Z", "dust": "ok", **common},
+        )
+
+        self.assertEqual(device["environmentStatus"], "critical")
+        self.assertEqual(device["lastEnvironmentInspectionAt"], "2026-08-20T00:00:00Z")
+
+    def test_no_signal_fault_uses_last_received_at_without_health_api_call(
+        self,
+    ) -> None:
+        device = next(item for item in DEVICES if item["id"] == "DEV-01-GEN-01")
+        device["health"] = "online"
+        device["lastSeenSecAgo"] = 0
+        device["lastReceivedAt"] = format_rfc3339(
+            datetime.now(timezone.utc) - timedelta(seconds=180)
+        )
+
+        faults = sensor_faults_for_device(self.operator, device["id"], page=1, size=50)
+
+        self.assertIn("no_signal", {item["faultType"] for item in faults["items"]})
 
     def test_all_not_checked_inspection_is_not_reported_as_ok(self) -> None:
         inspection = create_environment_inspection(
@@ -361,6 +528,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
             {**payload["source"], "type": "archive"},
             {**payload["source"], "uri": "s3://not-internal-telemetry"},
             {**payload["source"], "checksum": "not-a-sha256"},
+            {**payload["source"], "checksum": "sha256:x"},
         ]
 
         for invalid_source in invalid_sources:
@@ -373,6 +541,96 @@ class Week3DataBoundaryTest(unittest.TestCase):
                 self.assertEqual(invalid.exception.code, "INVALID_DATASET_SOURCE")
 
         self.assertEqual(DATASET_VERSIONS, [])
+
+    def test_dataset_units_reject_non_string_values(self) -> None:
+        payload = self.dataset_payload(
+            checksum="units-null",
+            source_filters={"siteId": "SITE-01"},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/units-null.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("units-null"),
+        }
+        payload["compatibility"]["units"]["acoustic"] = None
+
+        with self.assertRaises(ApiError) as invalid:
+            create_dataset_version(self.admin, payload)
+
+        self.assertEqual(invalid.exception.code, "INVALID_DATASET_UNITS")
+
+    def test_negative_zero_split_cannot_create_a_duplicate_version(self) -> None:
+        payload = self.dataset_payload(
+            checksum="negative-zero-split",
+            source_filters={"siteId": "SITE-01"},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/negative-zero.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("negative-zero-split"),
+        }
+        create_dataset_version(self.admin, payload)
+        duplicate = json.loads(json.dumps(payload))
+        duplicate["split"]["validation"] = -0.0
+
+        with self.assertRaises(ApiError) as exists:
+            create_dataset_version(self.admin, duplicate)
+
+        self.assertEqual(exists.exception.code, "DATASET_VERSION_EXISTS")
+
+    def test_equivalent_source_filter_forms_share_one_version_fingerprint(self) -> None:
+        payload = self.dataset_payload(
+            checksum="equivalent-source-filters",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["source"] = {
+            "type": "external",
+            "uri": "s3://training/equivalent-filters.csv",
+            "license": "verified-for-mvp",
+            "checksum": checksum_for("equivalent-source-filters"),
+        }
+        create_dataset_version(self.admin, payload)
+        duplicate = json.loads(json.dumps(payload))
+        duplicate["sourceFilters"] = {
+            "siteIds": ["SITE-01"],
+            "assetIds": ["SITE-01-MOT-02"],
+        }
+
+        with self.assertRaises(ApiError) as exists:
+            create_dataset_version(self.admin, duplicate)
+
+        self.assertEqual(exists.exception.code, "DATASET_VERSION_EXISTS")
+
+    def test_asset_referenced_by_frozen_dataset_cannot_be_deleted(self) -> None:
+        event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event_time = parse_rfc3339("occurredAt", event["occurredAt"])
+        self.add_split_ready_telemetry(event_time)
+        payload = self.dataset_payload(
+            checksum="frozen-delete-guard",
+            source_filters={
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+            },
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        create_dataset_version(self.admin, payload)
+        device = next(item for item in DEVICES if item["id"] == "DEV-01-MOT-02")
+        device["mappingStatus"] = "inactive"
+
+        with self.assertRaises(ApiError) as referenced:
+            delete_asset(self.admin, "SITE-01", "SITE-01-MOT-02")
+
+        self.assertEqual(
+            referenced.exception.code, "ASSET_REFERENCED_BY_FROZEN_DATASET"
+        )
 
     def test_internal_version_fingerprint_tracks_the_canonical_snapshot(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
@@ -400,7 +658,9 @@ class Week3DataBoundaryTest(unittest.TestCase):
             )
         )
         changed_reported_checksum = json.loads(json.dumps(payload))
-        changed_reported_checksum["source"]["checksum"] = "sha256:reported-source-b"
+        changed_reported_checksum["source"]["checksum"] = checksum_for(
+            "reported-source-b"
+        )
         with self.assertRaises(ApiError) as same_snapshot:
             create_dataset_version(self.admin, changed_reported_checksum)
         self.assertEqual(same_snapshot.exception.code, "DATASET_VERSION_EXISTS")
@@ -657,7 +917,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
             "type": "external",
             "uri": "s3://training/site-05/fan-03.csv",
             "license": "project-internal",
-            "checksum": "sha256:external-site-05",
+            "checksum": checksum_for("external-site-05"),
         }
         dataset = create_dataset_version(self.admin, payload)
 
@@ -1114,7 +1374,7 @@ class Week3HttpContractTest(unittest.TestCase):
                 "type": "external",
                 "uri": "dataset://existing/motor-vibration-v1",
                 "license": "verified-for-mvp",
-                "checksum": "sha256:week3-existing-dataset-v1",
+                "checksum": checksum_for("week3-existing-dataset-v1"),
             },
             "compatibility": {
                 "signalType": ["vibration", "acoustic"],
@@ -1158,7 +1418,9 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertEqual(duplicate["error"]["code"], "DATASET_VERSION_EXISTS")
 
         invalid_mapping_payload = json.loads(json.dumps(dataset_payload))
-        invalid_mapping_payload["source"]["checksum"] = "sha256:invalid-label-map"
+        invalid_mapping_payload["source"]["checksum"] = checksum_for(
+            "invalid-label-map"
+        )
         invalid_mapping_payload["labelMapping"]["Fault"] = "UNKNOWN_LABEL"
         status, invalid_mapping = self.request(
             "/api/datasets",
@@ -1216,10 +1478,10 @@ class Week3HttpContractTest(unittest.TestCase):
                 "acousticPeakHz": 216.4,
                 "scenarioLabel": "normal",
                 "knownVibrationLabel": "NORMAL",
-                "knownAcousticLabel": None,
-                "source": "CWRU_only_synthetic",
+                "knownAcousticLabel": "=1+1",
+                "source": "@SUM(1,1)",
                 "isSynthetic": True,
-                "vibrationUnitNote": "raw accelerometer output; not mm/s",
+                "vibrationUnitNote": "+unsafe spreadsheet value",
                 "acousticUnitNote": "raw waveform RMS; not dB SPL",
             }
         )
@@ -1229,7 +1491,7 @@ class Week3HttpContractTest(unittest.TestCase):
             "type": "internal",
             "uri": "api://telemetry",
             "license": "project-internal",
-            "checksum": "sha256:week3-internal-filtered-v1",
+            "checksum": checksum_for("week3-internal-filtered-v1"),
         }
         internal_payload["sourceFilters"] = {
             "siteId": "SITE-01",
@@ -1277,7 +1539,9 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertIn("label_priority", reader.fieldnames or [])
         self.assertEqual(first_row["ground_truth_label"], "NORMAL")
         self.assertEqual(first_row["ground_truth_source"], "known_vibration_label")
-        self.assertEqual(first_row["telemetry_source"], "CWRU_only_synthetic")
+        self.assertEqual(first_row["known_acoustic_label"], "'=1+1")
+        self.assertEqual(first_row["telemetry_source"], "'@SUM(1,1)")
+        self.assertEqual(first_row["vibration_unit_note"], "'+unsafe spreadsheet value")
         self.assertEqual(first_row["is_synthetic"], "True")
         self.assertEqual(
             int(first_row["source_record_count"]),
@@ -1290,7 +1554,9 @@ class Week3HttpContractTest(unittest.TestCase):
 
         unfiltered_payload = json.loads(json.dumps(internal_payload))
         unfiltered_payload["name"] = "internal-unfiltered-telemetry-v1"
-        unfiltered_payload["source"]["checksum"] = "sha256:week3-internal-unfiltered-v1"
+        unfiltered_payload["source"]["checksum"] = checksum_for(
+            "week3-internal-unfiltered-v1"
+        )
         unfiltered_payload.pop("sourceFilters")
         unfiltered_payload["labelMapping"] = {
             "needs_review": "BEARING_SUSPECT",

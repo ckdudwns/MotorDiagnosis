@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -98,6 +99,19 @@ from .web import render_page
 
 LOGGER = logging.getLogger("motor_diagnosis")
 MAX_JSON_BODY_BYTES = 64 * 1024
+
+
+def _safe_csv_cell(value: Any) -> Any:
+    if not isinstance(value, str) or not value:
+        return value
+    significant = value.lstrip(" \t\r\n")
+    if significant and significant[0] in "=+-@":
+        return "'" + value
+    return value
+
+
+def _event_occurred_at(item: dict[str, Any]) -> datetime:
+    return parse_rfc3339("event.occurredAt", item.get("occurredAt"))
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -976,7 +990,9 @@ class AppHandler(BaseHTTPRequestHandler):
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(
+            {key: _safe_csv_cell(value) for key, value in row.items()} for row in rows
+        )
         body = ("\ufeff" + output.getvalue()).encode("utf-8")
         filename = f"{manifest['siteId']}_{manifest['assetId']}_dataset.csv"
         self.send_response(200)
@@ -1093,15 +1109,12 @@ def paginated_events(
         item["reviewed"] = bool(item.get("reviewed", False))
     sort = query.get("sort", ["unreviewed_desc"])[0].strip()
     if sort == "unreviewed_desc":
-        rows.sort(
-            key=lambda item: str(item.get("occurredAt") or item.get("time") or ""),
-            reverse=True,
-        )
+        rows.sort(key=_event_occurred_at, reverse=True)
         rows.sort(key=lambda item: bool(item.get("reviewed", False)))
     elif sort == "occurredAt_desc":
-        rows.sort(key=lambda item: str(item.get("occurredAt", "")), reverse=True)
+        rows.sort(key=_event_occurred_at, reverse=True)
     elif sort == "occurredAt_asc":
-        rows.sort(key=lambda item: str(item.get("occurredAt", "")))
+        rows.sort(key=_event_occurred_at)
     elif sort == "score_desc":
         rows.sort(key=lambda item: float(item.get("maxScore") or 0), reverse=True)
     else:

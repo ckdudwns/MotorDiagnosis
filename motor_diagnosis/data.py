@@ -1789,15 +1789,6 @@ def delete_asset(user: dict[str, Any], site_id: str, asset_id: str) -> dict[str,
     require_site_access(user, site_id)
     with STORE_LOCK:
         get_asset(site_id, asset_id)
-        if any(
-            device["assetId"] == asset_id and device["mappingStatus"] == "active"
-            for device in DEVICES
-        ):
-            raise ApiError(
-                400,
-                "ASSET_HAS_DEVICE",
-                "An asset with an active device mapping cannot be deleted.",
-            )
         snapshot_key = f"{site_id}:{asset_id}"
         dataset_references = []
         for dataset in DATASET_VERSIONS:
@@ -1813,11 +1804,22 @@ def delete_asset(user: dict[str, Any], site_id: str, asset_id: str) -> dict[str,
         event_references = [
             event["id"] for event in EVENTS if event.get("assetId") == asset_id
         ]
-        if dataset_references or event_references:
+        inspection_references = [
+            inspection["id"]
+            for inspection in ENVIRONMENT_INSPECTIONS
+            if inspection.get("assetId") == asset_id
+        ]
+        if dataset_references or event_references or inspection_references:
             raise ApiError(
                 409,
                 "ASSET_HAS_IMMUTABLE_REFERENCES",
-                "An asset referenced by a frozen dataset or event cannot be deleted.",
+                "An asset referenced by a frozen dataset, event, or inspection cannot be deleted.",
+            )
+        if any(device["assetId"] == asset_id for device in DEVICES):
+            raise ApiError(
+                400,
+                "ASSET_HAS_DEVICE",
+                "An asset referenced by a device mapping cannot be deleted.",
             )
         ASSETS[:] = [asset for asset in ASSETS if asset["id"] != asset_id]
         ANOMALY_RULES[:] = [
@@ -2268,6 +2270,12 @@ def delete_device(user: dict[str, Any], device_id: str) -> dict[str, Any]:
     with STORE_LOCK:
         device = get_device(device_id)
         require_site_access(user, device["siteId"])
+        if any(record["deviceId"] == device_id for record in CONNECTIVITY_TEST_RECORDS):
+            raise ApiError(
+                409,
+                "DEVICE_HAS_CONNECTIVITY_HISTORY",
+                "A device with connectivity test history cannot be deleted.",
+            )
         if any(
             inspection["deviceId"] == device_id
             for inspection in ENVIRONMENT_INSPECTIONS
@@ -3887,11 +3895,15 @@ def update_anomaly_rule(
         return copy_payload(rule)
 
 
-def _alert_policy_site_ids(policy: dict[str, Any]) -> list[str]:
+def _alert_policy_site_ids(
+    policy: dict[str, Any], *, use_stored_scope: bool = True
+) -> list[str]:
     site_ids = {str(value).strip().upper() for value in policy.get("siteIds", [])}
     stored_site_ids = {
         str(value).strip().upper() for value in policy.get("scopeSiteIds", [])
     }
+    if use_stored_scope and "scopeSiteIds" in policy:
+        return sorted(site_ids | stored_site_ids)
     for asset_id in policy.get("assetIds", []):
         normalized_asset_id = str(asset_id).strip().upper()
         asset = next(
@@ -3899,9 +3911,6 @@ def _alert_policy_site_ids(policy: dict[str, Any]) -> list[str]:
         )
         if asset:
             site_ids.add(asset["siteId"])
-            continue
-        if stored_site_ids:
-            site_ids.update(stored_site_ids)
             continue
         matching_site = next(
             (
@@ -4027,7 +4036,10 @@ def update_alert_policy(
                 "updatedAt": now_iso(),
             }
         )
-        after_site_ids = _alert_policy_site_ids(policy)
+        scope_changed = "siteIds" in payload or "assetIds" in payload
+        after_site_ids = _alert_policy_site_ids(
+            policy, use_stored_scope=not scope_changed
+        )
         policy["scopeSiteIds"] = after_site_ids
         append_audit_log(
             user,
@@ -4170,8 +4182,6 @@ def create_environment_inspection(
     user: dict[str, Any], device_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
     require_permission(user, "environment-inspection:write")
-    device = get_device(device_id)
-    require_site_access(user, device["siteId"])
     inspected_at = required_text(payload, "inspectedAt")
     parse_rfc3339("inspectedAt", inspected_at)
     maintenance_action = str(payload.get("maintenanceAction") or "").strip() or None
@@ -4182,6 +4192,8 @@ def create_environment_inspection(
             "maintenanceAction must be 2000 characters or less.",
         )
     with STORE_LOCK:
+        device = get_device(device_id)
+        require_site_access(user, device["siteId"])
         record = {
             "id": f"ENV-{len(ENVIRONMENT_INSPECTIONS) + 1:06d}",
             "deviceId": device["id"],
@@ -4736,6 +4748,16 @@ def _dataset_compatibility(payload: dict[str, Any]) -> dict[str, Any]:
             400, "INVALID_DATASET_COMPATIBILITY", "compatibility must be an object."
         )
     signal_types = string_list(compatibility, "signalType", required=True)
+    normalized_signal_types = set()
+    for signal_type in signal_types:
+        canonical_signal_type = signal_type.strip().casefold()
+        if canonical_signal_type in normalized_signal_types:
+            raise ApiError(
+                400,
+                "INVALID_DATASET_COMPATIBILITY",
+                "compatibility.signalType values must be unique after normalization.",
+            )
+        normalized_signal_types.add(canonical_signal_type)
     units = compatibility.get("units")
     if not isinstance(units, dict) or not units:
         raise ApiError(400, "INVALID_DATASET_UNITS", "compatibility.units is required.")
@@ -4917,8 +4939,10 @@ def _dataset_version_fingerprint(
 ) -> str:
     canonical_compatibility = {
         "signalType": sorted(
-            str(value).strip().casefold()
-            for value in compatibility.get("signalType", [])
+            {
+                str(value).strip().casefold()
+                for value in compatibility.get("signalType", [])
+            }
         ),
         "samplingRateHz": compatibility.get("samplingRateHz"),
         "units": _canonical_casefold_keys(compatibility.get("units", {})),

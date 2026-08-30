@@ -7,6 +7,7 @@ import threading
 import unittest
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -23,6 +24,7 @@ from motor_diagnosis.data import (
     audit_logs_for,
     authenticate,
     create_asset,
+    create_connectivity_test,
     create_dataset_version,
     create_environment_inspection,
     create_site,
@@ -36,11 +38,13 @@ from motor_diagnosis.data import (
     event_reviews_for,
     environment_inspections_for,
     format_rfc3339,
+    get_device,
     parse_rfc3339,
     reset_runtime_state,
     recover_device_from_telemetry,
     review_event,
     sensor_faults_for_device,
+    STORE_LOCK,
     update_acoustic_taxonomy,
     update_alert_policy,
     update_anomaly_rule,
@@ -406,6 +410,46 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(len(alert_policies_for(site_01_operator)), 1)
         self.assertEqual(alert_policies_for(site_02_operator), [])
 
+    def test_reused_policy_asset_id_keeps_the_stored_site_scope(self) -> None:
+        asset = create_asset(
+            self.admin,
+            "SITE-01",
+            {
+                "id": "REUSED-POLICY-ASSET",
+                "assetCode": "REUSED-POLICY-01",
+                "name": "Original policy target",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
+        )
+        update_alert_policy(
+            self.admin,
+            "ALERT-POLICY-DEFAULT",
+            {
+                "siteIds": [],
+                "assetIds": [asset["id"]],
+                "recipients": ["site-01-private-recipient"],
+                "reason": "Freeze the original policy scope",
+            },
+        )
+        delete_asset(self.admin, "SITE-01", asset["id"])
+        create_asset(
+            self.admin,
+            "SITE-02",
+            {
+                "id": asset["id"],
+                "assetCode": "REUSED-POLICY-02",
+                "name": "Reused identifier on another site",
+                "assetType": "motor",
+                "ratedRpm": 1800,
+            },
+        )
+        site_01_operator = {**self.operator, "allowedSiteIds": ["SITE-01"]}
+        site_02_operator = {**self.operator, "allowedSiteIds": ["SITE-02"]}
+
+        self.assertEqual(len(alert_policies_for(site_01_operator)), 1)
+        self.assertEqual(alert_policies_for(site_02_operator), [])
+
     def test_older_environment_inspection_does_not_replace_current_status(self) -> None:
         device = next(item for item in DEVICES if item["id"] == "DEV-01-GEN-01")
         common = {
@@ -473,6 +517,101 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
         self.assertEqual(
             referenced.exception.code, "DEVICE_HAS_ENVIRONMENT_INSPECTIONS"
+        )
+        self.assertTrue(any(item["id"] == "DEV-01-GEN-01" for item in DEVICES))
+
+    def test_device_with_connectivity_history_cannot_be_deleted(self) -> None:
+        create_connectivity_test(
+            self.admin,
+            "DEV-01-GEN-01",
+            {
+                "testedAt": "2026-08-24T03:00:00Z",
+                "phase": "after",
+                "rssiDbm": -65,
+                "packetLossPct": 0,
+                "retryRatePct": 0,
+                "latencyMs": 12,
+                "verdict": "pass",
+            },
+        )
+
+        with self.assertRaises(ApiError) as referenced:
+            delete_device(self.admin, "DEV-01-GEN-01")
+
+        self.assertEqual(referenced.exception.code, "DEVICE_HAS_CONNECTIVITY_HISTORY")
+        self.assertTrue(any(item["id"] == "DEV-01-GEN-01" for item in DEVICES))
+
+    def test_inactive_device_reference_prevents_asset_deletion(self) -> None:
+        device = next(item for item in DEVICES if item["id"] == "DEV-01-GEN-01")
+        device["mappingStatus"] = "inactive"
+
+        with self.assertRaises(ApiError) as referenced:
+            delete_asset(self.admin, "SITE-01", device["assetId"])
+
+        self.assertEqual(referenced.exception.code, "ASSET_HAS_DEVICE")
+
+    def test_environment_inspection_and_device_delete_are_atomic(self) -> None:
+        lookup_started = threading.Event()
+        delete_attempted = threading.Event()
+        deletion_finished = threading.Event()
+        outcomes: dict[str, object] = {}
+        inspection_payload = {
+            "inspectedAt": "2026-08-24T03:00:00Z",
+            "dust": "ok",
+            "waterIngress": "ok",
+            "saltCorrosion": "ok",
+            "glandStatus": "ok",
+            "enclosureStatus": "ok",
+        }
+
+        def synchronized_get_device(device_id: str) -> dict:
+            device = get_device(device_id)
+            if threading.current_thread().name == "inspection-writer":
+                owns_store_lock = STORE_LOCK._is_owned()
+                lookup_started.set()
+                if not delete_attempted.wait(timeout=2):
+                    raise AssertionError("device deletion was not attempted")
+                if not owns_store_lock and not deletion_finished.wait(timeout=2):
+                    raise AssertionError("device deletion did not finish")
+            return device
+
+        def inspection_worker() -> None:
+            try:
+                outcomes["inspection"] = create_environment_inspection(
+                    self.admin, "DEV-01-GEN-01", inspection_payload
+                )
+            except Exception as exc:  # pragma: no cover - asserted below
+                outcomes["inspection_error"] = exc
+
+        def deletion_worker() -> None:
+            delete_attempted.set()
+            try:
+                outcomes["deletion"] = delete_device(self.admin, "DEV-01-GEN-01")
+            except ApiError as exc:
+                outcomes["deletion_error"] = exc
+            finally:
+                deletion_finished.set()
+
+        with patch(
+            "motor_diagnosis.data.get_device", side_effect=synchronized_get_device
+        ):
+            inspection_thread = threading.Thread(
+                target=inspection_worker, name="inspection-writer"
+            )
+            inspection_thread.start()
+            self.assertTrue(lookup_started.wait(timeout=2))
+            deletion_thread = threading.Thread(
+                target=deletion_worker, name="device-deleter"
+            )
+            deletion_thread.start()
+            inspection_thread.join(timeout=2)
+            deletion_thread.join(timeout=2)
+
+        self.assertFalse(inspection_thread.is_alive())
+        self.assertFalse(deletion_thread.is_alive())
+        self.assertNotIn("inspection_error", outcomes)
+        self.assertEqual(
+            outcomes["deletion_error"].code, "DEVICE_HAS_ENVIRONMENT_INSPECTIONS"
         )
         self.assertTrue(any(item["id"] == "DEV-01-GEN-01" for item in DEVICES))
 
@@ -854,6 +993,23 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
         self.assertTrue(first["versionFingerprint"].startswith("sha256:"))
         self.assertEqual(exists.exception.code, "DATASET_VERSION_EXISTS")
+
+    def test_signal_types_reject_mixed_case_duplicates(self) -> None:
+        payload = self.dataset_payload(
+            checksum="mixed-case-signal-type",
+            source_filters={"siteId": "SITE-01"},
+            label_mapping={"needs_review": "BEARING_SUSPECT"},
+        )
+        payload["compatibility"]["signalType"] = [
+            "vibration",
+            "VIBRATION",
+            "acoustic",
+        ]
+
+        with self.assertRaises(ApiError) as invalid:
+            create_dataset_version(self.admin, payload)
+
+        self.assertEqual(invalid.exception.code, "INVALID_DATASET_COMPATIBILITY")
 
     def test_external_dataset_validates_the_assets_actual_site(self) -> None:
         misleading_asset = create_asset(
@@ -1510,11 +1666,16 @@ class Week3HttpContractTest(unittest.TestCase):
         *,
         method: str = "GET",
         payload: dict[str, object] | None = None,
+        raw_body: bytes | None = None,
         token: str = "",
     ) -> tuple[int, bytes, object]:
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {}
+        if payload is not None and raw_body is not None:
+            raise ValueError("payload and raw_body cannot be provided together")
+        body = raw_body
         if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+        headers = {}
+        if body is not None:
             headers["content-type"] = "application/json"
         if token:
             headers["authorization"] = f"Bearer {token}"
@@ -1538,6 +1699,24 @@ class Week3HttpContractTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         return body["session"]["token"]
+
+    def test_invalid_utf8_and_oversized_json_integer_return_400(self) -> None:
+        invalid_bodies = (
+            b'{"name":"\xff"}',
+            b'{"value":' + (b"9" * 5000) + b"}",
+        )
+
+        for raw_body in invalid_bodies:
+            with self.subTest(body_prefix=raw_body[:20]):
+                status, body, _ = self.request_raw(
+                    "/api/datasets",
+                    method="POST",
+                    raw_body=raw_body,
+                    token=self.admin_token,
+                )
+                response = json.loads(body.decode("utf-8"))
+                self.assertEqual(status, 400)
+                self.assertEqual(response["error"]["code"], "INVALID_JSON")
 
     def test_event_lookup_detail_review_and_history(self) -> None:
         status, page = self.request(

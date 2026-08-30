@@ -785,9 +785,17 @@ class AppHandler(BaseHTTPRequestHandler):
             )
         try:
             data = json.loads(self.rfile.read(length).decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise ApiError(
+                400, "INVALID_JSON", "Request body must be valid UTF-8 JSON."
+            ) from exc
         except RecursionError as exc:
             raise ApiError(
                 400, "INVALID_JSON", "Request body nesting is too deep."
+            ) from exc
+        except ValueError as exc:
+            raise ApiError(
+                400, "INVALID_JSON", "Request body is not valid JSON."
             ) from exc
         if not isinstance(data, dict):
             raise ApiError(400, "INVALID_JSON_BODY", "JSON body must be an object.")

@@ -260,6 +260,7 @@ class MqttRetryQueue:
         self._ack_targets: dict[str, tuple[Any, RetryMessage]] = {}
         self._target_lock = threading.Lock()
         self._processing_lock = threading.Lock()
+        self._inflight_message_keys: set[str] = set()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._worker: threading.Thread | None = None
@@ -494,9 +495,12 @@ class MqttRetryQueue:
                     ),
                 )
             with self._target_lock:
-                self._ack_targets[str(row["message_key"])] = (client, retry_message)
+                message_key = str(row["message_key"])
+                self._ack_targets[message_key] = (client, retry_message)
             self._wake_event.set()
             if bool(row["delivery_completed"]):
+                if message_key in self._inflight_message_keys:
+                    return "retry"
                 outcome = str(row["delivery_outcome"]) or (
                     "quarantined" if row["operation"] == "quarantine" else "accepted"
                 )
@@ -602,16 +606,43 @@ class MqttRetryQueue:
         )
         return outcome
 
-    def _process_due_once(self, *, now: float | None = None) -> str:
-        row = self._next_due(time.time() if now is None else now)
-        if row is None:
-            return "idle"
+    def _claim_next_due(self, now: float) -> sqlite3.Row | None:
+        with self._processing_lock:
+            row = self._next_due(now)
+            if row is None:
+                return None
+            message_key = str(row["message_key"])
+            if message_key in self._inflight_message_keys:
+                return None
+            self._inflight_message_keys.add(message_key)
+            return row
+
+    def _release_claim(self, row: sqlite3.Row) -> None:
+        with self._processing_lock:
+            self._inflight_message_keys.discard(str(row["message_key"]))
+
+    def _complete_claimed(self, row: sqlite3.Row, outcome: str) -> str:
+        with self._processing_lock:
+            try:
+                return self._complete(row, outcome)
+            finally:
+                self._inflight_message_keys.discard(str(row["message_key"]))
+
+    def _reschedule_claimed(self, row: sqlite3.Row, error: MqttBridgeError) -> str:
+        with self._processing_lock:
+            try:
+                self._reschedule(row, error)
+                return "retry"
+            finally:
+                self._inflight_message_keys.discard(str(row["message_key"]))
+
+    def _process_due_once(self, row: sqlite3.Row) -> str:
         try:
             if bool(row["delivery_completed"]):
                 outcome = str(row["delivery_outcome"]) or (
                     "quarantined" if row["operation"] == "quarantine" else "accepted"
                 )
-                return self._complete(row, outcome)
+                return self._complete_claimed(row, outcome)
             if row["operation"] == "quarantine":
                 quarantine_local_mqtt_message(
                     self.quarantine_endpoint,
@@ -625,7 +656,7 @@ class MqttRetryQueue:
                         local=True,
                     ),
                 )
-                return self._complete(row, "quarantined")
+                return self._complete_claimed(row, "quarantined")
 
             forward_mqtt_message(
                 str(row["topic"]),
@@ -633,16 +664,19 @@ class MqttRetryQueue:
                 endpoint=self.ingest_endpoint,
                 token=self.token,
             )
-            return self._complete(row, "accepted")
+            return self._complete_claimed(row, "accepted")
         except MqttBridgeError as error:
             if row["operation"] == "ingest" and is_permanent_ingest_error(error):
-                return self._complete(row, "quarantined")
-            self._reschedule(row, error)
-            return "retry"
+                return self._complete_claimed(row, "quarantined")
+            return self._reschedule_claimed(row, error)
+        finally:
+            self._release_claim(row)
 
     def process_due_once(self, *, now: float | None = None) -> str:
-        with self._processing_lock:
-            return self._process_due_once(now=now)
+        row = self._claim_next_due(time.time() if now is None else now)
+        if row is None:
+            return "idle"
+        return self._process_due_once(row)
 
     def _run(self) -> None:
         while not self._stop_event.is_set():

@@ -1218,6 +1218,114 @@ class Week2HttpSmokeTest(unittest.TestCase):
         self.assertEqual(TELEMETRY_METRICS["rejected"], initial_rejected + 1)
         self.assertEqual(TELEMETRY_METRICS["localRejected"], initial_local_rejected + 1)
 
+    def test_slow_retry_does_not_block_unrelated_mqtt_message(self) -> None:
+        class AckClient:
+            def __init__(self) -> None:
+                self.ack_calls: list[tuple[int, int]] = []
+
+            def ack(self, mid: int, qos: int) -> int:
+                self.ack_calls.append((mid, qos))
+                return 0
+
+        retry_started = threading.Event()
+        release_retry = threading.Event()
+        fresh_completed = threading.Event()
+        results: dict[str, str] = {}
+        errors: list[BaseException] = []
+
+        queued_message = SimpleNamespace(
+            topic="devices/DEV-RETRY/telemetry",
+            payload=b'{"sequence": 201}',
+            mid=201,
+            qos=1,
+        )
+        fresh_message = SimpleNamespace(
+            topic="devices/DEV-FRESH/telemetry",
+            payload=b'{"sequence": 202}',
+            mid=202,
+            qos=1,
+        )
+        retry_client = AckClient()
+        fresh_client = AckClient()
+
+        with tempfile.TemporaryDirectory() as directory:
+            retry_queue = MqttRetryQueue(
+                database_path=Path(directory) / "nonblocking-retry.sqlite3",
+                ingest_endpoint="http://backend/api/telemetry/ingest",
+                quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                token="demo-mqtt-ingest-token",
+                initial_delay=0,
+            )
+            self.assertTrue(
+                retry_queue.enqueue(
+                    retry_client,
+                    queued_message,
+                    MqttBridgeError(503, "HTTP_SERVICE_UNAVAILABLE", "temporary"),
+                )
+            )
+
+            def delayed_forward(topic, payload, **kwargs):
+                if topic == queued_message.topic:
+                    retry_started.set()
+                    if not release_retry.wait(5):
+                        raise AssertionError("retry HTTP call was not released")
+                    sequence = 201
+                else:
+                    sequence = 202
+                return {
+                    "deviceId": topic.split("/")[1],
+                    "sequence": sequence,
+                    "duplicate": False,
+                }, 201
+
+            def run_retry() -> None:
+                try:
+                    results["retry"] = retry_queue.process_due_once(now=float("inf"))
+                except BaseException as error:
+                    errors.append(error)
+
+            def run_fresh_message() -> None:
+                try:
+                    results["fresh"] = process_mqtt_message(
+                        fresh_client,
+                        fresh_message,
+                        endpoint="http://backend/api/telemetry/ingest",
+                        quarantine_endpoint=("http://backend/api/telemetry/quarantine"),
+                        token="demo-mqtt-ingest-token",
+                        retry_queue=retry_queue,
+                    )
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    fresh_completed.set()
+
+            with patch(
+                "motor_diagnosis.mqtt_service.forward_mqtt_message",
+                side_effect=delayed_forward,
+            ):
+                retry_thread = threading.Thread(target=run_retry)
+                fresh_thread = threading.Thread(target=run_fresh_message)
+                retry_thread.start()
+                self.assertTrue(retry_started.wait(1))
+                fresh_thread.start()
+                try:
+                    self.assertTrue(
+                        fresh_completed.wait(1),
+                        "an unrelated MQTT message waited for retry HTTP I/O",
+                    )
+                finally:
+                    release_retry.set()
+                    retry_thread.join(timeout=2)
+                    fresh_thread.join(timeout=2)
+
+            self.assertFalse(retry_thread.is_alive())
+            self.assertFalse(fresh_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results, {"fresh": "accepted", "retry": "accepted"})
+            self.assertEqual(fresh_client.ack_calls, [(202, 1)])
+            self.assertEqual(retry_client.ack_calls, [(201, 1)])
+            self.assertEqual(retry_queue.pending_count(), 0)
+
     def test_actual_ai2_replay_output_is_accepted_and_queryable(self) -> None:
         source_asset_id = "SYN-ASSET-01"
         generated = build_replay_record(

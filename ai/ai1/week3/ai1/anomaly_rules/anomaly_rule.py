@@ -143,8 +143,16 @@ def evaluate_feature_stream(
             # NaN/Inf/결측 특징값은 check_outliers()가 조용히 건너뛰어
             # _max_deviation_sigma()가 0.0(=NORMAL)을 반환한다. 이를 그대로
             # 두면 진행 중인 이상 이벤트가 무효 윈도우 때문에 조기 종료될 수
-            # 있으므로, 히스테리시스 카운터(consecutive_over/under)와 현재
-            # 이벤트를 전혀 건드리지 않고 별도 INVALID 상태로만 기록한다.
+            # 있으므로 현재 이벤트는 건드리지 않는다. 다만 "연속된 유효
+            # 윈도우"라는 min_consecutive_* 조건을 지키려면 진행 중이던
+            # 연속 카운터는 끊어야 한다 — 그러지 않으면 INVALID로 갈라진
+            # 두 유효 윈도우가 연속 2회로 잘못 합산되어 start_index/end_index가
+            # INVALID 윈도우를 가리키는 이벤트가 생긴다.
+            if state == "NORMAL":
+                consecutive_over = 0
+                pending_max_dev = 0.0
+            else:  # state == "ANOMALY"
+                consecutive_under = 0
             window_states.append(
                 {
                     "index": i,

@@ -179,6 +179,46 @@ class TestHysteresisSuppressesSingleSpike(unittest.TestCase):
         invalid_states = [w for w in result["window_states"] if w["state"] == "INVALID"]
         self.assertEqual(len(invalid_states), 3)
 
+    def test_invalid_window_breaks_entry_consecutive_count(self):
+        """[이상, INVALID, 이상]은 연속 2회 진입으로 합산되면 안 된다.
+        INVALID는 consecutive_over를 끊어야 하므로 min_consecutive_enter=2에서는
+        이벤트가 아예 생기지 않아야 한다 (이전 버그: continue가 카운터를 보존해
+        연속 2회로 오판하고 start_index가 INVALID 윈도우를 가리켰다)."""
+        baseline = _fake_baseline()
+        config = AnomalyRuleConfig(min_consecutive_enter=2, min_consecutive_exit=2)
+        windows = (
+            [{"x": 0.0}] * 5
+            + [{"x": 20.0}]  # 이상 스파이크 1회
+            + [{"x": float("nan")}]  # 무효 윈도우 - 진입 카운터를 끊어야 함
+            + [{"x": 20.0}]  # 이상 스파이크 1회 (앞의 스파이크와 연속이 아님)
+            + [{"x": 0.0}] * 5
+        )
+        result = evaluate_feature_stream(windows, baseline, config)
+        self.assertEqual(
+            result["events"], [], "INVALID로 갈라진 두 스파이크가 연속 진입으로 합산되면 안 된다"
+        )
+
+    def test_invalid_window_breaks_exit_consecutive_count(self):
+        """[이상 진입, 정상, INVALID, 정상]은 연속 2회 복귀로 합산되면 안 된다.
+        ANOMALY 상태의 INVALID는 consecutive_under를 끊어야 한다 (이전 버그:
+        continue가 카운터를 보존해 연속 2회 복귀로 오판하고 end_index가
+        INVALID 윈도우를 가리켰다)."""
+        baseline = _fake_baseline()
+        config = AnomalyRuleConfig(min_consecutive_enter=2, min_consecutive_exit=2)
+        windows = (
+            [{"x": 0.0}] * 5
+            + [{"x": 20.0}] * 4  # 이상 진입 및 유지
+            + [{"x": 0.0}]  # 복귀 후보 1회
+            + [{"x": float("nan")}]  # 무효 윈도우 - 복귀 카운터를 끊어야 함
+            + [{"x": 0.0}]  # 복귀 후보 1회 (앞의 후보와 연속이 아님)
+        )
+        result = evaluate_feature_stream(windows, baseline, config)
+        self.assertEqual(len(result["events"]), 1)
+        self.assertIsNone(
+            result["events"][0]["end_index"],
+            "INVALID로 갈라진 두 복귀 후보가 연속 복귀로 합산되어 이벤트가 조기 종료되면 안 된다",
+        )
+
     def test_inf_feature_value_flagged_invalid_not_normal(self):
         baseline = _fake_baseline()
         windows = [{"x": float("inf")}]

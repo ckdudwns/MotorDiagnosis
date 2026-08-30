@@ -9,10 +9,16 @@ DATA_EXPORT_01 테스트 — CWRU 데이터로 매니페스트/CSV/XLSX 내보�
 import os
 import sys
 import csv
+import io
+import codecs
+import contextlib
 import json
 import shutil
 import tempfile
 import unittest
+from unittest import mock
+
+import numpy as np
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATASETS_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", "datasets"))
@@ -35,7 +41,8 @@ from register_dataset import (  # noqa: E402
     InsufficientAssetGroupsError,
 )
 from export_dataset import export_dataset  # noqa: E402
-from extract_features import FeatureConfig  # noqa: E402
+import extract_features as _extract_features_module  # noqa: E402
+from extract_features import FeatureConfig, compute_mfcc  # noqa: E402
 
 
 def _cwru_data_available() -> bool:
@@ -216,6 +223,23 @@ class TestComputeFeatureOutputFingerprint(unittest.TestCase):
             compute_feature_output_fingerprint(rows_a),
             compute_feature_output_fingerprint(rows_b),
         )
+
+
+class TestMfccFallbackWarningIsEncodingSafe(unittest.TestCase):
+    """안내된 설치 방법(루트 requirements.txt + week3 requirements.txt)만으로는
+    librosa가 설치되지 않는다. 이 상태로 register_dataset.py를 실행하면
+    extract_all_features() -> compute_mfcc()의 librosa 미설치 폴백 경고가
+    출력되는데, 이 메시지의 em dash(—)는 Windows 기본 콘솔 코드페이지인
+    cp949로 표현할 수 없어 print()가 UnicodeEncodeError를 내며 rows 생성과
+    fingerprint 계산 전에 실행이 통째로 중단됐다. cp949로 강제 인코딩되는
+    스트림에 실제로 출력해 이 크래시가 재발하지 않는지 확인한다."""
+
+    def test_fallback_warning_does_not_crash_on_cp949_console(self):
+        cp949_stream = codecs.getwriter("cp949")(io.BytesIO())
+        with mock.patch.object(_extract_features_module, "_HAS_LIBROSA", False):
+            with contextlib.redirect_stdout(cp949_stream):
+                mfcc = compute_mfcc(np.zeros(4096), FeatureConfig())
+        self.assertTrue(np.all(mfcc == 0.0))
 
 
 class TestValidateSplitRatios(unittest.TestCase):

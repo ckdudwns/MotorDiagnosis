@@ -137,14 +137,22 @@ class AssetBaselineRegistry:
 
     def resolve(self, *, asset_id: str = None, asset_type: str = None) -> dict:
         if asset_id and asset_id in self._by_asset_id:
-            return self._by_asset_id[asset_id]
-        if asset_type and asset_type in self._by_asset_type:
-            return self._by_asset_type[asset_type]
-        if self._default is not None:
-            return self._default
-        raise KeyError(
-            f"등록된 기준선이 없습니다: asset_id={asset_id!r}, asset_type={asset_type!r}"
-        )
+            entry = self._by_asset_id[asset_id]
+        elif asset_type and asset_type in self._by_asset_type:
+            entry = self._by_asset_type[asset_type]
+        elif self._default is not None:
+            entry = self._default
+        else:
+            raise KeyError(
+                f"등록된 기준선이 없습니다: asset_id={asset_id!r}, asset_type={asset_type!r}"
+            )
+        # register()가 deepcopy로 저장해도, 여기서 내부 entry를 그대로
+        # 돌려주면 호출자가 조회 결과(예: config.sigma_enter)를 그 자리에서
+        # 수정할 때 등록된 상태 자체가 오염된다 — 특히 asset_type/default
+        # 항목은 여러 설비가 같은 entry 객체를 공유하므로, 한 설비 조회
+        # 결과를 고치면 그 항목을 공유하는 다른 모든 설비에도 전파된다.
+        # 그래서 조회 시점에도 다시 deepcopy해 반환한다.
+        return {"baseline": copy.deepcopy(entry["baseline"]), "config": copy.deepcopy(entry["config"])}
 
 
 def _max_deviation_sigma(features: dict, baseline: dict) -> float:

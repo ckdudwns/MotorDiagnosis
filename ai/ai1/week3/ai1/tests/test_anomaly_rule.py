@@ -207,6 +207,51 @@ class TestAssetBaselineRegistry(unittest.TestCase):
         resolved = registry.resolve(asset_id="anything")
         self.assertEqual(resolved["config"].min_consecutive_enter, 2)
 
+    def test_mutating_resolved_entry_does_not_leak_to_other_assets(self):
+        """resolve()가 내부 entry를 그대로 돌려주면, 조회 결과를 그 자리에서
+        수정(예: sigma_enter 조정)했을 때 등록된 상태 자체가 오염된다.
+        특히 asset_type/default로 등록한 entry는 여러 설비가 같은 객체를
+        공유하므로, 한 설비의 조회 결과를 고치면 별도로 재등록하지 않은
+        다른 설비에도 그 변경이 전파된다 — 실제로 MOTOR 기본 설정을
+        조회해 sigma_enter를 11로 바꾸면 재등록하지 않은 다른 설비도
+        10sigma 이벤트를 놓치는 것을 재현한다."""
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": 1.0}}}
+        registry.register(
+            baseline,
+            config=AnomalyRuleConfig(
+                sigma_enter=10.0, sigma_exit=5.0,
+                min_consecutive_enter=1, min_consecutive_exit=1,
+            ),
+            asset_type="MOTOR",
+        )
+
+        resolved_for_a = registry.resolve(asset_type="MOTOR")
+        resolved_for_a["config"].sigma_enter = 11.0  # A 설비 전용으로 조정한다고 착각하기 쉬움
+        resolved_for_a["baseline"]["features"]["x"]["mean"] = 999.0
+
+        resolved_for_b = registry.resolve(asset_type="MOTOR")
+        self.assertEqual(
+            resolved_for_b["config"].sigma_enter,
+            10.0,
+            "B 설비 조회 결과가 A 설비의 조회 결과 수정에 영향을 받았습니다",
+        )
+        self.assertEqual(
+            resolved_for_b["baseline"]["features"]["x"]["mean"],
+            0.0,
+            "B 설비 조회 결과가 A 설비의 조회 결과 수정에 영향을 받았습니다",
+        )
+
+        # 등록되지 않은(재등록 없이 MOTOR 기본을 그대로 쓰는) 설비도
+        # 10sigma 이벤트를 그대로 잡아야 한다 — A 설비 조회 결과 수정으로
+        # 임계값이 11sigma로 올라가 이벤트를 놓치면 안 된다.
+        result = evaluate_asset_stream(
+            "SITE-B-MOT-01", [{"x": 10.0}], registry, asset_type="MOTOR"
+        )
+        self.assertEqual(
+            len(result["events"]), 1, "다른 설비 조회 결과 수정이 이 설비의 판정에 전파됐다"
+        )
+
 
 class TestHysteresisSuppressesSingleSpike(unittest.TestCase):
     def test_single_window_spike_does_not_trigger_event(self):

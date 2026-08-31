@@ -518,8 +518,13 @@ class TestValidateFiniteFeatures(unittest.TestCase):
         _validate_finite_features({"rms_mean": 0.05, "kurtosis_mean": -1.2}, "sample-1")
 
 
+@unittest.skipUnless(_cwru_data_available(), CWRU_SKIP_REASON)
 class TestBuildManifestRejectsNonFiniteFeatures(unittest.TestCase):
-    @unittest.skipUnless(_cwru_data_available(), CWRU_SKIP_REASON)
+    """extract_all_features()만 모킹하고 나머지(CWRU .mat 로딩)는 실제로
+    실행하므로, 원본 파일이 없는 체크아웃에서는 build_manifest가 특징값
+    검증에 도달하기 전에 FileNotFoundError로 먼저 실패한다 — 클래스
+    전체를 CWRU 데이터 유무에 따라 skip한다."""
+
     def test_nan_feature_value_blocks_manifest_build(self):
         """NaN/Inf 특징값이 그대로 저장되면 CSV에는 문자열 "nan"이, XLSX에는
         빈 셀로 남아 같은 값이 산출물마다 다르게 표현된다 — build_manifest

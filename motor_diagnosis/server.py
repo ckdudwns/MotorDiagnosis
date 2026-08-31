@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1313,8 +1314,20 @@ def optional_boolean_query(query: dict[str, list[str]], key: str) -> bool | None
 
 
 class MotorDiagnosisServer(ThreadingHTTPServer):
-    def service_actions(self):
-        if self.auto_alerts:
+    def start_alert_worker(self):
+        self._alert_stop = threading.Event()
+        self._alert_worker = threading.Thread(
+            target=self._run_alert_worker, name="alert-outbox", daemon=True
+        )
+        self._alert_worker.start()
+
+    def _run_alert_worker(self):
+        # SQLite can wait on another writer. Never perform this work in
+        # BaseServer.service_actions(), which runs in the HTTP accept loop.
+        # One coordinator coalesces polling; ticks never overlap or accumulate.
+        while not self._alert_stop.wait(0.5):
+            if not self.auto_alerts:
+                continue
             try:
                 self.alerts.tick()
             except Exception:
@@ -1323,6 +1336,10 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
                 )
 
     def server_close(self):
+        if hasattr(self, "_alert_stop"):
+            self._alert_stop.set()
+            if self._alert_worker.ident is not None:
+                self._alert_worker.join()
         super().server_close()
         if hasattr(self, "alerts"):
             self.alerts.close()
@@ -1349,6 +1366,7 @@ def create_server(
             alert_database,
             adapters=alert_adapters,
         )
+        server.start_alert_worker()
     except Exception:
         server.server_close()
         raise

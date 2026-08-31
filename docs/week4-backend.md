@@ -34,6 +34,8 @@ severity_mismatch / reviewed / outside_work_hours / cooldown 사유가 포함된
 
 웹 알림은 이벤트·정책당 한 건, 외부/Stub 채널은 수신자별 한 건이다.
 동일 이벤트·정책·채널·수신자·시험 여부로 다시 요청하면 기존 발송을 반환한다.
+현재 정책의 활성·범위·심각도·검토·근무시간 조건을 통과한 재요청은 쿨다운보다
+기존 발송 결과 조회가 우선이다. 새 채널/수신자 등 아직 없는 발송에는 쿨다운을 적용한다.
 시험 알림은 `[TEST]`로 구분하고 실제 알림의 쿨다운에 영향을 주지 않는다.
 시험 모드도 정책 활성 상태, 사이트/설비 범위, 심각도 조건은 우회하지 않는다.
 정책 근무시간은 **UTC HH:MM**이며 자정을 넘는 범위를 지원한다.
@@ -48,6 +50,11 @@ severity_mismatch / reviewed / outside_work_hours / cooldown 사유가 포함된
 대시보드는 이 API의 현재 사이트 `channel=web&status=sent` 결과를 표시한다.
 
 HTTP 서버는 새 이벤트를 관찰해 정책에 맞는 알림을 자동 등록한다.
+이벤트 관찰·SQLite 대기열 처리는 전용 작업자 한 개가 0.5초 간격으로 실행하며,
+HTTP 요청 수용 루프에서는 DB 작업을 하지 않는다. DB 잠금/일시 오류 중에도 다른
+API는 요청을 수용하고, 알림 작업자는 다음 주기에 재시도한다. 알림 DB를 사용하는
+API 자체는 잠금을 기다릴 수 있다. 서버 종료 시 작업자를 먼저 중지·합류한 다음
+채널 발송 작업 완료를 기다리고 DB를 닫는다.
 초기 화면용 기본 이벤트는 자동 발송하지 않는다. 실패한 이메일/Webhook과 별도로
 웹 알림 작업자가 실행된다. 일시 오류는 2초·4초 후 재시도하며 총 3회까지만 시도한다.
 미설정 채널과 영구 HTTP 거부는 `failed`로 저장한다. 네트워크 예외의 원문은
@@ -122,6 +129,10 @@ NaN/Infinity/null/boolean/숫자 문자열, 과도한 크기·중첩은 거부�
 예시 수치는 계약 설명용이며 실제 모델 성능이 아니다.
 보고 필드 errorCases(문자열 목록), domainGap, fieldCalibrationPlan은 선택값이다.
 artifactUri는 HTTPS/S3/file **참조만** 보관하고 파일을 다운로드·실행하지 않는다.
+HTTPS는 올바른 DNS 호스트명/IP와 선택적 포트(1~65535), S3는 버킷 호스트와
+경로를 요구한다. S3/file의 포트는 허용하지 않는다. file은 절대 경로와 선택적
+공유 호스트를 지원한다. 빈 호스트, 잘못된 포트, 공백/제어문자, 계정 정보,
+fragment는 `400 INVALID_ARTIFACT_URI`로 거부하며 DNS/파일 존재 여부는 검사하지 않는다.
 응답은 `draft`, `approvalStatus=pending`, `deploymentStatus=not_deployed`,
 `artifactVerified=false`다. 동일 version은 대소문자 구분 없이 409로 거부한다.
 baseline과 model의 datasetId가 다르면 `409 MODEL_DATASET_MISMATCH`다.
@@ -147,6 +158,7 @@ baseline과 model의 datasetId가 다르면 `409 MODEL_DATASET_MISMATCH`다.
     "siteId":"SITE-01", "assetId":"SITE-01-MOT-02", "deviceId":"DEV-01-MOT-02",
     "timestamp":"2026-08-31T00:00:00Z", "sequence":1, "rpm":1796,
     "vibrationRmsRaw":0.08, "acousticRmsRaw":0.007,
+    "vibrationPeakHz":29.9,
     "vibrationRmsMmS":null, "acousticDb":null,
     "scenarioLabel":"normal", "isSynthetic":true, "source":"week4-demo"
   }]
@@ -188,7 +200,7 @@ git diff --check
 외부 서비스 없이 테스트에서는 어댑터를 대체한다. 실제 SMTP/Webhook 발송,
 실제 MQTT 브로커·IoT 보드, 원본 데이터셋 학습은 별도로 확인해야 한다.
 
-### 이번 검증 결과 (2026-08-31)
+### 초기 구현 검증 결과 (2026-08-31)
 
 - Python 3.12.13 + Paho 포함 전체 테스트: 166개 통과 (4주차 신규 21개 포함)
 - HTTP smoke, 알림 DOM 동작/XSS 안전 텍스트 렌더링, 컴파일, Black, diff 검사 통과
@@ -197,3 +209,12 @@ git diff --check
 - AI-1의 librosa가 없어 MFCC는 기존 코드의 0벡터 fallback으로 실행됨. 실제 MFCC 검증 결과가 아님
 - Graphify의 기존 정책·데이터셋·권한·감사 연결을 탐색하고 원문과 테스트로 검증함.
   새 4주차 모듈을 포함한 그래프 전체 재생성/무결성 검사는 실행하지 않음
+
+### PR14 리뷰 보완 검증 (2026-08-31)
+
+- 전체 백엔드 172개 통과 (4주차 27개, 이번 회귀 테스트 6개 추가)
+- SQLite 쓰기 잠금 중 health/사이트 API 응답 및 잠금 해제 후 단일 발송 확인
+- 알림 작업자의 일시 오류 재시도와 종료, 기존 발송 재조회/새 발송 쿨다운 구분 검증
+- 산출물 URI 호스트·포트 검증 및 문서 bulk JSON의 실제 HTTP 수용 검증
+- HTTP smoke, 대시보드 DOM/XSS, 컴파일, Black, diff 검사 통과
+- 외부 이메일·Webhook 발송과 실물 장치 24시간 시험은 이번에도 미실행

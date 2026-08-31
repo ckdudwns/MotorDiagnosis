@@ -296,6 +296,33 @@ class Week4AlertsTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(service.list_for(self.admin)["items"][0]["status"], "sent")
 
+    def test_existing_delivery_precedes_cooldown_for_new_deliveries(self):
+        self.configure(["web"], cooldownSec=300)
+        service = self.service()
+        first = self.event()
+        original = service.send(self.admin, {"eventId": first["id"]})["deliveries"][0]
+        service.process_due()
+        self.now += 301
+        service.send(self.admin, {"eventId": self.event()["id"]})
+        service.process_due()
+        self.now += 1
+
+        repeated = service.send(self.admin, {"eventId": first["id"]})
+        self.assertEqual(repeated["suppressed"], [])
+        self.assertEqual(len(repeated["deliveries"]), 1)
+        self.assertEqual(repeated["deliveries"][0]["id"], original["id"])
+        self.assertEqual(repeated["deliveries"][0]["status"], "sent")
+        self.assertEqual(repeated["deliveries"][0]["attemptCount"], 1)
+
+        # Returning an existing web delivery must not bypass cooldown for a new channel.
+        self.configure(["web", "stub"], cooldownSec=300)
+        repeated = service.send(self.admin, {"eventId": first["id"]})
+        self.assertEqual(
+            [row["id"] for row in repeated["deliveries"]], [original["id"]]
+        )
+        self.assertEqual(repeated["suppressed"][0]["reason"], "cooldown")
+        self.assertEqual(service.list_for(self.admin)["total"], 2)
+
     def test_policy_scope_cooldown_review_work_hours_and_test_separation(self):
         service = self.service()
         self.configure(["web"], siteIds=["SITE-01"], cooldownSec=300)
@@ -487,6 +514,62 @@ class Week4RegistryTest(unittest.TestCase):
             create_baseline_version(self.admin, self.baseline_payload())
         self.assertEqual(data.MODEL_VERSIONS, [])
 
+    def test_artifact_uri_rejects_invalid_authority_without_partial_creation(self):
+        payload = self.model_payload()
+        invalid = (
+            "https://:443/model.pkl",
+            "https://models.example:invalid/model.pkl",
+            "https://models.example:65536/model.pkl",
+            "https://models.example:0/model.pkl",
+            "https://models.example:/model.pkl",
+            "https://bad host/model.pkl",
+            "https://bad\nhost/model.pkl",
+            "https://-host.example/model.pkl",
+            "https://host..example/model.pkl",
+            "https://999.999.999.999/model.pkl",
+            "https://[::1/model.pkl",
+            "https://@models.example/model.pkl",
+            "https://user:password@models.example/model.pkl",
+            "https://models.example/model.pkl#fragment",
+            "s3://:443/model.pkl",
+            "s3://models:443/model.pkl",
+            "file://:443/model.pkl",
+            "file://host:443/model.pkl",
+        )
+        before_audits = data.copy_payload(data.AUDIT_LOGS)
+        for uri in invalid:
+            with self.subTest(uri=uri):
+                with self.assertRaises(data.ApiError) as error:
+                    create_model_version(self.system, {**payload, "artifactUri": uri})
+                self.assertEqual(error.exception.code, "INVALID_ARTIFACT_URI")
+        self.assertEqual(data.MODEL_VERSIONS, [])
+        self.assertEqual(data.AUDIT_LOGS, before_audits)
+
+    def test_artifact_uri_accepts_structural_references_without_fetching(self):
+        payload = self.model_payload()
+        for index, uri in enumerate(
+            (
+                "https://models.example/model.pkl",
+                "https://models.example:8443/model.pkl?version=1",
+                "https://127.0.0.1:443/model.pkl",
+                "https://[::1]:8443/model.pkl",
+                "s3://project-models/baseline-v1.pkl",
+                "file:///C:/models/baseline.pkl",
+                "file://model-server/share/baseline.pkl",
+            )
+        ):
+            with self.subTest(uri=uri):
+                row = create_model_version(
+                    self.system,
+                    {
+                        **payload,
+                        "artifactUri": uri,
+                        "version": f"uri-v{index}",
+                    },
+                )
+                self.assertEqual(row["artifactUri"], uri)
+                self.assertFalse(row["artifactVerified"])
+
     def test_baseline_asset_reference_survives_delete_attempt(self):
         asset = data.create_asset(
             self.admin,
@@ -608,6 +691,23 @@ class Week4HttpTest(unittest.TestCase):
         for items_value in ([], [None], [items[0]] * 101):
             self.assertEqual(self.request(path, {"items": items_value}, token)[0], 400)
 
+    def test_documented_bulk_example_is_accepted_by_http_api(self):
+        document = (
+            Path(__file__).resolve().parents[1] / "docs/week4-backend.md"
+        ).read_text(encoding="utf-8")
+        section = document.split("## 오프라인 일괄 재전송", 1)[1]
+        payload = json.loads(section.split("```json", 1)[1].split("```", 1)[0])
+        payload["items"][0]["timestamp"] = data.now_iso()
+        payload["items"][0]["sequence"] = 1
+        status, result = self.request(
+            "/api/telemetry/bulk", payload, "demo-telemetry-ingest-token"
+        )
+        self.assertEqual((status, result["accepted"], result["rejected"]), (200, 1, 0))
+        self.assertEqual(
+            data.TELEMETRY_RECORDS[0]["vibrationPeakHz"],
+            payload["items"][0]["vibrationPeakHz"],
+        )
+
     def test_bulk_device_scope_preflight_prevents_partial_writes(self):
         principal = {
             "permissions": ["telemetry:ingest"],
@@ -686,6 +786,16 @@ class Week4HttpTest(unittest.TestCase):
             "artifactUri": "s3://models/w4",
             "metrics": {"f1": 0.8},
         }
+        for uri in ("https://:443/model", "https://models.example:invalid/model"):
+            status, result = self.request(
+                "/api/model-versions",
+                {**model_body, "artifactUri": uri},
+                self.tokens["system"],
+            )
+            self.assertEqual(
+                (status, result["error"]["code"]), (400, "INVALID_ARTIFACT_URI")
+            )
+        self.assertEqual(data.MODEL_VERSIONS, [])
         self.assertEqual(
             self.request("/api/model-versions", model_body, self.tokens["system"])[0],
             201,
@@ -703,6 +813,100 @@ class Week4HttpTest(unittest.TestCase):
             ],
             404,
         )
+
+
+class Week4AlertWorkerTest(unittest.TestCase):
+    def setUp(self):
+        data.reset_runtime_state()
+        self.folder = tempfile.TemporaryDirectory()
+        self.database = str(Path(self.folder.name) / "alerts.sqlite3")
+        self.server = create_server(
+            "127.0.0.1", 0, alert_database=self.database, auto_alerts=False
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.admin = user("admin")
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(2)
+        self.folder.cleanup()
+
+    def health(self):
+        with urlopen(
+            f"http://127.0.0.1:{self.server.server_port}/api/health", timeout=1
+        ) as response:
+            self.assertEqual(response.status, 200)
+
+    def test_locked_alert_database_does_not_block_http_and_recovers(self):
+        event = data.inject_anomaly({"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"})
+        entered, finished = threading.Event(), threading.Event()
+        original_queue = self.server.alerts._queue
+
+        def queue(*args, **kwargs):
+            entered.set()
+            try:
+                return original_queue(*args, **kwargs)
+            finally:
+                finished.set()
+
+        blocker = sqlite3.connect(self.database)
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            with patch.object(self.server.alerts, "_queue", side_effect=queue):
+                self.server.auto_alerts = True
+                self.assertTrue(entered.wait(2))
+                self.assertFalse(finished.is_set())
+                # Three fresh connections must be accepted while SQLite is still locked.
+                for _ in range(3):
+                    self.health()
+                token = data.authenticate(
+                    {"username": "admin", "password": "admin123"}
+                )["session"]["token"]
+                request = Request(
+                    f"http://127.0.0.1:{self.server.server_port}/api/sites",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                with urlopen(request, timeout=1) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertTrue(json.loads(response.read()))
+                self.assertFalse(finished.is_set())
+                blocker.rollback()
+                self.assertTrue(finished.wait(2))
+        finally:
+            blocker.close()
+        deadline = time.monotonic() + 3
+        while True:
+            rows = self.server.alerts.list_for(
+                self.admin, channel="web", status="sent"
+            )["items"]
+            if rows or time.monotonic() >= deadline:
+                break
+            threading.Event().wait(0.02)
+        self.assertEqual([row["eventId"] for row in rows], [event["id"]])
+        self.assertEqual(rows[0]["attemptCount"], 1)
+
+    def test_worker_retries_tick_failure_and_stops_before_database_close(self):
+        recovered = threading.Event()
+        calls = []
+
+        def tick():
+            calls.append(threading.get_ident())
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            recovered.set()
+
+        with patch.object(self.server.alerts, "tick", side_effect=tick):
+            self.server.auto_alerts = True
+            self.assertTrue(recovered.wait(3))
+            self.health()
+            self.assertEqual(len(set(calls)), 1)
+            self.assertNotEqual(calls[0], self.thread.ident)
+            self.server.shutdown()
+            self.server.server_close()
+            self.assertFalse(self.server._alert_worker.is_alive())
+            self.assertTrue(self.server.alerts._closed)
 
 
 if __name__ == "__main__":

@@ -258,6 +258,29 @@ class AlertService:
                 if reason:
                     suppressed.append({"policyId": policy["id"], "reason": reason})
                     continue
+                pending = []
+                for channel in sorted(set(policy["channels"])):
+                    # One web notification per event/policy; other channels per recipient.
+                    recipients = (
+                        ["site-operators"]
+                        if channel == "web"
+                        else sorted(set(policy["recipients"]))
+                    )
+                    for recipient in recipients:
+                        key = json.dumps(
+                            [event["id"], policy["id"], channel, recipient, is_test]
+                        )
+                        previous = self._db.execute(
+                            "SELECT payload FROM alert_deliveries WHERE dedupe_key=?",
+                            (key,),
+                        ).fetchone()
+                        if previous:
+                            deliveries.append(json.loads(previous[0]))
+                        else:
+                            pending.append((channel, recipient, key))
+                # Cooldown controls new sends, not reads of an existing delivery.
+                if not pending:
+                    continue
                 existing = [
                     json.loads(item[0])
                     for item in self._db.execute(
@@ -275,56 +298,39 @@ class AlertService:
                 ):
                     suppressed.append({"policyId": policy["id"], "reason": "cooldown"})
                     continue
-                for channel in sorted(set(policy["channels"])):
-                    # One web notification per event/policy; SMTP/Webhook deliveries per recipient.
-                    recipients = (
-                        ["site-operators"]
-                        if channel == "web"
-                        else sorted(set(policy["recipients"]))
+                for channel, recipient, key in pending:
+                    row = {
+                        "id": f"ALERT-{uuid.uuid4().hex}",
+                        "eventId": event["id"],
+                        "siteId": event["siteId"],
+                        "assetId": event["assetId"],
+                        "policyId": policy["id"],
+                        "policySnapshot": data.copy_payload(policy),
+                        "event": data.copy_payload(event),
+                        "channel": channel,
+                        "recipient": recipient,
+                        "isTest": is_test,
+                        "status": "pending",
+                        "attemptCount": 0,
+                        "attempts": [],
+                        "createdAt": data.format_rfc3339(stamp),
+                        "createdEpoch": now,
+                        "nextRetryAt": now,
+                        "deliveredAt": None,
+                        "lastError": None,
+                    }
+                    self._db.execute(
+                        "INSERT INTO alert_deliveries VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            row["id"],
+                            key,
+                            "pending",
+                            now,
+                            json.dumps(row, ensure_ascii=True),
+                            channel,
+                        ),
                     )
-                    for recipient in recipients:
-                        key = json.dumps(
-                            [event["id"], policy["id"], channel, recipient, is_test]
-                        )
-                        previous = self._db.execute(
-                            "SELECT payload FROM alert_deliveries WHERE dedupe_key=?",
-                            (key,),
-                        ).fetchone()
-                        if previous:
-                            deliveries.append(json.loads(previous[0]))
-                            continue
-                        row = {
-                            "id": f"ALERT-{uuid.uuid4().hex}",
-                            "eventId": event["id"],
-                            "siteId": event["siteId"],
-                            "assetId": event["assetId"],
-                            "policyId": policy["id"],
-                            "policySnapshot": data.copy_payload(policy),
-                            "event": data.copy_payload(event),
-                            "channel": channel,
-                            "recipient": recipient,
-                            "isTest": is_test,
-                            "status": "pending",
-                            "attemptCount": 0,
-                            "attempts": [],
-                            "createdAt": data.format_rfc3339(stamp),
-                            "createdEpoch": now,
-                            "nextRetryAt": now,
-                            "deliveredAt": None,
-                            "lastError": None,
-                        }
-                        self._db.execute(
-                            "INSERT INTO alert_deliveries VALUES (?, ?, ?, ?, ?, ?)",
-                            (
-                                row["id"],
-                                key,
-                                "pending",
-                                now,
-                                json.dumps(row, ensure_ascii=True),
-                                channel,
-                            ),
-                        )
-                        deliveries.append(row)
+                    deliveries.append(row)
         return {
             "eventId": event["id"],
             "deliveries": deliveries,
@@ -448,7 +454,7 @@ class AlertService:
                 self._busy.discard(row["channel"])
 
     def tick(self):
-        """Called by the HTTP loop; each channel has an independent bounded worker."""
+        """Called by the outbox coordinator; channel delivery workers are bounded."""
         self._flush_results()
         self.observe_events()
         for row in self._claim(one_per_channel=True):

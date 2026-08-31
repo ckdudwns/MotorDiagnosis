@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from ipaddress import ip_address
 from urllib.parse import urlsplit
 
 from . import data
@@ -25,6 +26,60 @@ def _text(payload, key, *, maximum=2000):
             400, "INVALID_MODEL_METADATA", f"{key} contains invalid Unicode."
         ) from exc
     return text
+
+
+def _valid_artifact_host(host):
+    if not host:
+        return False
+    try:
+        ip_address(host)
+        return True
+    except ValueError:
+        if re.fullmatch(r"[\d.]+", host):
+            return False
+    try:
+        host = host.encode("idna").decode("ascii").rstrip(".")
+    except UnicodeError:
+        return False
+    return len(host) <= 253 and all(
+        re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+        for label in host.split(".")
+    )
+
+
+def _valid_artifact_uri(artifact):
+    # urlsplit strips some control characters, so reject them before parsing.
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in artifact
+    ):
+        return False
+    try:
+        parsed = urlsplit(artifact)
+        port = parsed.port  # Access validates numeric syntax and the 0..65535 bound.
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or parsed.netloc.endswith(":")
+            or not parsed.path
+        ):
+            return False
+        if parsed.scheme == "file":
+            return (
+                parsed.path.startswith("/")
+                and port is None
+                and (not parsed.netloc or _valid_artifact_host(parsed.hostname))
+            )
+        if not _valid_artifact_host(parsed.hostname):
+            return False
+        if parsed.scheme == "https":
+            return port is None or 1 <= port <= 65535
+        if parsed.scheme == "s3":
+            return port is None and ":" not in parsed.hostname
+    except ValueError:
+        return False
+    return False
 
 
 def _numbers(value, field, *, depth=0):
@@ -159,26 +214,12 @@ def create_model_version(user, payload):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", version):
         raise data.ApiError(400, "INVALID_MODEL_VERSION", "version must be URL-safe.")
     artifact = _text(payload, "artifactUri")
-    try:
-        parsed = urlsplit(artifact)
-        valid_uri = (
-            parsed.scheme in {"https", "s3"}
-            and bool(parsed.netloc)
-            and bool(parsed.path)
-        ) or (parsed.scheme == "file" and parsed.path.startswith("/"))
-        valid_uri = (
-            valid_uri
-            and not parsed.username
-            and not parsed.password
-            and not parsed.fragment
-        )
-    except ValueError:
-        valid_uri = False
-    if not valid_uri:
+    if not _valid_artifact_uri(artifact):
         raise data.ApiError(
             400,
             "INVALID_ARTIFACT_URI",
-            "Use an HTTPS, S3 or file artifact reference without credentials.",
+            "Use an HTTPS, S3 or file reference with a valid host and path, "
+            "without credentials; only HTTPS permits a port (1..65535).",
         )
     dataset_id = _text(payload, "datasetId", maximum=100)
     baseline_version = _text(payload, "baselineVersion", maximum=100)

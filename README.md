@@ -36,15 +36,47 @@ MQTT/TLS 수집기는 별도 프로세스의 메모리에 저장하지 않고 �
 메시지를 전달한다. 따라서 MQTT로 들어온 값도 HTTP 서버의 검증·멱등성·저장 경로를
 거쳐 `GET /api/telemetry`와 대시보드에서 동일하게 조회된다.
 
-QoS 1/2 메시지는 HTTP 처리가 끝난 뒤에만 수동 ACK한다. 일시적인 네트워크·5xx 오류와
+MQTT 구독은 프로세스 재시작 후에도 브로커 재전송을 안전하게 복구할 수 있는 QoS 1만
+지원하며, HTTP 처리가 끝난 뒤에만 수동 ACK한다. 일시적인 네트워크·5xx 오류와
 `408`, `425`, `429` 응답은 SQLite 재시도 큐(`output/mqtt_retry.sqlite3`)에 보존하며,
 작업자가 지수 백오프로 실제 HTTP 전송에 성공한 뒤 ACK한다. 인증·권한·경로·본문 크기
 오류도 ACK하지 않으며, 백엔드 격리가 보장된 수집 validation 오류만 ACK한다. 잘못된
 MQTT JSON·토픽은
 `POST /api/telemetry/quarantine`에 원문과 오류 사유가 저장된 뒤 ACK된다. 브로커 상태는
 `POST /api/health/dependencies/mqtt`에 보고하되, SUBACK 승인 QoS가 요청 QoS 이상일 때만
-`healthy`로 전환한다.
+`healthy`로 전환하고 수집·재시도 작업자를 재개한다. CONNACK 수신이나 세션 epoch
+저장만으로 수집을 재개하지 않는다.
+SUBACK 대기 중 받은 QoS 1 메시지는 SQLite에 승인 대기 상태로 보존한다. 성공 SUBACK
+이후 대기 상태를 해제하고 작업자를 깨워 자동으로 HTTP 전달·격리 및 ACK를 수행한다.
+QoS 0은 승인 전 보관·전달하지 않으며, 거부·하향 SUBACK은 대기열을 해제하지 않는다.
+승인 대기열 해제의 DB 오류는 연결 세대가 유효한 동안 backoff로 재시도한다.
 
+재시도 ACK 전에는 처리 완료 generation과 ACK 시도 의도를 먼저 저장한다. PUBACK 이후
+DB 쓰기가 실패해 ACK 성공 여부가 불확실한 채 재시작하더라도 retry 행은 정리할 수 있으며,
+동일 세션의 활성 generation은 보존한다. 브로커가 DUP를 다시 보내면 이 완료 기록을 사용해
+HTTP 수집·격리를 반복하지 않고 ACK한다. SQLite와 MQTT가 하나의 원자적 트랜잭션이라는
+보장은 하지 않는다. Paho 2.x worker ACK는 콜백 mutex를 비차단으로 먼저 확보한 뒤
+동기 `loop_write`가 아닌 패킷 큐 경로를 사용한다.
+
+## 3주차 백엔드 범위
+
+- `GET /api/events`: 기간·사이트·설비·심각도·라벨·검토 여부 필터와 페이지 조회
+- `GET /api/anomaly/events/{eventId}`: 이벤트 전후 신호, 특징·규칙·모델·장치 스냅샷 조회
+- `POST /api/events/{eventId}/review`, `GET /api/events/{eventId}/reviews`:
+  운영자 판정과 변경 전후·담당자·사유 이력
+- `GET/PUT /api/anomaly/rules/{assetId}`: 점수·지속시간·히스테리시스·병합 구간 버전 관리
+- `GET /api/alerts/policies`, `PUT /api/alerts/policies/{policyId}`:
+  심각도·수신자·채널·근무시간·중복 알림 방지 구간 관리
+- `GET /api/parameters`, `PUT /api/parameters/{key}`, `GET /api/audit-logs`:
+  운영 파라미터 변경과 감사 이력
+- `POST/GET /api/devices/{deviceId}/environment-inspections`:
+  방진·방수·염해·케이블 글랜드·함체 점검 및 조치 이력
+- `GET /api/devices/{deviceId}/faults`: 센서 고장 후보를 설비 이상 이벤트와 분리 조회
+- `GET/PUT /api/label-taxonomies/acoustic`, `POST/GET /api/datasets`:
+  음향 라벨 버전과 기존 데이터셋의 출처·라이선스·호환성·체크섬·분할 정책 관리
+- `GET /api/datasets/export`: 학습 누수 방지를 위한 설비 단위 분할과 manifest 메타데이터를
+  포함한 내부 텔레메트리 CSV 내보내기. 등록된 외부 데이터셋은 원본 저장소에서 별도로
+  내보내며, XLSX는 후속 범위다.
 ### 이벤트 시각 PoC 범위
 
 이 PoC에서 `occurredAt`은 이벤트의 단일 기준 시각이며 브라우저는 이를 지역 시각으로

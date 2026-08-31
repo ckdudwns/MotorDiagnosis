@@ -158,14 +158,14 @@ def render_page() -> str:
       const assetId = $("assetSelect").value;
       const periodHours = Number($("periodSelect").value);
       const from = new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString();
-      const [telem, summaries, eventRows] = await Promise.all([
+      const [telem, summaries, eventPage] = await Promise.all([
         api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
         api("/api/dashboard/sites-summary"),
         api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
       ]);
       if (requestGeneration !== renderGeneration) return;
       siteSummaries = summaries;
-      events = eventRows;
+      events = eventPage.items;
       if (!events.some(event => event.id === selectedEventId)) clearEventSelection();
       $("siteCount").textContent = siteSummaries.length;
       $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);

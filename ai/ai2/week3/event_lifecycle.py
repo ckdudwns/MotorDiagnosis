@@ -8,6 +8,7 @@ and AI-2 week 2 score path remain the source of those values.
 from __future__ import annotations
 
 import math
+from uuid import uuid4
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -34,12 +35,18 @@ class EventLifecycleConfig:
                 or not 0 <= value <= 100
             ):
                 raise ValueError(f"{name} must be a finite score from 0 to 100.")
-        if self.score_exit >= self.score_enter:
-            raise ValueError("score_exit must be lower than score_enter.")
-        for name in ("min_consecutive_enter", "min_consecutive_exit", "merge_gap_sec"):
+        if self.score_exit > self.score_enter:
+            raise ValueError("score_exit must not be greater than score_enter.")
+        for name in ("min_consecutive_enter", "min_consecutive_exit"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be an integer greater than zero.")
+        if (
+            isinstance(self.merge_gap_sec, bool)
+            or not isinstance(self.merge_gap_sec, int)
+            or self.merge_gap_sec < 0
+        ):
+            raise ValueError("merge_gap_sec must be an integer greater than or equal to zero.")
         if not self.rule_version.strip():
             raise ValueError("rule_version must not be empty.")
 
@@ -98,7 +105,6 @@ class AnomalyEventLifecycle:
     def __init__(self, config: EventLifecycleConfig | None = None) -> None:
         self.config = config or EventLifecycleConfig()
         self._states: dict[str, _AssetState] = {}
-        self._event_sequence = 0
 
     def process_point(
         self,
@@ -219,9 +225,9 @@ class AnomalyEventLifecycle:
                 )
                 return previous, True
 
-        self._event_sequence += 1
+        model_version = str(point.get("anomalyModel") or "unknown")
         event = {
-            "id": f"AI2-EVENT-{self._event_sequence:05d}",
+            "id": f"AI2-EVENT-{uuid4()}",
             "assetId": asset_id,
             "startAt": start_at,
             "endAt": None,
@@ -232,7 +238,8 @@ class AnomalyEventLifecycle:
             "sampleCount": candidate_count,
             "mergeCount": 0,
             "thresholdVersion": self.config.rule_version,
-            "modelVersion": str(point.get("anomalyModel") or "unknown"),
+            "modelVersion": model_version,
+            "maxScoreModelVersion": model_version,
             "classification": "asset_anomaly",
         }
         return event, False
@@ -295,6 +302,9 @@ class AnomalyEventLifecycle:
                 {"kind": "asset_event_closed", "event": state.open_event.copy()}
             )
             state.open_event = None
+        # A sensor failure breaks the continuity of an otherwise mergeable
+        # anomaly. It must not be possible to erase this audit boundary later.
+        state.latest_closed_event = None
         return updates
 
     @staticmethod
@@ -307,9 +317,10 @@ class AnomalyEventLifecycle:
         max_score: float | None = None,
     ) -> None:
         event["lastScore"] = round(score)
-        event["maxScore"] = max(
-            int(event["maxScore"]), round(max_score if max_score is not None else score)
-        )
+        next_max_score = round(max_score if max_score is not None else score)
+        if next_max_score > int(event["maxScore"]):
+            event["maxScore"] = next_max_score
+            event["maxScoreModelVersion"] = str(
+                point.get("anomalyModel") or "unknown"
+            )
         event["sampleCount"] = int(event["sampleCount"]) + sample_count
-        if point.get("anomalyModel"):
-            event["modelVersion"] = str(point["anomalyModel"])

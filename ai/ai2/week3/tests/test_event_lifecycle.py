@@ -96,6 +96,84 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
         self.assertEqual(updates[1]["kind"], "asset_event_closed")
         self.assertEqual(updates[1]["event"]["endReason"], "sensor_fault_detected")
 
+    def test_sensor_fault_breaks_the_merge_boundary(self) -> None:
+        lifecycle = AnomalyEventLifecycle(
+            EventLifecycleConfig(
+                min_consecutive_enter=1,
+                min_consecutive_exit=1,
+                merge_gap_sec=30,
+            )
+        )
+        original = lifecycle.process_point(point("2026-08-31T00:00:00Z", 80))[0][
+            "event"
+        ]
+        lifecycle.process_point(point("2026-08-31T00:00:05Z", 40))
+        lifecycle.process_point(
+            point("2026-08-31T00:00:10Z", 100), sensor_fault=True
+        )
+
+        restarted = lifecycle.process_point(point("2026-08-31T00:00:20Z", 90))
+
+        self.assertEqual(restarted[0]["kind"], "asset_event_started")
+        self.assertNotEqual(restarted[0]["event"]["id"], original["id"])
+
+    def test_sensor_fault_closes_open_event_and_prevents_reopen_merge(self) -> None:
+        lifecycle = AnomalyEventLifecycle(
+            EventLifecycleConfig(min_consecutive_enter=1, merge_gap_sec=30)
+        )
+        original = lifecycle.process_point(point("2026-08-31T00:00:00Z", 80))[0][
+            "event"
+        ]
+        lifecycle.process_point(
+            point("2026-08-31T00:00:05Z", 100), sensor_fault=True
+        )
+
+        restarted = lifecycle.process_point(point("2026-08-31T00:00:20Z", 90))
+
+        self.assertEqual(restarted[0]["kind"], "asset_event_started")
+        self.assertNotEqual(restarted[0]["event"]["id"], original["id"])
+
+    def test_event_ids_do_not_collide_between_lifecycle_instances(self) -> None:
+        config = EventLifecycleConfig(min_consecutive_enter=1)
+        first = AnomalyEventLifecycle(config).process_point(
+            point("2026-08-31T00:00:00Z", 80)
+        )[0]["event"]
+        second = AnomalyEventLifecycle(config).process_point(
+            point("2026-08-31T00:00:00Z", 80)
+        )[0]["event"]
+
+        self.assertNotEqual(first["id"], second["id"])
+
+    def test_event_start_and_max_score_model_versions_are_preserved(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        started = lifecycle.process_point(
+            point("2026-08-31T00:00:00Z", 95, anomalyModel="model-v1")
+        )[0]["event"]
+
+        updated = lifecycle.process_point(
+            point("2026-08-31T00:00:05Z", 10, anomalyModel="model-v2")
+        )[0]["event"]
+
+        self.assertEqual(started["modelVersion"], "model-v1")
+        self.assertEqual(updated["modelVersion"], "model-v1")
+        self.assertEqual(updated["maxScoreModelVersion"], "model-v1")
+
+    def test_allows_zero_hysteresis_and_zero_merge_gap(self) -> None:
+        config = EventLifecycleConfig(
+            score_enter=75,
+            score_exit=75,
+            min_consecutive_enter=1,
+            min_consecutive_exit=1,
+            merge_gap_sec=0,
+        )
+        lifecycle = AnomalyEventLifecycle(config)
+        lifecycle.process_point(point("2026-08-31T00:00:00Z", 75))
+        lifecycle.process_point(point("2026-08-31T00:00:05Z", 74))
+
+        merged = lifecycle.process_point(point("2026-08-31T00:00:05Z", 75))
+
+        self.assertEqual(merged[0]["kind"], "asset_event_merged")
+
     def test_invalid_score_breaks_entry_streak(self) -> None:
         self.lifecycle.process_point(point("2026-08-31T00:00:00Z", 80))
         self.assertEqual(
@@ -108,7 +186,9 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
 
     def test_rejects_invalid_config_and_timestamp(self) -> None:
         with self.assertRaises(ValueError):
-            EventLifecycleConfig(score_enter=50, score_exit=50)
+            EventLifecycleConfig(score_enter=50, score_exit=51)
+        with self.assertRaises(ValueError):
+            EventLifecycleConfig(merge_gap_sec=-1)
         with self.assertRaises(ValueError):
             self.lifecycle.process_point(point("2026-08-31 00:00:00", 80))
         with self.assertRaises(ValueError):

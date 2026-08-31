@@ -4,6 +4,8 @@ import csv
 import io
 import json
 import logging
+import os
+import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -96,6 +98,9 @@ from .data import (
     parameters_for,
 )
 from .json_validation import loads_strict_json
+from .alerts import AlertService
+from .model_registry import create_baseline_version, create_model_version, versions_for
+from .telemetry_bulk import ingest_telemetry_bulk
 from .web import render_page
 
 
@@ -197,6 +202,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if segments == ["api", "bootstrap"]:
             response: dict[str, Any] = {"sites": visible_sites_for_user(user)}
+            response["demoEnabled"] = self.server.demo_enabled and has_permission(
+                user, "event:write"
+            )
             if has_permission(user, "network-profile:read"):
                 response["networkProfiles"] = copy_payload(NETWORK_PROFILES)
             if has_permission(user, "rollout:read"):
@@ -431,6 +439,36 @@ class AppHandler(BaseHTTPRequestHandler):
         if segments == ["api", "alerts", "policies"]:
             self.send_json(alert_policies_for(user))
             return
+        if segments == ["api", "alerts"]:
+            self.send_json(
+                self.server.alerts.list_for(
+                    user,
+                    site_id=query.get("siteId", [""])[0],
+                    channel=query.get("channel", [""])[0],
+                    status=query.get("status", [""])[0],
+                    page=positive_query_int(query, "page", 1),
+                    size=positive_query_int(query, "size", 50, maximum=200),
+                )
+            )
+            return
+        if (
+            len(segments) in {2, 3}
+            and segments[:1] == ["api"]
+            and segments[1] in {"model-versions", "baseline-versions"}
+        ):
+            self.send_json(
+                versions_for(
+                    user,
+                    "model" if segments[1] == "model-versions" else "baseline",
+                    version=segments[2] if len(segments) == 3 else "",
+                    site_id=query.get("siteId", [""])[0],
+                    asset_id=query.get("assetId", [""])[0],
+                    status=query.get("status", [""])[0],
+                    page=positive_query_int(query, "page", 1),
+                    size=positive_query_int(query, "size", 50, maximum=200),
+                )
+            )
+            return
         if segments == ["api", "parameters"]:
             self.send_json(parameters_for(user, query.get("category", [""])[0]))
             return
@@ -558,6 +596,12 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             self.send_json(result, status=status)
             return
+        if segments == ["api", "telemetry", "bulk"]:
+            result = ingest_telemetry_bulk(
+                telemetry_principal_for_token(self.bearer_token()), payload
+            )
+            self.send_json(result, status=207 if result["rejected"] else 200)
+            return
         if segments == ["api", "telemetry", "quarantine"]:
             self.send_json(
                 quarantine_mqtt_message(
@@ -651,8 +695,37 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(create_install_point(user, segments[2], payload), status=201)
             return
         if segments == ["api", "demo", "inject-anomaly"]:
+            if not self.server.demo_enabled:
+                raise ApiError(
+                    403, "DEMO_DISABLED", "Demo injection is disabled on this server."
+                )
             require_permission(user, "event:write")
-            self.send_json(inject_anomaly(payload), status=201)
+            from .data import STORE_LOCK, append_audit_log, required_text
+
+            with STORE_LOCK:
+                site_id = required_text(payload, "siteId").upper()
+                require_site_access(user, site_id)
+                event = inject_anomaly({**payload, "siteId": site_id})
+                append_audit_log(
+                    user,
+                    "demo.inject",
+                    "event",
+                    event["id"],
+                    None,
+                    event,
+                    "Synthetic demo event injected",
+                    site_id=site_id,
+                )
+            self.send_json(event, status=201)
+            return
+        if segments == ["api", "alerts", "send"]:
+            self.send_json(self.server.alerts.send(user, payload), status=202)
+            return
+        if segments == ["api", "baseline-versions"]:
+            self.send_json(create_baseline_version(user, payload), status=201)
+            return
+        if segments == ["api", "model-versions"]:
+            self.send_json(create_model_version(user, payload), status=201)
             return
         if (
             len(segments) == 4
@@ -1240,5 +1313,61 @@ def optional_boolean_query(query: dict[str, list[str]], key: str) -> bool | None
     raise ApiError(400, "INVALID_QUERY_PARAMETER", f"{key} must be true or false.")
 
 
-def create_server(host: str, port: int) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), AppHandler)
+class MotorDiagnosisServer(ThreadingHTTPServer):
+    def start_alert_worker(self):
+        self._alert_stop = threading.Event()
+        self._alert_worker = threading.Thread(
+            target=self._run_alert_worker, name="alert-outbox", daemon=True
+        )
+        self._alert_worker.start()
+
+    def _run_alert_worker(self):
+        # SQLite can wait on another writer. Never perform this work in
+        # BaseServer.service_actions(), which runs in the HTTP accept loop.
+        # One coordinator coalesces polling; ticks never overlap or accumulate.
+        while not self._alert_stop.wait(0.5):
+            if not self.auto_alerts:
+                continue
+            try:
+                self.alerts.tick()
+            except Exception:
+                LOGGER.exception(
+                    "Alert outbox processing failed; will retry on next tick"
+                )
+
+    def server_close(self):
+        if hasattr(self, "_alert_stop"):
+            self._alert_stop.set()
+            if self._alert_worker.ident is not None:
+                self._alert_worker.join()
+        super().server_close()
+        if hasattr(self, "alerts"):
+            self.alerts.close()
+
+
+def create_server(
+    host: str,
+    port: int,
+    *,
+    demo_enabled=None,
+    alert_database=":memory:",
+    alert_adapters=None,
+    auto_alerts=True,
+) -> ThreadingHTTPServer:
+    if demo_enabled is None:
+        demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
+    server = MotorDiagnosisServer((host, port), AppHandler)
+    server.demo_enabled = (
+        bool(demo_enabled) and os.environ.get("APP_ENV", "").lower() != "production"
+    )
+    server.auto_alerts = auto_alerts
+    try:
+        server.alerts = AlertService(
+            alert_database,
+            adapters=alert_adapters,
+        )
+        server.start_alert_worker()
+    except Exception:
+        server.server_close()
+        raise
+    return server

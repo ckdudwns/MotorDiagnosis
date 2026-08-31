@@ -66,7 +66,7 @@ def render_page() -> str:
           <option value="24" selected>Last 24 hours</option>
         </select></label>
         <button id="refreshBtn">Refresh</button>
-        <button class="danger" id="injectBtn">Inject Anomaly</button>
+        <button class="danger" id="injectBtn" hidden>Inject Anomaly (Demo)</button>
       </section>
       <section class="kpis">
         <div class="kpi"><span>Visible Sites</span><strong id="siteCount">-</strong></div>
@@ -87,6 +87,10 @@ def render_page() -> str:
         <article class="panel">
           <h2>Events</h2>
           <div id="events" class="event-list"></div>
+        </article>
+        <article class="panel">
+          <h2>Web Notifications</h2>
+          <div id="notifications" role="status" aria-live="polite">No notifications.</div>
         </article>
         <article class="panel detail">
           <h2>Event Review</h2>
@@ -134,6 +138,7 @@ def render_page() -> str:
       const boot = await api("/api/bootstrap");
       sites = boot.sites;
       events = boot.events;
+      $("injectBtn").hidden = !boot.demoEnabled;
       setOptions($("siteSelect"), sites, item => item.id, item => item.name);
       await renderAssets();
       await render();
@@ -158,14 +163,16 @@ def render_page() -> str:
       const assetId = $("assetSelect").value;
       const periodHours = Number($("periodSelect").value);
       const from = new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString();
-      const [telem, summaries, eventPage] = await Promise.all([
+      const [telem, summaries, eventPage, alertPage] = await Promise.all([
         api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
         api("/api/dashboard/sites-summary"),
         api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
+        api(`/api/alerts?siteId=${site.id}&channel=web&status=sent&size=10`),
       ]);
       if (requestGeneration !== renderGeneration) return;
       siteSummaries = summaries;
       events = eventPage.items;
+      renderNotifications(alertPage.items);
       if (!events.some(event => event.id === selectedEventId)) clearEventSelection();
       $("siteCount").textContent = siteSummaries.length;
       $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
@@ -175,6 +182,17 @@ def render_page() -> str:
       renderEvents();
       $("chartTitle").textContent = `${site.name} / ${assetId}`;
       draw(telem.points, telem.units);
+    }
+
+    function renderNotifications(rows) {
+      const panel = $("notifications");
+      panel.replaceChildren();
+      if (!rows.length) panel.textContent = "No notifications.";
+      rows.forEach(row => {
+        const item = document.createElement("p");
+        item.textContent = `${row.isTest ? "[TEST] " : ""}${row.event.isSynthetic ? "[SYNTHETIC] " : ""}${row.event.title} · ${new Date(row.deliveredAt).toLocaleString()}`;
+        panel.appendChild(item);
+      });
     }
 
     function setOptions(select, rows, valueOf, labelOf) {

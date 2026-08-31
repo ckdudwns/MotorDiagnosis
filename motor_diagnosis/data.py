@@ -281,6 +281,9 @@ ROLE_POLICIES = [
             "hardware-profile:read",
             "export:read",
             "alert-policy:read",
+            "alert:read",
+            "model:read",
+            "baseline:read",
             "parameter:read",
             "audit-log:read",
             "environment-inspection:read",
@@ -321,6 +324,10 @@ ROLE_POLICIES = [
             "export:read",
             "alert-policy:read",
             "alert-policy:write",
+            "alert:read",
+            "alert:send",
+            "model:read",
+            "baseline:read",
             "parameter:read",
             "parameter:write",
             "audit-log:read",
@@ -939,6 +946,8 @@ EVENT_EVIDENCE_SNAPSHOTS: dict[str, dict[str, Any]] = copy_payload(
 AUDIT_LOGS: list[dict[str, Any]] = []
 ENVIRONMENT_INSPECTIONS: list[dict[str, Any]] = []
 DATASET_VERSIONS: list[dict[str, Any]] = []
+MODEL_VERSIONS: list[dict[str, Any]] = []
+BASELINE_VERSIONS: list[dict[str, Any]] = []
 DATASET_SNAPSHOTS: dict[str, dict[str, list[dict[str, Any]]]] = {}
 ACOUSTIC_TAXONOMY_VERSIONS: list[dict[str, Any]] = [
     {
@@ -989,6 +998,8 @@ def reset_runtime_state() -> None:
         AUDIT_LOGS.clear()
         ENVIRONMENT_INSPECTIONS.clear()
         DATASET_VERSIONS.clear()
+        MODEL_VERSIONS.clear()
+        BASELINE_VERSIONS.clear()
         DATASET_SNAPSHOTS.clear()
         ACOUSTIC_TAXONOMY_VERSIONS[:] = [
             {
@@ -1850,6 +1861,7 @@ def delete_asset(user: dict[str, Any], site_id: str, asset_id: str) -> dict[str,
             or event_references
             or inspection_references
             or telemetry_references
+            or any(row["assetId"] == asset_id for row in BASELINE_VERSIONS)
         ):
             raise ApiError(
                 409,
@@ -2544,7 +2556,7 @@ def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
             )
 
     scenario_label = payload.get("scenarioLabel")
-    if scenario_label not in TELEMETRY_SCENARIOS:
+    if not isinstance(scenario_label, str) or scenario_label not in TELEMETRY_SCENARIOS:
         raise ApiError(
             400,
             "INVALID_TELEMETRY_PAYLOAD",
@@ -3555,7 +3567,8 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             .upper()
         )
         asset = get_asset(site["id"], asset_id)
-        event_id = f"EV-{250 + len(EVENTS)}"
+        # Alert delivery history is durable even when the demo store restarts.
+        event_id = f"EV-{secrets.token_hex(12).upper()}"
         event = {
             "id": event_id,
             "siteId": site["id"],
@@ -3575,6 +3588,8 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             "status": "open",
             "thresholdVersion": anomaly_rule_for(asset["id"])["version"],
             "modelVersion": "demo-anomaly-injection-v1",
+            "isSynthetic": True,
+            "source": "demo-injection",
         }
         _freeze_event_evidence(event)
         EVENTS.insert(0, event)
@@ -4055,10 +4070,10 @@ def alert_policies_for(user: dict[str, Any]) -> list[dict[str, Any]]:
 def _time_of_day(field: str, value: Any) -> str:
     text = str(value or "").strip()
     try:
-        datetime.strptime(text, "%H:%M")
+        parsed = datetime.strptime(text, "%H:%M")
     except ValueError as exc:
         raise ApiError(400, "INVALID_TIME_OF_DAY", f"{field} must use HH:MM.") from exc
-    return text
+    return parsed.strftime("%H:%M")
 
 
 def update_alert_policy(
@@ -5147,6 +5162,7 @@ def create_dataset_version(
             "split": split,
             "splitPolicy": DATASET_SPLIT_POLICY,
             "status": "frozen",
+            "approvalStatus": "pending",
             "artifactRefs": [],
             "reason": reason,
             "createdAt": created_at,

@@ -77,6 +77,19 @@ HTTP 수집·격리를 반복하지 않고 ACK한다. SQLite와 MQTT가 하나�
 - `GET /api/datasets/export`: 학습 누수 방지를 위한 설비 단위 분할과 manifest 메타데이터를
   포함한 내부 텔레메트리 CSV 내보내기. 등록된 외부 데이터셋은 원본 저장소에서 별도로
   내보내며, XLSX는 후속 범위다.
+
+## 4주차 백엔드 범위
+
+- 알림 정책 기반 웹/Stub/SMTP/Webhook 발송, 채널별 실패 격리와 SQLite 재시도 이력
+- `POST /api/alerts/send`, `GET /api/alerts` 및 대시보드 웹 알림 표시
+- `POST /api/telemetry/bulk`: 장치별 순서 재전송·중복 제거·부분 실패 결과
+- 데이터셋에 연결된 모델/기준선 버전 등록·조회, 사이트 권한 및 감사 기록
+- 데모 주입 기본 비활성화 (`DEMO_ENABLED=true`로 허용, `APP_ENV=production`에서는 차단)
+
+[4주차 백엔드 API·시연·설정 인계](docs/week4-backend.md)를 참고한다.
+모델 학습·승인·배포는 수행하지 않는다. 기존 메모리 데이터 저장소와 실제 장치
+24시간 복구 검증의 한계도 인계 문서에 구분했다.
+
 ### 이벤트 시각 PoC 범위
 
 이 PoC에서 `occurredAt`은 이벤트의 단일 기준 시각이며 브라우저는 이를 지역 시각으로

@@ -14,7 +14,9 @@ import codecs
 import contextlib
 import json
 import shutil
+import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -160,6 +162,78 @@ class TestGroupSplitSynthetic(unittest.TestCase):
             1,
             f"공유 자산 shared.mat이 여러 split에 걸쳐 있습니다: {shared_splits}",
         )
+
+    def test_split_is_independent_of_pythonhashseed(self):
+        """group_split은 그룹 순회에 set을 쓰므로, 정렬 시 gid를 마지막
+        tie-break로 넣지 않으면 결과가 PYTHONHASHSEED에 따라 달라진다.
+        같은 records/seed로 서로 다른 PYTHONHASHSEED 하의 두 서브프로세스를
+        실행해 split 배정(그리고 그로부터 나온 fingerprint)이 동일한지
+        확인한다."""
+        script = (
+            "import sys, json\n"
+            "sys.path.insert(0, %r)\n"
+            "from register_dataset import group_split\n"
+            "records = []\n"
+            "for name, count in [('a.mat', 20), ('b.mat', 15), ('c.mat', 10), "
+            "('d.mat', 5)]:\n"
+            "    records += [{'label': 'NORMAL', 'source_label': name}] * count\n"
+            "for name, count in [('e.mat', 12), ('f.mat', 9), ('g.mat', 6)]:\n"
+            "    records += [{'label': 'BEARING_FAULT_INNER', 'source_label': name}] "
+            "* count\n"
+            "print(json.dumps(group_split(records, seed=1)))\n"
+        ) % (_DATASETS_DIR,)
+
+        def _run_with_hashseed(seed_value: str) -> str:
+            env = dict(os.environ, PYTHONHASHSEED=seed_value)
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            return result.stdout.strip()
+
+        out_seed_1 = _run_with_hashseed("1")
+        out_seed_2 = _run_with_hashseed("2")
+        self.assertEqual(
+            out_seed_1,
+            out_seed_2,
+            "PYTHONHASHSEED가 달라지면 split 배정이 달라집니다 (결정성 위반)",
+        )
+
+    def test_feasible_mixed_label_coverage_succeeds_despite_greedy_trap(self):
+        """그룹이 서로 다른 라벨 쌍을 사슬처럼 공유하는 구조에서는, 각
+        (라벨, split) 조합을 독립적으로 그리디 배정하면 실제로 가능한
+        배정이 있어도 실패할 수 있다 — 이 테스트의 구조에서 예전 그리디는
+        L3의 두 그룹(g0, g1)이 다른 라벨(L1, L0)의 요구를 채우느라 둘 다
+        같은 split(test)에 몰려 배정돼, 정작 L3 자신은 train을 커버할
+        그룹이 남지 않아 InsufficientAssetGroupsError를 냈다(무작위 탐색으로
+        확인한 실제 반례). 최소 하나의 유효 배정이 존재하므로 예외 없이
+        성공해야 한다."""
+        records = (
+            [{"label": "L0", "source_label": "g4.mat"}]
+            + [{"label": "L0", "source_label": "g1.mat"}]
+            + [{"label": "L1", "source_label": "g0.mat"}]
+            + [{"label": "L1", "source_label": "g2.mat"}]
+            + [{"label": "L2", "source_label": "g3.mat"}]
+            + [{"label": "L2", "source_label": "g5.mat"}]
+            + [{"label": "L3", "source_label": "g0.mat"}]
+            + [{"label": "L3", "source_label": "g1.mat"}]
+        )
+        splits = group_split(
+            records, ratios={"train": 0.5, "validation": 0.0, "test": 0.5}, seed=1
+        )
+
+        by_label_splits: dict = {}
+        for rec, split in zip(records, splits):
+            by_label_splits.setdefault(rec["label"], set()).add(split)
+        for label, seen_splits in by_label_splits.items():
+            self.assertEqual(
+                seen_splits,
+                {"train", "test"},
+                f"라벨 {label!r}이 train/test를 모두 커버하지 못했습니다: {seen_splits}",
+            )
 
 
 class TestComputeVersionChecksum(unittest.TestCase):
@@ -413,6 +487,83 @@ class TestValidateSplitRatios(unittest.TestCase):
             )
 
 
+class TestValidateFiniteFeatures(unittest.TestCase):
+    def test_nan_value_rejected(self):
+        from register_dataset import _validate_finite_features
+
+        with self.assertRaises(ValueError):
+            _validate_finite_features({"rms_mean": float("nan")}, "sample-1")
+
+    def test_inf_value_rejected(self):
+        from register_dataset import _validate_finite_features
+
+        with self.assertRaises(ValueError):
+            _validate_finite_features({"rms_mean": float("inf")}, "sample-1")
+
+    def test_non_numeric_value_rejected(self):
+        from register_dataset import _validate_finite_features
+
+        with self.assertRaises(ValueError):
+            _validate_finite_features({"rms_mean": "0.05"}, "sample-1")
+
+    def test_bool_value_rejected(self):
+        from register_dataset import _validate_finite_features
+
+        with self.assertRaises(ValueError):
+            _validate_finite_features({"rms_mean": True}, "sample-1")
+
+    def test_finite_values_accepted(self):
+        from register_dataset import _validate_finite_features
+
+        _validate_finite_features({"rms_mean": 0.05, "kurtosis_mean": -1.2}, "sample-1")
+
+
+class TestBuildManifestRejectsNonFiniteFeatures(unittest.TestCase):
+    @unittest.skipUnless(_cwru_data_available(), CWRU_SKIP_REASON)
+    def test_nan_feature_value_blocks_manifest_build(self):
+        """NaN/Inf 특징값이 그대로 저장되면 CSV에는 문자열 "nan"이, XLSX에는
+        빈 셀로 남아 같은 값이 산출물마다 다르게 표현된다 — build_manifest
+        단계에서 명확히 막아야 한다."""
+        with mock.patch(
+            "register_dataset.extract_all_features",
+            return_value={"rms_mean": float("nan")},
+        ):
+            with self.assertRaises(ValueError):
+                build_manifest(
+                    data_dir=_CWRU_DATA_DIR,
+                    split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
+                )
+
+    def test_inf_feature_value_blocks_manifest_build(self):
+        with mock.patch(
+            "register_dataset.extract_all_features",
+            return_value={"rms_mean": float("inf")},
+        ):
+            with self.assertRaises(ValueError):
+                build_manifest(
+                    data_dir=_CWRU_DATA_DIR,
+                    split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
+                )
+
+
+class TestJsonDumpsRejectNonFiniteValues(unittest.TestCase):
+    """저장 전 검증을 뚫고 NaN/Inf가 들어오더라도, JSON 직렬화 계층에서
+    allow_nan=False가 마지막 방어선으로 명확히 실패해야 한다(기본값인
+    allow_nan=True는 표준이 아닌 NaN/Infinity 리터럴을 조용히 써버린다)."""
+
+    def test_compute_feature_output_fingerprint_rejects_nan(self):
+        with self.assertRaises(ValueError):
+            compute_feature_output_fingerprint(
+                [{"sample_id": "x", "rms_mean": float("nan")}]
+            )
+
+    def test_compute_feature_output_fingerprint_rejects_inf(self):
+        with self.assertRaises(ValueError):
+            compute_feature_output_fingerprint(
+                [{"sample_id": "x", "rms_mean": float("inf")}]
+            )
+
+
 class TestExportDatasetSynthetic(unittest.TestCase):
     """CWRU 실데이터 없이도 openpyxl XLSX 내보내기 자체를 검증하는 합성 매니페스트 테스트."""
 
@@ -487,7 +638,7 @@ class TestExportDatasetSynthetic(unittest.TestCase):
         """CSV/XLSX/manifest를 output_dir에 바로 순차 기록하면, 뒤쪽 파일
         생성이 실패했을 때 앞서 이미 덮어쓴 파일만 새 버전이고 나머지는
         이전 버전으로 남아 서로 다른 버전이 섞인다. XLSX 저장이 실패해도
-        output_dir의 세 파일이 실패 이전(v1) 상태 그대로여야 한다."""
+        v1 버전 디렉터리와 CURRENT 포인터가 실패 이전 상태 그대로여야 한다."""
         manifest_v1 = self._synthetic_manifest()
         tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_atomic_")
         try:
@@ -498,6 +649,9 @@ class TestExportDatasetSynthetic(unittest.TestCase):
                 xlsx_before = f.read()
             with open(result_v1["manifest_path"], "rb") as f:
                 manifest_before = f.read()
+            current_before = os.path.join(tmp_dir, "CURRENT")
+            with open(current_before, encoding="utf-8") as f:
+                current_contents_before = f.read()
 
             manifest_v2 = self._synthetic_manifest()
             manifest_v2["id"] = "DS-CWRU-VIBRATION-19700102-deadbeefcafe"
@@ -517,15 +671,118 @@ class TestExportDatasetSynthetic(unittest.TestCase):
                 self.assertEqual(
                     f.read(), manifest_before, "실패한 내보내기가 manifest를 건드렸습니다"
                 )
+            with open(current_before, encoding="utf-8") as f:
+                self.assertEqual(
+                    f.read(),
+                    current_contents_before,
+                    "실패한 내보내기가 CURRENT 포인터를 건드렸습니다",
+                )
 
+            v2_version_dir = os.path.join(tmp_dir, "versions", manifest_v2["id"])
+            self.assertFalse(
+                os.path.exists(v2_version_dir),
+                "실패한 내보내기가 v2 버전 디렉터리를 만들어 남겼습니다",
+            )
+
+            versions_dir = os.path.join(tmp_dir, "versions")
             leftovers = [
                 name
-                for name in os.listdir(tmp_dir)
-                if name.startswith(".dataset_export_staging-")
+                for name in os.listdir(versions_dir)
+                if name.startswith(".export-staging-")
             ]
             self.assertEqual(
                 leftovers, [], f"스테이징 디렉터리가 정리되지 않았습니다: {leftovers}"
             )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_export_writes_files_under_versioned_directory_with_current_pointer(self):
+        from export_dataset import resolve_current_version_dir
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_versioned_")
+        try:
+            result = export_dataset(manifest, tmp_dir)
+            self.assertEqual(result["version_id"], manifest["id"])
+            self.assertEqual(result["version_dir"], resolve_current_version_dir(tmp_dir))
+            self.assertTrue(result["csv_path"].startswith(result["version_dir"]))
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "CURRENT")))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_repeated_export_of_identical_manifest_is_idempotent(self):
+        """version_id는 산출물 내용으로 결정되는 불변 체크섬을 담고 있으므로,
+        같은 매니페스트를 두 번 내보내면 같은 version_dir을 재사용해야
+        한다(디렉터리가 이미 있다는 이유로 실패하면 안 됨)."""
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_idempotent_")
+        try:
+            result_a = export_dataset(manifest, tmp_dir)
+            result_b = export_dataset(manifest, tmp_dir)
+            self.assertEqual(result_a["version_dir"], result_b["version_dir"])
+            with open(result_b["csv_path"], "rb") as f:
+                self.assertGreater(len(f.read()), 0)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_concurrent_exports_of_different_manifests_never_expose_mixed_version(self):
+        """서로 다른 두 버전을 동시에 내보내도, CURRENT가 가리키는 버전의
+        csv/xlsx/manifest 세 파일은 항상 같은 버전에서 나온 것이어야 한다
+        (한쪽 버전의 CSV와 다른 쪽 버전의 XLSX가 섞여 보이면 안 됨)."""
+        from export_dataset import resolve_current_version_dir
+
+        manifest_a = self._synthetic_manifest()
+        manifest_a["id"] = "DS-CWRU-VIBRATION-CONCURRENT-A"
+        manifest_a["rows"][0]["rms_mean"] = 0.11
+
+        manifest_b = self._synthetic_manifest()
+        manifest_b["id"] = "DS-CWRU-VIBRATION-CONCURRENT-B"
+        manifest_b["rows"][0]["rms_mean"] = 0.22
+
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_concurrent_")
+        try:
+            errors = []
+
+            def _export(manifest):
+                try:
+                    export_dataset(manifest, tmp_dir)
+                except Exception as exc:  # pragma: no cover - 실패 시 진단용
+                    errors.append(exc)
+
+            for _ in range(20):
+                t_a = threading.Thread(target=_export, args=(manifest_a,))
+                t_b = threading.Thread(target=_export, args=(manifest_b,))
+                t_a.start()
+                t_b.start()
+                t_a.join()
+                t_b.join()
+
+                self.assertEqual(errors, [])
+
+                current_version_dir = resolve_current_version_dir(tmp_dir)
+                self.assertIn(
+                    os.path.basename(current_version_dir),
+                    (manifest_a["id"], manifest_b["id"]),
+                )
+                with open(
+                    os.path.join(current_version_dir, "dataset_manifest.json"),
+                    encoding="utf-8",
+                ) as f:
+                    exported_manifest = json.load(f)
+                with open(
+                    os.path.join(current_version_dir, "dataset_rows.csv"),
+                    newline="",
+                    encoding="utf-8",
+                ) as f:
+                    exported_rows = list(csv.DictReader(f))
+
+                # CURRENT가 가리키는 버전의 manifest.id와 실제로 그 디렉터리에
+                # 있는 CSV의 rms_mean이 항상 같은 버전 쌍(A-A 또는 B-B)이어야
+                # 한다 — 서로 다른 버전의 파일이 섞여 있으면 안 된다.
+                if exported_manifest["id"] == manifest_a["id"]:
+                    self.assertEqual(exported_rows[0]["rms_mean"], "0.11")
+                else:
+                    self.assertEqual(exported_rows[0]["rms_mean"], "0.22")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 

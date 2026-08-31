@@ -68,6 +68,10 @@ python -m pip install -r ai/ai1/week3/ai1/requirements.txt
   적으면(현재 CWRU는 라벨당 자산 1개뿐) 윈도우를 섞는 대신 `InsufficientAssetGroupsError`로
   데이터 부족 상태를 명시적으로 드러낸다 (근거: `datasets/dataset_manifest_format.md`)
 - 특징값 계산은 week2 `extract_all_features()`를 그대로 재사용
+- **산출물 3종(csv/xlsx/manifest.json)을 원자적으로 배치** — `output_dir/versions/<dataset
+  id>/`에 세 파일을 모두 만들고 검증한 뒤 그 디렉터리 자체를 단일 rename으로 배치하고,
+  `output_dir/CURRENT` 포인터를 새 버전으로 원자적으로 전환한다. 중간 실패나 동시 export가
+  서로 다른 버전의 파일을 섞어 놓지 않는다(근거·구현: `datasets/export_dataset.py`)
 
 **실행 결과 (실제 CWRU 4개 파일, seed=42 기준):** 라벨당 자산이 1개뿐이라 기본 3-way
 비율은 `InsufficientAssetGroupsError`를 낸다(의도된 동작 — 테스트로 확인). 그래서
@@ -78,7 +82,8 @@ python -m pip install -r ai/ai1/week3/ai1/requirements.txt
 
 ```bash
 python ai/ai1/week3/ai1/datasets/export_dataset.py --train-ratio 1 --validation-ratio 0 --test-ratio 0
-# 결과: ai/ai1/week3/ai1/data/handoff/{dataset_manifest.json, dataset_rows.csv, dataset_export.xlsx}
+# 결과: ai/ai1/week3/ai1/data/handoff/versions/<dataset id>/{dataset_manifest.json,
+#       dataset_rows.csv, dataset_export.xlsx} + CURRENT 포인터(최신 버전 id)
 ```
 
 ## 2. EVENT_LABEL_01 — 라벨 지정 및 변경 이력

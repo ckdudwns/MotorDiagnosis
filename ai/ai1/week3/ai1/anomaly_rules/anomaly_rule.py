@@ -14,6 +14,7 @@ week2 `validate_features.check_outliers()`(baseline mean/std 기반 정상범위
 
 import os
 import sys
+import copy
 import math
 from dataclasses import dataclass
 
@@ -119,7 +120,14 @@ class AssetBaselineRegistry:
         is_default: bool = False,
     ) -> None:
         _validate_baseline(baseline)
-        entry = {"baseline": baseline, "config": config or AnomalyRuleConfig()}
+        # 검증을 통과한 객체를 그대로 저장하면, 등록 후 호출자가 원본
+        # baseline/config를 변경(예: std를 NaN으로)했을 때 그 변경이 이미
+        # 등록된 항목에도 반영돼 검증을 우회한다. deepcopy로 등록 시점의
+        # 값을 스냅샷으로 고정한다.
+        entry = {
+            "baseline": copy.deepcopy(baseline),
+            "config": copy.deepcopy(config) if config is not None else AnomalyRuleConfig(),
+        }
         if asset_id:
             self._by_asset_id[asset_id] = entry
         if asset_type:

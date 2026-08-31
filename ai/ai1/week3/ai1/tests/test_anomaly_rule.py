@@ -172,6 +172,41 @@ class TestAssetBaselineRegistry(unittest.TestCase):
         result = evaluate_feature_stream(windows, baseline, AnomalyRuleConfig())
         self.assertEqual(result["events"], [], "NaN std baseline은 fail-open으로 이어진다")
 
+    def test_mutating_baseline_after_register_does_not_affect_registered_entry(self):
+        """검증을 통과한 baseline 객체를 그대로 저장하면, 등록 후 호출자가
+        원본 dict를 변경(예: std를 NaN으로)했을 때 그 변경이 이미 등록된
+        항목까지 오염시켜 검증을 우회한다 — register()는 deepcopy로 등록
+        시점의 값을 스냅샷으로 고정해야 한다."""
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": 1.0}}}
+        registry.register(baseline, is_default=True)
+
+        # 등록 후 원본 dict를 변경 — 등록된 항목이 이 변경에 영향을 받으면
+        # 안 된다.
+        baseline["features"]["x"]["std"] = float("nan")
+
+        resolved = registry.resolve(asset_id="anything")
+        self.assertEqual(resolved["baseline"]["features"]["x"]["std"], 1.0)
+
+        # 큰 이상값을 흘려도 등록된(오염되지 않은) baseline 기준으로 정상
+        # 탐지가 계속 동작해야 한다.
+        windows = [{"x": 1e9}] * 5
+        result = evaluate_feature_stream(windows, resolved["baseline"], resolved["config"])
+        self.assertGreater(
+            len(result["events"]), 0, "등록 후 원본 변경이 등록된 baseline을 오염시켰다"
+        )
+
+    def test_mutating_config_after_register_does_not_affect_registered_entry(self):
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": 1.0}}}
+        config = AnomalyRuleConfig(min_consecutive_enter=2, min_consecutive_exit=2)
+        registry.register(baseline, config=config, is_default=True)
+
+        config.min_consecutive_enter = 999
+
+        resolved = registry.resolve(asset_id="anything")
+        self.assertEqual(resolved["config"].min_consecutive_enter, 2)
+
 
 class TestHysteresisSuppressesSingleSpike(unittest.TestCase):
     def test_single_window_spike_does_not_trigger_event(self):

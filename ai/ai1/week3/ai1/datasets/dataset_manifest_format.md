@@ -45,6 +45,16 @@ API 명세서 v1.2의 `09_보완API상세` 시트 `POST /api/datasets`(MVP-042) 
 CSV/XLSX 경로)로 구성한다 — `export_dataset.py`가 이 형태로 별도 `dataset_manifest.json`을
 만든다.
 
+## 산출물 배치 (원자적 게시)
+
+`export_dataset.py`는 세 산출물(csv/xlsx/manifest.json)을 `output_dir/versions/<dataset
+id>/`에 모두 만들고 검증한 뒤 그 디렉터리 자체를 단일 rename으로 배치하고, 마지막으로
+`output_dir/CURRENT` 포인터 파일을 새 버전 id로 원자적으로 교체한다. 파일별로 따로
+교체하면 중간 실패나 동시 export 시 서로 다른 버전의 csv/xlsx/manifest가 섞여 보일 수
+있어, 세 파일의 "집합"을 바꾸는 동작 자체를 단일 원자적 연산으로 묶었다. `version_id`는
+`compute_version_checksum()`이 만드는 불변 체크섬을 담고 있으므로, 같은 입력으로 다시
+내보내면 같은 version_dir을 재사용한다(idempotent).
+
 ## 라벨 매핑 (`labelMapping`)
 
 | CWRU 원본 라벨 (`known_label`) | 공통 학습 라벨 (`common_label`) |

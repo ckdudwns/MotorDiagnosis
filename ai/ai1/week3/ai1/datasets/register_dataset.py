@@ -188,6 +188,24 @@ def validate_split_ratios(ratios: dict) -> None:
         raise ValueError(f"split_ratios 합계는 1.0이어야 합니다 (현재 {total}): {ratios!r}")
 
 
+def _validate_finite_features(features: dict, sample_id: str) -> None:
+    """추출된 특징값이 전부 유한한 실수인지 행을 만들기 전에 검증한다.
+
+    NaN/Inf가 그대로 rows에 들어가면 CSV에는 문자열 "nan"이, XLSX(openpyxl)는
+    NaN/Inf를 쓸 수 없어 빈 셀로 남아 같은 값이 산출물마다 다르게(그리고
+    조용히) 표현된다. 저장 직전에 명시적으로 막아 포맷 불일치를 방지한다.
+    """
+    for name, value in features.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"{sample_id}의 특징값 {name!r}이 숫자가 아닙니다: {value!r}"
+            )
+        if not math.isfinite(value):
+            raise ValueError(
+                f"{sample_id}의 특징값 {name!r}이 유한하지 않습니다: {value!r}"
+            )
+
+
 def group_split(
     records: list, ratios: dict = None, seed: int = 42, group_key: str = "source_label"
 ) -> list:
@@ -256,36 +274,63 @@ def group_split(
             assigned_counts[label][split_name] += count
 
     # 1단계: 그룹을 쪼개지 않고도 모든 (라벨, 필수 split) 조합이 최소 1개
-    # 그룹을 받도록, 비율이 작은 split부터 그 라벨을 포함한 가장 작은 미배정
-    # 그룹을 배정한다. 이미 배정된 그룹이 해당 라벨을 포함하면(공유 그룹)
-    # 그 조합은 이미 충족된 것으로 보고 건너뛴다.
+    # 그룹을 받도록 배정한다. coverage_pairs는 비율이 작은 split부터 처리
+    # 되도록 정렬한다(이미 배정된 그룹이 해당 라벨을 포함하면(공유 그룹) 그
+    # 조합은 이미 충족된 것으로 보고 건너뛴다).
+    #
+    # 각 pair를 되돌릴 수 없는 그리디로 독립적으로 처리하면, 그룹이 서로
+    # 다른 라벨 쌍을 사슬처럼 공유하는 구조에서는 실제로 가능한 배정이
+    # 있어도 특정 처리 순서 때문에 막다른 길에 몰릴 수 있다(예: 한 라벨의
+    # 그룹 두 개가 각각 다른 라벨의 요구를 채우느라 같은 split에 몰려
+    # 배정되면, 정작 그 라벨 자신은 나머지 split을 커버할 그룹이 남지
+    # 않는다). 그래서 pair마다 결정적으로 정렬한 후보를 시도하다 막히면
+    # 이전 선택으로 되돌아가는 백트래킹을 쓴다 — 가능한 배정이 존재하면
+    # 반드시 찾아낸다.
     coverage_pairs = [
         (label, name) for label in label_group_ids for name in required_splits
     ]
     coverage_pairs.sort(key=lambda pair: ratios[pair[1]])
 
-    for label, name in coverage_pairs:
-        if any(split_of_group.get(gid) == name for gid in label_group_ids[label]):
-            continue
-        candidates = [
-            gid for gid in label_group_ids[label] if gid not in split_of_group
-        ]
-        if not candidates:
-            # 그룹 수 자체는 충분해도, 공유 그룹이 다른 라벨의 커버리지
-            # 요구를 이미 흡수해 버리면 이 라벨에는 배정할 그룹이 남지 않을
-            # 수 있다 — 조용히 건너뛰지 않고 명시적으로 알린다.
-            raise InsufficientAssetGroupsError(
-                f"라벨 {label!r}: split {name!r}에 배정할 독립 그룹이 부족합니다 "
-                "(다른 라벨과 공유하는 그룹이 이미 다른 split의 커버리지에 쓰였습니다)."
-            )
-        # 여러 라벨이 공유하는 그룹을 먼저 커버리지에 써버리면 그 그룹을
-        # 필요로 하는 다른 라벨의 커버리지가 나중에 그룹 부족으로 막힐 수
-        # 있다. 그래서 이 라벨 전용(비공유) 그룹을 먼저, 그중에서도 가장
-        # 작은 것부터 쓰고 공유 그룹은 다른 선택지가 없을 때만 쓴다.
-        candidates.sort(
-            key=lambda gid: (len(group_label_counts[gid]) > 1, len(groups[gid]))
+    def _candidate_order(label: str) -> list:
+        # 비공유(전용) 그룹, 작은 그룹, gid 순으로 결정적으로 정렬한다.
+        # gid를 마지막 tie-break로 넣어야 label_group_ids[label](set)의
+        # PYTHONHASHSEED에 따라 달라지는 반복 순서가 결과(따라서 split 배정과
+        # dataset fingerprint)에 영향을 주지 않는다 — 동일한 PYTHONHASHSEED
+        # 없이도 매번 같은 records/seed에 대해 같은 split이 나와야 한다.
+        return sorted(
+            label_group_ids[label],
+            key=lambda gid: (len(group_label_counts[gid]) > 1, len(groups[gid]), gid),
         )
-        assign(candidates[0], name)
+
+    def _backtrack(pair_index: int, coverage_assignment: dict) -> bool:
+        if pair_index == len(coverage_pairs):
+            return True
+        label, name = coverage_pairs[pair_index]
+        if any(
+            coverage_assignment.get(gid) == name for gid in label_group_ids[label]
+        ):
+            return _backtrack(pair_index + 1, coverage_assignment)
+        for gid in _candidate_order(label):
+            if gid in coverage_assignment:
+                continue
+            coverage_assignment[gid] = name
+            if _backtrack(pair_index + 1, coverage_assignment):
+                return True
+            del coverage_assignment[gid]
+        return False
+
+    coverage_assignment: dict = {}
+    if not _backtrack(0, coverage_assignment):
+        # 그룹 수 자체는 라벨별로 충분해도(위 사전 검사 통과), 그룹을
+        # 공유하는 구조상 모든 (라벨, split) 조합을 리크 없이 동시에
+        # 커버하는 배정이 아예 존재하지 않을 수 있다 — 조용히 건너뛰지
+        # 않고 명시적으로 알린다.
+        raise InsufficientAssetGroupsError(
+            "라벨/그룹 공유 구조상 모든 (라벨, split) 조합을 그룹을 쪼개지 "
+            f"않고 리크 없이 커버하는 배정을 찾을 수 없습니다: {coverage_pairs!r}"
+        )
+    for gid, name in coverage_assignment.items():
+        assign(gid, name)
 
     # 2단계: 남은 그룹은 그 그룹이 걸친 모든 라벨의 목표 건수 대비 부족분
     # 합이 가장 큰 split에 큰 그룹부터 배정하는 그리디로 비율에 최대한
@@ -326,7 +371,9 @@ def compute_feature_output_fingerprint(rows: list) -> str:
     payload = [
         {name: row[name] for name in sorted(row)} for row in rows
     ]
-    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
@@ -373,7 +420,9 @@ def compute_version_checksum(
         },
         "feature_output_fingerprint": feature_output_fingerprint,
     }
-    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
@@ -402,6 +451,7 @@ def build_manifest(
         known_label = rec["label"]
         common_label = DATASET_LABEL_MAPPING[known_label]
         features = extract_all_features(rec["signal"], config)
+        _validate_finite_features(features, rec["sample_id"])
         row = {
             "sample_id": rec["sample_id"],
             "source_file": rec["source_label"],
@@ -500,7 +550,7 @@ if __name__ == "__main__":
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+        json.dump(manifest, f, ensure_ascii=False, indent=2, allow_nan=False)
 
     print(f"데이터셋 {manifest['id']} 매니페스트 생성 완료: {manifest['rowCount']}행")
     print(f"  분할 건수: {manifest['splitCounts']}")

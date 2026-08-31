@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import struct
 import tempfile
 import threading
 import time
@@ -2154,6 +2155,245 @@ class Week2BackendTest(unittest.TestCase):
                 self.assertTrue(retry_queue._session_ready.is_set())
                 client.on_message(client, None, message)
                 forward.assert_called_once()
+
+    def test_real_paho_pre_suback_qos_one_is_automatically_processed(self) -> None:
+        try:
+            import paho.mqtt.client as mqtt
+        except ImportError:
+            self.skipTest("paho-mqtt is required for the packet-order regression")
+
+        for malformed in (False, True):
+            with (
+                self.subTest(malformed=malformed),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                args = SimpleNamespace(
+                    topic="devices/+/telemetry",
+                    qos=1,
+                    health_endpoint="http://backend/api/health/dependencies/mqtt",
+                    ingest_endpoint="http://backend/api/telemetry/ingest",
+                    quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                    ingest_token="token",
+                )
+                client = mqtt.Client(
+                    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                    client_id="pre-suback-regression",
+                    clean_session=False,
+                    protocol=mqtt.MQTTv311,
+                    manual_ack=True,
+                )
+                options = dict(
+                    database_path=Path(directory) / "pre-suback.sqlite3",
+                    ingest_endpoint=args.ingest_endpoint,
+                    quarantine_endpoint=args.quarantine_endpoint,
+                    token="token",
+                    initial_delay=0,
+                    poll_interval=0.05,
+                )
+                retry_queue = MqttRetryQueue(**options, session_ready=False)
+                configure_mqtt_callbacks(client, args, retry_queue)
+
+                def packet(command: int, body: bytes) -> None:
+                    client._in_packet = {
+                        "command": command,
+                        "remaining_length": len(body),
+                        "packet": bytearray(body),
+                    }
+                    result = client._packet_handle()
+                    self.assertIn(result, (None, mqtt.MQTT_ERR_SUCCESS))
+
+                topic = b"devices/DEV-PRE-SUBACK/telemetry"
+                payload = (
+                    b"{invalid"
+                    if malformed
+                    else b'{"deviceId":"DEV-PRE-SUBACK","sequence":201}'
+                )
+                try:
+                    with (
+                        patch.object(client, "subscribe", return_value=(0, 202)),
+                        patch.object(
+                            client, "_on_message", wraps=client.on_message
+                        ) as on_message,
+                        patch.object(client, "ack", wraps=client.ack) as ack,
+                        patch("motor_diagnosis.mqtt_service.report_mqtt_status_safely"),
+                        patch(
+                            "motor_diagnosis.mqtt_service.forward_mqtt_message",
+                            return_value=({}, 201),
+                        ) as forward,
+                        patch(
+                            "motor_diagnosis.mqtt_service.quarantine_local_mqtt_message"
+                        ) as quarantine,
+                    ):
+                        retry_queue.start()
+                        packet(mqtt.CONNACK, b"\x00\x00")
+                        packet(
+                            mqtt.PUBLISH | 2,
+                            struct.pack("!H", len(topic))
+                            + topic
+                            + struct.pack("!H", 201)
+                            + payload,
+                        )
+                        self.assertFalse(retry_queue._session_ready.is_set())
+                        self.assertEqual(retry_queue.pending_count(), 1)
+                        # Even another ready worker must not consume unapproved rows.
+                        other_queue = MqttRetryQueue(**options)
+                        self.assertEqual(
+                            other_queue.process_due_once(now=float("inf")), "idle"
+                        )
+                        forward.assert_not_called()
+                        quarantine.assert_not_called()
+                        ack.assert_not_called()
+
+                        packet(mqtt.SUBACK, struct.pack("!HB", 202, 1))
+                        deadline = time.monotonic() + 3
+                        while (
+                            retry_queue.pending_count() and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.02)
+                        self.assertEqual(retry_queue.pending_count(), 0)
+                        self.assertEqual(on_message.call_count, 1)
+                        ack.assert_called_once_with(201, 1)
+                        if malformed:
+                            forward.assert_not_called()
+                            quarantine.assert_called_once()
+                            self.assertEqual(
+                                quarantine.call_args.args[4].code, "INVALID_JSON"
+                            )
+                        else:
+                            forward.assert_called_once()
+                            quarantine.assert_not_called()
+                        self.assertEqual(
+                            list(client._out_packet)[-1]["packet"], b"\x40\x02\x00\xc9"
+                        )
+                finally:
+                    retry_queue.stop()
+
+    def test_rejected_suback_keeps_qos_one_durably_gated(self) -> None:
+        for reason in (0, 128):
+            with (
+                self.subTest(reason=reason),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                args = SimpleNamespace(
+                    topic="devices/+/telemetry",
+                    qos=1,
+                    health_endpoint="http://backend/api/health/dependencies/mqtt",
+                    ingest_endpoint="http://backend/api/telemetry/ingest",
+                    quarantine_endpoint="http://backend/api/telemetry/quarantine",
+                    ingest_token="token",
+                )
+                client = SimpleNamespace(subscribe=lambda topic, qos: (0, 203))
+                options = dict(
+                    database_path=Path(directory) / "rejected-suback.sqlite3",
+                    ingest_endpoint=args.ingest_endpoint,
+                    quarantine_endpoint=args.quarantine_endpoint,
+                    token="token",
+                    initial_delay=0,
+                )
+                retry_queue = MqttRetryQueue(**options, session_ready=False)
+                message = SimpleNamespace(
+                    topic="devices/DEV-PRE-SUBACK/telemetry",
+                    payload=b'{"deviceId":"DEV-PRE-SUBACK","sequence":203}',
+                    mid=203,
+                    qos=1,
+                    dup=False,
+                )
+                with (
+                    patch("motor_diagnosis.mqtt_service.report_mqtt_status_safely"),
+                    patch(
+                        "motor_diagnosis.mqtt_service.forward_mqtt_message"
+                    ) as forward,
+                    patch("motor_diagnosis.mqtt_service.acknowledge_message") as ack,
+                ):
+                    configure_mqtt_callbacks(client, args, retry_queue)
+                    client.on_connect(client, None, {"session present": 0}, 0, None)
+                    client.on_message(client, None, message)
+                    # A broker DUP before approval is the same pending delivery.
+                    message.dup = True
+                    client.on_message(client, None, message)
+                    client.on_subscribe(client, None, 203, [reason], None)
+                    self.assertFalse(retry_queue._session_ready.is_set())
+                    self.assertEqual(retry_queue.pending_count(), 1)
+                    restarted = MqttRetryQueue(**options)
+                    self.assertEqual(
+                        restarted.process_due_once(now=float("inf")), "idle"
+                    )
+                    self.assertEqual(restarted.pending_count(), 1)
+                    forward.assert_not_called()
+                    ack.assert_not_called()
+
+    def test_suback_release_failure_retries_without_another_callback(self) -> None:
+        args = SimpleNamespace(
+            topic="devices/+/telemetry",
+            qos=1,
+            health_endpoint="http://backend/api/health/dependencies/mqtt",
+            ingest_endpoint="http://backend/api/telemetry/ingest",
+            quarantine_endpoint="http://backend/api/telemetry/quarantine",
+            ingest_token="token",
+        )
+        acks = []
+        client = SimpleNamespace(
+            subscribe=lambda topic, qos: (0, 204),
+            ack=lambda mid, qos: acks.append((mid, qos)) or 0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            retry_queue = MqttRetryQueue(
+                database_path=Path(directory) / "suback-release.sqlite3",
+                ingest_endpoint=args.ingest_endpoint,
+                quarantine_endpoint=args.quarantine_endpoint,
+                token="token",
+                initial_delay=0,
+                poll_interval=0.05,
+                session_ready=False,
+            )
+            message = SimpleNamespace(
+                topic="devices/DEV-PRE-SUBACK/telemetry",
+                payload=b'{"deviceId":"DEV-PRE-SUBACK","sequence":204}',
+                mid=204,
+                qos=1,
+                dup=False,
+            )
+            real_resume = retry_queue.resume_session
+            resume_calls = []
+
+            def resume():
+                resume_calls.append(True)
+                if len(resume_calls) == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                real_resume()
+
+            try:
+                with (
+                    patch.object(retry_queue, "resume_session", side_effect=resume),
+                    patch(
+                        "motor_diagnosis.mqtt_service.report_mqtt_status_safely"
+                    ) as report,
+                    patch(
+                        "motor_diagnosis.mqtt_service.forward_mqtt_message",
+                        return_value=({}, 201),
+                    ) as forward,
+                ):
+                    configure_mqtt_callbacks(client, args, retry_queue)
+                    retry_queue.start()
+                    client.on_connect(client, None, {"session present": 0}, 0, None)
+                    client.on_message(client, None, message)
+                    client.on_subscribe(client, None, 204, [1], None)
+                    self.assertFalse(retry_queue._session_ready.is_set())
+                    self.assertEqual(retry_queue.pending_count(), 1)
+                    forward.assert_not_called()
+                    deadline = time.monotonic() + 3
+                    while retry_queue.pending_count() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertEqual(retry_queue.pending_count(), 0)
+                    self.assertEqual(len(resume_calls), 2)
+                    forward.assert_called_once()
+                    self.assertEqual(acks, [(204, 1)])
+                    self.assertEqual(
+                        [call.kwargs["status"] for call in report.call_args_list],
+                        ["degraded", "healthy"],
+                    )
+            finally:
+                retry_queue.stop()
 
     def test_generation_gc_is_throttled_and_indexed(self) -> None:
         class AckClient:

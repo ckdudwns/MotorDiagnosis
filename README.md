@@ -46,6 +46,10 @@ MQTT JSON·토픽은
 `POST /api/health/dependencies/mqtt`에 보고하되, SUBACK 승인 QoS가 요청 QoS 이상일 때만
 `healthy`로 전환하고 수집·재시도 작업자를 재개한다. CONNACK 수신이나 세션 epoch
 저장만으로 수집을 재개하지 않는다.
+SUBACK 대기 중 받은 QoS 1 메시지는 SQLite에 승인 대기 상태로 보존한다. 성공 SUBACK
+이후 대기 상태를 해제하고 작업자를 깨워 자동으로 HTTP 전달·격리 및 ACK를 수행한다.
+QoS 0은 승인 전 보관·전달하지 않으며, 거부·하향 SUBACK은 대기열을 해제하지 않는다.
+승인 대기열 해제의 DB 오류는 연결 세대가 유효한 동안 backoff로 재시도한다.
 
 재시도 ACK 전에는 처리 완료 generation과 ACK 시도 의도를 먼저 저장한다. PUBACK 이후
 DB 쓰기가 실패해 ACK 성공 여부가 불확실한 채 재시작하더라도 retry 행은 정리할 수 있으며,

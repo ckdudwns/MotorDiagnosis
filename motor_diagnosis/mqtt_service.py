@@ -287,8 +287,11 @@ class MqttRetryQueue:
         self._session_epoch = ""
         self._session_lock = threading.Lock()
         self._session_fence_lock = threading.Lock()
+        self._subscription_buffer_lock = threading.Lock()
+        self._session_prepared = threading.Event()
         self._session_ready = threading.Event()
         if session_ready:
+            self._session_prepared.set()
             self._session_ready.set()
         self._ack_targets: dict[str, tuple[Any, RetryMessage]] = {}
         self._target_lock = threading.Lock()
@@ -366,6 +369,7 @@ class MqttRetryQueue:
                     delivery_outcome TEXT NOT NULL DEFAULT '',
                     acknowledged INTEGER NOT NULL DEFAULT 0,
                     ack_attempted INTEGER NOT NULL DEFAULT 0,
+                    awaiting_subscription INTEGER NOT NULL DEFAULT 0,
                     claim_owner TEXT NOT NULL DEFAULT '',
                     claim_token INTEGER NOT NULL DEFAULT 0,
                     claim_until REAL NOT NULL DEFAULT 0,
@@ -387,6 +391,7 @@ class MqttRetryQueue:
                 "delivery_outcome": "TEXT NOT NULL DEFAULT ''",
                 "acknowledged": "INTEGER NOT NULL DEFAULT 0",
                 "ack_attempted": "INTEGER NOT NULL DEFAULT 0",
+                "awaiting_subscription": "INTEGER NOT NULL DEFAULT 0",
                 "claim_owner": "TEXT NOT NULL DEFAULT ''",
                 "claim_token": "INTEGER NOT NULL DEFAULT 0",
                 "claim_until": "REAL NOT NULL DEFAULT 0",
@@ -553,6 +558,7 @@ class MqttRetryQueue:
         if reset_ack_targets:
             with self._target_lock:
                 self._ack_targets.clear()
+        self._session_prepared.set()
         LOGGER.info(
             "mqtt_session_epoch session_present=%s epoch=%s",
             session_present,
@@ -561,12 +567,74 @@ class MqttRetryQueue:
         return session_epoch
 
     def pause_session(self) -> None:
-        self._session_ready.clear()
+        with self._subscription_buffer_lock:
+            self._session_ready.clear()
+            self._session_prepared.clear()
         with self._target_lock:
             self._ack_targets.clear()
 
     def resume_session(self) -> None:
-        self._session_ready.set()
+        # Serialize with early-message enqueue so no row can be left gated by
+        # an INSERT committing just after the successful SUBACK release.
+        with self._subscription_buffer_lock:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                epoch = connection.execute(
+                    "SELECT value FROM mqtt_retry_state WHERE key = 'session_epoch'"
+                ).fetchone()["value"]
+                if epoch != self._session_epoch:
+                    raise sqlite3.OperationalError("MQTT session epoch changed")
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_queue
+                    SET awaiting_subscription = 0,
+                        next_attempt_at = MIN(next_attempt_at, ?)
+                    WHERE awaiting_subscription = 1
+                    """,
+                    (time.time(),),
+                )
+            self._session_ready.set()
+        self._wake_event.set()
+
+    def defer_unapproved_message(self, client: Any, message: Any) -> bool:
+        """Return True when normal processing must wait; never send HTTP/ACK."""
+        with self._subscription_buffer_lock:
+            if self._session_ready.is_set():
+                return False
+            if int(message.qos) != SUPPORTED_SUBSCRIPTION_QOS:
+                LOGGER.info("mqtt_unapproved_qos_dropped qos=%s", message.qos)
+                return True
+            try:
+                prepared = self.prepare_delivery(message, allow_unapproved=True)
+                operation = "ingest"
+                error = MqttBridgeError(
+                    503, "MQTT_SUBSCRIPTION_PENDING", "Waiting for successful SUBACK."
+                )
+                completed = prepared.delivery_state in {"terminal", "acked"}
+                if completed:
+                    if prepared.delivery_outcome == "quarantined":
+                        operation = "quarantine"
+                else:
+                    try:
+                        decode_mqtt_payload(message.topic, message.payload)
+                    except MqttBridgeError as validation_error:
+                        operation = "quarantine"
+                        error = validation_error
+                queued = self.enqueue(
+                    client,
+                    message,
+                    error,
+                    operation=operation,
+                    delivery_completed=completed,
+                    retry_message=prepared,
+                    awaiting_subscription=True,
+                )
+                LOGGER.info(
+                    "mqtt_pre_suback_deferred topic=%s queued=%s", message.topic, queued
+                )
+            except sqlite3.Error:
+                LOGGER.exception("mqtt_pre_suback_defer_failed topic=%s", message.topic)
+            return True
 
     @staticmethod
     def _payload_hash(topic: str, payload: bytes) -> str:
@@ -695,8 +763,14 @@ class MqttRetryQueue:
             delivery_outcome=delivery_outcome,
         )
 
-    def prepare_delivery(self, message: Any) -> RetryMessage:
-        if not self._session_ready.is_set():
+    def prepare_delivery(
+        self, message: Any, *, allow_unapproved: bool = False
+    ) -> RetryMessage:
+        if not self._session_ready.is_set() and not (
+            allow_unapproved
+            and self._session_prepared.is_set()
+            and int(message.qos) == SUPPORTED_SUBSCRIPTION_QOS
+        ):
             raise sqlite3.OperationalError("MQTT session state is not ready")
         retry_message = self._snapshot(message)
         payload_hash = self._payload_hash(retry_message.topic, retry_message.payload)
@@ -1004,6 +1078,7 @@ class MqttRetryQueue:
         delivery_completed: bool = False,
         ack_pending: bool = False,
         retry_message: RetryMessage | None = None,
+        awaiting_subscription: bool = False,
     ) -> bool:
         if operation not in {"ingest", "quarantine"}:
             raise ValueError(f"Unsupported retry operation: {operation}")
@@ -1047,6 +1122,10 @@ class MqttRetryQueue:
                 acknowledged = MAX(
                     mqtt_retry_queue.acknowledged,
                     excluded.acknowledged
+                ),
+                awaiting_subscription = MAX(
+                    mqtt_retry_queue.awaiting_subscription,
+                    excluded.awaiting_subscription
                 )
             """
         else:
@@ -1063,6 +1142,7 @@ class MqttRetryQueue:
                 delivery_outcome = excluded.delivery_outcome,
                 acknowledged = excluded.acknowledged,
                 ack_attempted = excluded.ack_attempted,
+                awaiting_subscription = excluded.awaiting_subscription,
                 claim_owner = '',
                 claim_token = 0,
                 claim_until = 0,
@@ -1080,8 +1160,9 @@ class MqttRetryQueue:
                         message_key, operation, topic, payload, mid, qos,
                         attempts, next_attempt_at, error_code, error_message,
                         last_error_code, last_error_message, delivery_completed,
-                        delivery_outcome, acknowledged, session_epoch, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                        delivery_outcome, acknowledged, session_epoch, created_at,
+                        awaiting_subscription
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                     ON CONFLICT(message_key) DO UPDATE SET
                         {conflict_action}
                     """,
@@ -1101,6 +1182,7 @@ class MqttRetryQueue:
                         delivery_outcome,
                         retry_message.session_epoch,
                         now,
+                        int(awaiting_subscription),
                     ),
                 )
         except sqlite3.Error:
@@ -1463,6 +1545,7 @@ class MqttRetryQueue:
                     """
                     SELECT * FROM mqtt_retry_queue
                     WHERE next_attempt_at <= ? AND claim_until <= ?
+                        AND awaiting_subscription = 0
                     ORDER BY next_attempt_at, created_at, message_key
                     LIMIT 1
                     """,
@@ -1970,6 +2053,8 @@ def process_mqtt_message(
     """Return accepted, quarantined, or retry based on HTTP processing outcome."""
     retry_message = None
     if retry_queue:
+        if retry_queue.defer_unapproved_message(client, message):
+            return "retry"
         try:
             retry_message = retry_queue.prepare_delivery(message)
         except sqlite3.Error as error:
@@ -2281,7 +2366,9 @@ def configure_mqtt_callbacks(
             early_subacks.clear()
             subscription_in_progress = None
 
-    def handle_suback(mid: int, reason_codes: list[Any], generation: int) -> None:
+    def handle_suback(
+        mid: int, reason_codes: list[Any], generation: int, attempt: int = 0
+    ) -> None:
         with status_transition_lock:
             if generation != current_activation_generation():
                 LOGGER.info(
@@ -2331,7 +2418,28 @@ def configure_mqtt_callbacks(
                     error_code=error_code,
                 )
                 return
-            retry_queue.resume_session()
+            try:
+                retry_queue.resume_session()
+            except sqlite3.Error as error:
+                delay = min(30.0, 0.25 * (2 ** min(attempt, 7)))
+                LOGGER.warning(
+                    "mqtt_suback_release_failed error=%s retry_in=%.2f", error, delay
+                )
+                report_mqtt_status_safely(
+                    endpoint=args.health_endpoint,
+                    token=args.ingest_token,
+                    status="degraded",
+                    detail=f"SUBACK queue release failed: {error}",
+                    error_code="MQTT_RETRY_STATE_FAILED",
+                )
+                timer = threading.Timer(
+                    delay,
+                    handle_suback,
+                    args=(mid, reason_codes, generation, attempt + 1),
+                )
+                timer.daemon = True
+                timer.start()
+                return
             report_mqtt_status_safely(
                 endpoint=args.health_endpoint,
                 token=args.ingest_token,

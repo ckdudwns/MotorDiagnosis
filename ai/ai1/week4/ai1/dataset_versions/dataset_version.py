@@ -9,6 +9,7 @@
 근거는 dataset_version_format.md 참고.
 """
 
+import copy
 import json
 import hashlib
 from datetime import datetime, timezone
@@ -41,7 +42,10 @@ def freeze_dataset_version(manifest: dict) -> dict:
             f"draft 상태만 동결할 수 있습니다 (현재 status={manifest.get('status')!r})."
         )
 
-    frozen = dict(manifest)
+    # 얕은 dict()는 중첩 rows 리스트를 원본과 공유한다 — 동결 후 원본 rows를
+    # 변형하면 frozen 데이터도 함께 바뀌는데 datasetChecksum은 그대로라, 변조된
+    # 데이터가 검증을 통과해 버린다. 깊은 복사로 동결 시점 내용을 독립 보존한다.
+    frozen = copy.deepcopy(manifest)
     frozen["status"] = "frozen"
     frozen["datasetChecksum"] = compute_dataset_checksum(manifest)
     frozen["frozenAt"] = _now_iso()
@@ -59,7 +63,17 @@ def approve_dataset_version(frozen_manifest: dict, *, approved_by: str, reason: 
     if not reason or not reason.strip():
         raise ValueError("reason은 필수입니다.")
 
-    approved = dict(frozen_manifest)
+    # 동결 이후 내용이 바뀌지 않았는지 승인 직전에 다시 검증한다 — 동결 시점
+    # 체크섬과 현재 내용의 체크섬이 어긋나면(중첩 객체 변조 등) 승인을 거부한다.
+    current_checksum = compute_dataset_checksum(frozen_manifest)
+    if current_checksum != frozen_manifest.get("datasetChecksum"):
+        raise ValueError(
+            "동결 이후 매니페스트 내용이 변경되어 승인할 수 없습니다 "
+            f"(frozen={frozen_manifest.get('datasetChecksum')!r}, "
+            f"current={current_checksum!r})."
+        )
+
+    approved = copy.deepcopy(frozen_manifest)
     approved["status"] = "approved"
     approved["approvedBy"] = approved_by
     approved["approvalReason"] = reason

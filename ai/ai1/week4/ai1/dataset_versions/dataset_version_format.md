@@ -35,6 +35,11 @@ draft --freeze_dataset_version()--> frozen --approve_dataset_version()--> approv
 
 각 전이는 역방향으로 되돌릴 수 없다(재동결/재승인 불가 — 재시도하려면 새 버전을 만든다).
 
+**중첩 객체 격리**: `freeze`/`approve`는 `copy.deepcopy`로 매니페스트를 독립 복사한다
+(얕은 `dict()`는 `rows` 리스트를 공유해, 동결 후 원본 `rows`를 변조해도 `datasetChecksum`이
+안 바뀌어 검증을 통과하는 문제가 있었다). `approve`는 복사 전에 현재 내용의 체크섬이
+동결 시점 `datasetChecksum`과 일치하는지 재검증하고, 어긋나면 승인을 거부한다.
+
 ## `datasetChecksum` 계산 방식
 
 ```python
@@ -64,8 +69,10 @@ checksum = "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 ```
 
 상태 머신: `registered --approve_model_version()--> approved`. 승인에는 `reason`과
-`metricSnapshot`(승인 시점 지표를 그대로 복사 — 나중에 지표 재계산 로직이 바뀌어도
-승인 당시 근거가 남도록)이 필수다(FUT-006 계약과 동일).
+`metricSnapshot`(승인 시점 지표를 **깊은 복사** — 나중에 원본 `metrics`나 재계산
+로직이 바뀌어도 승인 당시 근거가 남도록)이 필수다(FUT-006 계약과 동일). 기준선
+`features`도 `register`/`approve`/`activate` 각 단계에서 깊은 복사해, draft 수정이
+승인본·active 기준선으로 새지 않는다.
 
 `rollback_model_version(current, target, *, reason, target_environment)`은 **승인된
 버전으로만** 롤백할 수 있다(`target.status == "approved"` 검증) — 검증되지 않은

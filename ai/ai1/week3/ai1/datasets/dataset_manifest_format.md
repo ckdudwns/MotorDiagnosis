@@ -78,13 +78,15 @@ split)"를 권장한다. `register_dataset.py`의 `group_split()`은 이를 그�
   방지한다 (`seed` 고정, 라벨별로 독립적으로 그룹을 배정).
 - 라벨 하나의 독립 그룹 수가 요청한 분할 개수(기본 3: train/validation/test)보다 적으면
   **그룹을 쪼개서 윈도우 단위로 섞는 대신 `InsufficientAssetGroupsError`를 발생시킨다.**
-  CWRU는 **라벨 하나당 실제 자산(파일)이 1개뿐**이라(`97.mat` = NORMAL 자산 1대,
-  `105/118/130.mat` = 결함 자산 각 1대) 기본 3-way 비율로는 이 예외가 항상 발생하는 것이
-  정상 동작이다.
-- 그래서 지금은 `--train-ratio 1 --validation-ratio 0 --test-ratio 0`처럼 **train 전용
-  비율을 명시적으로 지정**해 파이프라인(체크섬 추적/라벨 매핑/내보내기)을 검증한다.
-  실제 현장 데이터처럼 **동일 라벨 안에 자산이 여러 대** 확보되면 기본 3-way 비율로
-  전환하면 된다.
+  (이 동작은 합성 케이스로 `TestGroupSplitSynthetic`가 계속 검증한다.)
+- CWRU는 이제 **라벨당 자산(파일) 4개** — 부하 조건 0/1/2/3 HP — 를 확보해 기본 3-way
+  비율이 리크 없이 성립한다. 파일 크기가 전부 달라 분할은 `seed`에 의존하지 않고
+  결정적이다: **test = 0HP(97/105/118/130), validation = 1HP(98/106/119/131),
+  train = 2HP+3HP**. 각 원본 파일은 정확히 하나의 split에만 들어간다.
+- 유의: CWRU에서는 "자산 = 부하 조건"이라 split 간 운전 조건이 겹치지 않는다. 정상
+  재구성 임계값이 train에 없던 부하 조건에서는 보정되지 않으므로, 하류 모델
+  (`AI_FREQ_MODEL_01`)은 RPM에 강하게 묶인 `vibration_peak_hz`를 모델 입력에서 제외하고
+  운전 조건별 임계값 재보정을 도메인갭으로 기록한다.
 
 ## 행(rows) 스키마 — CSV/XLSX로 내보내는 실제 컬럼
 
@@ -95,8 +97,8 @@ split)"를 권장한다. `register_dataset.py`의 `group_split()`은 이를 그�
 | `known_label` | CWRU 원본 라벨 |
 | `common_label` | 정규화된 공통 라벨 (`NORMAL`/`ANOMALY`) |
 | `split` | `train`/`validation`/`test` |
-| `sample_rate_hz`, `rpm` | 원본 메타데이터 |
-| `rms_mean`, `kurtosis_mean`, ... | `extract_all_features()`(week2 특징량 로직 재사용) 결과 — feature_extraction 로직을 중복 구현하지 않는다 |
+| `sample_rate_hz`, `rpm` | 원본 메타데이터 (RPM 키 없는 `98/99.mat`은 부하 조건으로 추정) |
+| `rms_mean`, `kurtosis_mean`, ... `vibration_peak_hz` | `extract_all_features()`(week2, 26개) + `compute_peak_frequency()`(week1, `vibration_peak_hz`) = 27개. 계산 로직은 중복 구현하지 않고 재사용 |
 
 ## 수용 기준 검증 방법
 
@@ -108,7 +110,8 @@ split)"를 권장한다. `register_dataset.py`의 `group_split()`은 이를 그�
 ## TODO (실제 센서/추가 데이터셋 확보 후)
 
 - [ ] MIMII 음향 데이터가 배치되면 `modality: "acoustic"` 데이터셋 버전을 동일 스키마로 추가 등록
-- [ ] 라벨당 자산이 여러 개가 되면 기본 3-way 비율(`--train-ratio 0.7 --validation-ratio 0.2
-      --test-ratio 0.1`)로 전환 (분할 로직 자체는 이미 설비 단위 group split — 자산 부족 문제만 남음)
+- [x] 라벨당 자산 4개(0~3HP)를 확보해 기본 3-way group split로 전환 완료. 남은 한계:
+      CWRU는 자산 = 부하 조건이라 split 간 운전 조건이 겹치지 않는다 — 현장에서 다양한
+      운전 조건의 자산이 쌓이면 해소된다
 - [ ] 실제 센서 채널 확보 후 이 CWRU 버전과 별도의 신규 데이터셋 버전으로 등록 (섞지 않음 —
       MVP 기획서 v1.2 "역할배정" 시트의 "대상 확정 후 보완" 항목)

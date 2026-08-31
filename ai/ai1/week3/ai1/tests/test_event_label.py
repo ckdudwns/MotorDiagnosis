@@ -240,8 +240,8 @@ class TestSeedLabelWithRealDatasetManifest(unittest.TestCase):
     def setUpClass(cls):
         from register_dataset import build_manifest
 
-        # CWRU는 라벨당 자산이 1개뿐이라 기본 3-way 비율은 InsufficientAssetGroupsError를
-        # 낸다 (의도된 동작) — 여기서는 라벨 매핑 시딩만 검증하면 되므로 train 전용으로 생성한다.
+        # 여기서는 라벨 매핑 시딩만 검증하면 되므로 분할 구성은 무관하다 — 가장
+        # 단순한 train 전용 비율로 생성한다(기본 3-way도 이제 성립한다).
         cls.manifest = build_manifest(
             data_dir=_CWRU_DATA_DIR,
             split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},

@@ -59,6 +59,14 @@ class FeatureScaler:
         self.mean_ = None
         self.std_ = None
 
+    @classmethod
+    def from_state(cls, mean_, std_) -> "FeatureScaler":
+        """저장된 평균/표준편차로 스케일러를 복원한다 (fit 없이 — 아티팩트 재로딩용)."""
+        scaler = cls()
+        scaler.mean_ = np.asarray(mean_, dtype=np.float64)
+        scaler.std_ = np.asarray(std_, dtype=np.float64)
+        return scaler
+
     def fit(self, matrix: np.ndarray) -> "FeatureScaler":
         flat = matrix.reshape(-1, matrix.shape[-1])
         self.mean_ = flat.mean(axis=0)

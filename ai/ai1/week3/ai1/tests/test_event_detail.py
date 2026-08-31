@@ -391,7 +391,9 @@ class TestBuildEventDetailRealCwruData(unittest.TestCase):
         from extract_features import extract_all_features, FeatureConfig
 
         records = load_cwru_dataset(_CWRU_DATA_DIR)
-        normal = [r for r in records if r["label"] == "NORMAL"]
+        # 105.mat(0HP 내륜 결함)와 같은 운전 조건의 정상 97.mat로 고정해
+        # 부하 차이가 아니라 결함 자체로 특징이 갈리는 것을 본다.
+        normal = [r for r in records if r["source_label"] == "97.mat"]
         fault = [r for r in records if r["source_label"] == "105.mat"]
         cls.event_index = len(normal)
 

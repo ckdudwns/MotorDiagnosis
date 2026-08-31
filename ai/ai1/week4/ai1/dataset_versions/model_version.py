@@ -6,6 +6,7 @@ FUT-010~011(기준선 버전 조회/등록) 계약을 그대로 데이터 구조
 근거는 dataset_version_format.md 참고.
 """
 
+import copy
 from datetime import datetime, timezone
 
 
@@ -27,7 +28,7 @@ def register_model_version(
         "artifactUri": artifact_uri,
         "datasetId": dataset_id,
         "baselineVersion": baseline_version,
-        "metrics": metrics,
+        "metrics": copy.deepcopy(metrics),  # 호출자가 이후 원본 metrics를 바꿔도 안전
         "status": "registered",
         "createdAt": _now_iso(),
     }
@@ -46,10 +47,15 @@ def approve_model_version(model_version: dict, *, reason: str, metric_snapshot: 
     if not reason or not reason.strip():
         raise ValueError("reason은 필수입니다.")
 
-    approved = dict(model_version)
+    # 얕은 dict()는 중첩 metrics(혼동행렬 등)를 원본과 공유한다 — 승인 후 원본
+    # metrics를 수정하면 승인 당시 근거(metricSnapshot)까지 바뀐다. 깊은 복사한다.
+    approved = copy.deepcopy(model_version)
     approved["status"] = "approved"
     approved["approvalReason"] = reason
-    approved["metricSnapshot"] = metric_snapshot or dict(model_version["metrics"])
+    snapshot_source = (
+        metric_snapshot if metric_snapshot is not None else model_version["metrics"]
+    )
+    approved["metricSnapshot"] = copy.deepcopy(snapshot_source)
     approved["approvedAt"] = _now_iso()
     return approved
 
@@ -103,7 +109,7 @@ def register_baseline_version(
         "siteId": site_id,
         "assetId": asset_id,
         "timeSegment": time_segment,
-        "features": features,
+        "features": copy.deepcopy(features),  # draft 수정이 등록본에 새지 않도록
         "status": "draft",
         "createdAt": _now_iso(),
     }
@@ -117,7 +123,9 @@ def approve_baseline_version(baseline_version: dict, *, approved_by: str, reason
     if not reason or not reason.strip():
         raise ValueError("reason은 필수입니다.")
 
-    approved = dict(baseline_version)
+    # features(mean/std/normal_range)를 참조 공유하면 draft 수정이 승인본·active
+    # 기준선에까지 전파된다. 승인 결과를 깊은 복사로 독립시킨다.
+    approved = copy.deepcopy(baseline_version)
     approved["status"] = "approved"
     approved["approvedBy"] = approved_by
     approved["approvalReason"] = reason
@@ -133,7 +141,7 @@ def activate_baseline_version(baseline_version: dict) -> dict:
             f"승인된(approved) 기준선만 배포할 수 있습니다 "
             f"(현재 status={baseline_version.get('status')!r})."
         )
-    active = dict(baseline_version)
+    active = copy.deepcopy(baseline_version)
     active["status"] = "active"
     active["activatedAt"] = _now_iso()
     return active

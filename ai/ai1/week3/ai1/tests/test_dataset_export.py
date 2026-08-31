@@ -793,34 +793,40 @@ class TestExportDatasetSynthetic(unittest.TestCase):
 
 
 @unittest.skipUnless(_cwru_data_available(), CWRU_SKIP_REASON)
-class TestRegisterManifestRejectsLeakyDefaultSplit(unittest.TestCase):
-    """실제 CWRU 데이터는 라벨당 자산(원본 파일)이 1개뿐이라, 기본 3-way 비율로는
-    그룹을 쪼개지 않고 리크 없는 분할을 만들 수 없다 — build_manifest가 이를
-    조용히 window 셔플로 얼버무리지 않고 명시적으로 실패하는지 확인한다."""
+class TestRegisterManifestDefaultSplitIsLeakFree(unittest.TestCase):
+    """CWRU가 라벨당 자산(원본 파일) 4개(0/1/2/3 HP)를 확보하면서 기본 3-way
+    비율이 그룹을 쪼개지 않고 리크 없이 성립한다 — 각 원본 파일은 정확히
+    하나의 split에만 들어가야 한다. 자산이 부족할 때 조용히 넘어가지 않고
+    예외를 던지는 동작은 TestGroupSplitSynthetic가 계속 검증한다."""
 
-    def test_default_ratios_raise_insufficient_asset_groups(self):
-        from register_dataset import InsufficientAssetGroupsError
+    def test_default_ratios_now_succeed_leak_free(self):
+        manifest = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)  # 기본 3-way
 
-        with self.assertRaises(InsufficientAssetGroupsError):
-            build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
+        splits_by_source = {}
+        for row in manifest["rows"]:
+            splits_by_source.setdefault(row["source_file"], set()).add(row["split"])
+        for source_file, splits in splits_by_source.items():
+            self.assertEqual(
+                len(splits), 1, f"{source_file} 가 여러 split에 걸쳐 데이터 누수가 생김: {splits}"
+            )
+
+        self.assertTrue(all(count > 0 for count in manifest["splitCounts"].values()))
+        self.assertEqual(
+            sum(manifest["splitCounts"].values()), manifest["rowCount"]
+        )
 
 
 @unittest.skipUnless(_cwru_data_available(), CWRU_SKIP_REASON)
 class TestRegisterAndExportRealCwruData(unittest.TestCase):
     """실제 CWRU 데이터로 매니페스트 생성 → CSV/XLSX 내보내기까지 전체 흐름을 검증.
 
-    라벨당 자산이 1개뿐이라 validation/test로 쪼갤 독립 그룹이 없으므로,
-    여기서는 train 전용 비율로 파이프라인 자체(체크섬/라벨매핑/내보내기)를 검증한다.
-    실제 자산이 여러 개 확보되면 기본 3-way 비율로 전환한다.
+    라벨당 자산 4개(0~3HP)를 확보하면서 기본 3-way 그룹 분할로 파이프라인
+    전체(분할/체크섬/라벨매핑/내보내기)를 검증한다.
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.manifest = build_manifest(
-            data_dir=_CWRU_DATA_DIR,
-            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
-            seed=42,
-        )
+        cls.manifest = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)  # 기본 3-way
         cls.tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_")
         cls.export_result = export_dataset(cls.manifest, cls.tmp_dir)
 
@@ -842,10 +848,12 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
             self.assertEqual(info["sha256"], recomputed)
 
     def test_id_and_source_checksum_change_with_split_config(self):
+        # CWRU 16파일은 크기가 전부 달라 group_split이 seed에 의존하지 않는다.
+        # 대신 분할 비율을 바꾸면(체크섬 payload에 포함) 다른 버전 체크섬/ID가 나와야 한다.
         other = build_manifest(
             data_dir=_CWRU_DATA_DIR,
-            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
-            seed=1,  # 다른 seed -> 다른 버전 체크섬/ID여야 함 (같은 날짜라도 충돌 없음)
+            split_ratios={"train": 0.5, "validation": 0.3, "test": 0.2},
+            seed=42,
         )
         self.assertIn("checksum", self.manifest["source"])
         self.assertNotEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])

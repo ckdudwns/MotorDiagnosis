@@ -36,8 +36,14 @@ ai/ai1/week1/ai1/
 
 센서 도착 전, 아래 두 공개 데이터셋을 소수 결합해 프로토타입 파이프라인을 검증한다.
 
-- **진동**: CWRU Bearing Dataset — `97.mat`(정상), `105.mat`(내륜 이상), `118.mat`(볼 이상), `130.mat`(외륜 이상)
+- **진동**: CWRU Bearing Dataset — 라벨당 부하조건 4개(0/1/2/3 HP), 총 16개 `.mat`:
+  정상 `97/98/99/100`, 내륜 이상 `105/106/107/108`, 볼 이상 `118/119/120/121`,
+  외륜 이상 `130/131/132/133`. 라벨당 파일을 4개로 늘린 것은 3주차 group_split이
+  라벨별 독립 그룹(자산)을 확보해 리크 없는 분할을 만들 수 있게 하기 위함이다.
   다운로드: https://engineering.case.edu/bearingdatacenter/welcome
+  - `98/99.mat`에는 RPM 키가 없어 파일 번호로 부하 조건을 추정해 채운다.
+  - `99.mat`은 `X098_DE_time`(=`98.mat`과 중복)과 `X099_DE_time`을 함께 담고 있어,
+    로더가 파일 번호와 일치하는 `X099_DE_time`만 선택한다.
 - **음향**: MIMII pump 데이터셋 `0_dB_pump.zip` (`normal`/`abnormal` 라벨)
 
 ### 데이터 배치
@@ -45,10 +51,8 @@ ai/ai1/week1/ai1/
 다운로드한 파일을 아래 경로에 놓는다 (`.gitignore`에 등록되어 레포에는 커밋되지 않음):
 
 ```
-ai/ai1/week1/ai1/data/external/cwru/97.mat
-ai/ai1/week1/ai1/data/external/cwru/105.mat
-ai/ai1/week1/ai1/data/external/cwru/118.mat
-ai/ai1/week1/ai1/data/external/cwru/130.mat
+ai/ai1/week1/ai1/data/external/cwru/97.mat  ...  ai/ai1/week1/ai1/data/external/cwru/133.mat
+  (정상 97~100, 내륜 105~108, 볼 118~121, 외륜 130~133 — 16개)
 
 ai/ai1/week1/ai1/data/external/mimii/pump/id_00/normal/*.wav
 ai/ai1/week1/ai1/data/external/mimii/pump/id_00/abnormal/*.wav
@@ -70,10 +74,10 @@ python ai/ai1/week1/ai1/scripts/build_prototype_dataset.py \
 
 | 모달리티 | source_label | label |
 |---|---|---|
-| vibration | 97.mat | `NORMAL` |
-| vibration | 105.mat | `BEARING_FAULT_INNER` |
-| vibration | 118.mat | `BEARING_FAULT_BALL` |
-| vibration | 130.mat | `BEARING_FAULT_OUTER` |
+| vibration | 97/98/99/100.mat | `NORMAL` |
+| vibration | 105/106/107/108.mat | `BEARING_FAULT_INNER` |
+| vibration | 118/119/120/121.mat | `BEARING_FAULT_BALL` |
+| vibration | 130/131/132/133.mat | `BEARING_FAULT_OUTER` |
 | acoustic | normal | `NORMAL` |
 | acoustic | abnormal | `PUMP_ANOMALY` |
 

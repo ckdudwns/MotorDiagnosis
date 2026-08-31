@@ -68,6 +68,15 @@ _week2_extract_features = _import_module_from_path(
 extract_all_features = _week2_extract_features.extract_all_features
 FeatureConfig = _week2_extract_features.FeatureConfig
 
+# week1 build_ai1_handoff_dataset.compute_peak_frequency(피크 주파수)도 같은
+# 이유(모듈명 충돌 회피)로 파일 경로로 명시 로드한다. 이 모듈의 top-level
+# import(load_cwru_vibration / load_mimii_acoustic)는 모두 guarded라 안전하다.
+_week1_build_handoff = _import_module_from_path(
+    "ai1_week3_register_dataset.week1_build_handoff",
+    os.path.join(_WEEK1_SCRIPTS_DIR, "build_ai1_handoff_dataset.py"),
+)
+compute_peak_frequency = _week1_build_handoff.compute_peak_frequency
+
 CWRU_SOURCE_URI = "https://engineering.case.edu/bearingdatacenter/welcome"
 CWRU_LICENSE_NOTE = (
     "Case Western Reserve University Bearing Data Center — 학술/연구 목적 "
@@ -87,10 +96,14 @@ DATASET_LABEL_MAPPING = {
 LABEL_TAXONOMY_VERSION = "CWRU-FAULT-V1"
 DEFAULT_SPLIT_RATIOS = {"train": 0.7, "validation": 0.2, "test": 0.1}
 
-# week2 extract_features.py의 특징 추출 로직(계산식/특징 목록)을 식별하는 버전표.
-# extract_all_features()의 산출 스키마나 계산식이 바뀌면 반드시 함께 올려야
-# 체크섬이 "같은 원본에서 다른 특징값이 나온" 상황을 잡아낼 수 있다.
-FEATURE_PIPELINE_VERSION = "week2.extract_all_features.v1"
+# 특징 추출 로직(계산식/특징 목록)을 식별하는 버전표. 산출 스키마나 계산식이
+# 바뀌면 반드시 함께 올려야 체크섬이 "같은 원본에서 다른 특징값이 나온"
+# 상황을 잡아낸다. v1(week2 extract_all_features 26개) -> peak_hz 추가로 v2
+# (week2 26개 + week1 compute_peak_frequency = vibration_peak_hz, 총 27개).
+FEATURE_PIPELINE_VERSION = "week2.extract_all_features+week1.peak_hz.v2"
+
+# 매니페스트 rows에 붙이는 피크 주파수 특징 이름 (week4 features.py와 동일).
+PEAK_FEATURE_NAME = "vibration_peak_hz"
 
 
 def sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
@@ -451,6 +464,11 @@ def build_manifest(
         known_label = rec["label"]
         common_label = DATASET_LABEL_MAPPING[known_label]
         features = extract_all_features(rec["signal"], config)
+        # 기능정의가 특징에 "피크"를 명시하므로 week1 피크 주파수를 결합한다
+        # (계산 재구현 없이 compute_peak_frequency 재사용).
+        features[PEAK_FEATURE_NAME] = compute_peak_frequency(
+            rec["signal"], rec["sample_rate"]
+        )
         _validate_finite_features(features, rec["sample_id"])
         row = {
             "sample_id": rec["sample_id"],

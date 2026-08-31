@@ -45,39 +45,42 @@ ai/ai1/week4/ai1/
 코드 레벨에서 강제한다.
 
 **실행 결과 (실제 CWRU 데이터, seed=42):** 같은 seed로 매니페스트를 두 번 생성해
-체크섬이 동일함을 확인했고, 다른 seed(99)로 생성하면 체크섬이 달라짐을 함께 확인해
-체크섬이 실제로 내용 변화에 민감하게 반응하는 것을 검증했다.
+체크섬이 동일함을 확인했다. CWRU 16파일은 크기가 전부 달라 `group_split`이 seed에
+의존하지 않으므로, 재현성 반례는 **분할 비율을 바꿔** 체크섬이 달라짐을 확인하는
+방식으로 검증한다.
 
 ## 2. AI_FREQ_MODEL_01 — Dense/LSTM Autoencoder 베이스라인
 
-`features.py`가 week2 `extract_all_features()`(RMS/스펙트럴/대역에너지/kurtosis/MFCC)와
-week1 `compute_peak_frequency()`(피크 주파수)를 합쳐 **27차원** 고정 순서 특징 벡터를
-만든다(계산 로직 재구현 없음). `models.py`의 두 후보 모두 **정상(NORMAL) 데이터만으로
-재구성을 학습**하는 비지도 오토인코더 방식이다:
+3주차 매니페스트 row에는 week2 `extract_all_features()`(RMS/스펙트럴/대역에너지/
+kurtosis/MFCC, 26개)에 week1 `compute_peak_frequency()`(`vibration_peak_hz`)를 더한
+**27개** 특징이 담긴다(계산 로직 재구현 없음). 다만 리크 없는 `group_split`이 사실상
+부하 조건별 분리라 RPM 프록시인 `vibration_peak_hz`는 정규화가 깨진다 — **모델 입력은
+이를 뺀 26개**를 쓰고, 매니페스트에는 27개를 그대로 남긴다.
 
-- **Dense Autoencoder**: 윈도우 단위 특징 벡터(27차원) 재구성. 3주차 `DATA_EXPORT_01`의
-  라벨별 층화 분할(window-level)을 그대로 재사용.
-- **LSTM Autoencoder**: 길이 5 연속 윈도우 시퀀스 재구성. 시퀀스는 시간적 인접성이
-  필요해 3주차 분할을 못 쓰므로, **파일별 시간순 비중첩 청크**를 셔플 없이 앞 70%/
-  다음 20%/뒤 10%로 나누는 별도 분할을 썼다 (데이터 누수 방지 — 근거는
-  `freq_baseline/freq_baseline_format.md` 참고).
+`models.py`의 두 후보 모두 **정상(NORMAL) 데이터만으로 재구성을 학습**하는 비지도
+오토인코더 방식이며, 3주차 `group_split`(원본 파일=부하조건 단위) 배정을 그대로 따른다:
 
-임계값은 `mean(validation NORMAL 재구성오차) + 3*std`로, week2 `baseline.json`/3주차
-`ANOMALY_RULE_01`과 동일한 sigma 관례를 재구성 오차에도 그대로 적용해 프로젝트 전체가
-일관된 "정상분포에서 3σ 벗어나면 이상" 기준을 쓰도록 했다.
+- **Dense Autoencoder**: 윈도우 단위. **동결 매니페스트 rows의 inline 특징값을 직접**
+  입력으로 쓴다(재윈도우/재계산 없음 — 학습 입력이 `datasetId`가 가리키는 데이터와 일치).
+- **LSTM Autoencoder**: 길이 5 연속 윈도우 시퀀스. 원신호를 매니페스트와 같은 윈도우로
+  재분할하되, 한 원본 파일의 모든 시퀀스는 그 파일이 배정된 한 split에만 들어간다
+  (파일 내부 재분할 없음 — 근거는 `freq_baseline/freq_baseline_format.md`).
 
-**실행 결과 (실제 CWRU 데이터, 296윈도우, dense_epochs=lstm_epochs=150):**
+후보 선택은 **validation f1**으로만 하고(`selectionCriterion`), 최종 지표는 선택된
+후보의 **test** 평가로 분리 보고한다. 임계값은 `mean(validation NORMAL 재구성오차)
++ 3*std` (week2/3주차와 동일한 sigma 관례).
 
-| 후보 | train(NORMAL만) | validation | test | threshold | precision | recall | f1 |
+**실행 결과 (실제 CWRU 16파일, 기본 3-way group split, dense=lstm=150 epochs):**
+
+| 후보 | train(NORMAL) | validation | test | 검증 f1 | 테스트 precision | recall | f1 |
 |---|---|---|---|---|---|---|---|
-| dense_autoencoder | 83 | 60 | 30 | 1.113 | 1.000 | 1.000 | 1.000 |
-| lstm_autoencoder | 16 | 11 | 5 | 1.027 | 1.000 | 1.000 | 1.000 |
+| dense_autoencoder | 473 | 413 | 296 | 1.000 | 1.000 | 1.000 | 1.000 |
+| lstm_autoencoder | 94 | 80 | 56 | 1.000 | 1.000 | 1.000 | 1.000 |
 
-두 후보 모두 test split에서 오탐/미탐 0건으로 완전 분리됐다 — week2(결함 윈도우
-100% 이상치 플래그)·3주차(정상→결함 경계에서 이벤트 1개 안정적 유지)에서 이미
-확인된 CWRU 베어링 결함의 강한 분리도와 일치하는 결과다. LSTM 후보는 시퀀스 청크
-특성상 표본 수가 훨씬 적어(train 16개) 통계적 신뢰도는 Dense 후보보다 낮다 — 아래
-"대상 확정 후 보완" 참고.
+두 후보 모두 오탐/미탐 0건으로 완전 분리됐다. 단, 이 결과는 `vibration_peak_hz`를
+모델 입력에서 제외했을 때다 — 포함하면 부하 조건 간 정규화가 깨져 f1이 0이 된다.
+정상 재구성 임계값이 train에 없던 부하 조건에서 보정되지 않는 것은 `domainGap`에
+"운전 조건별 임계값 재보정 필요"로 기록했다.
 
 `domainGap`/`fieldCalibrationPlan`은 MVP 기획서(v1.2) "AI 보장 범위"·"11. 후속
 로드맵" 문구를 그대로 반영해, 이 베이스라인이 CWRU 공개 데이터 기반이며 대상 모터의
@@ -102,8 +105,11 @@ CWRU 실데이터가 없는 환경에서도 합성(fixture) 데이터 기반 테
 
 ## 대상 확정 후 보완
 
-- LSTM 후보는 CWRU 규모(파일당 윈도우 59~119개)에서 시퀀스 청크 수가 적어(train
-  NORMAL 16개) 지표 신뢰도가 낮다 — 실측 데이터로 표본이 늘어나면 재검증 필요
+- CWRU에서는 자산 = 부하 조건이라 group split의 각 split이 서로 다른 운전 조건이다.
+  RPM 결합 특징(`vibration_peak_hz`)을 모델 입력에서 제외하고 운전 조건별 임계값
+  재보정을 도메인갭으로 기록했다 — 현장에서 다양한 조건의 자산이 쌓이면 해소된다
+- LSTM 후보는 CWRU 규모에서 시퀀스 청크 수가 적어(train NORMAL 94개) Dense보다 표본이
+  적다 — 실측 데이터로 늘어나면 재검증 필요
 - 음향(acoustic) 모달리티는 아직 없음 — MIMII 데이터 확보 후 같은 구조로 별도 후보 추가
 - `artifactUri`는 로컬 파일 경로 — 운영 전 오브젝트 스토리지로 교체
 - 대상 모터·센서 확정 후 전이학습, 임계값 재보정, 드리프트 모니터링 진행

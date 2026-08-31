@@ -64,6 +64,29 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         freeze_dataset_version(draft)
         self.assertEqual(draft["status"], "draft")
 
+    def test_freeze_deep_copies_nested_rows(self):
+        draft = _draft_manifest()
+        frozen = freeze_dataset_version(draft)
+        # 동결 후 원본 rows(중첩)를 바꿔도 frozen은 그대로여야 하고,
+        # frozen 내용과 저장된 체크섬은 계속 일치해야 한다.
+        draft["rows"][0]["common_label"] = "TAMPERED"
+        self.assertEqual(frozen["rows"][0]["common_label"], "NORMAL")
+        self.assertEqual(
+            frozen["datasetChecksum"], compute_dataset_checksum(frozen)
+        )
+
+    def test_approve_rejects_post_freeze_mutation(self):
+        frozen = freeze_dataset_version(_draft_manifest())
+        frozen["rows"][0]["common_label"] = "TAMPERED"  # 동결 이후 변조
+        with self.assertRaises(ValueError):
+            approve_dataset_version(frozen, approved_by="mgr", reason="검증 완료")
+
+    def test_approve_deep_copies_nested_rows(self):
+        frozen = freeze_dataset_version(_draft_manifest())
+        approved = approve_dataset_version(frozen, approved_by="mgr", reason="검증 완료")
+        frozen["rows"][0]["common_label"] = "CHANGED"
+        self.assertEqual(approved["rows"][0]["common_label"], "NORMAL")
+
     def test_freeze_non_draft_rejected(self):
         frozen = freeze_dataset_version(_draft_manifest())
         with self.assertRaises(ValueError):
@@ -153,6 +176,30 @@ class TestModelVersionLifecycle(unittest.TestCase):
         self.assertEqual(action["toVersion"], "v1")
         self.assertEqual(action["fromVersion"], "v2")
 
+    def test_metric_snapshot_is_isolated_from_source_metrics(self):
+        metrics = {"f1": 0.91, "cm": {"tp": 10, "fp": 1}}
+        mv = register_model_version(
+            version="v1", artifact_uri="a", dataset_id="d", baseline_version="b",
+            metrics=metrics,
+        )
+        approved = approve_model_version(mv, reason="지표 통과")
+        # 승인 후 원본/등록본 metrics를 바꿔도 승인 스냅샷은 그대로여야 한다.
+        metrics["f1"] = 0.12
+        metrics["cm"]["tp"] = 0
+        mv["metrics"]["f1"] = 0.0
+        self.assertEqual(approved["metricSnapshot"]["f1"], 0.91)
+        self.assertEqual(approved["metricSnapshot"]["cm"]["tp"], 10)
+
+    def test_explicit_metric_snapshot_is_deep_copied(self):
+        mv = register_model_version(
+            version="v1", artifact_uri="a", dataset_id="d", baseline_version="b",
+            metrics={"f1": 0.5},
+        )
+        snap = {"f1": 0.91, "cm": {"tp": 3}}
+        approved = approve_model_version(mv, reason="ok", metric_snapshot=snap)
+        snap["cm"]["tp"] = 999
+        self.assertEqual(approved["metricSnapshot"]["cm"]["tp"], 3)
+
 
 class TestBaselineVersionLifecycle(unittest.TestCase):
     def test_activate_requires_approved(self):
@@ -166,6 +213,20 @@ class TestBaselineVersionLifecycle(unittest.TestCase):
         approved = approve_baseline_version(bv, approved_by="mgr", reason="검증 통과")
         active = activate_baseline_version(approved)
         self.assertEqual(active["status"], "active")
+
+    def test_features_are_isolated_through_register_approve_activate(self):
+        features = {"rms_mean": {"mean": 0.05, "std": 0.01, "normal_range": [0.03, 0.07]}}
+        bv = register_baseline_version(
+            baseline_id="BL-1", dataset_id="DS-1", site_id="SITE-01",
+            asset_id="SITE-01-MOT-02", features=features,
+        )
+        approved = approve_baseline_version(bv, approved_by="mgr", reason="ok")
+        active = activate_baseline_version(approved)
+        # draft(원본/등록본) features를 수정해도 승인·active 기준선은 그대로여야 한다.
+        features["rms_mean"]["mean"] = 99.0
+        bv["features"]["rms_mean"]["std"] = 99.0
+        self.assertEqual(approved["features"]["rms_mean"]["mean"], 0.05)
+        self.assertEqual(active["features"]["rms_mean"]["std"], 0.01)
 
 
 @unittest.skipUnless(
@@ -185,14 +246,20 @@ class TestReproducibilityWithRealCwruData(unittest.TestCase):
         manifest_2 = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
         self.assertTrue(verify_reproducibility(frozen, manifest_2))
 
-    def test_different_seed_changes_checksum(self):
+    def test_different_split_config_changes_checksum(self):
         from register_dataset import build_manifest
 
+        # CWRU 16파일은 크기가 전부 달라 group_split이 seed에 의존하지 않는다.
+        # 대신 분할 비율을 바꾸면(체크섬 payload에 포함) 다른 버전이어야 한다.
         manifest_1 = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
         frozen = freeze_dataset_version(manifest_1)
 
-        manifest_different_seed = build_manifest(data_dir=_CWRU_DATA_DIR, seed=99)
-        self.assertFalse(verify_reproducibility(frozen, manifest_different_seed))
+        manifest_other = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            seed=42,
+            split_ratios={"train": 0.5, "validation": 0.3, "test": 0.2},
+        )
+        self.assertFalse(verify_reproducibility(frozen, manifest_other))
 
 
 if __name__ == "__main__":

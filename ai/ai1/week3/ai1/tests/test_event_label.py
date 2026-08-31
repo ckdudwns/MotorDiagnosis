@@ -120,10 +120,78 @@ class TestApplyLabelChange(unittest.TestCase):
                 reason="아무 이유",
             )
 
+    def test_list_new_label_rejected_with_value_error_not_type_error(self):
+        """list처럼 unhashable한 값은 `in EVENT_REVIEW_LABELS` 집합 조회에서
+        TypeError를 내므로, 타입 검증을 먼저 해서 ValueError로 통일해야 한다."""
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(),
+                new_label=["confirmed_anomaly"],
+                changed_by="op",
+                reason="아무 이유",
+            )
+
+    def test_dict_new_label_rejected_with_value_error_not_type_error(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(),
+                new_label={"label": "confirmed_anomaly"},
+                changed_by="op",
+                reason="아무 이유",
+            )
+
+    def test_none_new_label_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(), new_label=None, changed_by="op", reason="아무 이유"
+            )
+
+    def test_blank_changed_by_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(),
+                new_label="confirmed_anomaly",
+                changed_by="   ",
+                reason="사유",
+            )
+
+    def test_empty_changed_by_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(), new_label="confirmed_anomaly", changed_by="", reason="사유"
+            )
+
+    def test_non_string_changed_by_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(), new_label="confirmed_anomaly", changed_by=None, reason="사유"
+            )
+
     def test_blank_reason_rejected(self):
         with self.assertRaises(ValueError):
             apply_label_change(
                 _sample_event(), new_label="confirmed_anomaly", changed_by="op", reason="   "
+            )
+
+    def test_numeric_reason_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(), new_label="confirmed_anomaly", changed_by="op", reason=123
+            )
+
+    def test_list_reason_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(),
+                new_label="confirmed_anomaly",
+                changed_by="op",
+                reason=["사유"],
+            )
+
+    def test_none_reason_rejected(self):
+        with self.assertRaises(ValueError):
+            apply_label_change(
+                _sample_event(), new_label="confirmed_anomaly", changed_by="op", reason=None
             )
 
     def test_note_too_long_rejected(self):
@@ -172,7 +240,13 @@ class TestSeedLabelWithRealDatasetManifest(unittest.TestCase):
     def setUpClass(cls):
         from register_dataset import build_manifest
 
-        cls.manifest = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
+        # CWRU는 라벨당 자산이 1개뿐이라 기본 3-way 비율은 InsufficientAssetGroupsError를
+        # 낸다 (의도된 동작) — 여기서는 라벨 매핑 시딩만 검증하면 되므로 train 전용으로 생성한다.
+        cls.manifest = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
+            seed=42,
+        )
 
     def test_every_row_seeds_to_a_valid_event_label(self):
         seeded = {seed_label_from_dataset(row["common_label"]) for row in self.manifest["rows"]}

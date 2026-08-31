@@ -55,13 +55,42 @@ class TestAnomalyRuleConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             AnomalyRuleConfig(min_consecutive_enter=0)
 
+    def test_nan_sigma_enter_rejected(self):
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(sigma_enter=float("nan"))
+
+    def test_negative_sigma_exit_rejected(self):
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(sigma_exit=-1.0, sigma_enter=3.0)
+
+    def test_infinite_sigma_enter_rejected(self):
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(sigma_enter=float("inf"))
+
+    def test_bool_sigma_enter_rejected(self):
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(sigma_enter=True)
+
+    def test_float_min_consecutive_enter_rejected(self):
+        """1.5는 `< 1` 검사만으로는 통과된다 — 정수 타입인지 먼저 검증해야 한다."""
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(min_consecutive_enter=1.5)
+
+    def test_bool_min_consecutive_exit_rejected(self):
+        """bool은 int의 서브클래스라 `True >= 1` 검사를 통과해 버린다."""
+        with self.assertRaises(ValueError):
+            AnomalyRuleConfig(min_consecutive_exit=True)
+
 
 class TestAssetBaselineRegistry(unittest.TestCase):
     def test_resolve_prefers_asset_id_over_asset_type_over_default(self):
         registry = AssetBaselineRegistry()
-        default_baseline = {"tag": "default"}
-        motor_baseline = {"tag": "MOTOR"}
-        specific_baseline = {"tag": "SITE-01-MOT-02"}
+        default_baseline = {"tag": "default", "features": {"x": {"mean": 0.0, "std": 1.0}}}
+        motor_baseline = {"tag": "MOTOR", "features": {"x": {"mean": 0.0, "std": 1.0}}}
+        specific_baseline = {
+            "tag": "SITE-01-MOT-02",
+            "features": {"x": {"mean": 0.0, "std": 1.0}},
+        }
 
         registry.register(default_baseline, is_default=True)
         registry.register(motor_baseline, asset_type="MOTOR")
@@ -84,6 +113,144 @@ class TestAssetBaselineRegistry(unittest.TestCase):
         registry = AssetBaselineRegistry()
         with self.assertRaises(KeyError):
             registry.resolve(asset_id="X")
+
+    def test_register_rejects_nan_mean(self):
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": float("nan"), "std": 1.0}}}
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+    def test_register_rejects_nan_std(self):
+        """NaN std는 check_outliers()의 low/high도 NaN으로 만들어, 어떤 값과
+        비교해도 False가 되므로 모든 윈도우가 조용히 NORMAL 처리된다 —
+        등록 시점에 막아야 한다."""
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": float("nan")}}}
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+    def test_register_rejects_infinite_std(self):
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": float("inf")}}}
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+    def test_register_rejects_negative_std(self):
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": -1.0}}}
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+    def test_register_rejects_empty_features(self):
+        registry = AssetBaselineRegistry()
+        with self.assertRaises(ValueError):
+            registry.register({"features": {}}, is_default=True)
+
+    def test_register_rejects_missing_features_key(self):
+        registry = AssetBaselineRegistry()
+        with self.assertRaises(ValueError):
+            registry.register({}, is_default=True)
+
+    def test_register_rejects_non_numeric_mean(self):
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": "0.0", "std": 1.0}}}
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+    def test_corrupted_baseline_would_have_masked_extreme_values(self):
+        """등록 검증이 없다면 NaN std baseline은 극단값 윈도우도 전부
+        NORMAL로 판정한다는 것을 직접 재현해, 검증이 실제 탐지 실패를
+        막는다는 것을 보여준다."""
+        baseline = {"features": {"x": {"mean": 0.0, "std": float("nan")}}}
+        registry = AssetBaselineRegistry()
+        with self.assertRaises(ValueError):
+            registry.register(baseline, is_default=True)
+
+        # 레지스트리를 우회해 evaluate_feature_stream에 직접 손상된 baseline을
+        # 넘기면(검증이 없다면 실제로 벌어졌을 상황) 극단값도 NORMAL로 잡힌다.
+        windows = [{"x": 1e9}] * 5
+        result = evaluate_feature_stream(windows, baseline, AnomalyRuleConfig())
+        self.assertEqual(result["events"], [], "NaN std baseline은 fail-open으로 이어진다")
+
+    def test_mutating_baseline_after_register_does_not_affect_registered_entry(self):
+        """검증을 통과한 baseline 객체를 그대로 저장하면, 등록 후 호출자가
+        원본 dict를 변경(예: std를 NaN으로)했을 때 그 변경이 이미 등록된
+        항목까지 오염시켜 검증을 우회한다 — register()는 deepcopy로 등록
+        시점의 값을 스냅샷으로 고정해야 한다."""
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": 1.0}}}
+        registry.register(baseline, is_default=True)
+
+        # 등록 후 원본 dict를 변경 — 등록된 항목이 이 변경에 영향을 받으면
+        # 안 된다.
+        baseline["features"]["x"]["std"] = float("nan")
+
+        resolved = registry.resolve(asset_id="anything")
+        self.assertEqual(resolved["baseline"]["features"]["x"]["std"], 1.0)
+
+        # 큰 이상값을 흘려도 등록된(오염되지 않은) baseline 기준으로 정상
+        # 탐지가 계속 동작해야 한다.
+        windows = [{"x": 1e9}] * 5
+        result = evaluate_feature_stream(windows, resolved["baseline"], resolved["config"])
+        self.assertGreater(
+            len(result["events"]), 0, "등록 후 원본 변경이 등록된 baseline을 오염시켰다"
+        )
+
+    def test_mutating_config_after_register_does_not_affect_registered_entry(self):
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": 1.0}}}
+        config = AnomalyRuleConfig(min_consecutive_enter=2, min_consecutive_exit=2)
+        registry.register(baseline, config=config, is_default=True)
+
+        config.min_consecutive_enter = 999
+
+        resolved = registry.resolve(asset_id="anything")
+        self.assertEqual(resolved["config"].min_consecutive_enter, 2)
+
+    def test_mutating_resolved_entry_does_not_leak_to_other_assets(self):
+        """resolve()가 내부 entry를 그대로 돌려주면, 조회 결과를 그 자리에서
+        수정(예: sigma_enter 조정)했을 때 등록된 상태 자체가 오염된다.
+        특히 asset_type/default로 등록한 entry는 여러 설비가 같은 객체를
+        공유하므로, 한 설비의 조회 결과를 고치면 별도로 재등록하지 않은
+        다른 설비에도 그 변경이 전파된다 — 실제로 MOTOR 기본 설정을
+        조회해 sigma_enter를 11로 바꾸면 재등록하지 않은 다른 설비도
+        10sigma 이벤트를 놓치는 것을 재현한다."""
+        registry = AssetBaselineRegistry()
+        baseline = {"features": {"x": {"mean": 0.0, "std": 1.0}}}
+        registry.register(
+            baseline,
+            config=AnomalyRuleConfig(
+                sigma_enter=10.0, sigma_exit=5.0,
+                min_consecutive_enter=1, min_consecutive_exit=1,
+            ),
+            asset_type="MOTOR",
+        )
+
+        resolved_for_a = registry.resolve(asset_type="MOTOR")
+        resolved_for_a["config"].sigma_enter = 11.0  # A 설비 전용으로 조정한다고 착각하기 쉬움
+        resolved_for_a["baseline"]["features"]["x"]["mean"] = 999.0
+
+        resolved_for_b = registry.resolve(asset_type="MOTOR")
+        self.assertEqual(
+            resolved_for_b["config"].sigma_enter,
+            10.0,
+            "B 설비 조회 결과가 A 설비의 조회 결과 수정에 영향을 받았습니다",
+        )
+        self.assertEqual(
+            resolved_for_b["baseline"]["features"]["x"]["mean"],
+            0.0,
+            "B 설비 조회 결과가 A 설비의 조회 결과 수정에 영향을 받았습니다",
+        )
+
+        # 등록되지 않은(재등록 없이 MOTOR 기본을 그대로 쓰는) 설비도
+        # 10sigma 이벤트를 그대로 잡아야 한다 — A 설비 조회 결과 수정으로
+        # 임계값이 11sigma로 올라가 이벤트를 놓치면 안 된다.
+        result = evaluate_asset_stream(
+            "SITE-B-MOT-01", [{"x": 10.0}], registry, asset_type="MOTOR"
+        )
+        self.assertEqual(
+            len(result["events"]), 1, "다른 설비 조회 결과 수정이 이 설비의 판정에 전파됐다"
+        )
 
 
 class TestHysteresisSuppressesSingleSpike(unittest.TestCase):
@@ -115,6 +282,96 @@ class TestHysteresisSuppressesSingleSpike(unittest.TestCase):
         result = evaluate_feature_stream(windows, baseline, AnomalyRuleConfig())
         self.assertEqual(len(result["events"]), 1)
         self.assertIsNone(result["events"][0]["end_index"])
+
+    def test_entry_buildup_max_deviation_is_preserved_in_event(self):
+        """진입 대기 구간(consecutive_over)에서 관측된 최대 편차가 이벤트 생성 시
+        유실되면 안 된다 — 10sigma 다음 4sigma로 진입해도 이벤트의
+        max_deviation_sigma는 4가 아니라 10이어야 한다."""
+        baseline = _fake_baseline()
+        windows = [{"x": 0.0}] * 3 + [{"x": 10.0}, {"x": 4.0}] + [{"x": 0.0}] * 5
+        config = AnomalyRuleConfig(
+            sigma_enter=3.0, sigma_exit=2.0, min_consecutive_enter=2, min_consecutive_exit=2
+        )
+
+        result = evaluate_feature_stream(windows, baseline, config)
+        self.assertEqual(len(result["events"]), 1)
+        self.assertEqual(result["events"][0]["max_deviation_sigma"], 10.0)
+        self.assertEqual(result["events"][0]["start_index"], 3)
+
+    def test_invalid_window_does_not_close_anomaly_event(self):
+        """check_outliers()는 NaN/Inf 특징값을 건너뛰어 _max_deviation_sigma()가
+        0.0(=NORMAL)을 반환한다 — 예전 로직대로면 진행 중인 이벤트가 NaN
+        윈도우 2개만으로 조기 종료됐다. 무효 윈도우는 consecutive_under에
+        포함되면 안 되므로 이벤트가 계속 열려 있어야 한다."""
+        baseline = _fake_baseline()
+        config = AnomalyRuleConfig(min_consecutive_enter=2, min_consecutive_exit=2)
+        windows = (
+            [{"x": 0.0}] * 5
+            + [{"x": 20.0}] * 4  # 이상 진입
+            + [{"x": float("nan")}] * 3  # 무효 윈도우 - 조기 종료를 유발하면 안 됨
+        )
+        result = evaluate_feature_stream(windows, baseline, config)
+
+        self.assertEqual(len(result["events"]), 1)
+        self.assertIsNone(
+            result["events"][0]["end_index"],
+            "무효 윈도우 때문에 이벤트가 조기 종료되면 안 된다",
+        )
+        invalid_states = [w for w in result["window_states"] if w["state"] == "INVALID"]
+        self.assertEqual(len(invalid_states), 3)
+
+    def test_invalid_window_breaks_entry_consecutive_count(self):
+        """[이상, INVALID, 이상]은 연속 2회 진입으로 합산되면 안 된다.
+        INVALID는 consecutive_over를 끊어야 하므로 min_consecutive_enter=2에서는
+        이벤트가 아예 생기지 않아야 한다 (이전 버그: continue가 카운터를 보존해
+        연속 2회로 오판하고 start_index가 INVALID 윈도우를 가리켰다)."""
+        baseline = _fake_baseline()
+        config = AnomalyRuleConfig(min_consecutive_enter=2, min_consecutive_exit=2)
+        windows = (
+            [{"x": 0.0}] * 5
+            + [{"x": 20.0}]  # 이상 스파이크 1회
+            + [{"x": float("nan")}]  # 무효 윈도우 - 진입 카운터를 끊어야 함
+            + [{"x": 20.0}]  # 이상 스파이크 1회 (앞의 스파이크와 연속이 아님)
+            + [{"x": 0.0}] * 5
+        )
+        result = evaluate_feature_stream(windows, baseline, config)
+        self.assertEqual(
+            result["events"], [], "INVALID로 갈라진 두 스파이크가 연속 진입으로 합산되면 안 된다"
+        )
+
+    def test_invalid_window_breaks_exit_consecutive_count(self):
+        """[이상 진입, 정상, INVALID, 정상]은 연속 2회 복귀로 합산되면 안 된다.
+        ANOMALY 상태의 INVALID는 consecutive_under를 끊어야 한다 (이전 버그:
+        continue가 카운터를 보존해 연속 2회 복귀로 오판하고 end_index가
+        INVALID 윈도우를 가리켰다)."""
+        baseline = _fake_baseline()
+        config = AnomalyRuleConfig(min_consecutive_enter=2, min_consecutive_exit=2)
+        windows = (
+            [{"x": 0.0}] * 5
+            + [{"x": 20.0}] * 4  # 이상 진입 및 유지
+            + [{"x": 0.0}]  # 복귀 후보 1회
+            + [{"x": float("nan")}]  # 무효 윈도우 - 복귀 카운터를 끊어야 함
+            + [{"x": 0.0}]  # 복귀 후보 1회 (앞의 후보와 연속이 아님)
+        )
+        result = evaluate_feature_stream(windows, baseline, config)
+        self.assertEqual(len(result["events"]), 1)
+        self.assertIsNone(
+            result["events"][0]["end_index"],
+            "INVALID로 갈라진 두 복귀 후보가 연속 복귀로 합산되어 이벤트가 조기 종료되면 안 된다",
+        )
+
+    def test_inf_feature_value_flagged_invalid_not_normal(self):
+        baseline = _fake_baseline()
+        windows = [{"x": float("inf")}]
+        result = evaluate_feature_stream(windows, baseline, AnomalyRuleConfig())
+        self.assertEqual(result["window_states"][0]["state"], "INVALID")
+        self.assertEqual(result["events"], [])
+
+    def test_missing_required_feature_flagged_invalid(self):
+        baseline = _fake_baseline()  # "x"가 필수 특징값
+        windows = [{}]
+        result = evaluate_feature_stream(windows, baseline, AnomalyRuleConfig())
+        self.assertEqual(result["window_states"][0]["state"], "INVALID")
 
     def test_hysteresis_prevents_flicker_near_boundary(self):
         """진입(3sigma)과 복귀(2sigma) 임계값 사이(2.5sigma)를 오가는 값은,

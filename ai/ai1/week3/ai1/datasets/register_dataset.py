@@ -14,9 +14,11 @@ CWRU Bearing Dataset(1주차 인계 경로의 .mat 4개)을 API 명세서 v1.2
 import os
 import sys
 import json
+import math
 import random
 import hashlib
 import argparse
+import importlib.util
 from datetime import datetime, timezone
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +38,35 @@ sys.path.insert(0, _WEEK1_SCRIPTS_DIR)
 sys.path.insert(0, _WEEK2_FEATURE_DIR)
 
 from load_cwru_vibration import load_cwru_dataset, FILE_LABEL_MAP  # noqa: E402
-from extract_features import extract_all_features, FeatureConfig  # noqa: E402
+
+
+def _import_module_from_path(module_name: str, file_path: str):
+    """모듈 이름이 아니라 파일 경로로 정확히 특정해 import한다.
+
+    week1(`week1/ai1/feature_extraction/`)과 week2(`week2/ai1/feature_extraction/`)
+    모두 `extract_features.py`라는 동일한 이름의 모듈을 갖고 있다. 같은
+    프로세스에서 week1 쪽이 먼저 평범한 `from extract_features import ...`로
+    import되면(예: week1 테스트가 먼저 수집·실행됨) "extract_features"라는
+    이름이 sys.modules에 캐시되고, 이후 여기서 week2 디렉터리를 sys.path
+    앞쪽에 넣고 같은 이름으로 import해도 그 캐시된 week1 모듈이 조용히
+    재사용된다 — sys.path 순서는 sys.modules 캐시에 이미 있는 이름에는
+    영향을 주지 못한다. 그 결과 week2 전용 특징(kurtosis 등)이 빠진
+    week1 버전이 실제 판정에 쓰이는데도 아무 오류가 나지 않는다. 고유한
+    이름으로 파일 경로를 직접 지정해 로드하면 이 충돌을 원천적으로 피한다.
+    """
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_week2_extract_features = _import_module_from_path(
+    "ai1_week3_register_dataset.week2_extract_features",
+    os.path.join(_WEEK2_FEATURE_DIR, "extract_features.py"),
+)
+extract_all_features = _week2_extract_features.extract_all_features
+FeatureConfig = _week2_extract_features.FeatureConfig
 
 CWRU_SOURCE_URI = "https://engineering.case.edu/bearingdatacenter/welcome"
 CWRU_LICENSE_NOTE = (
@@ -56,6 +86,11 @@ DATASET_LABEL_MAPPING = {
 
 LABEL_TAXONOMY_VERSION = "CWRU-FAULT-V1"
 DEFAULT_SPLIT_RATIOS = {"train": 0.7, "validation": 0.2, "test": 0.1}
+
+# week2 extract_features.py의 특징 추출 로직(계산식/특징 목록)을 식별하는 버전표.
+# extract_all_features()의 산출 스키마나 계산식이 바뀌면 반드시 함께 올려야
+# 체크섬이 "같은 원본에서 다른 특징값이 나온" 상황을 잡아낼 수 있다.
+FEATURE_PIPELINE_VERSION = "week2.extract_all_features.v1"
 
 
 def sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
@@ -107,45 +142,288 @@ def build_compatibility_block(records: list) -> dict:
     }
 
 
-def stratified_split(
-    records: list, ratios: dict = None, seed: int = 42
-) -> list:
-    """라벨(known_label)별로 독립 셔플 후 비율 배분하는 층화 분할.
+class InsufficientAssetGroupsError(ValueError):
+    """라벨의 독립 그룹(source_file/자산) 수가 요청한 분할 수보다 적어,
+    그룹을 쪼개지 않고는(=리크 없이는) 분할을 만들 수 없을 때 발생한다."""
 
-    CWRU는 라벨당 실제 자산(파일)이 1개뿐이라 설비 단위(group) 분할을 쓰면
-    한쪽 split에 특정 라벨이 아예 사라진다. 그래서 윈도우 단위 층화 분할을
-    쓴다 (근거: dataset_manifest_format.md "분할 전략").
-    반올림 오차는 test 분할이 흡수해 각 라벨 그룹 크기와 정확히 합이 맞는다.
 
-    TODO: 실제 현장 데이터처럼 라벨당 자산이 여러 대가 되면 설비 단위
-    group split으로 전환해야 한다 (동일 자산이 train/test에 동시에 들어가면 데이터 누수).
+_REQUIRED_SPLIT_KEYS = ("train", "validation", "test")
+
+
+def validate_split_ratios(ratios: dict) -> None:
+    """분할 비율의 키/타입/범위/합계를 매니페스트 생성 전에 검증한다.
+
+    예를 들어 {train: 0.8, validation: 0.3, test: 0.1}처럼 합이 1.0이 아니면
+    조용히 통과시키지 않고, 전부 0이면(group_split 내부에서 `max() iterable is
+    empty`로 불명확하게 죽는 대신) 여기서 먼저 명확한 입력 오류로 거부한다.
+    합이 1.0이면 range(0~1) 검증과 합쳐 최소 하나는 항상 양수임이 보장된다.
     """
-    ratios = ratios or DEFAULT_SPLIT_RATIOS
-    by_label: dict = {}
+    if not isinstance(ratios, dict):
+        raise ValueError(f"split_ratios는 dict여야 합니다: {ratios!r}")
+
+    missing = [key for key in _REQUIRED_SPLIT_KEYS if key not in ratios]
+    if missing:
+        raise ValueError(f"split_ratios에 필수 키가 없습니다: {missing}")
+
+    extra = sorted(set(ratios) - set(_REQUIRED_SPLIT_KEYS))
+    if extra:
+        # holdout처럼 쓰이지 않는 키가 섞여 있으면, 실제 결과(group_split)는
+        # 동일한데도 체크섬 payload에 그 키가 포함돼 다른 dataset id가 나온다.
+        raise ValueError(
+            f"split_ratios에 허용되지 않은 키가 있습니다: {extra} "
+            f"(허용 키: {list(_REQUIRED_SPLIT_KEYS)})"
+        )
+
+    for key in _REQUIRED_SPLIT_KEYS:
+        value = ratios[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"split_ratios[{key!r}]는 숫자여야 합니다: {value!r}")
+        if not math.isfinite(value):
+            raise ValueError(f"split_ratios[{key!r}]는 유한한 값이어야 합니다: {value!r}")
+        if not (0 <= value <= 1):
+            raise ValueError(f"split_ratios[{key!r}]는 0~1 범위여야 합니다: {value!r}")
+
+    total = sum(ratios[key] for key in _REQUIRED_SPLIT_KEYS)
+    if not math.isclose(total, 1.0, rel_tol=0, abs_tol=1e-6):
+        raise ValueError(f"split_ratios 합계는 1.0이어야 합니다 (현재 {total}): {ratios!r}")
+
+
+def _validate_finite_features(features: dict, sample_id: str) -> None:
+    """추출된 특징값이 전부 유한한 실수인지 행을 만들기 전에 검증한다.
+
+    NaN/Inf가 그대로 rows에 들어가면 CSV에는 문자열 "nan"이, XLSX(openpyxl)는
+    NaN/Inf를 쓸 수 없어 빈 셀로 남아 같은 값이 산출물마다 다르게(그리고
+    조용히) 표현된다. 저장 직전에 명시적으로 막아 포맷 불일치를 방지한다.
+    """
+    for name, value in features.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"{sample_id}의 특징값 {name!r}이 숫자가 아닙니다: {value!r}"
+            )
+        if not math.isfinite(value):
+            raise ValueError(
+                f"{sample_id}의 특징값 {name!r}이 유한하지 않습니다: {value!r}"
+            )
+
+
+def group_split(
+    records: list, ratios: dict = None, seed: int = 42, group_key: str = "source_label"
+) -> list:
+    """`group_key`(기본: 원본 파일명) 단위 그룹을 통째로 하나의 split에만
+    배정하는 그룹 분할.
+
+    동일 그룹(예: 같은 원본 .mat 파일)의 윈도우가 train/validation/test에
+    나뉘어 들어가면 모델이 그룹 고유 특성(센서 개체차, 노이즈 지문 등)을
+    외워 검증 지표가 부풀려지는 데이터 누수가 생긴다. 그래서 윈도우를
+    섞지 않고 그룹 단위로만 분할한다.
+
+    그룹은 **라벨과 무관하게** 전역으로 묶는다 — 같은 자산(group_key)이
+    라벨이 다른 레코드를 함께 갖고 있어도(예: 한 설비의 NORMAL 구간과
+    ANOMALY 구간) 그 자산 전체가 하나의 split에만 배정돼야 하기 때문이다.
+    라벨별로 그룹을 따로 만들면 같은 자산이 라벨에 따라 서로 다른 split에
+    배정될 수 있어(예: NORMAL은 train, ANOMALY는 test) 위와 동일한 데이터
+    누수가 생긴다.
+
+    라벨 하나에 그 라벨을 포함하는 독립 그룹이 비율 개수(예:
+    train/validation/test 3개)보다 적으면 그룹을 쪼개지 않는 한 리크 없이
+    분할을 만들 수 없다 — 이 경우 조용히 윈도우 단위로 섞는 대신
+    `InsufficientAssetGroupsError`를 발생시켜 "데이터 부족" 상태를 명시적으로
+    드러낸다 (근거: dataset_manifest_format.md "분할 전략"). CWRU는 현재
+    라벨당 자산이 1개뿐이라 기본 3-way 분할에서는 이 예외가 발생하는 것이
+    정상이며, 자산이 늘어나거나 train 전용 등 분할 비율을 조정해야 해소된다.
+    """
+    ratios = DEFAULT_SPLIT_RATIOS if ratios is None else ratios
+    validate_split_ratios(ratios)
+    required_splits = [
+        name for name in ("train", "validation", "test") if ratios.get(name, 0) > 0
+    ]
+
+    groups: dict = {}  # group_id -> [record idx, ...] (라벨 무관, 전역)
+    group_label_counts: dict = {}  # group_id -> {label: count}
+    label_group_ids: dict = {}  # label -> {group_id, ...}
+    label_totals: dict = {}  # label -> 전체 레코드 수
+
     for idx, rec in enumerate(records):
-        by_label.setdefault(rec["label"], []).append(idx)
+        group_id, label = rec[group_key], rec["label"]
+        groups.setdefault(group_id, []).append(idx)
+        label_counts = group_label_counts.setdefault(group_id, {})
+        label_counts[label] = label_counts.get(label, 0) + 1
+        label_group_ids.setdefault(label, set()).add(group_id)
+        label_totals[label] = label_totals.get(label, 0) + 1
+
+    for label, group_ids in label_group_ids.items():
+        if len(group_ids) < len(required_splits):
+            raise InsufficientAssetGroupsError(
+                f"라벨 {label!r}: 독립 그룹이 {len(group_ids)}개({sorted(group_ids)})뿐이라 "
+                f"{required_splits} {len(required_splits)}-way 그룹 분할을 리크 없이 "
+                "만들 수 없습니다. 자산을 추가하거나 분할 비율(ratios)을 조정하세요."
+            )
+
+    targets = {
+        label: {name: ratios[name] * total for name in required_splits}
+        for label, total in label_totals.items()
+    }
+    assigned_counts = {
+        label: {name: 0 for name in required_splits} for label in label_totals
+    }
+    split_of_group: dict = {}
+
+    def assign(group_id: str, split_name: str) -> None:
+        split_of_group[group_id] = split_name
+        for label, count in group_label_counts[group_id].items():
+            assigned_counts[label][split_name] += count
+
+    # 1단계: 그룹을 쪼개지 않고도 모든 (라벨, 필수 split) 조합이 최소 1개
+    # 그룹을 받도록 배정한다. coverage_pairs는 비율이 작은 split부터 처리
+    # 되도록 정렬한다(이미 배정된 그룹이 해당 라벨을 포함하면(공유 그룹) 그
+    # 조합은 이미 충족된 것으로 보고 건너뛴다).
+    #
+    # 각 pair를 되돌릴 수 없는 그리디로 독립적으로 처리하면, 그룹이 서로
+    # 다른 라벨 쌍을 사슬처럼 공유하는 구조에서는 실제로 가능한 배정이
+    # 있어도 특정 처리 순서 때문에 막다른 길에 몰릴 수 있다(예: 한 라벨의
+    # 그룹 두 개가 각각 다른 라벨의 요구를 채우느라 같은 split에 몰려
+    # 배정되면, 정작 그 라벨 자신은 나머지 split을 커버할 그룹이 남지
+    # 않는다). 그래서 pair마다 결정적으로 정렬한 후보를 시도하다 막히면
+    # 이전 선택으로 되돌아가는 백트래킹을 쓴다 — 가능한 배정이 존재하면
+    # 반드시 찾아낸다.
+    coverage_pairs = [
+        (label, name) for label in label_group_ids for name in required_splits
+    ]
+    coverage_pairs.sort(key=lambda pair: ratios[pair[1]])
+
+    def _candidate_order(label: str) -> list:
+        # 비공유(전용) 그룹, 작은 그룹, gid 순으로 결정적으로 정렬한다.
+        # gid를 마지막 tie-break로 넣어야 label_group_ids[label](set)의
+        # PYTHONHASHSEED에 따라 달라지는 반복 순서가 결과(따라서 split 배정과
+        # dataset fingerprint)에 영향을 주지 않는다 — 동일한 PYTHONHASHSEED
+        # 없이도 매번 같은 records/seed에 대해 같은 split이 나와야 한다.
+        return sorted(
+            label_group_ids[label],
+            key=lambda gid: (len(group_label_counts[gid]) > 1, len(groups[gid]), gid),
+        )
+
+    def _backtrack(pair_index: int, coverage_assignment: dict) -> bool:
+        if pair_index == len(coverage_pairs):
+            return True
+        label, name = coverage_pairs[pair_index]
+        if any(
+            coverage_assignment.get(gid) == name for gid in label_group_ids[label]
+        ):
+            return _backtrack(pair_index + 1, coverage_assignment)
+        for gid in _candidate_order(label):
+            if gid in coverage_assignment:
+                continue
+            coverage_assignment[gid] = name
+            if _backtrack(pair_index + 1, coverage_assignment):
+                return True
+            del coverage_assignment[gid]
+        return False
+
+    coverage_assignment: dict = {}
+    if not _backtrack(0, coverage_assignment):
+        # 그룹 수 자체는 라벨별로 충분해도(위 사전 검사 통과), 그룹을
+        # 공유하는 구조상 모든 (라벨, split) 조합을 리크 없이 동시에
+        # 커버하는 배정이 아예 존재하지 않을 수 있다 — 조용히 건너뛰지
+        # 않고 명시적으로 알린다.
+        raise InsufficientAssetGroupsError(
+            "라벨/그룹 공유 구조상 모든 (라벨, split) 조합을 그룹을 쪼개지 "
+            f"않고 리크 없이 커버하는 배정을 찾을 수 없습니다: {coverage_pairs!r}"
+        )
+    for gid, name in coverage_assignment.items():
+        assign(gid, name)
+
+    # 2단계: 남은 그룹은 그 그룹이 걸친 모든 라벨의 목표 건수 대비 부족분
+    # 합이 가장 큰 split에 큰 그룹부터 배정하는 그리디로 비율에 최대한
+    # 맞춘다.
+    rng = random.Random(seed)
+    remaining = [gid for gid in groups if gid not in split_of_group]
+    rng.shuffle(remaining)  # 동일 크기 그룹 간 배정 순서만 흔들어 결정성 유지
+    remaining.sort(key=lambda gid: -len(groups[gid]))
+
+    for group_id in remaining:
+        def deficit(split_name: str, group_id: str = group_id) -> float:
+            return sum(
+                targets[label][split_name] - assigned_counts[label][split_name]
+                for label in group_label_counts[group_id]
+            )
+
+        best = max(required_splits, key=deficit)
+        assign(group_id, best)
 
     split_of_index = {}
-    for label, indices in by_label.items():
-        rng = random.Random(f"{seed}-{label}")
-        shuffled = list(indices)
-        rng.shuffle(shuffled)
-
-        n = len(shuffled)
-        n_train = round(n * ratios["train"])
-        n_train = min(n_train, n)
-        n_val = round(n * ratios["validation"])
-        n_val = min(n_val, n - n_train)
-        n_test = n - n_train - n_val  # 잔여를 test가 흡수 -> 합이 항상 n과 일치
-
-        for i in shuffled[:n_train]:
-            split_of_index[i] = "train"
-        for i in shuffled[n_train : n_train + n_val]:
-            split_of_index[i] = "validation"
-        for i in shuffled[n_train + n_val :]:
-            split_of_index[i] = "test"
+    for group_id, split_name in split_of_group.items():
+        for idx in groups[group_id]:
+            split_of_index[idx] = split_name
 
     return [split_of_index[i] for i in range(len(records))]
+
+
+def compute_feature_output_fingerprint(rows: list) -> str:
+    """실제로 계산된 특징값 산출물 자체의 canonical hash.
+
+    week2 `extract_all_features()`의 MFCC는 librosa가 없으면 조용히 0벡터로
+    대체된다(`compute_mfcc()` fallback). 이 차이는 소스 코드/설정 어디에도
+    드러나지 않으므로, feature_pipeline_version이나 FeatureConfig만으로는
+    같은 원본에서 실제 MFCC 값과 0벡터가 나온 두 실행을 구분할 수 없다.
+    그래서 메타데이터가 아니라 **최종 산출된 특징값 자체**를 해시해, 실행
+    환경 차이로 산출물이 달라지면 반드시 체크섬도 달라지게 한다.
+    """
+    payload = [
+        {name: row[name] for name in sorted(row)} for row in rows
+    ]
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def compute_version_checksum(
+    source_files: dict,
+    window_size: int,
+    hop_size: int,
+    split_ratios: dict,
+    seed: int,
+    label_taxonomy_version: str,
+    label_mapping: dict,
+    feature_config: FeatureConfig,
+    feature_output_fingerprint: str,
+    feature_pipeline_version: str = FEATURE_PIPELINE_VERSION,
+) -> str:
+    """원본 파일·라벨·전처리/분할/특징 추출 설정 + 실제 산출물로 불변 버전 체크섬을 만든다.
+
+    입력 파일 sha256 + **파일별 source label**, window/hop 크기, 분할 비율,
+    seed, label taxonomy 버전, label mapping, 특징 추출 설정(FeatureConfig:
+    sample_rate/frame_length/hop_length/n_mfcc/band_edges), 파이프라인 버전,
+    **실제 계산된 특징값의 fingerprint(compute_feature_output_fingerprint())**
+    중 하나라도 달라지면 다른 체크섬이 나와야 한다. feature_output_fingerprint를
+    포함해야 librosa 유무처럼 소스 코드/설정에는 드러나지 않는 실행 환경
+    차이(MFCC 0벡터 폴백 등)로 산출물이 달라진 경우까지 잡아낼 수 있다.
+    """
+    payload = {
+        "files": {
+            name: {"sha256": info["sha256"], "label": info["label"]}
+            for name, info in sorted(source_files.items())
+        },
+        "window_size": window_size,
+        "hop_size": hop_size,
+        "split_ratios": {name: split_ratios[name] for name in sorted(split_ratios)},
+        "seed": seed,
+        "label_taxonomy_version": label_taxonomy_version,
+        "label_mapping": {name: label_mapping[name] for name in sorted(label_mapping)},
+        "feature_pipeline_version": feature_pipeline_version,
+        "feature_config": {
+            "sample_rate": feature_config.sample_rate,
+            "frame_length": feature_config.frame_length,
+            "hop_length": feature_config.hop_length,
+            "n_mfcc": feature_config.n_mfcc,
+            "band_edges": list(feature_config.band_edges),
+        },
+        "feature_output_fingerprint": feature_output_fingerprint,
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def build_manifest(
@@ -156,22 +434,24 @@ def build_manifest(
     seed: int = 42,
 ) -> dict:
     """CWRU 데이터를 로드해 DATA_EXPORT_01 매니페스트(dict)를 만든다."""
-    split_ratios = split_ratios or DEFAULT_SPLIT_RATIOS
+    split_ratios = DEFAULT_SPLIT_RATIOS if split_ratios is None else split_ratios
+    validate_split_ratios(split_ratios)
 
     records = load_cwru_dataset(data_dir, window_size=window_size, hop_size=hop_size)
     if not records:
         raise FileNotFoundError(f"{data_dir}에서 CWRU 레코드를 하나도 로드하지 못했습니다.")
 
     source = build_source_block(data_dir)
-    compatibility = build_compatibility_block(records)
-    splits = stratified_split(records, split_ratios, seed)
-
     config = FeatureConfig(sample_rate=records[0]["sample_rate"])
+    compatibility = build_compatibility_block(records)
+    splits = group_split(records, split_ratios, seed)
+
     rows = []
     for rec, split in zip(records, splits):
         known_label = rec["label"]
         common_label = DATASET_LABEL_MAPPING[known_label]
         features = extract_all_features(rec["signal"], config)
+        _validate_finite_features(features, rec["sample_id"])
         row = {
             "sample_id": rec["sample_id"],
             "source_file": rec["source_label"],
@@ -184,12 +464,29 @@ def build_manifest(
         }
         rows.append(row)
 
+    version_checksum = compute_version_checksum(
+        source["files"],
+        window_size,
+        hop_size,
+        split_ratios,
+        seed,
+        LABEL_TAXONOMY_VERSION,
+        DATASET_LABEL_MAPPING,
+        config,
+        compute_feature_output_fingerprint(rows),
+    )
+    source["checksum"] = version_checksum
+
     split_counts = {"train": 0, "validation": 0, "test": 0}
     for split in splits:
         split_counts[split] += 1
 
+    version_short_hash = version_checksum.split(":", 1)[1][:12]
     return {
-        "id": f"DS-CWRU-VIBRATION-{datetime.now(timezone.utc).strftime('%Y%m%d')}",
+        "id": (
+            f"DS-CWRU-VIBRATION-{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+            f"-{version_short_hash}"
+        ),
         "name": "cwru-bearing-vibration-v1",
         "source": source,
         "compatibility": compatibility,
@@ -197,8 +494,8 @@ def build_manifest(
         "labelMapping": DATASET_LABEL_MAPPING,
         "split": split_ratios,
         "splitStrategy": (
-            "stratified_by_label (window-level; group-by-asset not applicable — "
-            "CWRU provides a single asset per fault label)"
+            "group_split_by_source_file (per-label; whole source_label groups are "
+            "assigned to a single split — never split at window level to avoid leakage)"
         ),
         "status": "draft",
         "reason": "3주차 기존 데이터셋 선정 및 정규화 — AI_FREQ_MODEL_01 선행학습 입력 준비",
@@ -218,6 +515,15 @@ if __name__ == "__main__":
     parser.add_argument("--hop-size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--train-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["train"]
+    )
+    parser.add_argument(
+        "--validation-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["validation"]
+    )
+    parser.add_argument(
+        "--test-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["test"]
+    )
+    parser.add_argument(
         "--output",
         default=os.path.normpath(
             os.path.join(_THIS_DIR, "..", "data", "handoff", "dataset_manifest_full.json")
@@ -225,16 +531,26 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # 기본 비율(0.7/0.2/0.1)은 라벨당 자산이 여러 개일 때를 전제로 한다. 지금처럼
+    # CWRU가 라벨당 자산 1개뿐이면 group_split이 InsufficientAssetGroupsError를
+    # 낸다 — 조용히 window 셔플로 우회하지 않고, 자산을 추가하거나
+    # --train-ratio 1 --validation-ratio 0 --test-ratio 0 처럼 명시적으로
+    # train 전용 비율을 지정해야 한다.
     manifest = build_manifest(
         data_dir=args.data_dir,
         window_size=args.window_size,
         hop_size=args.hop_size,
+        split_ratios={
+            "train": args.train_ratio,
+            "validation": args.validation_ratio,
+            "test": args.test_ratio,
+        },
         seed=args.seed,
     )
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+        json.dump(manifest, f, ensure_ascii=False, indent=2, allow_nan=False)
 
     print(f"데이터셋 {manifest['id']} 매니페스트 생성 완료: {manifest['rowCount']}행")
     print(f"  분할 건수: {manifest['splitCounts']}")

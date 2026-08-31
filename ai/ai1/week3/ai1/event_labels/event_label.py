@@ -53,13 +53,25 @@ def apply_label_change(
 
     반환: (updated_event, history_entry)
     """
+    if not isinstance(new_label, str):
+        # list/dict 등 unhashable 값은 집합 조회(`in EVENT_REVIEW_LABELS`)에서
+        # TypeError를 내므로, 먼저 타입을 걸러 일관된 ValueError로 바꾼다.
+        raise ValueError(f"new_label은 문자열이어야 합니다: {new_label!r}")
     if new_label not in EVENT_REVIEW_LABELS:
         raise ValueError(
             f"허용되지 않은 라벨입니다: {new_label!r} "
             f"(허용값: {sorted(EVENT_REVIEW_LABELS)})"
         )
-    if not reason or not reason.strip():
-        raise ValueError("reason은 필수입니다 (빈 문자열/공백만 있는 값은 허용하지 않음).")
+    if not isinstance(changed_by, str) or not changed_by.strip():
+        raise ValueError(
+            "changed_by는 공백이 아닌 문자열이어야 합니다 (감사 추적을 위해 변경자를 "
+            "식별할 수 있어야 함)."
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(
+            "reason은 공백이 아닌 문자열이어야 합니다 (빈 문자열/공백만 있는 값이나 "
+            "숫자·list 등 비문자열 값은 허용하지 않음)."
+        )
     if new_note is not None:
         if not isinstance(new_note, str):
             raise ValueError("note는 문자열이어야 합니다.")

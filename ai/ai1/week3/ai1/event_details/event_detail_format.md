@@ -22,6 +22,7 @@
 | `window_seconds` | 전/후 비교 구간 길이 (초) — "이벤트 전 N초 vs 이후 N초" |
 | `window_duration_sec` | 개별 윈도우 하나의 길이 (초) = `window_size / sample_rate` |
 | `applied_baseline_version` / `applied_threshold_version` | 적용된 기준선/임계값 버전(선택) — 있으면 그대로 기록만 함 |
+| `applied_model_version` | 적용된 모델 버전(선택) — 명시적으로 넘기면 그 값을 쓰고, 없으면 `event["modelVersion"]`(판정 당시 이벤트에 기록돼 있던 값)을 대신 씀 |
 
 `window_seconds`를 `window_duration_sec`으로 나눠 필요한 윈도우 개수(`n_windows`)를
 구하고, `event_index` 기준으로 `[event_index - n_windows, event_index)`를 "전(before)",
@@ -36,6 +37,7 @@
   "asset_id": "SITE-01-MOT-02",
   "applied_baseline_version": "2026-08-21T08:17:43.221079+00:00",
   "applied_threshold_version": null,
+  "applied_model_version": null,
   "window_seconds_requested": 1.7,
   "window_duration_sec": 0.1707,
   "before": {

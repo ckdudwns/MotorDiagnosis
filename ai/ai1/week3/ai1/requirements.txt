@@ -1,0 +1,4 @@
+# DATA_EXPORT_01(export_dataset.py)의 XLSX 내보내기 전용 의존성.
+# numpy/scipy 등 나머지 의존성은 week1/week2 requirements.txt에서 이미 선언됨
+# (register_dataset.py가 해당 로더/특징량 모듈을 그대로 재사용).
+openpyxl>=3.1,<4

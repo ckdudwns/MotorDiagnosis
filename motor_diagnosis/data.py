@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import secrets
 import threading
 import time
@@ -433,6 +434,7 @@ TELEMETRY_SERVICE_TOKENS = {
         "type": "service",
         "permissions": ["telemetry:ingest", "telemetry:label"],
         "allowedDeviceIds": ["*"],
+        "demoOnly": True,
     },
 }
 
@@ -2424,6 +2426,14 @@ def telemetry_principal_for_token(token: str) -> dict[str, Any]:
         )
     service = TELEMETRY_SERVICE_TOKENS.get(token)
     if service:
+        if service.get("demoOnly") and os.environ.get(
+            "APP_ENV", ""
+        ).strip().lower() == ("production"):
+            raise ApiError(
+                401,
+                "AUTH_REQUIRED",
+                "Demo telemetry validation tokens are disabled in production.",
+            )
         return copy_payload(service)
     user = current_user_for_token(token)
     if not has_permission(user, "telemetry:ingest"):
@@ -2458,15 +2468,22 @@ def principal_can_ingest(principal: dict[str, Any], device_id: str) -> None:
 
 
 def telemetry_label_fields(payload: dict[str, Any]) -> list[str]:
-    return [
-        field
-        for field in (
-            "scenarioLabel",
-            "knownVibrationLabel",
-            "knownAcousticLabel",
-        )
-        if payload.get(field) is not None
-    ]
+    fields = []
+    for field in (
+        "scenarioLabel",
+        "knownVibrationLabel",
+        "knownAcousticLabel",
+    ):
+        value = payload.get(field)
+        # Authorization follows the same canonical values produced by the
+        # single-record normalizer. Malformed values are rejected later as 400s;
+        # blank optional labels normalize to null and do not require label rights.
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if field == "scenarioLabel" and value.strip() not in TELEMETRY_SCENARIOS:
+            continue
+        fields.append(field)
+    return fields
 
 
 def principal_can_submit_telemetry_labels(
@@ -3690,9 +3707,10 @@ def review_event(
         changed_at = now_iso()
         event["label"] = label
         event["note"] = note
-        event["reviewed"] = True
-        event["reviewedAt"] = changed_at
-        event["reviewedBy"] = user["id"]
+        review_completed = label != "needs_review"
+        event["reviewed"] = review_completed
+        event["reviewedAt"] = changed_at if review_completed else None
+        event["reviewedBy"] = user["id"] if review_completed else None
         review = {
             "id": f"REVIEW-{len(EVENT_REVIEW_HISTORY) + 1:05d}",
             "eventId": event["id"],
@@ -5575,6 +5593,22 @@ def _dataset_export_window(
     )
 
 
+def _active_dataset_taxonomy() -> dict[str, Any] | None:
+    return next(
+        (item for item in reversed(ACOUSTIC_TAXONOMY_VERSIONS) if item.get("active")),
+        None,
+    )
+
+
+def _dataset_event_has_verified_label(event: dict[str, Any] | None) -> bool:
+    return bool(
+        event
+        and event.get("reviewed")
+        and str(event.get("label") or "").strip()
+        and str(event.get("label") or "").strip() != "needs_review"
+    )
+
+
 def _dataset_label_for_event(
     dataset: dict[str, Any] | None, event: dict[str, Any] | None
 ) -> tuple[str | None, str | None]:
@@ -5583,8 +5617,8 @@ def _dataset_label_for_event(
     source_label = str(event.get("label") or "").strip()
     if not source_label:
         return None, None
-    # An unreviewed event is candidate metadata, not a taxonomy-backed label.
-    if not event.get("reviewed"):
+    # Unreviewed and still-pending events are candidate metadata, not taxonomy labels.
+    if not _dataset_event_has_verified_label(event):
         return source_label, None
     if not dataset:
         return source_label, None
@@ -5606,29 +5640,30 @@ def _dataset_target_label(
     normalized = str(source_label or "").strip()
     if not normalized:
         return None, None
-    if not dataset:
-        return normalized, None
-    label_mapping = {
-        str(key).strip().casefold(): str(value).strip().upper()
-        for key, value in dataset.get("labelMapping", {}).items()
-    }
-    mapped = label_mapping.get(normalized.casefold())
-    if mapped:
-        return mapped, dataset["labelTaxonomyVersion"]
-    taxonomy = next(
-        (
-            item
-            for item in ACOUSTIC_TAXONOMY_VERSIONS
-            if item["version"] == dataset["labelTaxonomyVersion"]
-        ),
-        None,
-    )
+    if dataset:
+        label_mapping = {
+            str(key).strip().casefold(): str(value).strip().upper()
+            for key, value in dataset.get("labelMapping", {}).items()
+        }
+        mapped = label_mapping.get(normalized.casefold())
+        if mapped:
+            return mapped, dataset["labelTaxonomyVersion"]
+        taxonomy = next(
+            (
+                item
+                for item in ACOUSTIC_TAXONOMY_VERSIONS
+                if item["version"] == dataset["labelTaxonomyVersion"]
+            ),
+            None,
+        )
+    else:
+        taxonomy = _active_dataset_taxonomy()
     taxonomy_codes = {
         str(item["code"]).strip().upper() for item in (taxonomy or {}).get("labels", [])
     }
     direct_code = normalized.upper()
     if direct_code in taxonomy_codes:
-        return direct_code, dataset["labelTaxonomyVersion"]
+        return direct_code, taxonomy["version"]
     return None, None
 
 
@@ -5637,11 +5672,7 @@ def _dataset_ground_truth(
     point: dict[str, Any],
     matching_event: dict[str, Any] | None,
 ) -> tuple[str | None, str | None, str | None, str | None]:
-    if (
-        matching_event
-        and matching_event.get("reviewed")
-        and str(matching_event.get("label") or "").strip()
-    ):
+    if _dataset_event_has_verified_label(matching_event):
         raw_label = str(matching_event["label"]).strip()
         target_label, taxonomy_version = _dataset_target_label(dataset, raw_label)
         return (
@@ -5785,6 +5816,7 @@ def _dataset_rows_for_points(
     asset_events = sorted(
         (item for item in EVENTS if item["assetId"] == asset_id),
         key=lambda item: (
+            _dataset_event_has_verified_label(item),
             parse_rfc3339("event.occurredAt", item["occurredAt"]),
             item["id"],
         ),
@@ -5806,7 +5838,11 @@ def _dataset_rows_for_points(
         event_reviewed = bool(matching_event and matching_event.get("reviewed"))
         if ground_truth_label:
             label_status = "verified" if target_label else "unmapped"
-        elif matching_event and not event_reviewed and str(event_label or "").strip():
+        elif (
+            matching_event
+            and not _dataset_event_has_verified_label(matching_event)
+            and str(event_label or "").strip()
+        ):
             label_status = "weak"
         else:
             label_status = "unlabeled"
@@ -6021,7 +6057,11 @@ def dataset_export_for(
                 },
             }
         ),
-        "labelTaxonomyVersion": dataset["labelTaxonomyVersion"] if dataset else None,
+        "labelTaxonomyVersion": (
+            dataset["labelTaxonomyVersion"]
+            if dataset
+            else (_active_dataset_taxonomy() or {}).get("version")
+        ),
         "labelMapping": dataset["labelMapping"] if dataset else {},
         "labelPriority": copy_payload(
             DATASET_LABEL_PRIORITY

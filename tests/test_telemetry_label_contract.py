@@ -78,6 +78,15 @@ class TelemetryLabelAuthorizationTest(unittest.TestCase):
                 self.assertEqual(invalid.exception.status, 400)
                 self.assertEqual(invalid.exception.code, "INVALID_TELEMETRY_PAYLOAD")
 
+    def test_demo_validation_token_is_disabled_in_production(self) -> None:
+        with patch.dict("os.environ", {"APP_ENV": "production"}):
+            with self.assertRaises(data.ApiError) as disabled:
+                data.telemetry_principal_for_token("demo-telemetry-validation-token")
+            self.assertEqual(disabled.exception.status, 401)
+            self.assertEqual(disabled.exception.code, "AUTH_REQUIRED")
+            general = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+        self.assertNotIn("telemetry:label", general["permissions"])
+
     def test_only_explicit_label_principal_can_store_labels_with_provenance(
         self,
     ) -> None:
@@ -186,6 +195,42 @@ class TelemetryLabelAuthorizationTest(unittest.TestCase):
         self.assertEqual(forbidden.exception.code, "TELEMETRY_LABEL_FORBIDDEN")
         self.assertEqual(data.TELEMETRY_RECORDS, [])
         self.assertEqual(data.TELEMETRY_METRICS["requests"], 0)
+
+    def test_bulk_and_single_ingest_normalize_blank_labels_consistently(self) -> None:
+        single, single_status = data.ingest_telemetry(
+            self.general,
+            telemetry_payload(1, knownVibrationLabel="   "),
+        )
+        self.assertEqual(single_status, 201)
+        self.assertTrue(single["accepted"])
+        self.assertIsNone(data.TELEMETRY_RECORDS[0]["knownVibrationLabel"])
+
+        data.reset_runtime_state()
+        bulk = ingest_telemetry_bulk(
+            self.general,
+            {"items": [telemetry_payload(1, knownVibrationLabel="   ")]},
+        )
+        self.assertEqual((bulk["accepted"], bulk["rejected"]), (1, 0))
+        self.assertIsNone(data.TELEMETRY_RECORDS[0]["knownVibrationLabel"])
+
+        data.reset_runtime_state()
+        with self.assertRaises(data.ApiError) as single_invalid:
+            data.ingest_telemetry(
+                self.general,
+                telemetry_payload(1, scenarioLabel="   "),
+            )
+        self.assertEqual(single_invalid.exception.code, "INVALID_TELEMETRY_PAYLOAD")
+
+        bulk_invalid = ingest_telemetry_bulk(
+            self.general,
+            {"items": [telemetry_payload(1, scenarioLabel="   ")]},
+        )
+        self.assertEqual(bulk_invalid["items"][0]["status"], 400)
+        self.assertEqual(
+            bulk_invalid["items"][0]["error"]["code"],
+            "INVALID_TELEMETRY_PAYLOAD",
+        )
+        self.assertEqual(data.TELEMETRY_RECORDS, [])
 
     def test_mqtt_label_forbidden_is_terminal_and_acknowledged(self) -> None:
         error = MqttBridgeError(
@@ -383,6 +428,132 @@ class DatasetLabelPolicyTest(unittest.TestCase):
             manifest["snapshotSchemaVersion"],
             data.DATASET_SNAPSHOT_SCHEMA_VERSION,
         )
+
+    def test_live_export_requires_active_taxonomy_membership(self) -> None:
+        data.EVENTS.clear()
+        sample_time = timestamp(-10)
+        data.TELEMETRY_RECORDS.append(
+            self.point(
+                sample_time,
+                1,
+                knownVibrationLabel="arbitrary-unregistered-label",
+                labelProvenance=self.provenance(sample_time, "knownVibrationLabel"),
+            )
+        )
+        normal_time = timestamp(-9)
+        data.TELEMETRY_RECORDS.append(
+            self.point(
+                normal_time,
+                2,
+                scenarioLabel="normal",
+                labelProvenance=self.provenance(normal_time, "scenarioLabel"),
+            )
+        )
+
+        exported = data.dataset_export_for(
+            self.admin,
+            "SITE-01",
+            "SITE-01-MOT-02",
+        )
+        row = exported["rows"][0]
+        self.assertEqual(row["ground_truth_label"], "arbitrary-unregistered-label")
+        self.assertIsNone(row["target_label"])
+        self.assertIsNone(row["target_label_taxonomy_version"])
+        self.assertEqual(row["label_status"], "unmapped")
+        self.assertFalse(row["training_eligible"])
+        normal_row = exported["rows"][1]
+        self.assertEqual(normal_row["target_label"], "NORMAL")
+        self.assertEqual(normal_row["target_label_taxonomy_version"], "ACOUSTIC-V1")
+        self.assertEqual(normal_row["label_status"], "verified")
+        self.assertTrue(normal_row["training_eligible"])
+        self.assertEqual(exported["manifest"]["labelTaxonomyVersion"], "ACOUSTIC-V1")
+
+    def test_needs_review_stays_weak_even_after_note_only_review(self) -> None:
+        data.EVENTS.clear()
+        sample_time = timestamp(-10)
+        event = {
+            "id": "EV-NOTE-ONLY",
+            "siteId": "SITE-01",
+            "assetId": "SITE-01-MOT-02",
+            "deviceId": "DEV-01-MOT-02",
+            "severity": "warning",
+            "eventType": "anomaly",
+            "title": "Needs decision",
+            "occurredAt": sample_time,
+            "time": sample_time,
+            "durationSec": 30,
+            "label": "needs_review",
+            "note": "",
+            "reviewed": False,
+        }
+        data.EVENTS.append(event)
+
+        reviewed = data.review_event(
+            self.admin,
+            event["id"],
+            {"note": "Added context only", "reason": "No final label yet"},
+        )
+        self.assertFalse(reviewed["event"]["reviewed"])
+        self.assertIsNone(reviewed["event"]["reviewedAt"])
+        rows = data._dataset_rows_for_points(
+            None,
+            "SITE-01",
+            "SITE-01-MOT-02",
+            [self.point(sample_time, 1)],
+        )
+        self.assertEqual(rows[0]["event_label"], "needs_review")
+        self.assertIsNone(rows[0]["ground_truth_label"])
+        self.assertEqual(rows[0]["label_status"], "weak")
+        self.assertFalse(rows[0]["training_eligible"])
+
+        event["reviewed"] = True
+        legacy_rows = data._dataset_rows_for_points(
+            None,
+            "SITE-01",
+            "SITE-01-MOT-02",
+            [self.point(sample_time, 2)],
+        )
+        self.assertEqual(legacy_rows[0]["label_status"], "weak")
+        self.assertFalse(legacy_rows[0]["training_eligible"])
+
+    def test_reviewed_event_wins_when_candidate_events_overlap(self) -> None:
+        data.EVENTS.clear()
+        base = datetime.now(timezone.utc) - timedelta(minutes=5)
+        point_time = data.format_rfc3339(base + timedelta(seconds=30))
+        reviewed_event = {
+            "id": "EV-REVIEWED-OLDER",
+            "siteId": "SITE-01",
+            "assetId": "SITE-01-MOT-02",
+            "occurredAt": data.format_rfc3339(base),
+            "durationSec": 120,
+            "label": "confirmed_anomaly",
+            "reviewed": True,
+        }
+        newer_candidate = {
+            "id": "EV-CANDIDATE-NEWER",
+            "siteId": "SITE-01",
+            "assetId": "SITE-01-MOT-02",
+            "occurredAt": data.format_rfc3339(base + timedelta(seconds=20)),
+            "durationSec": 120,
+            "label": "needs_review",
+            "reviewed": False,
+        }
+        data.EVENTS.extend([reviewed_event, newer_candidate])
+        dataset = {
+            "labelTaxonomyVersion": "ACOUSTIC-V1",
+            "labelMapping": {"confirmed_anomaly": "BEARING_SUSPECT"},
+        }
+
+        rows = data._dataset_rows_for_points(
+            dataset,
+            "SITE-01",
+            "SITE-01-MOT-02",
+            [self.point(point_time, 1)],
+        )
+        self.assertEqual(rows[0]["event_id"], reviewed_event["id"])
+        self.assertEqual(rows[0]["ground_truth_source"], "event_review")
+        self.assertEqual(rows[0]["target_label"], "BEARING_SUSPECT")
+        self.assertTrue(rows[0]["training_eligible"])
 
     def test_dataset_fingerprint_includes_policy_and_snapshot_versions(self) -> None:
         source = {

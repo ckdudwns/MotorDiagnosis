@@ -1020,7 +1020,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(rows[2]["event_id"], "EV-241")
         self.assertEqual(rows[2]["event_label"], "needs_review")
         self.assertIsNone(rows[2]["label_taxonomy_version"])
-        self.assertIsNone(exported["manifest"]["labelTaxonomyVersion"])
+        self.assertEqual(exported["manifest"]["labelTaxonomyVersion"], "ACOUSTIC-V1")
         self.assertEqual(exported["manifest"]["exportType"], "internal_telemetry")
         self.assertEqual(exported["manifest"]["source"]["uri"], "api://telemetry")
         self.assertEqual(
@@ -1030,6 +1030,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
     def test_dataset_export_applies_registered_label_mapping(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event["label"] = "confirmed_anomaly"
         event["reviewed"] = True
         event_time = parse_rfc3339("occurredAt", event["occurredAt"])
         self.add_split_ready_telemetry(event_time + timedelta(seconds=10))
@@ -1041,7 +1042,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
                     "siteId": "SITE-01",
                     "assetId": "SITE-01-MOT-02",
                 },
-                label_mapping={"needs_review": "BEARING_SUSPECT"},
+                label_mapping={"confirmed_anomaly": "BEARING_SUSPECT"},
             ),
         )
 
@@ -1055,7 +1056,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(exported["rows"][0]["event_label"], "BEARING_SUSPECT")
         self.assertEqual(exported["rows"][0]["label_taxonomy_version"], "ACOUSTIC-V1")
         self.assertEqual(
-            exported["manifest"]["labelMapping"]["needs_review"],
+            exported["manifest"]["labelMapping"]["confirmed_anomaly"],
             "BEARING_SUSPECT",
         )
         self.assertEqual(

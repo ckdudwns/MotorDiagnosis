@@ -18,6 +18,7 @@ venv/
 *.csv
 output/
 tmp/
+graphify-out/
 *.tar
 *.tar.gz
 *.tgz

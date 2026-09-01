@@ -211,6 +211,65 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
         started = self.lifecycle.process_point(point("2026-08-31T00:00:15Z", 80))
         self.assertEqual(started[0]["kind"], "asset_event_started")
 
+    def test_overflow_score_resets_candidate_before_duplicate_is_ignored(self) -> None:
+        self.lifecycle.process_point(point("2026-08-31T00:00:00Z", 80))
+        overflow_score = 10**400
+        self.assertEqual(
+            self.lifecycle.process_point(
+                point("2026-08-31T00:00:05Z", overflow_score)
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.lifecycle.process_point(
+                point("2026-08-31T00:00:05Z", overflow_score)
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.lifecycle.process_point(point("2026-08-31T00:00:10Z", 80)), []
+        )
+        started = self.lifecycle.process_point(point("2026-08-31T00:00:15Z", 80))
+        self.assertEqual(started[0]["kind"], "asset_event_started")
+
+    def test_normalizes_numeric_duplicate_telemetry_and_rejects_conflict(self) -> None:
+        first = point(
+            "2026-08-31T00:00:00Z", 80, deviceId="DEVICE-01", sequence=1
+        )
+        retransmission = point(
+            "2026-08-31T00:00:00Z", 80.0, deviceId="DEVICE-01", sequence=1
+        )
+        self.assertEqual(self.lifecycle.process_point(first), [])
+        self.assertEqual(self.lifecycle.process_point(retransmission), [])
+        with self.assertRaises(ValueError):
+            self.lifecycle.process_point(
+                point(
+                    "2026-08-31T00:00:00Z",
+                    81,
+                    deviceId="DEVICE-01",
+                    sequence=1,
+                )
+            )
+
+        started = self.lifecycle.process_point(
+            point("2026-08-31T00:00:05Z", 80, deviceId="DEVICE-01", sequence=2)
+        )
+        self.assertEqual(started[0]["kind"], "asset_event_started")
+
+    def test_tracks_max_score_model_before_rounding_the_external_value(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        lifecycle.process_point(
+            point("2026-08-31T00:00:00Z", 95.1, anomalyModel="model-v1")
+        )
+
+        updated = lifecycle.process_point(
+            point("2026-08-31T00:00:05Z", 95.4, anomalyModel="model-v2")
+        )[0]["event"]
+
+        self.assertEqual(updated["maxScore"], 95)
+        self.assertEqual(updated["maxScoreModelVersion"], "model-v2")
+        self.assertNotIn("_maxScoreRaw", updated)
+
     def test_recovery_end_at_and_statistics_use_the_confirmation_point(self) -> None:
         lifecycle = AnomalyEventLifecycle(
             EventLifecycleConfig(min_consecutive_enter=1, min_consecutive_exit=2)

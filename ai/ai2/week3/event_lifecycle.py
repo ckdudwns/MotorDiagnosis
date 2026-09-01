@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from uuid import uuid4
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -64,6 +64,9 @@ class _AssetState:
     latest_closed_event: dict[str, Any] | None = None
     last_processed_at: datetime | None = None
     last_point_identity: tuple[object, ...] | None = None
+    processed_telemetry: dict[tuple[str, int], tuple[object, ...]] = field(
+        default_factory=dict
+    )
 
 
 def _finite_score(point: dict[str, Any]) -> float | None:
@@ -72,7 +75,7 @@ def _finite_score(point: dict[str, Any]) -> float | None:
         return None
     try:
         numeric_value = float(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
     if not math.isfinite(numeric_value) or not 0 <= numeric_value <= 100:
         return None
@@ -97,22 +100,44 @@ def _parse_timestamp(value: object) -> datetime:
 
 
 def _point_identity(
-    point: dict[str, Any], timestamp: datetime, sensor_fault: bool, reason: str | None
+    point: dict[str, Any],
+    timestamp: datetime,
+    score: float | None,
+    sensor_fault: bool,
+    reason: str | None,
 ) -> tuple[object, ...]:
     """Return the stable identity used to ignore an immediate retransmission."""
     sequence = point.get("sequence")
     if isinstance(sequence, bool) or not isinstance(sequence, int):
         sequence = None
-    score = point.get("anomalyScore", point.get("score"))
     return (
         timestamp,
         point.get("deviceId") if isinstance(point.get("deviceId"), str) else None,
         sequence,
-        repr(score),
+        score,
         str(point.get("anomalyModel") or "unknown"),
         sensor_fault,
         reason or "",
     )
+
+
+def _telemetry_key(point: dict[str, Any]) -> tuple[str, int] | None:
+    """Return the device idempotency key when both contract fields exist."""
+    device_id = point.get("deviceId")
+    sequence = point.get("sequence")
+    if (
+        not isinstance(device_id, str)
+        or not device_id.strip()
+        or isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+    ):
+        return None
+    return device_id.strip(), sequence
+
+
+def _event_view(event: dict[str, Any]) -> dict[str, Any]:
+    """Return an external event without lifecycle-only precision fields."""
+    return {key: value for key, value in event.items() if not key.startswith("_")}
 
 
 class AnomalyEventLifecycle:
@@ -147,11 +172,21 @@ class AnomalyEventLifecycle:
             raise ValueError("assetId must be a non-empty string.")
         timestamp = point.get("timestamp")
         parsed_timestamp = _parse_timestamp(timestamp)
+        score = _finite_score(point)
         asset_id = asset_id.strip().upper()
         state = self._states.setdefault(asset_id, _AssetState())
         point_identity = _point_identity(
-            point, parsed_timestamp, sensor_fault, sensor_fault_reason
+            point, parsed_timestamp, score, sensor_fault, sensor_fault_reason
         )
+        telemetry_key = _telemetry_key(point)
+        if telemetry_key is not None:
+            previous_identity = state.processed_telemetry.get(telemetry_key)
+            if previous_identity is not None:
+                if previous_identity == point_identity:
+                    return []
+                raise ValueError(
+                    "deviceId and sequence were already processed with a different payload."
+                )
         if (
             state.last_processed_at is not None
             and parsed_timestamp < state.last_processed_at
@@ -164,6 +199,8 @@ class AnomalyEventLifecycle:
             return []
         state.last_processed_at = parsed_timestamp
         state.last_point_identity = point_identity
+        if telemetry_key is not None:
+            state.processed_telemetry[telemetry_key] = point_identity
 
         if sensor_fault:
             return self._suppress_for_sensor_fault(
@@ -173,7 +210,6 @@ class AnomalyEventLifecycle:
                 sensor_fault_reason or "sensor_fault_detected",
             )
 
-        score = _finite_score(point)
         if score is None:
             self._reset_entry_candidate(state)
             state.exit_count = 0
@@ -230,7 +266,7 @@ class AnomalyEventLifecycle:
         return [
             {
                 "kind": "asset_event_merged" if is_merge else "asset_event_started",
-                "event": event.copy(),
+                "event": _event_view(event),
             }
         ]
 
@@ -273,6 +309,7 @@ class AnomalyEventLifecycle:
             "status": "open",
             "endReason": None,
             "maxScore": round(candidate_max_score),
+            "_maxScoreRaw": candidate_max_score,
             "lastScore": round(score),
             "sampleCount": candidate_count,
             "mergeCount": 0,
@@ -297,13 +334,13 @@ class AnomalyEventLifecycle:
         if score >= self.config.score_exit:
             state.exit_count = 0
             state.exit_start_at = None
-            return [{"kind": "asset_event_updated", "event": event.copy()}]
+            return [{"kind": "asset_event_updated", "event": _event_view(event)}]
 
         state.exit_count += 1
         if state.exit_start_at is None:
             state.exit_start_at = timestamp
         if state.exit_count < self.config.min_consecutive_exit:
-            return [{"kind": "asset_event_updated", "event": event.copy()}]
+            return [{"kind": "asset_event_updated", "event": _event_view(event)}]
 
         event["endAt"] = timestamp
         event["status"] = "closed"
@@ -312,7 +349,7 @@ class AnomalyEventLifecycle:
         state.open_event = None
         state.exit_count = 0
         state.exit_start_at = None
-        return [{"kind": "asset_event_closed", "event": event.copy()}]
+        return [{"kind": "asset_event_closed", "event": _event_view(event)}]
 
     def _suppress_for_sensor_fault(
         self,
@@ -340,7 +377,7 @@ class AnomalyEventLifecycle:
             state.open_event["endReason"] = "sensor_fault_detected"
             state.latest_closed_event = state.open_event
             updates.append(
-                {"kind": "asset_event_closed", "event": state.open_event.copy()}
+                {"kind": "asset_event_closed", "event": _event_view(state.open_event)}
             )
             state.open_event = None
         # A sensor failure breaks the continuity of an otherwise mergeable
@@ -366,8 +403,10 @@ class AnomalyEventLifecycle:
         max_score_model_version: str,
     ) -> None:
         event["lastScore"] = round(score)
-        next_max_score = round(max_score if max_score is not None else score)
-        if next_max_score > int(event["maxScore"]):
-            event["maxScore"] = next_max_score
+        next_max_score = max_score if max_score is not None else score
+        current_max_score = float(event["_maxScoreRaw"])
+        if next_max_score > current_max_score:
+            event["_maxScoreRaw"] = next_max_score
+            event["maxScore"] = round(next_max_score)
             event["maxScoreModelVersion"] = max_score_model_version
         event["sampleCount"] = int(event["sampleCount"]) + sample_count

@@ -31,6 +31,9 @@ AI-1이 계산한 기준선·임계값과 AI-2 2주차의 `anomalyScore`를 입�
 - 입력 순서: 자산별 시간은 비감소 순서여야 한다. 과거 시각 point는 `ValueError`로 거부하고,
   바로 재전송된 동일 point는 무시한다. 수집 어댑터는 `deviceId`·`sequence` 기준 멱등성과
   시간순 전달을 보장해야 한다.
+- 멱등성·정밀도: `deviceId`·`sequence`가 있는 telemetry는 유한 숫자 점수로 정규화해
+  중복을 판별하며, 같은 키의 다른 payload는 충돌로 거부한다. 최대 점수 비교는 반올림 전
+  값으로 수행하고 외부 이벤트에는 표시용 반올림 값만 제공한다.
 
 실제 값은 AI-1의 설비별 `scoreThreshold`, 지속 조건, 히스테리시스 규칙을 받아
 `EventLifecycleConfig`로 주입한다.

@@ -29,8 +29,10 @@ AI-1의 공개 데이터 기반 합성 인계 파일을 AI-2가 분석 경로와
 - `GET /api/device-hardware-profiles`,
   `PUT /api/devices/{deviceId}/hardware-profile`: 하드웨어 프로필 조회·교체 이력
 
-로컬 AI-2 리플레이의 기본 수집 토큰은 `demo-telemetry-ingest-token`이다.
-운영 환경에서는 이 데모 토큰을 사용하지 않고 별도 장치/서비스 토큰으로 교체한다.
+라벨이 포함된 로컬 AI-2 검증 리플레이의 기본 수집 토큰은
+`demo-telemetry-validation-token`이다. 라벨이 없는 일반 수집은
+`demo-telemetry-ingest-token`을 사용한다. 운영 환경에서는 이 데모 토큰을 사용하지
+않고 별도 장치/서비스 토큰으로 교체한다.
 
 MQTT/TLS 수집기는 별도 프로세스의 메모리에 저장하지 않고 중앙 HTTP 수집 API로
 메시지를 전달한다. 따라서 MQTT로 들어온 값도 HTTP 서버의 검증·멱등성·저장 경로를

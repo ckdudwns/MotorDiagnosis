@@ -141,9 +141,10 @@ python ai/ai2/week1/replay_telemetry.py --limit 3
 python ai/ai2/week1/replay_telemetry.py --send --limit 10 --interval-seconds 1
 ```
 
-기본 엔드포인트는 `http://127.0.0.1:8787/api/telemetry/ingest`이며 로컬 개발용
-Bearer 토큰은 `demo-telemetry-ingest-token`이다. 다른 토큰은 환경 변수 또는 옵션으로
-전달한다.
+기본 엔드포인트는 `http://127.0.0.1:8787/api/telemetry/ingest`이며 라벨이 포함된
+검증 재생의 로컬 개발용 Bearer 토큰은 `demo-telemetry-validation-token`이다. 라벨이
+없는 일반 수집에는 `demo-telemetry-ingest-token`을 사용하며, 다른 토큰은 환경 변수
+또는 옵션으로 전달한다.
 
 ```bash
 export TELEMETRY_INGEST_TOKEN=your-device-or-service-token

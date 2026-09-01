@@ -150,7 +150,7 @@ baseline과 model의 datasetId가 다르면 `409 MODEL_DATASET_MISMATCH`다.
 
 ## 오프라인 일괄 재전송
 
-`POST /api/telemetry/bulk`, telemetry:ingest 토큰 사용:
+`POST /api/telemetry/bulk`, 일반 telemetry:ingest 토큰 사용:
 
 ```json
 {
@@ -160,7 +160,7 @@ baseline과 model의 datasetId가 다르면 `409 MODEL_DATASET_MISMATCH`다.
     "vibrationRmsRaw":0.08, "acousticRmsRaw":0.007,
     "vibrationPeakHz":29.9,
     "vibrationRmsMmS":null, "acousticDb":null,
-    "scenarioLabel":"normal", "isSynthetic":true, "source":"week4-demo"
+    "scenarioLabel":null, "isSynthetic":true, "source":"week4-demo"
   }]
 }
 ```
@@ -169,6 +169,8 @@ timestamp는 보존 기간 내 실제 샘플 시각으로, sequence는 장치의
 HTTP 본문 한도는 기존 64KiB다.
 단건과 동일한 raw-only 필드, 시각, 합성/출처, 장치 인증·매핑 검증을 적용한다.
 배치 전체의 장치 토큰 권한을 먼저 검사하고, 같은 장치 안에서는 sequence 순으로 처리한다.
+`scenarioLabel`은 필수 nullable이다. 일반 ESP/MQTT 토큰은 세 라벨 필드를 null로
+보내야 하며, 비-null 라벨은 telemetry:label 권한이 있는 실험·검증 토큰만 제출한다.
 결과 items의 index는 **원래 요청 배열 위치**다. 다른 배치 사이의 도착 순서는 보장하지 않는다.
 
 모두 수용되면 200, 일부 거부되면 207과 accepted / duplicates / rejected 건수를 반환한다.

@@ -13,6 +13,7 @@
 - Kurtosis (첨도, 베어링 결함의 충격성 성분 탐지용) — 2주차 추가
 """
 
+import sys
 from dataclasses import dataclass, asdict
 import numpy as np
 
@@ -22,6 +23,19 @@ try:
     _HAS_LIBROSA = True
 except ImportError:
     _HAS_LIBROSA = False
+
+
+def _print_console_safe(message: str) -> None:
+    """콘솔 인코딩(예: Windows 기본 cp949)이 표현 못하는 문자가 메시지에 있어도
+    떨어지지 않게 출력한다. Windows에서 로케일이 cp949인 콘솔에 유니코드
+    구두점(em dash 등)을 그대로 print()하면 UnicodeEncodeError로 프로세스가
+    중단된다 — 이 폴백 경고 하나 때문에 데이터셋 생성 전체가 멎으면 안 되므로
+    인코딩 실패 시 표현 불가 문자를 대체해서라도 출력을 이어간다."""
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(message.encode(encoding, errors="replace").decode(encoding, errors="replace"))
 
 
 @dataclass
@@ -131,7 +145,7 @@ def compute_spectral_features(signal: np.ndarray, config: FeatureConfig) -> dict
 def compute_mfcc(signal: np.ndarray, config: FeatureConfig) -> np.ndarray:
     """MFCC 계산. librosa가 있으면 사용, 없으면 0벡터 반환(경고 출력)."""
     if not _HAS_LIBROSA:
-        print(
+        _print_console_safe(
             "[경고] librosa 미설치 — MFCC는 0벡터로 대체됩니다. "
             "pip install librosa 후 재실행하세요."
         )

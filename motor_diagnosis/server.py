@@ -1032,6 +1032,29 @@ class AppHandler(BaseHTTPRequestHandler):
                         ensure_ascii=False,
                         separators=(",", ":"),
                     ),
+                    "label_policy_version": manifest.get("labelPolicyVersion"),
+                    "snapshot_schema_version": manifest.get("snapshotSchemaVersion"),
+                    "label_counts": (
+                        json.dumps(
+                            manifest["labelCounts"],
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if "labelCounts" in manifest
+                        else None
+                    ),
+                    "training_eligible_count": manifest.get("trainingEligibleCount"),
+                    "training_eligible_split_counts": (
+                        json.dumps(
+                            manifest["trainingEligibleSplitCounts"],
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if "trainingEligibleSplitCounts" in manifest
+                        else None
+                    ),
                     "split_policy": manifest["splitPolicy"],
                 }
             )
@@ -1062,6 +1085,9 @@ class AppHandler(BaseHTTPRequestHandler):
             "ground_truth_source",
             "target_label",
             "target_label_taxonomy_version",
+            "label_status",
+            "training_eligible",
+            "event_reviewed",
             "dataset_split",
             "dataset_id",
             "source_filters",
@@ -1078,6 +1104,11 @@ class AppHandler(BaseHTTPRequestHandler):
             "operating_conditions",
             "label_mapping",
             "label_priority",
+            "label_policy_version",
+            "snapshot_schema_version",
+            "label_counts",
+            "training_eligible_count",
+            "training_eligible_split_counts",
             "split_policy",
         ]
         output = io.StringIO()

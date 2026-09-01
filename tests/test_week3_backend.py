@@ -1020,7 +1020,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(rows[2]["event_id"], "EV-241")
         self.assertEqual(rows[2]["event_label"], "needs_review")
         self.assertIsNone(rows[2]["label_taxonomy_version"])
-        self.assertIsNone(exported["manifest"]["labelTaxonomyVersion"])
+        self.assertEqual(exported["manifest"]["labelTaxonomyVersion"], "ACOUSTIC-V1")
         self.assertEqual(exported["manifest"]["exportType"], "internal_telemetry")
         self.assertEqual(exported["manifest"]["source"]["uri"], "api://telemetry")
         self.assertEqual(
@@ -1030,6 +1030,8 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
     def test_dataset_export_applies_registered_label_mapping(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
+        event["label"] = "confirmed_anomaly"
+        event["reviewed"] = True
         event_time = parse_rfc3339("occurredAt", event["occurredAt"])
         self.add_split_ready_telemetry(event_time + timedelta(seconds=10))
         dataset = create_dataset_version(
@@ -1040,7 +1042,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
                     "siteId": "SITE-01",
                     "assetId": "SITE-01-MOT-02",
                 },
-                label_mapping={"needs_review": "BEARING_SUSPECT"},
+                label_mapping={"confirmed_anomaly": "BEARING_SUSPECT"},
             ),
         )
 
@@ -1054,7 +1056,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
         self.assertEqual(exported["rows"][0]["event_label"], "BEARING_SUSPECT")
         self.assertEqual(exported["rows"][0]["label_taxonomy_version"], "ACOUSTIC-V1")
         self.assertEqual(
-            exported["manifest"]["labelMapping"]["needs_review"],
+            exported["manifest"]["labelMapping"]["confirmed_anomaly"],
             "BEARING_SUSPECT",
         )
         self.assertEqual(
@@ -1620,6 +1622,17 @@ class Week3DataBoundaryTest(unittest.TestCase):
                 "isSynthetic": True,
                 "vibrationUnitNote": "+raw accelerometer output; not mm/s",
                 "acousticUnitNote": "raw waveform RMS; not dB SPL",
+                "labelProvenance": {
+                    "principalId": "service-telemetry-validation",
+                    "principalType": "service",
+                    "submittedAt": "2026-08-24T03:00:01Z",
+                    "fields": [
+                        "scenarioLabel",
+                        "knownVibrationLabel",
+                        "knownAcousticLabel",
+                    ],
+                    "verifiedByServer": True,
+                },
             }
         )
         TELEMETRY_RECORDS.append(record)
@@ -1673,7 +1686,6 @@ class Week3DataBoundaryTest(unittest.TestCase):
                 "known_vibration_label",
                 "known_acoustic_label",
                 "scenario_label",
-                "event_candidate",
             ],
         )
 
@@ -2576,6 +2588,17 @@ class Week3HttpContractTest(unittest.TestCase):
                 "isSynthetic": True,
                 "vibrationUnitNote": "+unsafe spreadsheet value",
                 "acousticUnitNote": "raw waveform RMS; not dB SPL",
+                "labelProvenance": {
+                    "principalId": "service-telemetry-validation",
+                    "principalType": "service",
+                    "submittedAt": "2026-08-24T03:00:01Z",
+                    "fields": [
+                        "scenarioLabel",
+                        "knownVibrationLabel",
+                        "knownAcousticLabel",
+                    ],
+                    "verifiedByServer": True,
+                },
             }
         )
         internal_payload = json.loads(json.dumps(dataset_payload))
@@ -2630,12 +2653,32 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertIn("vibration_peak_hz", reader.fieldnames or [])
         self.assertIn("acoustic_peak_hz", reader.fieldnames or [])
         self.assertIn("label_priority", reader.fieldnames or [])
+        self.assertIn("label_status", reader.fieldnames or [])
+        self.assertIn("training_eligible", reader.fieldnames or [])
+        self.assertIn("event_reviewed", reader.fieldnames or [])
+        self.assertIn("label_policy_version", reader.fieldnames or [])
+        self.assertIn("snapshot_schema_version", reader.fieldnames or [])
+        self.assertIn("label_counts", reader.fieldnames or [])
+        self.assertIn("training_eligible_count", reader.fieldnames or [])
+        self.assertIn("training_eligible_split_counts", reader.fieldnames or [])
         self.assertEqual(first_row["ground_truth_label"], "NORMAL")
         self.assertEqual(first_row["ground_truth_source"], "known_vibration_label")
+        self.assertEqual(first_row["label_status"], "verified")
+        self.assertEqual(first_row["training_eligible"], "True")
         self.assertEqual(first_row["known_acoustic_label"], "'=1+1")
         self.assertEqual(first_row["telemetry_source"], "'@SUM(1,1)")
         self.assertEqual(first_row["vibration_unit_note"], "'+unsafe spreadsheet value")
         self.assertEqual(first_row["is_synthetic"], "True")
+        self.assertEqual(first_row["label_policy_version"], "LABEL-POLICY-V2")
+        self.assertEqual(first_row["snapshot_schema_version"], "2")
+        self.assertEqual(
+            sum(json.loads(first_row["label_counts"]).values()),
+            int(first_row["normalized_record_count"]),
+        )
+        unlabeled_row = next(row for row in reader if row["sequence"] == "2")
+        self.assertEqual(unlabeled_row["scenario_label"], "")
+        self.assertEqual(unlabeled_row["known_vibration_label"], "")
+        self.assertEqual(unlabeled_row["known_acoustic_label"], "")
         self.assertEqual(
             int(first_row["source_record_count"]),
             int(first_row["normalized_record_count"]),

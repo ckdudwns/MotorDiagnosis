@@ -35,11 +35,16 @@ from register_dataset import (  # noqa: E402
     group_split,
     compute_version_checksum,
     compute_feature_output_fingerprint,
+    dataset_export_label_fields,
+    summarize_dataset_labels,
     validate_split_ratios,
     sha256_of_file,
     extract_all_features,
     DATASET_LABEL_MAPPING,
+    DATASET_EXPORT_LABEL_FIELDS,
     LABEL_TAXONOMY_VERSION,
+    LABEL_POLICY_VERSION,
+    SNAPSHOT_SCHEMA_VERSION,
     FEATURE_PIPELINE_VERSION,
     InsufficientAssetGroupsError,
 )
@@ -302,6 +307,16 @@ class TestComputeVersionChecksum(unittest.TestCase):
         차이(MFCC 0벡터 폴백 등)로 실제 산출된 특징값이 달라지면, 다른 입력이
         전부 같아도 fingerprint를 통해 체크섬이 달라져야 한다."""
         changed = self._checksum(feature_output_fingerprint="sha256:different-fingerprint")
+        self.assertNotEqual(self._checksum(), changed)
+
+    def test_changes_when_label_policy_version_changes(self):
+        """라벨 정책 버전이 바뀌면(v1.3) 같은 원본·특징이어도 다른 데이터셋 버전이어야
+        한다 — 신규 데이터셋이 기존 frozen id를 재사용하는 것을 막는다."""
+        changed = self._checksum(label_policy_version="LABEL-POLICY-V3")
+        self.assertNotEqual(self._checksum(), changed)
+
+    def test_changes_when_snapshot_schema_version_changes(self):
+        changed = self._checksum(snapshot_schema_version="3")
         self.assertNotEqual(self._checksum(), changed)
 
 
@@ -569,6 +584,64 @@ class TestJsonDumpsRejectNonFiniteValues(unittest.TestCase):
             )
 
 
+class TestDatasetExportLabelFields(unittest.TestCase):
+    """API 명세서 v1.3 DatasetExportRow: CWRU known_label은 신뢰된 외부 라벨이므로
+    매핑 성공 행은 verified/training_eligible, 매핑 실패는 unmapped, 라벨 없음은
+    unlabeled. scenario_label 등 텔레메트리 전용 필드는 항상 None."""
+
+    _TAX = "CWRU-FAULT-V1"
+
+    def test_mapped_known_label_is_verified_and_trainable(self):
+        info = dataset_export_label_fields(
+            {"known_label": "BEARING_FAULT_INNER", "common_label": "ANOMALY"},
+            DATASET_LABEL_MAPPING, self._TAX,
+        )
+        self.assertEqual(info["label_status"], "verified")
+        self.assertTrue(info["training_eligible"])
+        self.assertEqual(info["ground_truth_label"], "BEARING_FAULT_INNER")
+        self.assertEqual(info["ground_truth_source"], "dataset_registration")
+        self.assertEqual(info["target_label"], "ANOMALY")
+        self.assertEqual(info["target_label_taxonomy_version"], self._TAX)
+        self.assertIsNone(info["scenario_label"])
+        self.assertFalse(info["event_reviewed"])
+
+    def test_unmapped_known_label_is_excluded_from_training(self):
+        info = dataset_export_label_fields(
+            {"known_label": "UNSEEN_FAULT"}, DATASET_LABEL_MAPPING, self._TAX
+        )
+        self.assertEqual(info["label_status"], "unmapped")
+        self.assertFalse(info["training_eligible"])
+        self.assertEqual(info["ground_truth_label"], "UNSEEN_FAULT")
+        self.assertIsNone(info["target_label"])
+        self.assertIsNone(info["target_label_taxonomy_version"])
+
+    def test_missing_known_label_is_unlabeled(self):
+        for row in ({"known_label": None}, {"known_label": ""}, {}):
+            info = dataset_export_label_fields(row, DATASET_LABEL_MAPPING, self._TAX)
+            self.assertEqual(info["label_status"], "unlabeled")
+            self.assertFalse(info["training_eligible"])
+            self.assertIsNone(info["ground_truth_label"])
+            self.assertIsNone(info["ground_truth_source"])
+
+    def test_summarize_counts_and_split_breakdown(self):
+        rows = [
+            {"known_label": "NORMAL", "split": "train"},
+            {"known_label": "BEARING_FAULT_BALL", "split": "validation"},
+            {"known_label": "UNSEEN", "split": "test"},
+            {"known_label": None, "split": "train"},
+        ]
+        summary = summarize_dataset_labels(rows, DATASET_LABEL_MAPPING, self._TAX)
+        self.assertEqual(
+            summary["labelCounts"],
+            {"verified": 2, "weak": 0, "unlabeled": 1, "unmapped": 1},
+        )
+        self.assertEqual(summary["trainingEligibleCount"], 2)
+        self.assertEqual(
+            summary["trainingEligibleSplitCounts"],
+            {"train": 1, "validation": 1, "test": 0},
+        )
+
+
 class TestExportDatasetSynthetic(unittest.TestCase):
     """CWRU 실데이터 없이도 openpyxl XLSX 내보내기 자체를 검증하는 합성 매니페스트 테스트."""
 
@@ -613,6 +686,8 @@ class TestExportDatasetSynthetic(unittest.TestCase):
             },
             "labelTaxonomyVersion": "CWRU-FAULT-V1",
             "labelMapping": DATASET_LABEL_MAPPING,
+            "labelPolicyVersion": LABEL_POLICY_VERSION,
+            "snapshotSchemaVersion": SNAPSHOT_SCHEMA_VERSION,
             "split": {"train": 0.5, "validation": 0.0, "test": 0.5},
             "splitStrategy": "test",
             "status": "draft",
@@ -620,6 +695,7 @@ class TestExportDatasetSynthetic(unittest.TestCase):
             "createdAt": "1970-01-01T00:00:00+00:00",
             "rowCount": len(rows),
             "splitCounts": {"train": 1, "validation": 0, "test": 1},
+            **summarize_dataset_labels(rows, DATASET_LABEL_MAPPING, "CWRU-FAULT-V1"),
             "rows": rows,
         }
 
@@ -638,6 +714,49 @@ class TestExportDatasetSynthetic(unittest.TestCase):
             self.assertEqual(wb["rows"].max_row - 1, manifest["rowCount"])
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_export_csv_has_v13_label_columns_with_verified_status(self):
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_labels_")
+        try:
+            result = export_dataset(manifest, tmp_dir)
+            with open(result["csv_path"], newline="", encoding="utf-8") as f:
+                csv_rows = list(csv.DictReader(f))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        for field in DATASET_EXPORT_LABEL_FIELDS:
+            self.assertIn(field, csv_rows[0])
+        # 합성 매니페스트의 두 known_label은 모두 labelMapping에 있다 → verified.
+        for row in csv_rows:
+            self.assertEqual(row["label_status"], "verified")
+            self.assertEqual(row["training_eligible"], "True")
+            self.assertEqual(row["ground_truth_source"], "dataset_registration")
+            self.assertEqual(row["ground_truth_label"], row["known_label"])
+            self.assertEqual(row["target_label"], row["common_label"])
+            self.assertEqual(row["target_label_taxonomy_version"], "CWRU-FAULT-V1")
+            self.assertEqual(row["scenario_label"], "")  # CSV 빈 셀
+            self.assertEqual(row["event_reviewed"], "False")
+
+    def test_export_manifest_json_has_label_summary_and_policy_versions(self):
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_summary_")
+        try:
+            result = export_dataset(manifest, tmp_dir)
+            with open(result["manifest_path"], encoding="utf-8") as f:
+                exported = json.load(f)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual(exported["labelPolicyVersion"], LABEL_POLICY_VERSION)
+        self.assertEqual(exported["snapshotSchemaVersion"], SNAPSHOT_SCHEMA_VERSION)
+        self.assertEqual(sum(exported["labelCounts"].values()), exported["rowCount"])
+        self.assertEqual(exported["labelCounts"]["verified"], exported["rowCount"])
+        self.assertEqual(exported["trainingEligibleCount"], exported["rowCount"])
+        self.assertEqual(
+            sum(exported["trainingEligibleSplitCounts"].values()),
+            exported["trainingEligibleCount"],
+        )
 
     def test_failed_export_does_not_corrupt_previous_version(self):
         """CSV/XLSX/manifest를 output_dir에 바로 순차 기록하면, 뒤쪽 파일
@@ -869,6 +988,37 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
         with open(self.export_result["csv_path"], newline="", encoding="utf-8") as f:
             csv_rows = list(csv.DictReader(f))
         self.assertEqual(len(csv_rows), self.manifest["rowCount"])
+
+    def test_all_cwru_rows_verified_and_training_eligible(self):
+        # CWRU 원본 라벨 4종은 모두 labelMapping에 있으므로 전 행 verified.
+        self.assertEqual(
+            self.manifest["labelCounts"],
+            {
+                "verified": self.manifest["rowCount"],
+                "weak": 0,
+                "unlabeled": 0,
+                "unmapped": 0,
+            },
+        )
+        self.assertEqual(
+            self.manifest["trainingEligibleCount"], self.manifest["rowCount"]
+        )
+        self.assertEqual(
+            sum(self.manifest["trainingEligibleSplitCounts"].values()),
+            self.manifest["rowCount"],
+        )
+        self.assertEqual(self.manifest["labelPolicyVersion"], LABEL_POLICY_VERSION)
+        self.assertEqual(
+            self.manifest["snapshotSchemaVersion"], SNAPSHOT_SCHEMA_VERSION
+        )
+
+    def test_exported_csv_carries_v13_label_columns(self):
+        with open(self.export_result["csv_path"], newline="", encoding="utf-8") as f:
+            csv_rows = list(csv.DictReader(f))
+        for field in DATASET_EXPORT_LABEL_FIELDS:
+            self.assertIn(field, csv_rows[0])
+        self.assertTrue(all(r["label_status"] == "verified" for r in csv_rows))
+        self.assertTrue(all(r["training_eligible"] == "True" for r in csv_rows))
 
     def test_exported_manifest_json_excludes_rows_and_has_artifact_refs(self):
         with open(self.export_result["manifest_path"], encoding="utf-8") as f:

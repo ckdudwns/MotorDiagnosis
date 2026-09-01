@@ -48,6 +48,14 @@ def freeze_dataset_version(manifest: dict) -> dict:
     frozen = copy.deepcopy(manifest)
     frozen["status"] = "frozen"
     frozen["datasetChecksum"] = compute_dataset_checksum(manifest)
+    # API 명세서 v1.3: 라벨 정책·snapshot 스키마 버전과 동결 시점 snapshot checksum을
+    # 함께 남긴다. snapshotChecksum은 3주차 compute_version_checksum() 결과
+    # (source.checksum)를 그대로 재사용한다 — 원본 파일·전처리·특징 산출물·라벨
+    # 정책까지 반영된 불변 체크섬이다. 구버전 draft(해당 키 없음)는 None으로 남겨
+    # 기존 frozen 데이터셋을 재계산·변경하지 않는다.
+    frozen["labelPolicyVersion"] = manifest.get("labelPolicyVersion")
+    frozen["snapshotSchemaVersion"] = manifest.get("snapshotSchemaVersion")
+    frozen["snapshotChecksum"] = manifest.get("source", {}).get("checksum")
     frozen["frozenAt"] = _now_iso()
     return frozen
 

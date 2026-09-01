@@ -2,7 +2,7 @@
 
 Bind Edge AI 프로젝트 3주차, AI-1 담당 영역.
 
-3주차 기능정의서(W3.2, 2026-08-24)와 API 명세서(v1.2)를 기준으로 작업했다. 원래
+3주차 기능정의서(W3.2, 2026-08-24)와 API 명세서(v1.3)를 기준으로 작업했다. 원래
 초안(W3.1)과 달리 **DATA_EXPORT_01의 범위가 "기존 공개·보유 데이터셋 선정·정규화"로
 확장**되었고, AI-1의 착수 순서도 재조정되었다. 이 폴더의 4개 기능은 "선행일정" 시트에
 명시된 순서 그대로 작업했다:
@@ -48,10 +48,13 @@ ai/ai1/week3/ai1/
 MIMII 음향 데이터는 이 저장소에 실제 파일이 배치돼 있지 않아(로더 코드만 존재),
 이번 3주차 등록·내보내기는 **CWRU Bearing Dataset(진동)만** 대상으로 했다.
 
-`register_dataset.py`가 CWRU 16개 `.mat` 파일(라벨당 부하조건 4개)을 API 명세서 v1.2
-`POST /api/datasets` 계약(`source`/`compatibility`/`labelMapping`/`split`) 형태의 매니페스트로 정규화하고,
+`register_dataset.py`가 CWRU 16개 `.mat` 파일(라벨당 부하조건 4개)을 API 명세서 v1.3
+`POST /api/datasets` 계약(`source`/`compatibility`/`labelMapping`/`split` +
+`labelPolicyVersion`/`snapshotSchemaVersion`/`labelCounts`) 형태의 매니페스트로 정규화하고,
 `export_dataset.py`가 `dataset_manifest.json`(GET 응답 형태) + `dataset_rows.csv` +
-`dataset_export.xlsx`(manifest/rows 2개 시트)로 내보낸다.
+`dataset_export.xlsx`(manifest/rows 2개 시트)로 내보낸다. CSV/XLSX 행에는 v1.3
+`DatasetExportRow` 라벨 컬럼(`label_status`/`training_eligible`/`ground_truth_*`/`target_label*`)이
+붙는다 — CWRU 원본 라벨은 신뢰된 외부 라벨이라 전 행 `verified`/`training_eligible`.
 
 **XLSX 내보내기는 루트 `requirements.txt`에 없는 `openpyxl`이 필요하다** — 실행·테스트
 전에 이 폴더의 의존성을 추가로 설치해야 한다:

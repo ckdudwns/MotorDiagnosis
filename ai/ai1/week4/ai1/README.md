@@ -1,7 +1,7 @@
 # AI-1 — 4주차 (통합 시연·AI 학습 준비 / 기존 데이터셋 베이스라인)
 
 Bind Edge AI 프로젝트 4주차, AI-1 담당 영역. 4주차 기능정의서(W4.2, 2026-08-24)와
-API 명세서(v1.2) 기준으로 작업했다. "선행일정" 시트 순서 그대로 진행했다:
+API 명세서(v1.3) 기준으로 작업했다. "선행일정" 시트 순서 그대로 진행했다:
 
 | 순서 | 기능ID | 폴더 | 상태 |
 |---|---|---|---|
@@ -38,6 +38,12 @@ ai/ai1/week4/ai1/
 `draft → frozen → approved` 상태 머신으로 동결·승인한다. 동결 시점에 `rows`/`labelMapping`/
 `split`만으로 `datasetChecksum`(sha256)을 계산해 저장하고, 나중에 같은 `seed`로 다시
 만든 매니페스트와 비교해 "동일 데이터셋 버전을 재현할 수 있다"는 수용 기준을 검증한다.
+
+API 명세서 v1.3에서 추가된 `labelPolicyVersion`(`LABEL-POLICY-V2`)·`snapshotSchemaVersion`(`2`)·
+`snapshotChecksum`도 동결 산출물에 남긴다. `snapshotChecksum`은 3주차
+`compute_version_checksum()` 결과를 재사용하고, `datasetChecksum` 계산식은 그대로 둬
+이미 동결·재현성 검증된 데이터셋은 영향받지 않는다(라벨 정책이 바뀐 신규 데이터셋만
+다른 `id`를 받는다).
 
 `model_version.py`는 API 명세서 FUT-005~007(모델 버전 등록/승인/롤백), FUT-010~011
 (기준선 버전 등록/승인)을 데이터 구조로 옮겼다. 롤백은 `approved` 상태의 대상으로만

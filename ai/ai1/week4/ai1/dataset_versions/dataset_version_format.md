@@ -54,6 +54,28 @@ checksum = "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 `createdAt`처럼 실행마다 달라지는 필드는 포함하지 않는다 — 같은 `seed`로 다시 실행한
 매니페스트가 같은 체크섬을 내야 재현성 검증이 의미가 있기 때문이다.
 
+**이 계산식은 바꾸지 않는다** — 아래 v1.3 신규 필드를 추가해도 `datasetChecksum` payload는
+`rows`/`labelMapping`/`split` 그대로라, 이미 동결·재현성 검증된 데이터셋이 영향을 받지 않는다.
+
+## v1.3 신규 필드 (`labelPolicyVersion` / `snapshotSchemaVersion` / `snapshotChecksum`)
+
+API 명세서 v1.3 `05_데이터모델`이 데이터셋 버전에 3개 필드를 추가했다. `freeze_dataset_version()`이
+draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다:
+
+| 필드 | 값 | 출처 |
+|---|---|---|
+| `labelPolicyVersion` | `LABEL-POLICY-V2` | 3주차 `register_dataset.build_manifest()`가 채운 값. 없으면(구버전 draft) `None` |
+| `snapshotSchemaVersion` | `2` | 위와 동일 |
+| `snapshotChecksum` | `manifest["source"]["checksum"]` | 3주차 `compute_version_checksum()` 결과를 **그대로 재사용** — 원본 파일 sha256 + 전처리/분할/특징 설정 + 실제 특징 산출물 fingerprint + **라벨 정책 버전**까지 반영된 불변 체크섬. 별도 계산 로직을 새로 두지 않는다 |
+
+- **정책 버전은 `id`(fingerprint)에 포함**: `compute_version_checksum()` payload에
+  `label_policy_version`/`snapshot_schema_version`이 들어가므로, 라벨 정책이 바뀐 신규
+  데이터셋은 기존 frozen 버전과 **다른 `id`**를 받는다.
+- **기존에 동결된 데이터셋은 재계산·변경하지 않는다**. `freeze`는 항상 draft→신규 frozen을
+  만들 뿐이고, 이미 커밋된 frozen 산출물은 이 변경으로 다시 쓰이지 않는다.
+- `approve_dataset_version()`은 frozen을 `copy.deepcopy`하므로 3개 필드가 자동 승계되고,
+  `dataset_version_summary()`도 깊은 복사한 뒤 `rows`만 빼므로 자동 노출된다.
+
 ## 모델 버전 (`model_version.py`, `ModelVersion`)
 
 ```json

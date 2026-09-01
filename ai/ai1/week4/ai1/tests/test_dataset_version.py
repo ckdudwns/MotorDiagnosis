@@ -52,6 +52,15 @@ def _draft_manifest() -> dict:
     }
 
 
+def _draft_manifest_v13() -> dict:
+    """API 명세서 v1.3 build_manifest() 출력을 흉내낸 draft (신규 정책·버전 필드 포함)."""
+    manifest = _draft_manifest()
+    manifest["source"] = {"type": "external", "checksum": "sha256:cwru-version-checksum"}
+    manifest["labelPolicyVersion"] = "LABEL-POLICY-V2"
+    manifest["snapshotSchemaVersion"] = "2"
+    return manifest
+
+
 class TestDatasetVersionStateMachine(unittest.TestCase):
     def test_freeze_sets_status_and_checksum(self):
         frozen = freeze_dataset_version(_draft_manifest())
@@ -158,6 +167,52 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         summary["labelMapping"]["FAULT"] = "TAMPERED"
         self.assertEqual(approved["labelMapping"]["FAULT"], "ANOMALY")
         self.assertEqual(approved["datasetChecksum"], compute_dataset_checksum(approved))
+
+
+class TestDatasetVersionV13LabelPolicyFields(unittest.TestCase):
+    """API 명세서 v1.3: 동결 산출물에 labelPolicyVersion·snapshotSchemaVersion·
+    snapshotChecksum을 남긴다. snapshotChecksum은 3주차 compute_version_checksum()
+    결과(source.checksum)를 재사용한다. 기존 재현성 검증(datasetChecksum)은 그대로다."""
+
+    def test_freeze_carries_policy_and_schema_and_snapshot_checksum(self):
+        frozen = freeze_dataset_version(_draft_manifest_v13())
+        self.assertEqual(frozen["labelPolicyVersion"], "LABEL-POLICY-V2")
+        self.assertEqual(frozen["snapshotSchemaVersion"], "2")
+        self.assertEqual(frozen["snapshotChecksum"], "sha256:cwru-version-checksum")
+
+    def test_freeze_leaves_fields_none_for_pre_v13_draft(self):
+        # source.checksum / 정책 버전이 없는 구버전 draft는 None으로 남겨 기존 frozen
+        # 데이터셋을 재계산·변경하지 않는다.
+        frozen = freeze_dataset_version(_draft_manifest())
+        self.assertIsNone(frozen["labelPolicyVersion"])
+        self.assertIsNone(frozen["snapshotSchemaVersion"])
+        self.assertIsNone(frozen["snapshotChecksum"])
+
+    def test_dataset_checksum_and_reproducibility_unaffected_by_new_fields(self):
+        # 신규 필드는 rows/labelMapping/split 밖이라 datasetChecksum에 영향을 주지 않는다.
+        frozen = freeze_dataset_version(_draft_manifest_v13())
+        self.assertEqual(frozen["datasetChecksum"], compute_dataset_checksum(frozen))
+        recomputed = _draft_manifest_v13()  # 같은 내용, 다른 인스턴스
+        self.assertTrue(verify_reproducibility(frozen, recomputed))
+        self.assertEqual(
+            frozen["datasetChecksum"],
+            freeze_dataset_version(_draft_manifest())["datasetChecksum"],
+        )
+
+    def test_approve_carries_new_fields(self):
+        approved = approve_dataset_version(
+            freeze_dataset_version(_draft_manifest_v13()),
+            approved_by="mgr", reason="검증 완료",
+        )
+        self.assertEqual(approved["labelPolicyVersion"], "LABEL-POLICY-V2")
+        self.assertEqual(approved["snapshotChecksum"], "sha256:cwru-version-checksum")
+
+    def test_summary_exposes_and_deep_copies_new_fields(self):
+        frozen = freeze_dataset_version(_draft_manifest_v13())
+        summary = dataset_version_summary(frozen)
+        self.assertEqual(summary["snapshotSchemaVersion"], "2")
+        summary["snapshotSchemaVersion"] = "TAMPERED"
+        self.assertEqual(frozen["snapshotSchemaVersion"], "2")
 
 
 class TestModelVersionLifecycle(unittest.TestCase):

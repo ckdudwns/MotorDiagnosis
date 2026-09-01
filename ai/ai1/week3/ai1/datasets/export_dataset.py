@@ -24,6 +24,8 @@ from openpyxl import Workbook, load_workbook
 
 from register_dataset import (  # noqa: E402
     build_manifest,
+    dataset_export_label_fields,
+    DATASET_EXPORT_LABEL_FIELDS,
     _DEFAULT_DATA_DIR,
     DEFAULT_SPLIT_RATIOS,
 )
@@ -76,17 +78,31 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
     if not rows:
         raise ValueError("내보낼 행이 없습니다 (manifest['rows']가 비어 있음).")
 
+    # 매니페스트 rows(윈도우별 특징값)는 그대로 두고, export 산출물에만 v1.3
+    # DatasetExportRow 라벨 필드를 파생 컬럼으로 붙인다 — label_status/training_eligible
+    # 등은 known_label + labelMapping의 결정적 함수라 특징 산출물 fingerprint에는
+    # 넣지 않는다.
+    label_mapping = manifest["labelMapping"]
+    taxonomy_version = manifest["labelTaxonomyVersion"]
+    export_rows = [
+        {
+            **row,
+            **dataset_export_label_fields(row, label_mapping, taxonomy_version),
+        }
+        for row in rows
+    ]
+
     version_id = manifest["id"]
     version_dir = os.path.join(versions_dir, version_id)
 
     staging_dir = tempfile.mkdtemp(prefix=".export-staging-", dir=versions_dir)
     try:
         csv_path = os.path.join(staging_dir, "dataset_rows.csv")
-        fieldnames = list(rows[0].keys())
+        fieldnames = list(rows[0].keys()) + list(DATASET_EXPORT_LABEL_FIELDS)
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(export_rows)
 
         xlsx_path = os.path.join(staging_dir, "dataset_export.xlsx")
         wb = Workbook()
@@ -115,6 +131,12 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
         rpm_range = manifest["compatibility"]["operatingConditions"]["rpmRange"]
         manifest_sheet.append(["compatibility.operatingConditions.rpmRange", str(rpm_range)])
         manifest_sheet.append(["labelTaxonomyVersion", manifest["labelTaxonomyVersion"]])
+        manifest_sheet.append(
+            ["labelPolicyVersion", manifest.get("labelPolicyVersion")]
+        )
+        manifest_sheet.append(
+            ["snapshotSchemaVersion", manifest.get("snapshotSchemaVersion")]
+        )
         for src_label, common_label in manifest["labelMapping"].items():
             manifest_sheet.append([f"labelMapping.{src_label}", common_label])
         manifest_sheet.append(["split.train", manifest["split"]["train"]])
@@ -127,10 +149,22 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
         manifest_sheet.append(["rowCount", manifest["rowCount"]])
         for split_name, count in manifest["splitCounts"].items():
             manifest_sheet.append([f"splitCounts.{split_name}", count])
+        for status, count in (manifest.get("labelCounts") or {}).items():
+            manifest_sheet.append([f"labelCounts.{status}", count])
+        if "trainingEligibleCount" in manifest:
+            manifest_sheet.append(
+                ["trainingEligibleCount", manifest["trainingEligibleCount"]]
+            )
+        for split_name, count in (
+            manifest.get("trainingEligibleSplitCounts") or {}
+        ).items():
+            manifest_sheet.append(
+                [f"trainingEligibleSplitCounts.{split_name}", count]
+            )
 
         rows_sheet = wb.create_sheet("rows")
         rows_sheet.append(fieldnames)
-        for row in rows:
+        for row in export_rows:
             rows_sheet.append([row.get(name) for name in fieldnames])
 
         wb.save(xlsx_path)
@@ -251,6 +285,12 @@ if __name__ == "__main__":
     result = export_dataset(manifest, args.output_dir)
 
     print(f"{result['row_count']}행 내보내기 완료")
+    print(
+        f"  라벨: {manifest['labelCounts']} / "
+        f"학습가능 {manifest['trainingEligibleCount']}건 "
+        f"{manifest['trainingEligibleSplitCounts']} "
+        f"(정책 {manifest['labelPolicyVersion']}, 스키마 {manifest['snapshotSchemaVersion']})"
+    )
     print(f"  매니페스트: {result['manifest_path']}")
     print(f"  CSV: {result['csv_path']}")
     print(f"  XLSX: {result['xlsx_path']}")

@@ -1,10 +1,11 @@
 """
 기존 데이터셋 등록 매니페스트 빌더 (AI-1, 3주차 DATA_EXPORT_01)
 
-CWRU Bearing Dataset(1주차 인계 경로의 .mat 4개)을 API 명세서 v1.2
+CWRU Bearing Dataset(1주차 인계 경로의 .mat 4개)을 API 명세서 v1.3
 `09_보완API상세` 시트의 `POST /api/datasets`(MVP-042) 계약에 맞춰 정규화한
-불변 데이터셋 버전 매니페스트로 만든다. 필드 정의와 분할 전략의 근거는
-`dataset_manifest_format.md`를 참고한다.
+불변 데이터셋 버전 매니페스트로 만든다 — v1.3의 `labelPolicyVersion`/
+`snapshotSchemaVersion`과 export 행 라벨 상태까지 반영한다. 필드 정의와 분할
+전략의 근거는 `dataset_manifest_format.md`를 참고한다.
 
 원본 데이터/로더는 1주차 경로(`ai/ai1/week1/ai1/`)의 것을 그대로 재사용하고
 복제하지 않는다. 특징값 계산도 week2의 `extract_all_features()`를 그대로
@@ -104,6 +105,24 @@ FEATURE_PIPELINE_VERSION = "week2.extract_all_features+week1.peak_hz.v2"
 
 # 매니페스트 rows에 붙이는 피크 주파수 특징 이름 (week4 features.py와 동일).
 PEAK_FEATURE_NAME = "vibration_peak_hz"
+
+# API 명세서 v1.3 `05_데이터모델`의 라벨 정책·snapshot 스키마 버전.
+# 신규 데이터셋은 이 값을 fingerprint(compute_version_checksum)와 manifest에 포함해
+# 동결한다 — 정책이 바뀌면 다른 id가 나온다. 기존 frozen 데이터셋은 재계산하지 않는다.
+LABEL_POLICY_VERSION = "LABEL-POLICY-V2"
+SNAPSHOT_SCHEMA_VERSION = "2"
+
+# export 행의 라벨 상태 값 (v1.3 DatasetExportRow.label_status).
+#   verified  = 신뢰된 라벨 + taxonomy 매핑 성공 → 지도학습 사용
+#   weak      = 미검수 이벤트 후보만 존재 → 학습 제외 (CWRU 공개 데이터셋 경로에서는
+#               이벤트가 없어 발생하지 않음. parity 위해 값만 정의)
+#   unlabeled = 라벨·후보 없음
+#   unmapped  = 신뢰 라벨은 있으나 taxonomy 매핑 실패
+LABEL_STATUSES = ("verified", "weak", "unlabeled", "unmapped")
+
+# CWRU known_label의 출처: 공개 데이터셋 파일→라벨 맵(신뢰된 import).
+# source/isSynthetic이 아니라 이 검증 가능한 출처로만 supervised target을 승격한다.
+DATASET_REGISTRATION_LABEL_SOURCE = "dataset_registration"
 
 
 def sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
@@ -401,16 +420,21 @@ def compute_version_checksum(
     feature_config: FeatureConfig,
     feature_output_fingerprint: str,
     feature_pipeline_version: str = FEATURE_PIPELINE_VERSION,
+    label_policy_version: str = LABEL_POLICY_VERSION,
+    snapshot_schema_version: str = SNAPSHOT_SCHEMA_VERSION,
 ) -> str:
     """원본 파일·라벨·전처리/분할/특징 추출 설정 + 실제 산출물로 불변 버전 체크섬을 만든다.
 
     입력 파일 sha256 + **파일별 source label**, window/hop 크기, 분할 비율,
     seed, label taxonomy 버전, label mapping, 특징 추출 설정(FeatureConfig:
     sample_rate/frame_length/hop_length/n_mfcc/band_edges), 파이프라인 버전,
+    라벨 정책·snapshot 스키마 버전(API 명세서 v1.3),
     **실제 계산된 특징값의 fingerprint(compute_feature_output_fingerprint())**
     중 하나라도 달라지면 다른 체크섬이 나와야 한다. feature_output_fingerprint를
     포함해야 librosa 유무처럼 소스 코드/설정에는 드러나지 않는 실행 환경
     차이(MFCC 0벡터 폴백 등)로 산출물이 달라진 경우까지 잡아낼 수 있다.
+    label_policy_version을 포함해야 라벨 정책이 바뀐 신규 데이터셋이 기존 frozen
+    버전과 같은 id를 재사용하지 않는다.
     """
     payload = {
         "files": {
@@ -432,11 +456,95 @@ def compute_version_checksum(
             "band_edges": list(feature_config.band_edges),
         },
         "feature_output_fingerprint": feature_output_fingerprint,
+        "label_policy_version": label_policy_version,
+        "snapshot_schema_version": snapshot_schema_version,
     }
     encoded = json.dumps(
         payload, sort_keys=True, ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+# export 행에 붙는 v1.3 DatasetExportRow 라벨 필드의 고정 순서(CSV/XLSX 컬럼 순서).
+DATASET_EXPORT_LABEL_FIELDS = (
+    "scenario_label",
+    "known_vibration_label",
+    "known_acoustic_label",
+    "ground_truth_label",
+    "ground_truth_source",
+    "target_label",
+    "target_label_taxonomy_version",
+    "label_status",
+    "training_eligible",
+    "event_reviewed",
+)
+
+
+def dataset_export_label_fields(
+    row: dict, label_mapping: dict, taxonomy_version: str
+) -> dict:
+    """CWRU 매니페스트 행 하나에 대한 v1.3 라벨 필드 dict를 만든다.
+
+    CWRU의 ``known_label``은 공개 데이터셋 파일→라벨 맵에서 온 **신뢰된 외부 라벨**
+    (검증 가능한 출처: ``dataset_registration``)이므로, taxonomy 매핑에 성공한 행은
+    전부 ``label_status="verified"`` / ``training_eligible=True``다. 미검수 이벤트·모델
+    판정 같은 약한 후보는 이 경로에 존재하지 않는다.
+
+    - ``known_label`` ∈ ``label_mapping``  → verified, target_label = 공통 라벨
+    - ``known_label`` 있으나 매핑 실패      → unmapped, target_label = None (학습 제외)
+    - ``known_label`` 없음/빈값             → unlabeled (학습 제외)
+    """
+    known_label = str(row.get("known_label") or "").strip() or None
+    fields = {
+        "scenario_label": None,
+        "known_vibration_label": None,
+        "known_acoustic_label": None,
+        "ground_truth_label": known_label,
+        "ground_truth_source": (
+            DATASET_REGISTRATION_LABEL_SOURCE if known_label else None
+        ),
+        "target_label": None,
+        "target_label_taxonomy_version": None,
+        "label_status": "unlabeled",
+        "training_eligible": False,
+        "event_reviewed": False,
+    }
+    if known_label is None:
+        return fields
+    if known_label in label_mapping:
+        fields["target_label"] = label_mapping[known_label]
+        fields["target_label_taxonomy_version"] = taxonomy_version
+        fields["label_status"] = "verified"
+        fields["training_eligible"] = True
+    else:
+        fields["label_status"] = "unmapped"
+    return fields
+
+
+def summarize_dataset_labels(
+    rows: list, label_mapping: dict, taxonomy_version: str
+) -> dict:
+    """행 전체의 라벨 상태 집계 (v1.3 DatasetExportManifest 필드).
+
+    반환: ``{labelCounts: {verified, weak, unlabeled, unmapped},
+    trainingEligibleCount: int, trainingEligibleSplitCounts: {train, validation, test}}``
+    """
+    label_counts = {status: 0 for status in LABEL_STATUSES}
+    eligible_split_counts = {"train": 0, "validation": 0, "test": 0}
+    eligible_total = 0
+    for row in rows:
+        info = dataset_export_label_fields(row, label_mapping, taxonomy_version)
+        label_counts[info["label_status"]] += 1
+        if info["training_eligible"]:
+            eligible_total += 1
+            split = row.get("split")
+            if split in eligible_split_counts:
+                eligible_split_counts[split] += 1
+    return {
+        "labelCounts": label_counts,
+        "trainingEligibleCount": eligible_total,
+        "trainingEligibleSplitCounts": eligible_split_counts,
+    }
 
 
 def build_manifest(
@@ -492,12 +600,18 @@ def build_manifest(
         DATASET_LABEL_MAPPING,
         config,
         compute_feature_output_fingerprint(rows),
+        label_policy_version=LABEL_POLICY_VERSION,
+        snapshot_schema_version=SNAPSHOT_SCHEMA_VERSION,
     )
     source["checksum"] = version_checksum
 
     split_counts = {"train": 0, "validation": 0, "test": 0}
     for split in splits:
         split_counts[split] += 1
+
+    label_summary = summarize_dataset_labels(
+        rows, DATASET_LABEL_MAPPING, LABEL_TAXONOMY_VERSION
+    )
 
     version_short_hash = version_checksum.split(":", 1)[1][:12]
     return {
@@ -510,6 +624,8 @@ def build_manifest(
         "compatibility": compatibility,
         "labelTaxonomyVersion": LABEL_TAXONOMY_VERSION,
         "labelMapping": DATASET_LABEL_MAPPING,
+        "labelPolicyVersion": LABEL_POLICY_VERSION,
+        "snapshotSchemaVersion": SNAPSHOT_SCHEMA_VERSION,
         "split": split_ratios,
         "splitStrategy": (
             "group_split_by_source_file (per-label; whole source_label groups are "
@@ -520,6 +636,9 @@ def build_manifest(
         "createdAt": datetime.now(timezone.utc).isoformat(),
         "rowCount": len(rows),
         "splitCounts": split_counts,
+        "labelCounts": label_summary["labelCounts"],
+        "trainingEligibleCount": label_summary["trainingEligibleCount"],
+        "trainingEligibleSplitCounts": label_summary["trainingEligibleSplitCounts"],
         "rows": rows,
     }
 

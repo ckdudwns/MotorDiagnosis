@@ -49,12 +49,20 @@ ENVIRONMENT_INSPECTION_STATUSES = {
     "critical",
 }
 DATASET_SPLIT_POLICY = "asset_grouped"
-DATASET_LABEL_PRIORITY = [
+DATASET_LABEL_POLICY_VERSION = "LABEL-POLICY-V2"
+DATASET_SNAPSHOT_SCHEMA_VERSION = "2"
+DATASET_LABEL_PRIORITY_V1 = [
     "event_review",
     "known_vibration_label",
     "known_acoustic_label",
     "scenario_label",
     "event_candidate",
+]
+DATASET_LABEL_PRIORITY = [
+    "event_review",
+    "known_vibration_label",
+    "known_acoustic_label",
+    "scenario_label",
 ]
 NON_ASSET_ANOMALY_EVENT_LABELS = {
     "normal_false_positive",
@@ -419,6 +427,12 @@ TELEMETRY_SERVICE_TOKENS = {
         ],
         "allowedDeviceIds": ["*"],
         "allowedDependencyIds": ["mqtt"],
+    },
+    "demo-telemetry-validation-token": {
+        "id": "service-telemetry-validation",
+        "type": "service",
+        "permissions": ["telemetry:ingest", "telemetry:label"],
+        "allowedDeviceIds": ["*"],
     },
 }
 
@@ -2443,6 +2457,34 @@ def principal_can_ingest(principal: dict[str, Any], device_id: str) -> None:
         )
 
 
+def telemetry_label_fields(payload: dict[str, Any]) -> list[str]:
+    return [
+        field
+        for field in (
+            "scenarioLabel",
+            "knownVibrationLabel",
+            "knownAcousticLabel",
+        )
+        if payload.get(field) is not None
+    ]
+
+
+def principal_can_submit_telemetry_labels(
+    principal: dict[str, Any], payload: dict[str, Any]
+) -> list[str]:
+    fields = telemetry_label_fields(payload)
+    permissions = set(principal.get("permissions", []))
+    # Label submission is deliberately narrower than the ordinary wildcard role:
+    # only a principal explicitly provisioned for controlled experiments may use it.
+    if fields and "telemetry:label" not in permissions:
+        raise ApiError(
+            403,
+            "TELEMETRY_LABEL_FORBIDDEN",
+            "The token cannot submit non-null telemetry labels.",
+        )
+    return fields
+
+
 def telemetry_number(
     payload: dict[str, Any], key: str, *, required: bool, nullable: bool
 ) -> float | None:
@@ -2555,13 +2597,25 @@ def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 f"{key} must be present and null for the raw-only contract.",
             )
 
-    scenario_label = payload.get("scenarioLabel")
-    if not isinstance(scenario_label, str) or scenario_label not in TELEMETRY_SCENARIOS:
+    if "scenarioLabel" not in payload:
         raise ApiError(
             400,
             "INVALID_TELEMETRY_PAYLOAD",
-            "scenarioLabel is not supported.",
+            "scenarioLabel is required and may be null.",
         )
+    scenario_label = payload["scenarioLabel"]
+    if scenario_label is not None and (
+        not isinstance(scenario_label, str)
+        or not scenario_label.strip()
+        or scenario_label.strip() not in TELEMETRY_SCENARIOS
+    ):
+        raise ApiError(
+            400,
+            "INVALID_TELEMETRY_PAYLOAD",
+            "scenarioLabel must be null or a supported scenario.",
+        )
+    if isinstance(scenario_label, str):
+        scenario_label = scenario_label.strip()
     is_synthetic = payload.get("isSynthetic")
     if not isinstance(is_synthetic, bool):
         raise ApiError(
@@ -2831,6 +2885,7 @@ def ingest_telemetry(
         try:
             record = normalize_telemetry_payload(payload)
             principal_can_ingest(principal, record["deviceId"])
+            label_fields = principal_can_submit_telemetry_labels(principal, record)
             device = validate_telemetry_mapping(record)
             payload_hash = hashlib.sha256(
                 json.dumps(
@@ -2864,7 +2919,20 @@ def ingest_telemetry(
                 )
 
             received_at = format_rfc3339(datetime.now(timezone.utc))
-            stored_record = {**record, "receivedAt": received_at}
+            label_provenance = None
+            if label_fields:
+                label_provenance = {
+                    "principalId": str(principal.get("id") or "unknown"),
+                    "principalType": str(principal.get("type") or "unknown"),
+                    "submittedAt": received_at,
+                    "fields": sorted(label_fields),
+                    "verifiedByServer": True,
+                }
+            stored_record = {
+                **record,
+                "receivedAt": received_at,
+                "labelProvenance": label_provenance,
+            }
             TELEMETRY_RECORDS.append(stored_record)
             TELEMETRY_IDEMPOTENCY[idempotency_key] = {
                 "payloadHash": payload_hash,
@@ -5061,6 +5129,8 @@ def _dataset_version_fingerprint(
     label_taxonomy_version: str,
     label_mapping: dict[str, str],
     split: dict[str, float],
+    label_policy_version: str,
+    snapshot_schema_version: str,
     snapshot_checksum: str | None = None,
 ) -> str:
     canonical_compatibility = {
@@ -5087,6 +5157,8 @@ def _dataset_version_fingerprint(
         "labelMapping": {key.casefold(): value for key, value in label_mapping.items()},
         "split": copy_payload(split),
         "splitPolicy": DATASET_SPLIT_POLICY,
+        "labelPolicyVersion": label_policy_version,
+        "snapshotSchemaVersion": snapshot_schema_version,
         "snapshotChecksum": snapshot_checksum,
     }
     digest = hashlib.sha256(
@@ -5161,6 +5233,8 @@ def create_dataset_version(
             "labelMapping": normalized_mapping,
             "split": split,
             "splitPolicy": DATASET_SPLIT_POLICY,
+            "labelPolicyVersion": DATASET_LABEL_POLICY_VERSION,
+            "snapshotSchemaVersion": DATASET_SNAPSHOT_SCHEMA_VERSION,
             "status": "frozen",
             "approvalStatus": "pending",
             "artifactRefs": [],
@@ -5199,6 +5273,8 @@ def create_dataset_version(
             label_taxonomy_version,
             normalized_mapping,
             split,
+            record["labelPolicyVersion"],
+            record["snapshotSchemaVersion"],
             record["snapshotChecksum"],
         )
         if any(
@@ -5507,6 +5583,9 @@ def _dataset_label_for_event(
     source_label = str(event.get("label") or "").strip()
     if not source_label:
         return None, None
+    # An unreviewed event is candidate metadata, not a taxonomy-backed label.
+    if not event.get("reviewed"):
+        return source_label, None
     if not dataset:
         return source_label, None
     label_mapping = {
@@ -5514,13 +5593,11 @@ def _dataset_label_for_event(
         for key, value in dataset.get("labelMapping", {}).items()
     }
     mapped_label = label_mapping.get(source_label.casefold())
-    if not mapped_label:
-        raise ApiError(
-            409,
-            "DATASET_LABEL_MAPPING_MISSING",
-            f"No labelMapping entry exists for event label '{source_label}'.",
-        )
-    return mapped_label, dataset["labelTaxonomyVersion"]
+    return (
+        (mapped_label, dataset["labelTaxonomyVersion"])
+        if mapped_label
+        else (None, None)
+    )
 
 
 def _dataset_target_label(
@@ -5559,38 +5636,57 @@ def _dataset_ground_truth(
     dataset: dict[str, Any] | None,
     point: dict[str, Any],
     matching_event: dict[str, Any] | None,
-    event_label: str | None,
 ) -> tuple[str | None, str | None, str | None, str | None]:
     if (
         matching_event
         and matching_event.get("reviewed")
         and str(matching_event.get("label") or "").strip()
     ):
+        raw_label = str(matching_event["label"]).strip()
+        target_label, taxonomy_version = _dataset_target_label(dataset, raw_label)
         return (
-            str(matching_event["label"]).strip(),
+            raw_label,
             "event_review",
-            event_label,
-            dataset["labelTaxonomyVersion"] if dataset and event_label else None,
+            target_label,
+            taxonomy_version,
         )
+    trusted_fields = _trusted_telemetry_label_fields(point)
     candidates = (
         ("knownVibrationLabel", "known_vibration_label"),
         ("knownAcousticLabel", "known_acoustic_label"),
         ("scenarioLabel", "scenario_label"),
     )
     for field, source in candidates:
+        if field not in trusted_fields:
+            continue
         raw_label = str(point.get(field) or "").strip()
         if not raw_label:
             continue
         target_label, taxonomy_version = _dataset_target_label(dataset, raw_label)
         return raw_label, source, target_label, taxonomy_version
-    if matching_event and str(matching_event.get("label") or "").strip():
-        return (
-            str(matching_event["label"]).strip(),
-            "event_candidate",
-            event_label,
-            dataset["labelTaxonomyVersion"] if dataset and event_label else None,
-        )
     return None, None, None, None
+
+
+def _trusted_telemetry_label_fields(point: dict[str, Any]) -> set[str]:
+    provenance = point.get("labelProvenance")
+    if not (
+        isinstance(provenance, dict)
+        and provenance.get("verifiedByServer") is True
+        and isinstance(provenance.get("fields"), list)
+        and provenance.get("principalId")
+        and provenance.get("submittedAt")
+    ):
+        return set()
+    allowed_fields = {
+        "scenarioLabel",
+        "knownVibrationLabel",
+        "knownAcousticLabel",
+    }
+    return {
+        field
+        for field in provenance["fields"]
+        if isinstance(field, str) and field in allowed_fields
+    }
 
 
 def _dataset_snapshot_key(site_id: str, asset_id: str) -> str:
@@ -5705,7 +5801,16 @@ def _dataset_rows_for_points(
             ground_truth_source,
             target_label,
             target_label_taxonomy_version,
-        ) = _dataset_ground_truth(dataset, point, matching_event, event_label)
+        ) = _dataset_ground_truth(dataset, point, matching_event)
+        trusted_fields = _trusted_telemetry_label_fields(point)
+        event_reviewed = bool(matching_event and matching_event.get("reviewed"))
+        if ground_truth_label:
+            label_status = "verified" if target_label else "unmapped"
+        elif matching_event and not event_reviewed and str(event_label or "").strip():
+            label_status = "weak"
+        else:
+            label_status = "unlabeled"
+        training_eligible = label_status == "verified"
         row = {
             "site_id": site_id,
             "asset_id": asset_id,
@@ -5719,9 +5824,21 @@ def _dataset_rows_for_points(
             "acoustic_db": point.get("acousticDb"),
             "acoustic_peak_hz": point.get("acousticPeakHz"),
             "rpm": point.get("rpm"),
-            "scenario_label": point.get("scenarioLabel"),
-            "known_vibration_label": point.get("knownVibrationLabel"),
-            "known_acoustic_label": point.get("knownAcousticLabel"),
+            "scenario_label": (
+                point.get("scenarioLabel")
+                if "scenarioLabel" in trusted_fields
+                else None
+            ),
+            "known_vibration_label": (
+                point.get("knownVibrationLabel")
+                if "knownVibrationLabel" in trusted_fields
+                else None
+            ),
+            "known_acoustic_label": (
+                point.get("knownAcousticLabel")
+                if "knownAcousticLabel" in trusted_fields
+                else None
+            ),
             "telemetry_source": point.get("source"),
             "is_synthetic": point.get("isSynthetic"),
             "vibration_unit_note": point.get("vibrationUnitNote"),
@@ -5733,6 +5850,9 @@ def _dataset_rows_for_points(
             "ground_truth_source": ground_truth_source,
             "target_label": target_label,
             "target_label_taxonomy_version": target_label_taxonomy_version,
+            "label_status": label_status,
+            "training_eligible": training_eligible,
+            "event_reviewed": event_reviewed,
         }
         rows.append({key: _safe_tabular_value(value) for key, value in row.items()})
     return rows
@@ -5880,6 +6000,10 @@ def dataset_export_for(
             "checksum": export_checksum,
         }
     )
+    is_current_label_schema = not dataset or (
+        dataset.get("labelPolicyVersion") == DATASET_LABEL_POLICY_VERSION
+        and dataset.get("snapshotSchemaVersion") == DATASET_SNAPSHOT_SCHEMA_VERSION
+    )
     manifest = {
         "datasetId": dataset["id"] if dataset else None,
         "exportType": "internal_telemetry",
@@ -5899,7 +6023,11 @@ def dataset_export_for(
         ),
         "labelTaxonomyVersion": dataset["labelTaxonomyVersion"] if dataset else None,
         "labelMapping": dataset["labelMapping"] if dataset else {},
-        "labelPriority": copy_payload(DATASET_LABEL_PRIORITY),
+        "labelPriority": copy_payload(
+            DATASET_LABEL_PRIORITY
+            if is_current_label_schema
+            else DATASET_LABEL_PRIORITY_V1
+        ),
         "sourceFilters": copy_payload(dataset["sourceFilters"]) if dataset else None,
         "siteId": site["id"],
         "assetId": asset["id"],
@@ -5913,6 +6041,30 @@ def dataset_export_for(
         "checksum": export_checksum,
         "generatedAt": dataset["frozenAt"] if dataset else now_iso(),
     }
+    if is_current_label_schema:
+        label_counts = {
+            status: sum(row.get("label_status") == status for row in rows)
+            for status in ("verified", "weak", "unlabeled", "unmapped")
+        }
+        training_eligible_split_counts = {
+            name: sum(
+                row.get("training_eligible") is True
+                and row.get("dataset_split") == name
+                for row in rows
+            )
+            for name in ("train", "validation", "test")
+        }
+        manifest.update(
+            {
+                "labelPolicyVersion": DATASET_LABEL_POLICY_VERSION,
+                "snapshotSchemaVersion": DATASET_SNAPSHOT_SCHEMA_VERSION,
+                "labelCounts": label_counts,
+                "trainingEligibleCount": sum(
+                    row.get("training_eligible") is True for row in rows
+                ),
+                "trainingEligibleSplitCounts": training_eligible_split_counts,
+            }
+        )
     return {"manifest": manifest, "rows": rows}
 
 

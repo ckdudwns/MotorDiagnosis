@@ -82,8 +82,8 @@ def telemetry_payload(sequence: int = 1, **changes: object) -> dict[str, object]
         "acousticRmsRaw": 0.007019,
         "acousticDb": None,
         "acousticPeakHz": 216.4,
-        "scenarioLabel": "normal",
-        "knownVibrationLabel": "NORMAL",
+        "scenarioLabel": None,
+        "knownVibrationLabel": None,
         "knownAcousticLabel": None,
         "source": "CWRU_only_synthetic",
         "isSynthetic": True,
@@ -3593,7 +3593,7 @@ class Week2HttpSmokeTest(unittest.TestCase):
         )
         status, accepted = post_payload(
             f"http://127.0.0.1:{self.port}/api/telemetry/ingest",
-            "demo-telemetry-ingest-token",
+            "demo-telemetry-validation-token",
             mapped_payload,
         )
         self.assertEqual(status, 201)

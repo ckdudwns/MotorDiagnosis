@@ -65,7 +65,7 @@ def telemetry(sequence, *, timestamp=None):
         "acousticRmsRaw": 0.007,
         "vibrationRmsMmS": None,
         "acousticDb": None,
-        "scenarioLabel": "normal",
+        "scenarioLabel": None,
         "isSynthetic": True,
         "source": "week4-replay-test",
         "vibrationPeakHz": 29.9,
@@ -726,7 +726,7 @@ class Week4HttpTest(unittest.TestCase):
         self.assertEqual(data.TELEMETRY_RECORDS, [])
 
     def test_bulk_rejects_invalid_nested_values_without_stopping_other_items(self):
-        payload = {"items": [{**telemetry(1), "scenarioLabel": {}}, telemetry(2)]}
+        payload = {"items": [{**telemetry(1), "rpm": {}}, telemetry(2)]}
         status, result = self.request(
             "/api/telemetry/bulk", payload, "demo-telemetry-ingest-token"
         )

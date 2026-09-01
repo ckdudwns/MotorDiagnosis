@@ -71,8 +71,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--token",
-        default=os.environ.get("TELEMETRY_INGEST_TOKEN", "demo-telemetry-ingest-token"),
-        help="Bearer token with telemetry:ingest permission.",
+        default=os.environ.get(
+            "TELEMETRY_INGEST_TOKEN", "demo-telemetry-validation-token"
+        ),
+        help="Bearer token with telemetry:ingest and telemetry:label permissions.",
     )
     parser.add_argument(
         "--site-id",

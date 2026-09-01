@@ -19,6 +19,10 @@ def ingest_telemetry_bulk(principal, payload):
         data.principal_can_ingest(
             principal, device_id.strip().upper() if isinstance(device_id, str) else ""
         )
+    # Label authorization is an all-or-nothing preflight. Do not allow an
+    # unauthorized item later in the batch to leave earlier records stored.
+    for item in items:
+        data.principal_can_submit_telemetry_labels(principal, item)
 
     def ordering(pair):
         index, item = pair

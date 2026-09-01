@@ -36,11 +36,13 @@ ai/ai1/week1/ai1/
 
 센서 도착 전, 아래 두 공개 데이터셋을 소수 결합해 프로토타입 파이프라인을 검증한다.
 
-- **진동**: CWRU Bearing Dataset — 라벨당 부하조건 4개(0/1/2/3 HP), 총 16개 `.mat`:
-  정상 `97/98/99/100`, 내륜 이상 `105/106/107/108`, 볼 이상 `118/119/120/121`,
-  외륜 이상 `130/131/132/133`. 라벨당 파일을 4개로 늘린 것은 3주차 group_split이
-  라벨별 독립 그룹(자산)을 확보해 리크 없는 분할을 만들 수 있게 하기 위함이다.
-  다운로드: https://engineering.case.edu/bearingdatacenter/welcome
+- **진동**: CWRU Bearing Dataset — **10 물리 베어링(specimen)**, 각 0/1/2/3 HP 부하로
+  측정한 4파일 = 총 40개 `.mat`:
+  정상 베이스라인 `97~100`(1 specimen), 내륜 `105~108`/`169~172`/`209~212`(0.007/0.014/0.021"),
+  볼 `118~121`/`185~188`/`222~225`, 외륜 `130~133`/`197~200`/`234~237`.
+  같은 베어링의 부하별 4파일은 하나의 specimen이다 — group split은 specimen 단위로 해야
+  같은 베어링이 train/test에 섞이는 누수를 막는다. **건강한 베어링은 1개뿐**이라 NORMAL
+  specimen 독립 분할은 불가능하다(3주차 참고). 다운로드: https://engineering.case.edu/bearingdatacenter/welcome
   - `98/99.mat`에는 RPM 키가 없어 파일 번호로 부하 조건을 추정해 채운다.
   - `99.mat`은 `X098_DE_time`(=`98.mat`과 중복)과 `X099_DE_time`을 함께 담고 있어,
     로더가 파일 번호와 일치하는 `X099_DE_time`만 선택한다.
@@ -51,8 +53,9 @@ ai/ai1/week1/ai1/
 다운로드한 파일을 아래 경로에 놓는다 (`.gitignore`에 등록되어 레포에는 커밋되지 않음):
 
 ```
-ai/ai1/week1/ai1/data/external/cwru/97.mat  ...  ai/ai1/week1/ai1/data/external/cwru/133.mat
-  (정상 97~100, 내륜 105~108, 볼 118~121, 외륜 130~133 — 16개)
+ai/ai1/week1/ai1/data/external/cwru/97.mat  ...  ai/ai1/week1/ai1/data/external/cwru/237.mat
+  (정상 97~100 / 내륜 105~108·169~172·209~212 / 볼 118~121·185~188·222~225 /
+   외륜 130~133·197~200·234~237 — 40개. 없는 파일은 로더가 건너뛴다)
 
 ai/ai1/week1/ai1/data/external/mimii/pump/id_00/normal/*.wav
 ai/ai1/week1/ai1/data/external/mimii/pump/id_00/abnormal/*.wav

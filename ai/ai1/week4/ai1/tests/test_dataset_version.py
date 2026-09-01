@@ -6,6 +6,7 @@ DATASET_MODEL_01 테스트 — 데이터셋/모델/기준선 버전 상태 머�
 실행해 체크섬이 같은지 확인한다.
 """
 
+import copy
 import os
 import sys
 import unittest
@@ -26,8 +27,11 @@ from dataset_version import (  # noqa: E402
     freeze_dataset_version,
     approve_dataset_version,
     verify_reproducibility,
+    verify_frozen_integrity,
     compute_dataset_checksum,
+    compute_snapshot_digest,
     dataset_version_summary,
+    is_legacy_v1_frozen,
 )
 from model_version import (  # noqa: E402
     register_model_version,
@@ -40,11 +44,26 @@ from model_version import (  # noqa: E402
 
 
 def _draft_manifest() -> dict:
+    """API 명세서 v1.3 build_manifest() 출력을 흉내낸 draft (신규 필수 필드 포함)."""
     return {
         "id": "DS-TEST-001",
+        "name": "test-dataset",
         "status": "draft",
+        "source": {
+            "type": "external",
+            "uri": "https://example.invalid/cwru",
+            "license": "test-license",
+            "checksum": "sha256:cwru-version-checksum",
+        },
+        "compatibility": {"signalType": ["vibration"], "samplingRateHz": 12000},
+        "labelTaxonomyVersion": "CWRU-FAULT-V1",
         "labelMapping": {"NORMAL": "NORMAL", "FAULT": "ANOMALY"},
+        "labelPolicyVersion": "LABEL-POLICY-V2",
+        "snapshotSchemaVersion": "2",
         "split": {"train": 0.7, "validation": 0.2, "test": 0.1},
+        "splitStrategy": "operating_condition_holdout: ...",
+        "holdoutType": "operating_condition",
+        "independentHoldout": False,
         "rows": [
             {"sample_id": "A", "common_label": "NORMAL"},
             {"sample_id": "B", "common_label": "ANOMALY"},
@@ -52,13 +71,26 @@ def _draft_manifest() -> dict:
     }
 
 
-def _draft_manifest_v13() -> dict:
-    """API 명세서 v1.3 build_manifest() 출력을 흉내낸 draft (신규 정책·버전 필드 포함)."""
-    manifest = _draft_manifest()
-    manifest["source"] = {"type": "external", "checksum": "sha256:cwru-version-checksum"}
-    manifest["labelPolicyVersion"] = "LABEL-POLICY-V2"
-    manifest["snapshotSchemaVersion"] = "2"
-    return manifest
+def _draft_manifest_legacy() -> dict:
+    """v1.3 필드가 없는 구형 draft — 신규 동결이 거부되어야 한다."""
+    return {
+        "id": "DS-LEGACY-001",
+        "status": "draft",
+        "labelMapping": {"NORMAL": "NORMAL", "FAULT": "ANOMALY"},
+        "split": {"train": 0.7, "validation": 0.2, "test": 0.1},
+        "rows": [{"sample_id": "A", "common_label": "NORMAL"}],
+    }
+
+
+def _legacy_frozen() -> dict:
+    """이미 커밋된 구(v1) 동결본 — snapshotDigest/v1.3 필드 없음. approve/summary는
+    관용 처리해야 한다."""
+    manifest = _draft_manifest_legacy()
+    frozen = copy.deepcopy(manifest)
+    frozen["status"] = "frozen"
+    frozen["datasetChecksum"] = compute_dataset_checksum(manifest)
+    frozen["frozenAt"] = "2026-08-01T00:00:00+00:00"
+    return frozen
 
 
 class TestDatasetVersionStateMachine(unittest.TestCase):
@@ -67,24 +99,23 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         self.assertEqual(frozen["status"], "frozen")
         self.assertIn("datasetChecksum", frozen)
         self.assertIn("frozenAt", frozen)
+        self.assertIn("snapshotDigest", frozen)
 
     def test_freeze_does_not_mutate_original(self):
         draft = _draft_manifest()
         freeze_dataset_version(draft)
         self.assertEqual(draft["status"], "draft")
+        self.assertNotIn("snapshotDigest", draft)
 
     def test_freeze_deep_copies_nested_rows(self):
         draft = _draft_manifest()
         frozen = freeze_dataset_version(draft)
-        # 동결 후 원본 rows(중첩)를 바꿔도 frozen은 그대로여야 하고,
-        # frozen 내용과 저장된 체크섬은 계속 일치해야 한다.
         draft["rows"][0]["common_label"] = "TAMPERED"
         self.assertEqual(frozen["rows"][0]["common_label"], "NORMAL")
-        self.assertEqual(
-            frozen["datasetChecksum"], compute_dataset_checksum(frozen)
-        )
+        self.assertEqual(frozen["datasetChecksum"], compute_dataset_checksum(frozen))
+        self.assertEqual(frozen["snapshotDigest"], compute_snapshot_digest(frozen))
 
-    def test_approve_rejects_post_freeze_mutation(self):
+    def test_approve_rejects_post_freeze_row_mutation(self):
         frozen = freeze_dataset_version(_draft_manifest())
         frozen["rows"][0]["common_label"] = "TAMPERED"  # 동결 이후 변조
         with self.assertRaises(ValueError):
@@ -128,7 +159,7 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
 
     def test_verify_reproducibility_true_for_identical_content(self):
         manifest_a = _draft_manifest()
-        manifest_b = _draft_manifest()  # 내용은 동일, 다른 dict 인스턴스
+        manifest_b = _draft_manifest()  # 내용 동일, 다른 dict 인스턴스
         frozen = freeze_dataset_version(manifest_a)
         self.assertTrue(verify_reproducibility(frozen, manifest_b))
 
@@ -145,9 +176,6 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         self.assertEqual(summary["status"], "frozen")
 
     def test_summary_deep_copies_nested_objects_frozen(self):
-        # frozen 요약 결과의 중첩 객체(labelMapping/split)를 수정해도 동결본과
-        # 저장된 체크섬이 그대로여야 한다 — 안 그러면 status=frozen인데 내용과
-        # 체크섬이 어긋난다.
         frozen = freeze_dataset_version(_draft_manifest())
         summary = dataset_version_summary(frozen)
         summary["labelMapping"]["NORMAL"] = "TAMPERED"
@@ -157,8 +185,6 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         self.assertEqual(frozen["datasetChecksum"], compute_dataset_checksum(frozen))
 
     def test_summary_deep_copies_nested_objects_approved(self):
-        # approved 요약 결과의 labelMapping만 바꿔도 승인본이 함께 변하면,
-        # 승인 내용과 datasetChecksum(승인본이 그대로 물려받음)이 불일치한다.
         approved = approve_dataset_version(
             freeze_dataset_version(_draft_manifest()),
             approved_by="mgr", reason="검증 완료",
@@ -169,63 +195,161 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         self.assertEqual(approved["datasetChecksum"], compute_dataset_checksum(approved))
 
 
-class TestDatasetVersionV13LabelPolicyFields(unittest.TestCase):
-    """API 명세서 v1.3: 동결 산출물에 labelPolicyVersion·snapshotSchemaVersion·
-    snapshotChecksum을 남긴다. snapshotChecksum은 3주차 compute_version_checksum()
-    결과(source.checksum)를 재사용한다. 기존 재현성 검증(datasetChecksum)은 그대로다."""
+class TestFreezeRequiresV13Fields(unittest.TestCase):
+    """[리뷰 P1] v1.3 필드가 없는 신규 draft의 동결을 차단한다 — 이미 동결된 v1과
+    지금 새로 동결하는 것은 다른 요구사항이다."""
 
-    def test_freeze_carries_policy_and_schema_and_snapshot_checksum(self):
-        frozen = freeze_dataset_version(_draft_manifest_v13())
+    def test_legacy_draft_freeze_rejected(self):
+        with self.assertRaises(ValueError):
+            freeze_dataset_version(_draft_manifest_legacy())
+
+    def test_each_required_field_missing_rejects(self):
+        for drop in ("labelPolicyVersion", "snapshotSchemaVersion"):
+            draft = _draft_manifest()
+            del draft[drop]
+            with self.assertRaises(ValueError, msg=drop):
+                freeze_dataset_version(draft)
+        draft = _draft_manifest()
+        draft["source"].pop("checksum")
+        with self.assertRaises(ValueError):
+            freeze_dataset_version(draft)
+
+
+class TestV13FrozenFields(unittest.TestCase):
+    def test_freeze_carries_policy_schema_and_snapshot_checksum(self):
+        frozen = freeze_dataset_version(_draft_manifest())
         self.assertEqual(frozen["labelPolicyVersion"], "LABEL-POLICY-V2")
         self.assertEqual(frozen["snapshotSchemaVersion"], "2")
         self.assertEqual(frozen["snapshotChecksum"], "sha256:cwru-version-checksum")
 
-    def test_freeze_leaves_fields_none_for_pre_v13_draft(self):
-        # source.checksum / 정책 버전이 없는 구버전 draft는 None으로 남겨 기존 frozen
-        # 데이터셋을 재계산·변경하지 않는다.
+    def test_datasetChecksum_calc_unchanged_reproducibility_holds(self):
         frozen = freeze_dataset_version(_draft_manifest())
-        self.assertIsNone(frozen["labelPolicyVersion"])
-        self.assertIsNone(frozen["snapshotSchemaVersion"])
-        self.assertIsNone(frozen["snapshotChecksum"])
-
-    def test_dataset_checksum_and_reproducibility_unaffected_by_new_fields(self):
-        # 신규 필드는 rows/labelMapping/split 밖이라 datasetChecksum에 영향을 주지 않는다.
-        frozen = freeze_dataset_version(_draft_manifest_v13())
         self.assertEqual(frozen["datasetChecksum"], compute_dataset_checksum(frozen))
-        recomputed = _draft_manifest_v13()  # 같은 내용, 다른 인스턴스
-        self.assertTrue(verify_reproducibility(frozen, recomputed))
-        self.assertEqual(
-            frozen["datasetChecksum"],
-            freeze_dataset_version(_draft_manifest())["datasetChecksum"],
-        )
+        self.assertTrue(verify_reproducibility(frozen, _draft_manifest()))
 
     def test_approve_carries_new_fields(self):
         approved = approve_dataset_version(
-            freeze_dataset_version(_draft_manifest_v13()),
+            freeze_dataset_version(_draft_manifest()),
             approved_by="mgr", reason="검증 완료",
         )
         self.assertEqual(approved["labelPolicyVersion"], "LABEL-POLICY-V2")
         self.assertEqual(approved["snapshotChecksum"], "sha256:cwru-version-checksum")
+        self.assertEqual(approved["snapshotDigest"], compute_snapshot_digest(approved))
 
-    def test_summary_exposes_and_deep_copies_new_fields(self):
-        frozen = freeze_dataset_version(_draft_manifest_v13())
-        summary = dataset_version_summary(frozen)
-        self.assertEqual(summary["snapshotSchemaVersion"], "2")
-        summary["snapshotSchemaVersion"] = "TAMPERED"
-        self.assertEqual(frozen["snapshotSchemaVersion"], "2")
+
+class TestSnapshotDigestProtectsApproval(unittest.TestCase):
+    """[리뷰 P1] datasetChecksum(rows+labelMapping+split)만으로는 freeze 이후
+    source.license/checksum, samplingRate, 정책 버전 변조가 승인을 통과한다.
+    snapshotDigest는 매니페스트 전체 불변 필드를 보호한다."""
+
+    def _tamper_and_expect_reject(self, mutate):
+        frozen = freeze_dataset_version(_draft_manifest())
+        mutate(frozen)
+        with self.assertRaises(ValueError):
+            approve_dataset_version(frozen, approved_by="mgr", reason="검증 완료")
+
+    def test_source_license_tamper_rejected(self):
+        self._tamper_and_expect_reject(
+            lambda f: f["source"].__setitem__("license", "CHANGED")
+        )
+
+    def test_source_checksum_tamper_rejected(self):
+        self._tamper_and_expect_reject(
+            lambda f: f["source"].__setitem__("checksum", "sha256:other")
+        )
+
+    def test_sampling_rate_tamper_rejected(self):
+        self._tamper_and_expect_reject(
+            lambda f: f["compatibility"].__setitem__("samplingRateHz", 48000)
+        )
+
+    def test_label_policy_version_tamper_rejected(self):
+        self._tamper_and_expect_reject(
+            lambda f: f.__setitem__("labelPolicyVersion", "LABEL-POLICY-V9")
+        )
+
+    def test_snapshot_schema_version_tamper_rejected(self):
+        self._tamper_and_expect_reject(
+            lambda f: f.__setitem__("snapshotSchemaVersion", "99")
+        )
+
+    def test_split_strategy_tamper_rejected(self):
+        self._tamper_and_expect_reject(
+            lambda f: f.__setitem__("independentHoldout", True)
+        )
+
+    def test_untampered_frozen_still_approves(self):
+        frozen = freeze_dataset_version(_draft_manifest())
+        approved = approve_dataset_version(frozen, approved_by="mgr", reason="ok")
+        self.assertEqual(approved["status"], "approved")
+
+
+class TestFrozenIntegrityVerification(unittest.TestCase):
+    """[리뷰 P1] verify_frozen_integrity: 학습·배포처럼 동결본을 입력으로 쓰는 쪽이
+    status만 보지 말고 전체 snapshot 무결성을 재검증해야 한다."""
+
+    def test_passes_for_untampered_frozen(self):
+        verify_frozen_integrity(freeze_dataset_version(_draft_manifest()))  # no raise
+
+    def test_raises_on_row_tamper(self):
+        frozen = freeze_dataset_version(_draft_manifest())
+        frozen["rows"][0]["common_label"] = "TAMPERED"
+        with self.assertRaises(ValueError):
+            verify_frozen_integrity(frozen)
+
+    def test_raises_on_metadata_tamper(self):
+        frozen = freeze_dataset_version(_draft_manifest())
+        frozen["source"]["license"] = "CHANGED"
+        with self.assertRaises(ValueError):
+            verify_frozen_integrity(frozen)
+
+    def test_raises_for_non_frozen(self):
+        with self.assertRaises(ValueError):
+            verify_frozen_integrity(_draft_manifest())  # draft
+
+
+class TestLegacyV1FrozenTolerance(unittest.TestCase):
+    """이미 동결된 v1(snapshotDigest 없음)은 재동결하지 않고 관용 처리한다."""
+
+    def test_is_legacy_v1_frozen(self):
+        self.assertTrue(is_legacy_v1_frozen(_legacy_frozen()))
+        self.assertFalse(is_legacy_v1_frozen(freeze_dataset_version(_draft_manifest())))
+
+    def test_v1_frozen_approve_still_works(self):
+        approved = approve_dataset_version(
+            _legacy_frozen(), approved_by="mgr", reason="기존 승인"
+        )
+        self.assertEqual(approved["status"], "approved")
+
+    def test_v1_frozen_approve_rejects_row_tamper(self):
+        frozen = _legacy_frozen()
+        frozen["rows"][0]["common_label"] = "TAMPERED"
+        with self.assertRaises(ValueError):
+            approve_dataset_version(frozen, approved_by="mgr", reason="x")
+
+    def test_v1_frozen_integrity_falls_back_to_dataset_checksum(self):
+        verify_frozen_integrity(_legacy_frozen())  # no raise
+        frozen = _legacy_frozen()
+        frozen["rows"][0]["common_label"] = "TAMPERED"
+        with self.assertRaises(ValueError):
+            verify_frozen_integrity(frozen)
+
+    def test_v1_frozen_summary_still_works(self):
+        summary = dataset_version_summary(_legacy_frozen())
+        self.assertNotIn("rows", summary)
 
 
 class TestModelVersionLifecycle(unittest.TestCase):
     def test_register_starts_as_registered(self):
         mv = register_model_version(
-            version="v1", artifact_uri="file://v1.pt", dataset_id="DS-1",
+            version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
             baseline_version="b1", metrics={"f1": 0.9},
         )
         self.assertEqual(mv["status"], "registered")
 
     def test_approve_requires_registered(self):
         mv = register_model_version(
-            version="v1", artifact_uri="file://v1.pt", dataset_id="DS-1",
+            version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
             baseline_version="b1", metrics={"f1": 0.9},
         )
         approved = approve_model_version(mv, reason="지표 통과")
@@ -234,27 +358,6 @@ class TestModelVersionLifecycle(unittest.TestCase):
         with self.assertRaises(ValueError):
             approve_model_version(approved, reason="재승인 시도")
 
-    def test_rollback_requires_approved_target(self):
-        v1 = approve_model_version(
-            register_model_version(
-                version="v1", artifact_uri="a", dataset_id="d", baseline_version="b",
-                metrics={},
-            ),
-            reason="초기 승인",
-        )
-        v2_registered = register_model_version(
-            version="v2", artifact_uri="a2", dataset_id="d", baseline_version="b",
-            metrics={},
-        )
-        with self.assertRaises(ValueError):
-            # v2가 아직 registered일 뿐 approved가 아니므로 롤백 대상이 될 수 없음
-            rollback_model_version(v2_registered, v2_registered, reason="문제 발생", target_environment="prod")
-
-        action = rollback_model_version(v2_registered, v1, reason="v2 회귀 발생", target_environment="prod")
-        self.assertEqual(action["action"], "rollback")
-        self.assertEqual(action["toVersion"], "v1")
-        self.assertEqual(action["fromVersion"], "v2")
-
     def test_metric_snapshot_is_isolated_from_source_metrics(self):
         metrics = {"f1": 0.91, "cm": {"tp": 10, "fp": 1}}
         mv = register_model_version(
@@ -262,7 +365,6 @@ class TestModelVersionLifecycle(unittest.TestCase):
             metrics=metrics,
         )
         approved = approve_model_version(mv, reason="지표 통과")
-        # 승인 후 원본/등록본 metrics를 바꿔도 승인 스냅샷은 그대로여야 한다.
         metrics["f1"] = 0.12
         metrics["cm"]["tp"] = 0
         mv["metrics"]["f1"] = 0.0
@@ -278,6 +380,79 @@ class TestModelVersionLifecycle(unittest.TestCase):
         approved = approve_model_version(mv, reason="ok", metric_snapshot=snap)
         snap["cm"]["tp"] = 999
         self.assertEqual(approved["metricSnapshot"]["cm"]["tp"], 3)
+
+
+class TestRollbackLineage(unittest.TestCase):
+    """[리뷰 P1] 롤백 대상은 실제로 current보다 앞선 승인 버전이어야 한다.
+    자기 자신·더 최신 버전으로의 '롤백'을 차단한다."""
+
+    def _approved(self, version, when):
+        mv = register_model_version(
+            version=version, artifact_uri=f"file:///{version}.pt", dataset_id="d",
+            baseline_version="b", metrics={},
+        )
+        approved = approve_model_version(mv, reason="ok")
+        approved["approvedAt"] = when  # 결정적 시각으로 고정
+        return approved
+
+    def test_rollback_to_earlier_approved_version_ok(self):
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        action = rollback_model_version(
+            v2, v1, reason="v2 회귀", target_environment="prod"
+        )
+        self.assertEqual(action["fromVersion"], "v2")
+        self.assertEqual(action["toVersion"], "v1")
+        self.assertEqual(action["targetApprovedAt"], "2026-08-01T00:00:00+00:00")
+
+    def test_self_rollback_rejected(self):
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        with self.assertRaises(ValueError):
+            rollback_model_version(v1, v1, reason="x", target_environment="prod")
+
+    def test_forward_rollback_rejected(self):
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        with self.assertRaises(ValueError):
+            rollback_model_version(v1, v2, reason="x", target_environment="prod")
+
+    def test_non_approved_target_rejected(self):
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        v1_reg = register_model_version(
+            version="v1", artifact_uri="a1", dataset_id="d", baseline_version="b",
+            metrics={},
+        )
+        with self.assertRaises(ValueError):  # target(v1)이 approved가 아님
+            rollback_model_version(v2, v1_reg, reason="x", target_environment="prod")
+
+    def test_rollback_without_approvedAt_and_no_history_rejected(self):
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        del v2["approvedAt"]  # current에 승인 시각이 없으면 계보 검증 불가
+        with self.assertRaises(ValueError):
+            rollback_model_version(v2, v1, reason="x", target_environment="prod")
+
+    def test_approved_history_lineage_enforced(self):
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        v3 = self._approved("v3", "2026-08-20T00:00:00+00:00")
+        history = [v1, v2, v3]
+        # v3 -> v1 (계보상 앞) OK
+        rollback_model_version(
+            v3, v1, reason="ok", target_environment="prod", approved_history=history
+        )
+        # v1 -> v3 (계보상 뒤) 거부
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v1, v3, reason="x", target_environment="prod", approved_history=history
+            )
+        # 계보에 없는 target 거부
+        stray = self._approved("vX", "2026-07-01T00:00:00+00:00")
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v3, stray, reason="x", target_environment="prod",
+                approved_history=history,
+            )
 
 
 class TestBaselineVersionLifecycle(unittest.TestCase):
@@ -301,7 +476,6 @@ class TestBaselineVersionLifecycle(unittest.TestCase):
         )
         approved = approve_baseline_version(bv, approved_by="mgr", reason="ok")
         active = activate_baseline_version(approved)
-        # draft(원본/등록본) features를 수정해도 승인·active 기준선은 그대로여야 한다.
         features["rms_mean"]["mean"] = 99.0
         bv["features"]["rms_mean"]["std"] = 99.0
         self.assertEqual(approved["features"]["rms_mean"]["mean"], 0.05)
@@ -313,32 +487,36 @@ class TestBaselineVersionLifecycle(unittest.TestCase):
     f"CWRU 실데이터 없음: {os.path.join(_CWRU_DATA_DIR, '97.mat')}",
 )
 class TestReproducibilityWithRealCwruData(unittest.TestCase):
-    """같은 seed로 register_dataset.build_manifest()를 두 번 실행해 동결 시점
-    체크섬이 재현되는지 확인한다 (DATASET_MODEL_01 수용 기준)."""
+    """같은 조건으로 build_manifest()를 두 번 실행해 동결 시점 체크섬이 재현되는지
+    확인한다 (DATASET_MODEL_01 수용 기준). 기본 specimen_group은 CWRU에서 실패하므로
+    operating_condition_holdout으로 검증한다."""
 
-    def test_same_seed_reproduces_checksum(self):
+    def test_same_inputs_reproduce_checksum(self):
         from register_dataset import build_manifest
 
-        manifest_1 = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
-        frozen = freeze_dataset_version(manifest_1)
-
-        manifest_2 = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
-        self.assertTrue(verify_reproducibility(frozen, manifest_2))
+        m1 = build_manifest(
+            data_dir=_CWRU_DATA_DIR, split_strategy="operating_condition_holdout"
+        )
+        frozen = freeze_dataset_version(m1)
+        m2 = build_manifest(
+            data_dir=_CWRU_DATA_DIR, split_strategy="operating_condition_holdout"
+        )
+        self.assertTrue(verify_reproducibility(frozen, m2))
 
     def test_different_split_config_changes_checksum(self):
         from register_dataset import build_manifest
 
-        # CWRU 16파일은 크기가 전부 달라 group_split이 seed에 의존하지 않는다.
-        # 대신 분할 비율을 바꾸면(체크섬 payload에 포함) 다른 버전이어야 한다.
-        manifest_1 = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
-        frozen = freeze_dataset_version(manifest_1)
-
-        manifest_other = build_manifest(
-            data_dir=_CWRU_DATA_DIR,
-            seed=42,
-            split_ratios={"train": 0.5, "validation": 0.3, "test": 0.2},
+        frozen = freeze_dataset_version(
+            build_manifest(
+                data_dir=_CWRU_DATA_DIR, split_strategy="operating_condition_holdout"
+            )
         )
-        self.assertFalse(verify_reproducibility(frozen, manifest_other))
+        other = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            split_ratios={"train": 0.5, "validation": 0.3, "test": 0.2},
+            split_strategy="operating_condition_holdout",
+        )
+        self.assertFalse(verify_reproducibility(frozen, other))
 
 
 if __name__ == "__main__":

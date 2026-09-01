@@ -48,7 +48,7 @@ ai/ai1/week3/ai1/
 MIMII 음향 데이터는 이 저장소에 실제 파일이 배치돼 있지 않아(로더 코드만 존재),
 이번 3주차 등록·내보내기는 **CWRU Bearing Dataset(진동)만** 대상으로 했다.
 
-`register_dataset.py`가 CWRU 16개 `.mat` 파일(라벨당 부하조건 4개)을 API 명세서 v1.3
+`register_dataset.py`가 CWRU 40개 `.mat` 파일(10 물리 specimen, 각 부하조건 4개)을 API 명세서 v1.3
 `POST /api/datasets` 계약(`source`/`compatibility`/`labelMapping`/`split` +
 `labelPolicyVersion`/`snapshotSchemaVersion`/`labelCounts`) 형태의 매니페스트로 정규화하고,
 `export_dataset.py`가 `dataset_manifest.json`(GET 응답 형태) + `dataset_rows.csv` +
@@ -66,11 +66,11 @@ python -m pip install -r ai/ai1/week3/ai1/requirements.txt
 - 원본 파일별 SHA-256 체크섬을 매니페스트에 기록해 원본 추적 가능 — 원본 체크섬들 +
   window/hop 크기 + 분할 비율 + seed로 만든 불변 버전 체크섬(`source.checksum`)을 데이터셋
   `id`에도 반영해, 같은 날짜에 입력·설정이 다른 버전이 같은 ID로 충돌하지 않도록 했다
-- **`source_label`(원본 파일) 단위 group split** — 동일 그룹의 윈도우가 여러 split에
-  나뉘지 않게 통째로 하나의 split에만 배정한다. CWRU는 이제 라벨당 자산 4개(0/1/2/3 HP)라
-  기본 3-way 비율이 리크 없이 성립한다. 자산이 분할 수보다 적으면 윈도우를 섞는 대신
-  `InsufficientAssetGroupsError`로 데이터 부족 상태를 명시적으로 드러낸다
-  (근거: `datasets/dataset_manifest_format.md`)
+- **물리 베어링(specimen) 단위 group split** — CWRU 부하별 4파일은 같은 베어링이므로
+  `specimen_id`(결함타입+직경) 단위로 배정한다. `build_manifest` 기본 `specimen_group`은
+  NORMAL specimen이 1개뿐이라 3-way에서 `InsufficientAssetGroupsError`로 **정직하게
+  실패**한다. 데모용 `operating_condition_holdout`(부하조건 기준)은 `independentHoldout=false`
+  플래그를 붙인다 (근거: `datasets/dataset_manifest_format.md`)
 - 특징값은 week2 `extract_all_features()`(26개)에 week1 `compute_peak_frequency()`
   (`vibration_peak_hz`)를 더한 27개 — 계산 로직은 재구현하지 않고 그대로 재사용
 - **산출물 3종(csv/xlsx/manifest.json)을 원자적으로 배치** — `output_dir/versions/<dataset
@@ -78,12 +78,13 @@ python -m pip install -r ai/ai1/week3/ai1/requirements.txt
   `output_dir/CURRENT` 포인터를 새 버전으로 원자적으로 전환한다. 중간 실패나 동시 export가
   서로 다른 버전의 파일을 섞어 놓지 않는다(근거·구현: `datasets/export_dataset.py`)
 
-**실행 결과 (실제 CWRU 16개 파일, seed=42, 기본 3-way):** 총 1537행(NORMAL 828 +
-ANOMALY 709)을 group split로 등록했다. 파일 크기가 전부 달라 분할은 seed에 의존하지
-않고 결정적이다 — test = 0HP(97/105/118/130, 296행), validation = 1HP(98/106/119/131,
-413행), train = 2HP+3HP(828행). 각 원본 파일은 정확히 하나의 split에만 들어가고(누수
-없음), 변환 전후 건수가 일치하며 체크섬 재계산 값이 매니페스트 기록과 일치함을
-테스트로 확인했다.
+**실행 결과 (실제 CWRU 40개 파일 / 10 물리 specimen):**
+- 기본 `specimen_group` 3-way → `InsufficientAssetGroupsError` (NORMAL specimen 1개). 정상.
+- `operating_condition_holdout` → 총 2953행을 부하 tier 기준으로 등록
+  (test=0HP, validation=1HP, train=2·3HP). `independentHoldout=false` — 같은 물리 베어링이
+  여러 split에 등장하므로 이 분할은 specimen 독립 검증이 아니다.
+- 결함 3클래스는 specimen 3개(0.007/0.014/0.021")라 결함 데이터만으로는 specimen 독립
+  3-way가 성립함을 테스트로 확인했다.
 
 ```bash
 python ai/ai1/week3/ai1/datasets/export_dataset.py

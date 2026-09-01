@@ -21,7 +21,7 @@ export 행의 라벨 상태(`label_status`/`training_eligible`), manifest 라벨
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
-| `id` | string | 데이터셋 버전 ID (`DS-CWRU-VIBRATION-<날짜>-<버전체크섬 12자리>` 형식) — 같은 날짜라도 입력 파일/라벨/윈도우/분할 설정/라벨 taxonomy·mapping/특징 추출 설정이 다르면 다른 ID가 나온다 |
+| `id` | string | 데이터셋 버전 ID (`DS-CWRU-VIBRATION-<날짜>-<버전체크섬 12자리>` 형식) — 같은 날짜라도 입력 파일/라벨/윈도우/분할 비율/분할 전략(`split_strategy`)/라벨 taxonomy·mapping/정책 버전/특징 추출 설정이 다르면 다른 ID가 나온다 |
 | `name` | string | 데이터셋 이름 (`cwru-bearing-vibration-v1`) |
 | `source.type` | string | `external` (외부 공개 데이터셋) |
 | `source.uri` | string | CWRU Bearing Data Center 공식 URL |
@@ -39,8 +39,10 @@ export 행의 라벨 상태(`label_status`/`training_eligible`), manifest 라벨
 | `labelCounts` | object | `{verified, weak, unlabeled, unmapped}` — 행의 라벨 상태별 건수 (합 = `rowCount`) |
 | `trainingEligibleCount` | number | `training_eligible=true` 전체 건수 |
 | `trainingEligibleSplitCounts` | object | `{train, validation, test}` — split별 학습 가능 건수 |
-| `split` | object | `{"train":0.7,"validation":0.2,"test":0.1}` |
+| `split` | object | `{"train":0.7,"validation":0.2,"test":0.1}` (operating_condition_holdout에서는 부하 tier가 실제 배정을 결정) |
 | `splitStrategy` | string | 분할 전략 설명 (아래 "분할 전략" 참고) |
+| `holdoutType` | string | `"specimen"` \| `"operating_condition"` |
+| `independentHoldout` | boolean | `specimen` 전략이면 `true`, `operating_condition_holdout`이면 `false` (같은 물리 베어링이 여러 split에) |
 | `status` | string | `draft` (승인 전) |
 | `reason` | string | 등록 사유 |
 | `createdAt` | ISO8601 | 생성 시각 |
@@ -74,25 +76,39 @@ id>/`에 모두 만들고 검증한 뒤 그 디렉터리 자체를 단일 rename
 합성 이벤트의 초기 운영자 라벨(`confirmed_anomaly`/`normal_false_positive`)을 자동으로
 채우는 데 쓰인다 (자세한 내용은 `../event_labels/event_label_schema.md` 참고).
 
-## 분할 전략 (`splitStrategy`)
+## 분할 전략 (`split_strategy` / `splitStrategy` / `holdoutType` / `independentHoldout`)
 
-`dataset/schema.md`(1주차)는 "동일 설비의 샘플이 train/test에 섞이지 않도록 설비 단위(group
-split)"를 권장한다. `register_dataset.py`의 `group_split()`은 이를 그대로 따른다:
+**`build_manifest(split_strategy=...)`로 선택** (기본 `"specimen_group"`):
 
-- **`source_label`(원본 `.mat` 파일) 단위로 그룹을 통째로 하나의 split에만 배정**한다.
-  동일 그룹의 윈도우가 여러 split에 나뉘어 들어가는 것을 원천적으로 막아 데이터 누수를
-  방지한다 (`seed` 고정, 라벨별로 독립적으로 그룹을 배정).
-- 라벨 하나의 독립 그룹 수가 요청한 분할 개수(기본 3: train/validation/test)보다 적으면
-  **그룹을 쪼개서 윈도우 단위로 섞는 대신 `InsufficientAssetGroupsError`를 발생시킨다.**
-  (이 동작은 합성 케이스로 `TestGroupSplitSynthetic`가 계속 검증한다.)
-- CWRU는 이제 **라벨당 자산(파일) 4개** — 부하 조건 0/1/2/3 HP — 를 확보해 기본 3-way
-  비율이 리크 없이 성립한다. 파일 크기가 전부 달라 분할은 `seed`에 의존하지 않고
-  결정적이다: **test = 0HP(97/105/118/130), validation = 1HP(98/106/119/131),
-  train = 2HP+3HP**. 각 원본 파일은 정확히 하나의 split에만 들어간다.
-- 유의: CWRU에서는 "자산 = 부하 조건"이라 split 간 운전 조건이 겹치지 않는다. 정상
-  재구성 임계값이 train에 없던 부하 조건에서는 보정되지 않으므로, 하류 모델
-  (`AI_FREQ_MODEL_01`)은 RPM에 강하게 묶인 `vibration_peak_hz`를 모델 입력에서 제외하고
-  운전 조건별 임계값 재보정을 도메인갭으로 기록한다.
+### `specimen_group` (기본) — 물리 베어링 단위 독립 분할
+
+CWRU 부하별 `.mat` 4개(0/1/2/3 HP)는 서로 다른 자산이 아니라 **같은 물리 베어링
+(specimen)**을 부하만 바꿔 측정한 것이다. group split은 `specimen_id`(결함타입+직경,
+부하 무관) 단위로 해야 같은 베어링이 train/validation/test에 섞이는 누수를 막는다.
+
+- `load_cwru_vibration`이 40파일 → **10 물리 specimen**으로 매핑한다:
+  `CWRU-NORMAL-BASELINE`(1개) + `CWRU-{IR,BALL,OR}-{0007,0014,0021}`(각 3개).
+- `group_split(group_key="specimen_id")`가 specimen을 통째로 한 split에만 배정하고,
+  라벨 하나의 독립 specimen 수가 분할 개수보다 적으면 `InsufficientAssetGroupsError`.
+- **CWRU는 NORMAL specimen이 1개뿐이라 기본 3-way에서 이 예외가 나는 것이 정상이다**
+  — 조용히 우회하지 않는다(정직한 실패). 결함 3클래스는 specimen 3개라 결함 간에는
+  독립 3-way가 가능하지만 NORMAL 제약이 전체 3-way를 막는다.
+- `independentHoldout = True`.
+
+### `operating_condition_holdout` (opt-in) — 부하조건 기준, **독립 아님**
+
+데모/리포트용. 부하조건 기준 고정 배정: **test=0HP, validation=1HP, train=2·3HP**
+(결정적, `seed` 무관). 같은 물리 베어링이 모든 split에 등장하므로 **specimen 독립
+검증이 아니라 운전조건 기준 in-distribution 평가**다.
+
+- `independentHoldout = False`, `holdoutType = "operating_condition"`.
+- 하류 모델(`AI_FREQ_MODEL_01`)은 이 매니페스트로 학습한 지표를 일반화 성능으로
+  보고하지 않고 `report.metrics.independentHoldout = false`를 붙인다. RPM 프록시
+  `vibration_peak_hz`는 이 분할이 부하 기준이라 train/validation 값 범위가 겹치지 않아
+  모델 입력에서 제외한다(매니페스트에는 27개 유지).
+
+`compute_version_checksum` payload에 `split_strategy`가 포함되므로 전략이 다르면
+다른 데이터셋 `id`가 나온다.
 
 ## 행(rows) 스키마 — CSV/XLSX로 내보내는 실제 컬럼
 
@@ -100,6 +116,7 @@ split)"를 권장한다. `register_dataset.py`의 `group_split()`은 이를 그�
 |---|---|
 | `sample_id` | `load_cwru_vibration.load_cwru_dataset()`가 부여한 윈도우 ID |
 | `source_file` | 원본 `.mat` 파일명 (체크섬 추적용 키) |
+| `specimen_id` | 물리 베어링 식별자 (`CWRU-IR-0014` 등) — group split 단위, 누수 추적용 |
 | `known_label` | CWRU 원본 라벨 |
 | `common_label` | 정규화된 공통 라벨 (`NORMAL`/`ANOMALY`) |
 | `split` | `train`/`validation`/`test` |
@@ -139,9 +156,12 @@ split)"를 권장한다. `register_dataset.py`의 `group_split()`은 이를 그�
 ## TODO (실제 센서/추가 데이터셋 확보 후)
 
 - [ ] MIMII 음향 데이터가 배치되면 `modality: "acoustic"` 데이터셋 버전을 동일 스키마로 추가 등록
-- [x] 라벨당 자산 4개(0~3HP)를 확보해 기본 3-way group split로 전환 완료. 남은 한계:
-      CWRU는 자산 = 부하 조건이라 split 간 운전 조건이 겹치지 않는다 — 현장에서 다양한
-      운전 조건의 자산이 쌓이면 해소된다
+- [x] 결함 클래스(IR/Ball/OR)에 0.007/0.014/0.021" 3개 물리 specimen 확보 — 결함 간에는
+      specimen 독립 3-way가 가능하다.
+- [ ] **NORMAL specimen이 1개뿐**이라 전체 3-way specimen 독립 분할은 불가능하다
+      (`build_manifest` 기본 `specimen_group`은 `InsufficientAssetGroupsError`). 현장 정상
+      데이터 또는 추가 CWRU 베이스라인 베어링 확보 후 해소. 그때까지 데모는
+      `operating_condition_holdout`(`independentHoldout=false`)만 제공한다.
 - [ ] 실제 센서 채널 확보 후 이 CWRU 버전과 별도의 신규 데이터셋 버전으로 등록 (섞지 않음 —
       MVP 기획서 "역할배정" 시트의 "대상 확정 후 보완" 항목)
 - [ ] 텔레메트리 스냅샷 기반 내부 데이터셋(`POST /api/telemetry/ingest` → export)의 라벨 권한·

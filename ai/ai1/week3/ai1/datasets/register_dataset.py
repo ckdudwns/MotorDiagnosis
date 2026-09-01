@@ -260,9 +260,13 @@ def group_split(
     train/validation/test 3개)보다 적으면 그룹을 쪼개지 않는 한 리크 없이
     분할을 만들 수 없다 — 이 경우 조용히 윈도우 단위로 섞는 대신
     `InsufficientAssetGroupsError`를 발생시켜 "데이터 부족" 상태를 명시적으로
-    드러낸다 (근거: dataset_manifest_format.md "분할 전략"). CWRU는 현재
-    라벨당 자산이 1개뿐이라 기본 3-way 분할에서는 이 예외가 발생하는 것이
-    정상이며, 자산이 늘어나거나 train 전용 등 분할 비율을 조정해야 해소된다.
+    드러낸다 (근거: dataset_manifest_format.md "분할 전략").
+
+    `build_manifest`는 `group_key="specimen_id"`(물리 베어링)로 이 함수를 호출한다.
+    CWRU는 IR/Ball/OR 결함마다 specimen 3개(0.007/0.014/0.021")를 확보했지만
+    **NORMAL specimen은 1개뿐**이라(건강 베어링 1개) 기본 3-way 분할에서는 이
+    예외가 발생하는 것이 정상이다 — 정직한 실패다. 데모/리포트용으로는
+    `operating_condition_split()`(부하조건 기준, 독립 검증 아님)을 opt-in으로 쓴다.
     """
     ratios = DEFAULT_SPLIT_RATIOS if ratios is None else ratios
     validate_split_ratios(ratios)
@@ -390,6 +394,39 @@ def group_split(
     return [split_of_index[i] for i in range(len(records))]
 
 
+# 부하조건(0/1/2/3 HP) → split 고정 배정. test는 가장 낮은 부하(0HP), validation은
+# 1HP, train은 2·3HP. 결정적(seed 무관)이며 각 부하 tier의 윈도우는 통째로 한 split에만
+# 들어간다.
+_OPERATING_CONDITION_SPLIT_MAP = {0: "test", 1: "validation", 2: "train", 3: "train"}
+
+
+def operating_condition_split(records: list, ratios: dict = None) -> list:
+    """부하조건(`load_hp`) 기준으로 split을 고정 배정한다 — **specimen 독립 아님**.
+
+    같은 물리 베어링(specimen)이 모든 부하조건에 걸쳐 있으므로 이 분할에서는 같은
+    specimen이 train/validation/test에 함께 들어간다(누수). CWRU는 건강한 베어링이
+    1개뿐이라 specimen 독립 holdout 자체가 불가능해서, 데모/리포트용으로만 이 분할을
+    opt-in으로 쓴다. 매니페스트에 `independentHoldout=False`가 붙는다.
+
+    `ratios`는 시그니처 호환을 위해 받지만 무시한다(부하 tier가 배정을 결정).
+    """
+    del ratios  # 부하 tier 배정이 우선. 시그니처 호환용으로만 받는다.
+    missing = [
+        rec.get("sample_id") for rec in records if rec.get("load_hp") is None
+    ]
+    if missing:
+        raise ValueError(
+            "operating_condition_split에는 레코드마다 load_hp(0~3)가 필요합니다. "
+            f"누락: {missing[:5]}{'...' if len(missing) > 5 else ''}"
+        )
+    unknown = sorted(
+        {rec["load_hp"] for rec in records} - set(_OPERATING_CONDITION_SPLIT_MAP)
+    )
+    if unknown:
+        raise ValueError(f"알 수 없는 load_hp 값: {unknown} (허용: 0~3).")
+    return [_OPERATING_CONDITION_SPLIT_MAP[rec["load_hp"]] for rec in records]
+
+
 def compute_feature_output_fingerprint(rows: list) -> str:
     """실제로 계산된 특징값 산출물 자체의 canonical hash.
 
@@ -422,6 +459,7 @@ def compute_version_checksum(
     feature_pipeline_version: str = FEATURE_PIPELINE_VERSION,
     label_policy_version: str = LABEL_POLICY_VERSION,
     snapshot_schema_version: str = SNAPSHOT_SCHEMA_VERSION,
+    split_strategy: str = "specimen_group",
 ) -> str:
     """원본 파일·라벨·전처리/분할/특징 추출 설정 + 실제 산출물로 불변 버전 체크섬을 만든다.
 
@@ -458,6 +496,7 @@ def compute_version_checksum(
         "feature_output_fingerprint": feature_output_fingerprint,
         "label_policy_version": label_policy_version,
         "snapshot_schema_version": snapshot_schema_version,
+        "split_strategy": split_strategy,
     }
     encoded = json.dumps(
         payload, sort_keys=True, ensure_ascii=False, allow_nan=False
@@ -547,14 +586,49 @@ def summarize_dataset_labels(
     }
 
 
+# 분할 전략.
+#   specimen_group            : 물리 베어링(specimen) 단위 group split. 라벨별로 독립
+#                               specimen이 분할 수보다 적으면 InsufficientAssetGroupsError.
+#                               CWRU는 NORMAL specimen이 1개뿐이라 기본 3-way에서 실패한다
+#                               (정직한 실패). independentHoldout=True.
+#   operating_condition_holdout: 부하조건(0/1/2/3 HP) 기준 고정 배정. 같은 specimen이 여러
+#                               split에 등장 → specimen 독립 검증이 아님. 데모/리포트 opt-in.
+#                               independentHoldout=False.
+SPLIT_STRATEGIES = ("specimen_group", "operating_condition_holdout")
+
+_SPLIT_STRATEGY_TEXT = {
+    "specimen_group": (
+        "specimen_group: 물리 베어링(결함타입+직경, 부하 무관) 단위로 group split. "
+        "같은 specimen의 윈도우는 통째로 한 split에만 — specimen-independent holdout."
+    ),
+    "operating_condition_holdout": (
+        "operating_condition_holdout: 부하조건(test=0HP, validation=1HP, train=2·3HP) "
+        "기준 고정 배정. 같은 물리 베어링이 train/validation/test에 함께 들어간다 — "
+        "specimen 독립 검증이 아니라 운전조건 기준 in-distribution 평가다 "
+        "(independentHoldout=False). split 비율은 부하 tier가 결정한다."
+    ),
+}
+
+
 def build_manifest(
     data_dir: str = _DEFAULT_DATA_DIR,
     window_size: int = 2048,
     hop_size: int = 2048,
     split_ratios: dict = None,
     seed: int = 42,
+    split_strategy: str = "specimen_group",
 ) -> dict:
-    """CWRU 데이터를 로드해 DATA_EXPORT_01 매니페스트(dict)를 만든다."""
+    """CWRU 데이터를 로드해 DATA_EXPORT_01 매니페스트(dict)를 만든다.
+
+    split_strategy 기본값은 `specimen_group`(물리 베어링 단위 독립 분할)이다. CWRU는
+    NORMAL specimen이 1개뿐이라 기본 3-way에서 `InsufficientAssetGroupsError`가 나는
+    것이 정상이다. 데모/리포트가 필요하면 `operating_condition_holdout`를 명시적으로
+    지정한다 — 이 경우 결과에 `independentHoldout=False`가 붙는다.
+    """
+    if split_strategy not in SPLIT_STRATEGIES:
+        raise ValueError(
+            f"split_strategy는 {SPLIT_STRATEGIES} 중 하나여야 합니다: {split_strategy!r}"
+        )
     split_ratios = DEFAULT_SPLIT_RATIOS if split_ratios is None else split_ratios
     validate_split_ratios(split_ratios)
 
@@ -565,7 +639,15 @@ def build_manifest(
     source = build_source_block(data_dir)
     config = FeatureConfig(sample_rate=records[0]["sample_rate"])
     compatibility = build_compatibility_block(records)
-    splits = group_split(records, split_ratios, seed)
+
+    if split_strategy == "specimen_group":
+        splits = group_split(records, split_ratios, seed, group_key="specimen_id")
+        holdout_type = "specimen"
+        independent_holdout = True
+    else:  # operating_condition_holdout
+        splits = operating_condition_split(records, split_ratios)
+        holdout_type = "operating_condition"
+        independent_holdout = False
 
     rows = []
     for rec, split in zip(records, splits):
@@ -581,6 +663,7 @@ def build_manifest(
         row = {
             "sample_id": rec["sample_id"],
             "source_file": rec["source_label"],
+            "specimen_id": rec["specimen_id"],
             "known_label": known_label,
             "common_label": common_label,
             "split": split,
@@ -602,6 +685,7 @@ def build_manifest(
         compute_feature_output_fingerprint(rows),
         label_policy_version=LABEL_POLICY_VERSION,
         snapshot_schema_version=SNAPSHOT_SCHEMA_VERSION,
+        split_strategy=split_strategy,
     )
     source["checksum"] = version_checksum
 
@@ -627,10 +711,9 @@ def build_manifest(
         "labelPolicyVersion": LABEL_POLICY_VERSION,
         "snapshotSchemaVersion": SNAPSHOT_SCHEMA_VERSION,
         "split": split_ratios,
-        "splitStrategy": (
-            "group_split_by_source_file (per-label; whole source_label groups are "
-            "assigned to a single split — never split at window level to avoid leakage)"
-        ),
+        "splitStrategy": _SPLIT_STRATEGY_TEXT[split_strategy],
+        "holdoutType": holdout_type,
+        "independentHoldout": independent_holdout,
         "status": "draft",
         "reason": "3주차 기존 데이터셋 선정 및 정규화 — AI_FREQ_MODEL_01 선행학습 입력 준비",
         "createdAt": datetime.now(timezone.utc).isoformat(),
@@ -661,6 +744,16 @@ if __name__ == "__main__":
         "--test-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["test"]
     )
     parser.add_argument(
+        "--split-strategy",
+        choices=SPLIT_STRATEGIES,
+        default="specimen_group",
+        help=(
+            "specimen_group(기본, 물리 베어링 단위 독립 분할 — CWRU는 NORMAL specimen이 "
+            "1개뿐이라 3-way에서 InsufficientAssetGroupsError) 또는 "
+            "operating_condition_holdout(부하조건 기준, independentHoldout=False)"
+        ),
+    )
+    parser.add_argument(
         "--output",
         default=os.path.normpath(
             os.path.join(_THIS_DIR, "..", "data", "handoff", "dataset_manifest_full.json")
@@ -668,11 +761,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # 기본 비율(0.7/0.2/0.1)은 라벨당 자산이 여러 개일 때를 전제로 한다. 지금처럼
-    # CWRU가 라벨당 자산 1개뿐이면 group_split이 InsufficientAssetGroupsError를
-    # 낸다 — 조용히 window 셔플로 우회하지 않고, 자산을 추가하거나
-    # --train-ratio 1 --validation-ratio 0 --test-ratio 0 처럼 명시적으로
-    # train 전용 비율을 지정해야 한다.
+    # 기본(specimen_group)은 물리 베어링 단위 독립 분할이다. CWRU는 건강한 베어링이
+    # 1개뿐(NORMAL specimen 1개)이라 기본 3-way에서 InsufficientAssetGroupsError가 나는
+    # 것이 정상이다 — 조용히 우회하지 않는다. 데모/리포트가 필요하면
+    # --split-strategy operating_condition_holdout 를 명시한다 (independentHoldout=False).
     manifest = build_manifest(
         data_dir=args.data_dir,
         window_size=args.window_size,
@@ -683,6 +775,7 @@ if __name__ == "__main__":
             "test": args.test_ratio,
         },
         seed=args.seed,
+        split_strategy=args.split_strategy,
     )
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -690,5 +783,6 @@ if __name__ == "__main__":
         json.dump(manifest, f, ensure_ascii=False, indent=2, allow_nan=False)
 
     print(f"데이터셋 {manifest['id']} 매니페스트 생성 완료: {manifest['rowCount']}행")
+    print(f"  분할 전략: {args.split_strategy} (independentHoldout={manifest['independentHoldout']})")
     print(f"  분할 건수: {manifest['splitCounts']}")
     print(f"  저장 위치: {args.output}")

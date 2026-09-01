@@ -8,8 +8,10 @@ GET /api/training-jobs/{jobId}(FUT-009) 응답 형태를 따른다. 설계 근�
 freq_baseline_format.md 참고.
 """
 
+import hashlib
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +19,7 @@ import numpy as np
 import torch
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATASET_VERSIONS_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", "dataset_versions"))
 # __main__ 배선에서 register_dataset.build_manifest / dataset_version.freeze를
 # 쓸 때만 필요하다. 학습 파이프라인 자체(run_training_job)는 동결 매니페스트
 # dict만 받아 원본 CWRU를 다시 읽지 않는다.
@@ -24,6 +27,7 @@ _WEEK3_DATASETS_DIR = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "..", "week3", "ai1", "datasets")
 )
 sys.path.insert(0, _WEEK3_DATASETS_DIR)
+sys.path.insert(0, _DATASET_VERSIONS_DIR)
 sys.path.insert(0, _THIS_DIR)
 
 from models import (  # noqa: E402
@@ -33,6 +37,15 @@ from models import (  # noqa: E402
     train_autoencoder,
     reconstruction_error,
 )
+from dataset_version import verify_frozen_integrity  # noqa: E402
+
+
+def _sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
 
 SEQ_LEN = 5
 
@@ -41,6 +54,7 @@ _NON_FEATURE_ROW_KEYS = frozenset(
     {
         "sample_id",
         "source_file",
+        "specimen_id",
         "known_label",
         "common_label",
         "split",
@@ -50,24 +64,27 @@ _NON_FEATURE_ROW_KEYS = frozenset(
 )
 
 # 운전 조건(부하/RPM)에 강하게 묶인 특징 — 모델 입력에서 제외한다.
-# 리크 없는 group_split은 사실상 부하조건(0/1/2/3 HP)별 분리라, 이 특징은
-# train과 val/test 구간의 값 범위가 겹치지 않는다. z-score가 발산해
-# 재구성 오차·임계값 보정이 망가진다(제외 시 test AUC 1.0, 포함 시 f1 0).
-# 매니페스트에는 27개 그대로 남기고(데이터셋 산출물은 완전해야 하며
-# datasetId가 전체 특징을 정직하게 담는다), 모델 입력만 26개로 좁힌다.
+#
+# 근거(물리 + train/validation 관찰, test 평가 전에 확정·동결한 결정):
+#   vibration_peak_hz ≈ 회전 주파수 = RPM/60. CWRU는 부하조건별로 RPM이 고정이고
+#   (0HP≈1797 / 1HP≈1772 / 2HP≈1750 / 3HP≈1730), operating_condition_holdout 분할은
+#   바로 그 부하조건 기준이라 이 특징의 값 범위가 train(2·3HP)과 validation(1HP)에서
+#   이미 겹치지 않는다 — z-score가 발산해 재구성 오차·임계값 보정이 무너진다.
+#   특징 선택·후보 비교는 train/validation만으로 했고, test split은 이 결정에 쓰지 않았다.
+# 매니페스트에는 27개 그대로 남기고(datasetId가 전체 특징을 정직하게 담는다),
+# 모델 입력만 26개로 좁힌다.
 _OPERATING_POINT_FEATURES = frozenset({"vibration_peak_hz"})
 
 DENSE_SPLIT_STRATEGY = (
-    "3주차 group_split(source_file=자산 단위) 배정을 그대로 재사용하고, 동결 "
-    "매니페스트의 inline 특징 컬럼(27개 중 운전 조건 결합 특징을 뺀 26개)을 직접 "
-    "입력으로 사용 (재윈도우/재계산 없음 — 학습 입력이 datasetId가 가리키는 "
+    "동결 매니페스트의 split 배정(operating_condition_holdout — 부하조건 기준, specimen "
+    "독립 아님)을 그대로 재사용하고, inline 특징 컬럼(27개 중 운전 조건 결합 특징을 뺀 "
+    "26개)을 직접 입력으로 사용 (재윈도우/재계산 없음 — 학습 입력이 datasetId가 가리키는 "
     "데이터와 정확히 일치)"
 )
 LSTM_SPLIT_STRATEGY = (
-    f"동일 group_split 파일→split 배정 안에서만 동결 매니페스트 rows(inline 특징)를 "
-    f"윈도우 순번으로 정렬해 길이 {SEQ_LEN} 비중첩 시퀀스를 구성 (원본 재로드·재계산 "
-    "없음 — dense 경로와 동일하게 학습 입력이 datasetId가 가리키는 데이터와 정확히 "
-    "일치, 한 원본 파일의 모든 시퀀스는 한 split에만)"
+    f"동일 split 배정 안에서만 동결 매니페스트 rows(inline 특징)를 윈도우 순번으로 정렬해 "
+    f"길이 {SEQ_LEN} 비중첩 시퀀스를 구성 (원본 재로드·재계산 없음, 한 원본 파일의 모든 "
+    "시퀀스는 한 split에만). 분할 자체는 operating_condition_holdout이라 specimen 독립 아님"
 )
 
 
@@ -302,7 +319,15 @@ def _evaluate_candidate(
     scaler_mean = scaler.mean_.tolist()
     scaler_std = scaler.std_.tolist()
 
+    artifact_checksum = None
     if artifact_path:
+        # 불변 artifact: 이미 존재하면 절대 덮어쓰지 않는다 — 같은 경로가 나중에
+        # 만들어진 다른 모델을 가리키면 이전 보고서의 URI가 거짓말이 된다.
+        if os.path.exists(artifact_path):
+            raise FileExistsError(
+                f"artifact 경로가 이미 존재합니다 (덮어쓰기 금지): {artifact_path}. "
+                "job_id 기반 경로가 유일해야 합니다."
+            )
         os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
         # 가중치만 저장하면 학습 당시 입력 변환(정규화)을 복원할 수 없다 —
         # 스케일러 평균·표준편차·특징 순서·임계값을 함께 저장한다.
@@ -321,6 +346,7 @@ def _evaluate_candidate(
             },
             artifact_path,
         )
+        artifact_checksum = _sha256_of_file(artifact_path)
 
     candidate = {
         "name": name,
@@ -335,6 +361,7 @@ def _evaluate_candidate(
         # INVALID_ARTIFACT_URI로 거부된다. 표준 파일 URI로 변환한다
         # (Windows: file:///C:/..., POSIX: file:///...).
         "artifactUri": Path(artifact_path).resolve().as_uri() if artifact_path else None,
+        "artifactChecksum": artifact_checksum,
         "normalization": {
             "featureOrder": list(feature_names),
             "mean": scaler_mean,
@@ -347,25 +374,57 @@ def _evaluate_candidate(
     return candidate, error_cases
 
 
-def score_from_artifact(artifact_path: str, matrix: np.ndarray) -> dict:
+def score_from_artifact(
+    artifact_path: str, matrix: np.ndarray, *, input_feature_names: list
+) -> dict:
     """저장된 아티팩트만으로 재구성 오차·이상 판정을 재현한다.
 
-    학습 코드와 같은 입력이 주어지면 같은 오차/판정이 나와야 한다 (스케일러
-    상태와 임계값이 아티팩트에 함께 저장돼 있으므로).
+    `input_feature_names`(입력 행렬 각 열의 특징 이름)는 **필수**다 — 아티팩트에 저장된
+    학습 시점 특징 순서와 대조·재정렬한다. 이름 없이 shape만 맞는 입력을 넘기면
+    열 순서가 어긋나도 오류 없이 다른 판정이 나오기 때문이다.
+
+    - 특징 집합이 아티팩트와 다르면 → ValueError
+    - 순서만 다르면 → 아티팩트 순서로 열 재정렬
+    - 열 개수 불일치 / NaN·Inf → ValueError
     """
     payload = torch.load(artifact_path, weights_only=False)  # 신뢰된 로컬 아티팩트
+    artifact_names = list(payload["feature_names"])
+
+    input_names = list(input_feature_names)
+    if len(input_names) != len(set(input_names)):
+        raise ValueError(f"input_feature_names에 중복이 있습니다: {input_names}")
+    if set(input_names) != set(artifact_names):
+        raise ValueError(
+            "입력 특징 집합이 아티팩트와 다릅니다.\n"
+            f"  아티팩트: {sorted(artifact_names)}\n  입력: {sorted(input_names)}"
+        )
+
+    arr = np.asarray(matrix, dtype=np.float64)
+    if arr.shape[-1] != len(artifact_names):
+        raise ValueError(
+            f"입력 열 개수({arr.shape[-1]})가 아티팩트 특징 수({len(artifact_names)})와 "
+            "다릅니다."
+        )
+    if not np.isfinite(arr).all():
+        raise ValueError("입력 행렬에 NaN 또는 Inf가 있습니다.")
+
+    if input_names != artifact_names:
+        # 이름 기준으로 아티팩트 열 순서에 맞춰 재정렬 (마지막 축이 특징 축).
+        order = [input_names.index(n) for n in artifact_names]
+        arr = arr[..., order]
+
     model = _MODEL_BUILDERS[payload["model_type"]](payload["input_dim"])
     model.load_state_dict(payload["state_dict"])
 
     scaler = FeatureScaler.from_state(payload["scaler_mean"], payload["scaler_std"])
-    tensor = torch.tensor(scaler.transform(np.asarray(matrix)), dtype=torch.float32)
+    tensor = torch.tensor(scaler.transform(arr), dtype=torch.float32)
     errors = reconstruction_error(model, tensor)
     threshold = payload["threshold"]
     return {
         "errors": errors,
         "verdict": (errors > threshold).tolist(),
         "threshold": threshold,
-        "feature_names": payload["feature_names"],
+        "feature_names": artifact_names,
     }
 
 
@@ -382,10 +441,13 @@ def build_domain_gap() -> dict:
             "source": "파일별 고정 부하(0~3HP 근사)/고정 RPM",
             "target": "가변 부하·RPM 예상",
             "note": (
-                "리크 없는 group_split이 사실상 부하조건별 분리라, 정상 재구성 "
-                "임계값이 train에 없던 부하조건에서는 보정되지 않는다. RPM에 강하게 "
-                "묶인 vibration_peak_hz는 모델 입력에서 제외했다(매니페스트에는 유지). "
-                "현장에서는 운전 조건별로 임계값을 재보정해야 한다."
+                "이 베이스라인 지표는 operating_condition_holdout(부하조건 기준) 평가이며 "
+                "specimen 독립 검증이 아니다 — 같은 물리 베어링이 train/validation/test에 "
+                "함께 들어간다. CWRU는 건강한 베어링이 1개뿐이라 specimen 독립 holdout "
+                "자체가 불가능하다. 정상 재구성 임계값이 train에 없던 부하조건에서는 "
+                "보정되지 않고, RPM 프록시인 vibration_peak_hz는 모델 입력에서 제외했다"
+                "(매니페스트에는 유지). 현장 데이터 또는 추가 독립 베어링 확보 후 "
+                "specimen 독립 평가로 재검증하고, 운전 조건별 임계값을 재보정해야 한다."
             ),
         },
         "labelTaxonomy": {
@@ -428,7 +490,23 @@ def run_training_job(
         raise ValueError(
             f"frozen 상태의 매니페스트가 필요합니다 (status={frozen_manifest.get('status')!r})."
         )
+    # status만 보면 freeze 이후 row 값이 바뀌어도 같은 datasetId로 학습이 완료된다 —
+    # 특징 준비 전에 전체 snapshot 무결성을 재검증한다.
+    verify_frozen_integrity(frozen_manifest)
     torch.manual_seed(seed)
+
+    # 작업별 유일 job_id. artifact는 이 아래 불변 경로에 저장 — 다음 학습이 이전 모델을
+    # 덮어쓰지 않는다(보고서 URI가 나중 모델을 가리키는 문제 방지).
+    job_id = (
+        "TJ-"
+        + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        + "-"
+        + uuid.uuid4().hex[:8]
+    )
+    job_dir = os.path.join(artifact_dir, job_id) if artifact_dir else None
+
+    independent_holdout = bool(frozen_manifest.get("independentHoldout"))
+    holdout_type = frozen_manifest.get("holdoutType")
 
     # dense와 lstm 모두 동결 매니페스트 rows의 inline 특징값만 입력으로 쓴다
     # (원본 CWRU 재로드·재계산 없음). 같은 feature_names로 두 경로를 묶는다.
@@ -439,7 +517,7 @@ def run_training_job(
         dense_splits,
         feature_names=feature_names,
         epochs=dense_epochs,
-        artifact_path=os.path.join(artifact_dir, "dense_autoencoder.pt") if artifact_dir else None,
+        artifact_path=os.path.join(job_dir, "dense_autoencoder.pt") if job_dir else None,
     )
 
     lstm_splits = prepare_lstm_chunks(frozen_manifest, feature_names)
@@ -449,22 +527,33 @@ def run_training_job(
         lstm_splits,
         feature_names=feature_names,
         epochs=lstm_epochs,
-        artifact_path=os.path.join(artifact_dir, "lstm_autoencoder.pt") if artifact_dir else None,
+        artifact_path=os.path.join(job_dir, "lstm_autoencoder.pt") if job_dir else None,
     )
 
     candidates = [dense_candidate, lstm_candidate]
     best = select_best(candidates)
 
+    evaluation_note = (
+        "specimen-independent holdout"
+        if independent_holdout
+        else "operating_condition_holdout — NOT specimen-independent (운전조건 기준 "
+        "in-distribution 평가). CWRU는 건강한 베어링이 1개뿐이라 specimen 독립 검증 불가."
+    )
+
     return {
-        "id": f"TJ-CWRU-VIBRATION-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+        "id": job_id,
         "datasetId": frozen_manifest.get("id"),
+        "datasetSnapshotDigest": frozen_manifest.get("snapshotDigest"),
         "status": "completed",
         "candidates": candidates,
         "metrics": {
             "bestCandidate": best["name"],
             "selectionCriterion": "validation_f1",
+            "independentHoldout": independent_holdout,
+            "holdoutType": holdout_type,
+            "evaluation": evaluation_note,
             "validation": best["validationMetrics"],
-            **best["metrics"],  # 선택된 모델의 독립적인 최종(test) 지표
+            **best["metrics"],  # 선택된 모델의 test 지표 (독립 검증 아님 — 위 플래그 참고)
         },
         "errorCases": {"dense_autoencoder": dense_errors, "lstm_autoencoder": lstm_errors},
         "domainGap": build_domain_gap(),
@@ -494,17 +583,24 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dense-epochs", type=int, default=150)
     parser.add_argument("--lstm-epochs", type=int, default=150)
+    parser.add_argument(
+        "--split-strategy",
+        choices=("specimen_group", "operating_condition_holdout"),
+        default="operating_condition_holdout",
+        help=(
+            "기본 데모는 operating_condition_holdout(운전조건 기준, independentHoldout=False). "
+            "specimen_group은 물리 베어링 단위 독립 분할 — CWRU는 NORMAL specimen이 1개뿐이라 "
+            "3-way에서 InsufficientAssetGroupsError."
+        ),
+    )
     args = parser.parse_args()
 
     from register_dataset import build_manifest
-
-    sys.path.insert(
-        0, os.path.normpath(os.path.join(_THIS_DIR, "..", "dataset_versions"))
-    )
     from dataset_version import freeze_dataset_version  # noqa: E402
 
-    # 라벨당 자산 4개(0~3HP)로 기본 3-way group_split이 성립한다.
-    manifest = build_manifest(data_dir=args.cwru_dir)
+    manifest = build_manifest(
+        data_dir=args.cwru_dir, split_strategy=args.split_strategy
+    )
     frozen = freeze_dataset_version(manifest)
 
     report = run_training_job(
@@ -518,17 +614,22 @@ if __name__ == "__main__":
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2, allow_nan=False)
 
+    m = report["metrics"]
     print(f"학습 완료: {report['id']}  (datasetId={report['datasetId']})")
+    if not m["independentHoldout"]:
+        print(
+            "  [주의] independentHoldout=False: 이 지표는 운전조건 기준 in-distribution "
+            "평가이며 specimen 독립 검증이 아닙니다."
+        )
     for candidate in report["candidates"]:
         vm, tm = candidate["validationMetrics"], candidate["metrics"]
         print(
-            f"  {candidate['name']}: 검증 f1={vm['f1']:.3f} / 테스트 f1={tm['f1']:.3f}, "
-            f"precision={tm['precision']:.3f}, recall={tm['recall']:.3f}"
+            f"  {candidate['name']}: 검증 f1={vm['f1']:.3f} / (비독립) 테스트 f1={tm['f1']:.3f}, "
+            f"precision={tm['precision']:.3f}, recall={tm['recall']:.3f}  "
+            f"artifact={candidate['artifactChecksum']}"
         )
     print(
-        f"  선택 기준: {report['metrics']['selectionCriterion']} → "
-        f"최적 후보: {report['metrics']['bestCandidate']} "
-        f"(검증 f1={report['metrics']['validation']['f1']:.3f}, "
-        f"최종 테스트 f1={report['metrics']['f1']:.3f})"
+        f"  선택 기준: {m['selectionCriterion']} → 최적 후보: {m['bestCandidate']} "
+        f"(검증 f1={m['validation']['f1']:.3f}, 비독립 테스트 f1={m['f1']:.3f})"
     )
     print(f"저장 위치: {args.output}")

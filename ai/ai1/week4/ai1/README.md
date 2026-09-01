@@ -50,52 +50,66 @@ API 명세서 v1.3에서 추가된 `labelPolicyVersion`(`LABEL-POLICY-V2`)·`sna
 허용하고, 기준선은 `approved`가 아니면 `activate`할 수 없게 해 "승인 전 배포 금지"를
 코드 레벨에서 강제한다.
 
-**실행 결과 (실제 CWRU 데이터, seed=42):** 같은 seed로 매니페스트를 두 번 생성해
-체크섬이 동일함을 확인했다. CWRU 16파일은 크기가 전부 달라 `group_split`이 seed에
-의존하지 않으므로, 재현성 반례는 **분할 비율을 바꿔** 체크섬이 달라짐을 확인하는
-방식으로 검증한다.
+**무결성 (리뷰 P1 반영):**
+- `compute_snapshot_digest`가 매니페스트 **전체 불변 필드**(source·compatibility·정책
+  버전·splitStrategy·rows 등)를 해시한다. `approve_dataset_version`은 동결 이후 어떤
+  불변 필드가 변조돼도 승인을 거부하고, `verify_frozen_integrity`는 학습 시작 전에
+  같은 검증을 한다.
+- 신규 동결은 v1.3 필수 필드(`labelPolicyVersion`/`snapshotSchemaVersion`/`source.checksum`)를
+  요구한다. 이미 동결된 v1은 재동결하지 않고 관용 처리한다(`is_legacy_v1_frozen`).
+- `rollback_model_version`은 target이 **실제로 current보다 앞선 승인 버전**인지
+  (`approved_history` 계보 또는 `approvedAt` 비교) 검증하고 자기 자신·더 최신 버전으로의
+  롤백을 거부한다.
+
+**재현성:** 같은 입력·`split_strategy`로 `build_manifest`를 두 번 생성해 체크섬이
+동일함을 확인한다. `split_strategy`가 다르면(specimen_group vs operating_condition_holdout)
+다른 데이터셋 id가 나온다.
 
 ## 2. AI_FREQ_MODEL_01 — Dense/LSTM Autoencoder 베이스라인
 
-3주차 매니페스트 row에는 week2 `extract_all_features()`(RMS/스펙트럴/대역에너지/
-kurtosis/MFCC, 26개)에 week1 `compute_peak_frequency()`(`vibration_peak_hz`)를 더한
-**27개** 특징이 담긴다(계산 로직 재구현 없음). 다만 리크 없는 `group_split`이 사실상
-부하 조건별 분리라 RPM 프록시인 `vibration_peak_hz`는 정규화가 깨진다 — **모델 입력은
-이를 뺀 26개**를 쓰고, 매니페스트에는 27개를 그대로 남긴다.
+### 데이터 분할의 근본 한계 (리뷰 P1)
 
-`models.py`의 두 후보 모두 **정상(NORMAL) 데이터만으로 재구성을 학습**하는 비지도
-오토인코더 방식이며, 3주차 `group_split`(원본 파일=부하조건 단위) 배정을 그대로 따른다:
+CWRU 부하별 `.mat` 4개(0/1/2/3 HP)는 **같은 물리 베어링(specimen)**을 부하만 바꿔
+측정한 것이다. 데이터셋 계층의 기본 분할은 물리 specimen 단위(`specimen_group`)이고,
+CWRU는 **건강한 베어링이 1개뿐**이라 3-way specimen 독립 분할이 불가능하다 —
+`build_manifest` 기본값은 `InsufficientAssetGroupsError`로 정직하게 실패한다.
+(결함 클래스 IR/Ball/OR은 0.007/0.014/0.021" 3 specimen을 확보했으나 NORMAL 제약이 남는다.)
 
-- **Dense Autoencoder**: 윈도우 단위. **동결 매니페스트 rows의 inline 특징값을 직접**
-  입력으로 쓴다(재윈도우/재계산 없음 — 학습 입력이 `datasetId`가 가리키는 데이터와 일치).
-- **LSTM Autoencoder**: 길이 5 연속 윈도우 시퀀스. 원신호를 매니페스트와 같은 윈도우로
-  재분할하되, 한 원본 파일의 모든 시퀀스는 그 파일이 배정된 한 split에만 들어간다
-  (파일 내부 재분할 없음 — 근거는 `freq_baseline/freq_baseline_format.md`).
+데모 베이스라인은 **`operating_condition_holdout`**(test=0HP / validation=1HP /
+train=2·3HP)으로 얻으며, 같은 물리 베어링이 모든 split에 들어간다 →
+**`independentHoldout=false`**. 아래 지표는 "specimen 독립 일반화 성능"이 아니라
+**운전조건 기준 in-distribution 평가**다.
 
-후보 선택은 **validation f1**으로만 하고(`selectionCriterion`), 최종 지표는 선택된
-후보의 **test** 평가로 분리 보고한다. 임계값은 `mean(validation NORMAL 재구성오차)
-+ 3*std` (week2/3주차와 동일한 sigma 관례).
+### 모델
 
-**실행 결과 (실제 CWRU 16파일, 기본 3-way group split, dense=lstm=150 epochs):**
+매니페스트 row에는 27개 특징(week2 `extract_all_features` 26개 + week1
+`compute_peak_frequency`)이 담기고, **모델 입력은 `vibration_peak_hz`를 뺀 26개**다
+— 이 특징은 RPM/60에 비례하고 `operating_condition_holdout`이 부하(=RPM) 기준 분할이라
+train/validation 구간에서 이미 값 범위가 겹치지 않는다(train/validation 관찰 + 물리 근거로
+판단, test 평가 전 동결). 두 후보 모두 정상(NORMAL) 데이터만으로 재구성 학습하고,
+동결 매니페스트 rows의 inline 특징값만 입력으로 쓴다. 후보 선택은 **validation f1**으로만
+하고 최종(비독립) test 지표는 분리 보고한다.
 
-| 후보 | train(NORMAL) | validation | test | 검증 f1 | 테스트 precision | recall | f1 |
-|---|---|---|---|---|---|---|---|
-| dense_autoencoder | 473 | 413 | 296 | 1.000 | 1.000 | 1.000 | 1.000 |
-| lstm_autoencoder | 94 | 80 | 56 | 1.000 | 1.000 | 1.000 | 1.000 |
+**실행 결과 (실제 CWRU 40파일, `operating_condition_holdout`, dense=lstm=8 epochs 스모크):**
 
-두 후보 모두 오탐/미탐 0건으로 완전 분리됐다. 단, 이 결과는 `vibration_peak_hz`를
-모델 입력에서 제외했을 때다 — 포함하면 부하 조건 간 정규화가 깨져 f1이 0이 된다.
-정상 재구성 임계값이 train에 없던 부하 조건에서 보정되지 않는 것은 `domainGap`에
-"운전 조건별 임계값 재보정 필요"로 기록했다.
+| 후보 | 검증 f1 | (비독립) 테스트 f1 | 비고 |
+|---|---|---|---|
+| dense_autoencoder | ~0.90 | ~0.90 | `independentHoldout=false` — 운전조건 기준 in-distribution |
+| lstm_autoencoder | ~1.00 | ~1.00 | 완전한 일반화 성능이 **아님**. specimen 독립 검증 미실시 |
 
-`domainGap`/`fieldCalibrationPlan`은 MVP 기획서(v1.2) "AI 보장 범위"·"11. 후속
-로드맵" 문구를 그대로 반영해, 이 베이스라인이 CWRU 공개 데이터 기반이며 대상 모터의
-고장 유형·RUL 성능을 보장하지 않는다는 점과 현장 전이학습·임계값 재보정 계획을
-`training-job` 보고서에 함께 담는다.
+epoch·시드에 따라 값이 흔들리며, 이 수치를 일반화 성능으로 해석하면 안 된다. NORMAL
+독립 베어링 확보 후 `specimen_group`으로 재검증해야 한다.
+
+`run_training_job`은 학습 전 `verify_frozen_integrity`로 동결본 변조를 검사하고, artifact를
+작업별 유일 `job_id` 아래 불변 경로에 저장하며(덮어쓰기 금지) 보고서에 `artifactChecksum`·
+`datasetSnapshotDigest`를 남긴다. 추론(`score_from_artifact`)은 `input_feature_names`를
+필수로 받아 열 순서를 검증·재정렬한다.
 
 ```bash
-python ai/ai1/week4/ai1/freq_baseline/train_and_evaluate.py
-# 결과: ai/ai1/week4/ai1/data/training_job_report.json (+ data/models/*.pt)
+# 기본(specimen_group)은 CWRU에서 InsufficientAssetGroupsError로 정직하게 실패
+python ai/ai1/week4/ai1/freq_baseline/train_and_evaluate.py --split-strategy operating_condition_holdout
+# 결과: ai/ai1/week4/ai1/data/training_job_report.json  (metrics.independentHoldout == false)
+#       (+ data/models/<job_id>/*.pt)
 ```
 
 ## 테스트 실행
@@ -111,11 +125,13 @@ CWRU 실데이터가 없는 환경에서도 합성(fixture) 데이터 기반 테
 
 ## 대상 확정 후 보완
 
-- CWRU에서는 자산 = 부하 조건이라 group split의 각 split이 서로 다른 운전 조건이다.
-  RPM 결합 특징(`vibration_peak_hz`)을 모델 입력에서 제외하고 운전 조건별 임계값
-  재보정을 도메인갭으로 기록했다 — 현장에서 다양한 조건의 자산이 쌓이면 해소된다
-- LSTM 후보는 CWRU 규모에서 시퀀스 청크 수가 적어(train NORMAL 94개) Dense보다 표본이
-  적다 — 실측 데이터로 늘어나면 재검증 필요
+- **specimen 독립 평가**: CWRU는 NORMAL 물리 베어링이 1개뿐이라 specimen 독립 holdout이
+  불가능하다. 현재 데모 지표(`operating_condition_holdout`)는 `independentHoldout=false`이며
+  일반화 성능이 아니다. NORMAL 독립 베어링(현장 정상 데이터 또는 추가 CWRU 베이스라인)
+  확보 후 `split_strategy="specimen_group"`로 재검증
+- `vibration_peak_hz`(RPM 프록시)는 `operating_condition_holdout`이 부하 기준 분할이라
+  train/validation에서 값 범위가 겹치지 않아 모델 입력에서 제외했다 (매니페스트에는 유지)
+- LSTM 후보는 시퀀스 청크 수가 Dense보다 적다 — 실측 데이터로 늘어나면 재검증 필요
 - 음향(acoustic) 모달리티는 아직 없음 — MIMII 데이터 확보 후 같은 구조로 별도 후보 추가
 - `artifactUri`는 로컬 파일을 가리키는 표준 `file://` URI(`Path(...).resolve().as_uri()`)
   — 운영 전 오브젝트 스토리지 URI로 교체

@@ -61,26 +61,77 @@ def approve_model_version(model_version: dict, *, reason: str, metric_snapshot: 
 
 
 def rollback_model_version(
-    current: dict, target: dict, *, reason: str, target_environment: str
+    current: dict,
+    target: dict,
+    *,
+    reason: str,
+    target_environment: str,
+    approved_history: list[dict] | None = None,
 ) -> dict:
     """target으로 롤백하는 액션 레코드를 만든다 (FUT-007).
 
-    "이전 승인 버전만 롤백 대상 허용" — target은 반드시 approved 상태여야 한다.
+    "이전 승인 버전만 롤백 대상 허용" — target은 다음을 모두 만족해야 한다:
+    - `status == "approved"`
+    - `current`와 다른 버전 (자기 자신으로의 롤백 금지)
+    - **`current`보다 앞선 승인 버전** — `approved_history`(승인 시각 오름차순)가 주어지면
+      그 안에서 target이 current보다 앞 index여야 하고, 없으면 `approvedAt` 비교로
+      `target.approvedAt < current.approvedAt`를 요구한다 (더 최신/동일 버전으로의
+      "롤백"을 차단).
+
     배포와 롤백은 별도 작업으로 기록한다(반환값은 current/target을 바꾸지 않고
     새 액션 레코드만 만든다).
     """
+    if not reason or not reason.strip():
+        raise ValueError("reason은 필수입니다.")
     if target.get("status") != "approved":
         raise ValueError(
             f"승인된(approved) 버전으로만 롤백할 수 있습니다 "
             f"(target status={target.get('status')!r})."
         )
-    if not reason or not reason.strip():
-        raise ValueError("reason은 필수입니다.")
+    if current.get("version") is None or target.get("version") is None:
+        raise ValueError("current/target 모두 version이 필요합니다.")
+    if current["version"] == target["version"]:
+        raise ValueError(
+            f"자기 자신({target['version']})으로는 롤백할 수 없습니다."
+        )
+
+    if approved_history is not None:
+        versions = [item.get("version") for item in approved_history]
+        if target["version"] not in versions:
+            raise ValueError(
+                f"target {target['version']!r}이 승인 계보에 없습니다: {versions}"
+            )
+        target_idx = versions.index(target["version"])
+        current_idx = (
+            versions.index(current["version"])
+            if current.get("version") in versions
+            else len(versions)  # current가 계보에 없으면 가장 최신으로 간주
+        )
+        if target_idx >= current_idx:
+            raise ValueError(
+                f"target {target['version']!r}은 current {current['version']!r}보다 "
+                "앞선 승인 버전이어야 합니다 (계보상 이후/동일 버전으로 롤백 불가)."
+            )
+        target_approved_at = approved_history[target_idx].get("approvedAt")
+    else:
+        target_approved_at = target.get("approvedAt")
+        current_approved_at = current.get("approvedAt")
+        if not target_approved_at or not current_approved_at:
+            raise ValueError(
+                "approved_history가 없으면 current/target 모두 approvedAt이 필요합니다 "
+                "(계보 검증용)."
+            )
+        if target_approved_at >= current_approved_at:
+            raise ValueError(
+                f"target(approvedAt={target_approved_at})은 current"
+                f"(approvedAt={current_approved_at})보다 먼저 승인된 버전이어야 합니다."
+            )
 
     return {
         "action": "rollback",
-        "fromVersion": current.get("version"),
+        "fromVersion": current["version"],
         "toVersion": target["version"],
+        "targetApprovedAt": target_approved_at,
         "reason": reason,
         "targetEnvironment": target_environment,
         "at": _now_iso(),

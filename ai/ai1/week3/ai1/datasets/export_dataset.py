@@ -26,6 +26,7 @@ from register_dataset import (  # noqa: E402
     build_manifest,
     dataset_export_label_fields,
     DATASET_EXPORT_LABEL_FIELDS,
+    SPLIT_STRATEGIES,
     _DEFAULT_DATA_DIR,
     DEFAULT_SPLIT_RATIOS,
 )
@@ -265,6 +266,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--test-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["test"])
     parser.add_argument(
+        "--split-strategy",
+        choices=SPLIT_STRATEGIES,
+        default="specimen_group",
+        help="specimen_group(기본, CWRU는 InsufficientAssetGroupsError) 또는 "
+        "operating_condition_holdout(independentHoldout=False)",
+    )
+    parser.add_argument(
         "--output-dir",
         default=os.path.normpath(
             os.path.join(os.path.dirname(__file__), "..", "data", "handoff")
@@ -272,8 +280,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # 기본 비율은 라벨당 자산이 여러 개일 때를 전제로 한다 — CWRU처럼 자산이
-    # 1개뿐이면 build_manifest가 InsufficientAssetGroupsError를 낸다 (의도된 동작).
+    # 기본 specimen_group은 CWRU의 NORMAL specimen 1개 제약으로 3-way에서
+    # InsufficientAssetGroupsError를 낸다 (의도된 정직한 실패).
     manifest = build_manifest(
         data_dir=args.data_dir,
         split_ratios={
@@ -281,6 +289,7 @@ if __name__ == "__main__":
             "validation": args.validation_ratio,
             "test": args.test_ratio,
         },
+        split_strategy=args.split_strategy,
     )
     result = export_dataset(manifest, args.output_dir)
 

@@ -33,6 +33,7 @@ sys.path.insert(0, _DATASETS_DIR)
 from register_dataset import (  # noqa: E402
     build_manifest,
     group_split,
+    operating_condition_split,
     compute_version_checksum,
     compute_feature_output_fingerprint,
     dataset_export_label_fields,
@@ -319,6 +320,11 @@ class TestComputeVersionChecksum(unittest.TestCase):
         changed = self._checksum(snapshot_schema_version="3")
         self.assertNotEqual(self._checksum(), changed)
 
+    def test_changes_when_split_strategy_changes(self):
+        # specimen_group vs operating_condition_holdout는 서로 다른 데이터셋 버전이어야 한다.
+        changed = self._checksum(split_strategy="operating_condition_holdout")
+        self.assertNotEqual(self._checksum(), changed)
+
 
 class TestComputeFeatureOutputFingerprint(unittest.TestCase):
     def test_deterministic_given_same_rows(self):
@@ -582,6 +588,42 @@ class TestJsonDumpsRejectNonFiniteValues(unittest.TestCase):
             compute_feature_output_fingerprint(
                 [{"sample_id": "x", "rms_mean": float("inf")}]
             )
+
+
+class TestOperatingConditionSplit(unittest.TestCase):
+    """부하조건 기준 고정 배정 — 결정적(seed 무관), 부하 tier 통째로 한 split에.
+    같은 물리 베어링이 여러 부하에 걸쳐 있으므로 specimen 독립 검증이 아니다."""
+
+    def _recs(self, n_per_hp=3):
+        recs = []
+        for specimen in ("S-A", "S-B"):
+            for hp in (0, 1, 2, 3):
+                recs += [
+                    {"specimen_id": specimen, "load_hp": hp, "label": "NORMAL"}
+                ] * n_per_hp
+        return recs
+
+    def test_deterministic_load_tier_assignment(self):
+        recs = self._recs()
+        a = operating_condition_split(recs)
+        b = operating_condition_split(recs, ratios={"train": 0.1})  # ratios 무시
+        self.assertEqual(a, b)
+        # 0HP->test, 1HP->validation, 2·3HP->train
+        for rec, split in zip(recs, a):
+            expected = {0: "test", 1: "validation", 2: "train", 3: "train"}[rec["load_hp"]]
+            self.assertEqual(split, expected)
+
+    def test_same_specimen_spans_multiple_splits(self):
+        recs = self._recs()
+        splits = operating_condition_split(recs)
+        by_specimen = {}
+        for rec, split in zip(recs, splits):
+            by_specimen.setdefault(rec["specimen_id"], set()).add(split)
+        self.assertTrue(all(len(s) == 3 for s in by_specimen.values()))
+
+    def test_missing_load_hp_raises(self):
+        with self.assertRaises(ValueError):
+            operating_condition_split([{"specimen_id": "x", "label": "NORMAL"}])
 
 
 class TestDatasetExportLabelFields(unittest.TestCase):
@@ -912,26 +954,48 @@ class TestExportDatasetSynthetic(unittest.TestCase):
 
 
 @unittest.skipUnless(_cwru_data_available(), CWRU_SKIP_REASON)
-class TestRegisterManifestDefaultSplitIsLeakFree(unittest.TestCase):
-    """CWRU가 라벨당 자산(원본 파일) 4개(0/1/2/3 HP)를 확보하면서 기본 3-way
-    비율이 그룹을 쪼개지 않고 리크 없이 성립한다 — 각 원본 파일은 정확히
-    하나의 split에만 들어가야 한다. 자산이 부족할 때 조용히 넘어가지 않고
-    예외를 던지는 동작은 TestGroupSplitSynthetic가 계속 검증한다."""
+class TestSpecimenGroupingForCwru(unittest.TestCase):
+    """[리뷰 P1] CWRU 부하별 파일은 독립 자산이 아니라 같은 물리 베어링(specimen)이다.
+    group split은 specimen 단위로 해야 하고, NORMAL specimen은 1개뿐이라 기본
+    3-way는 정직하게 실패해야 한다. 데모용 operating_condition_holdout은 비독립임을
+    플래그로 표시한다."""
 
-    def test_default_ratios_now_succeed_leak_free(self):
-        manifest = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)  # 기본 3-way
+    def test_specimen_group_3way_fails_because_normal_has_one_specimen(self):
+        with self.assertRaises(InsufficientAssetGroupsError):
+            build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)  # 기본 specimen_group 3-way
 
-        splits_by_source = {}
+    def test_fault_only_records_do_support_specimen_independent_3way(self):
+        # NORMAL을 뺀 결함 3클래스는 각 specimen 3개(0.007/0.014/0.021")라 진짜
+        # specimen 독립 3-way split이 가능하다 — grouping 자체가 동작함을 증명.
+        # (register_dataset import 시 load_cwru_vibration 경로가 sys.path에 추가됨)
+        from load_cwru_vibration import load_cwru_dataset as _load
+
+        records = [
+            r for r in _load(_CWRU_DATA_DIR) if r["label"] != "NORMAL"
+        ]
+        splits = group_split(records, seed=42, group_key="specimen_id")
+        by_specimen = {}
+        for rec, split in zip(records, splits):
+            by_specimen.setdefault(rec["specimen_id"], set()).add(split)
+        for specimen, s in by_specimen.items():
+            self.assertEqual(len(s), 1, f"{specimen}가 여러 split에: {s}")
+        self.assertEqual(set(splits), {"train", "validation", "test"})
+
+    def test_operating_condition_holdout_succeeds_but_is_not_independent(self):
+        manifest = build_manifest(
+            data_dir=_CWRU_DATA_DIR, split_strategy="operating_condition_holdout"
+        )
+        self.assertFalse(manifest["independentHoldout"])
+        self.assertEqual(manifest["holdoutType"], "operating_condition")
+        self.assertEqual(sum(manifest["splitCounts"].values()), manifest["rowCount"])
+        self.assertTrue(all(c > 0 for c in manifest["splitCounts"].values()))
+        # 같은 물리 베어링이 train/validation/test에 함께 들어간다 (비독립).
+        splits_by_specimen = {}
         for row in manifest["rows"]:
-            splits_by_source.setdefault(row["source_file"], set()).add(row["split"])
-        for source_file, splits in splits_by_source.items():
-            self.assertEqual(
-                len(splits), 1, f"{source_file} 가 여러 split에 걸쳐 데이터 누수가 생김: {splits}"
-            )
-
-        self.assertTrue(all(count > 0 for count in manifest["splitCounts"].values()))
-        self.assertEqual(
-            sum(manifest["splitCounts"].values()), manifest["rowCount"]
+            splits_by_specimen.setdefault(row["specimen_id"], set()).add(row["split"])
+        self.assertTrue(
+            any(len(s) > 1 for s in splits_by_specimen.values()),
+            "operating_condition_holdout인데 specimen이 split을 안 넘나든다?",
         )
 
 
@@ -939,15 +1003,22 @@ class TestRegisterManifestDefaultSplitIsLeakFree(unittest.TestCase):
 class TestRegisterAndExportRealCwruData(unittest.TestCase):
     """실제 CWRU 데이터로 매니페스트 생성 → CSV/XLSX 내보내기까지 전체 흐름을 검증.
 
-    라벨당 자산 4개(0~3HP)를 확보하면서 기본 3-way 그룹 분할로 파이프라인
+    기본 specimen_group은 NORMAL specimen 1개 제약으로 실패하므로
+    operating_condition_holdout(비독립, independentHoldout=False)로 파이프라인
     전체(분할/체크섬/라벨매핑/내보내기)를 검증한다.
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.manifest = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)  # 기본 3-way
+        cls.manifest = build_manifest(
+            data_dir=_CWRU_DATA_DIR, split_strategy="operating_condition_holdout"
+        )
         cls.tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_")
         cls.export_result = export_dataset(cls.manifest, cls.tmp_dir)
+
+    def test_holdout_is_flagged_non_independent(self):
+        self.assertFalse(self.manifest["independentHoldout"])
+        self.assertEqual(self.manifest["holdoutType"], "operating_condition")
 
     @classmethod
     def tearDownClass(cls):
@@ -967,12 +1038,12 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
             self.assertEqual(info["sha256"], recomputed)
 
     def test_id_and_source_checksum_change_with_split_config(self):
-        # CWRU 16파일은 크기가 전부 달라 group_split이 seed에 의존하지 않는다.
-        # 대신 분할 비율을 바꾸면(체크섬 payload에 포함) 다른 버전 체크섬/ID가 나와야 한다.
+        # 분할 비율을 바꾸면(체크섬 payload에 포함) 다른 버전 체크섬/ID가 나와야 한다.
         other = build_manifest(
             data_dir=_CWRU_DATA_DIR,
             split_ratios={"train": 0.5, "validation": 0.3, "test": 0.2},
             seed=42,
+            split_strategy="operating_condition_holdout",
         )
         self.assertIn("checksum", self.manifest["source"])
         self.assertNotEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])

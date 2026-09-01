@@ -37,8 +37,9 @@ draft --freeze_dataset_version()--> frozen --approve_dataset_version()--> approv
 
 **중첩 객체 격리**: `freeze`/`approve`는 `copy.deepcopy`로 매니페스트를 독립 복사한다
 (얕은 `dict()`는 `rows` 리스트를 공유해, 동결 후 원본 `rows`를 변조해도 `datasetChecksum`이
-안 바뀌어 검증을 통과하는 문제가 있었다). `approve`는 복사 전에 현재 내용의 체크섬이
-동결 시점 `datasetChecksum`과 일치하는지 재검증하고, 어긋나면 승인을 거부한다.
+안 바뀌어 검증을 통과하는 문제가 있었다). `approve`는 복사 전에 현재 내용이 동결 시점과
+일치하는지 재검증한다 — `datasetChecksum`(v1 호환) **과** `snapshotDigest`(전체 불변 필드,
+아래) 둘 다 대조하고 하나라도 어긋나면 승인을 거부한다.
 
 ## `datasetChecksum` 계산 방식
 
@@ -71,10 +72,39 @@ draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다
 - **정책 버전은 `id`(fingerprint)에 포함**: `compute_version_checksum()` payload에
   `label_policy_version`/`snapshot_schema_version`이 들어가므로, 라벨 정책이 바뀐 신규
   데이터셋은 기존 frozen 버전과 **다른 `id`**를 받는다.
-- **기존에 동결된 데이터셋은 재계산·변경하지 않는다**. `freeze`는 항상 draft→신규 frozen을
-  만들 뿐이고, 이미 커밋된 frozen 산출물은 이 변경으로 다시 쓰이지 않는다.
-- `approve_dataset_version()`은 frozen을 `copy.deepcopy`하므로 3개 필드가 자동 승계되고,
+- `approve_dataset_version()`은 frozen을 `copy.deepcopy`하므로 자동 승계되고,
   `dataset_version_summary()`도 깊은 복사한 뒤 `rows`만 빼므로 자동 노출된다.
+
+### 신규 동결 필수 필드 · v1 호환 (리뷰 P1)
+
+`freeze_dataset_version()`은 **신규 draft에 `labelPolicyVersion`·`snapshotSchemaVersion`·
+`source.checksum`이 없으면 거부**한다 — "이미 동결된 v1을 유지"하는 것과 "구형 draft를
+지금 새로 동결"하는 것은 다른 요구사항이다. 이미 커밋된 v1 frozen(이 필드·`snapshotDigest`
+없음)은 재동결하지 않고 `approve`/`verify_reproducibility`/`dataset_version_summary`가
+관용 처리한다. `is_legacy_v1_frozen(frozen)`으로 v1/v2를 구분한다(별도 migration 함수는 없음).
+
+## `snapshotDigest` — 전체 불변 필드 변조 탐지 (리뷰 P1)
+
+`datasetChecksum`은 `rows`/`labelMapping`/`split`만 보므로, freeze 이후 `source.license`,
+`source.checksum`, `compatibility.samplingRateHz`, `labelPolicyVersion`,
+`snapshotSchemaVersion`, `splitStrategy`, `independentHoldout` 등을 바꿔도 승인이
+통과했다. `compute_snapshot_digest()`는 휘발성 키(`status`, `createdAt`, `frozenAt`,
+`approvedAt`, `approvedBy`, `approvalReason`, `datasetChecksum`, `snapshotDigest`)를 뺀
+**매니페스트 전체**의 canonical sha256이다.
+
+- `freeze`가 `frozen["snapshotDigest"]`를 저장한다(v1.3 필드 세팅 후).
+- `approve`는 `datasetChecksum`(v1 호환) **+** `snapshotDigest`를 모두 재검증하고,
+  둘 중 하나라도 어긋나면 승인을 거부한다.
+- `verify_frozen_integrity(frozen)`는 같은 검증을 학습·배포 시작 전에 하도록 노출한
+  함수다 — 하류(`train_and_evaluate.run_training_job`)가 `status=="frozen"`만 보지 않고
+  이걸 호출한다. v1 frozen에는 `datasetChecksum`으로 폴백한다.
+
+## `checksum` vs `digest` 역할 구분
+
+| 값 | 목적 | 입력 |
+|---|---|---|
+| `source.checksum` = `snapshotChecksum` | **id 재현성** — 같은 정규화 입력이면 같은 id | 원본 파일 sha256 + 전처리/분할 전략/특징 설정 + 특징 산출물 fingerprint + 정책 버전 |
+| `snapshotDigest` | **변조 탐지** — 동결 이후 내용이 바뀌지 않았는가 | 매니페스트 전체(라이선스 텍스트·rowCount·splitCounts 등 포함) |
 
 ## 모델 버전 (`model_version.py`, `ModelVersion`)
 
@@ -96,10 +126,16 @@ draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다
 `features`도 `register`/`approve`/`activate` 각 단계에서 깊은 복사해, draft 수정이
 승인본·active 기준선으로 새지 않는다.
 
-`rollback_model_version(current, target, *, reason, target_environment)`은 **승인된
-버전으로만** 롤백할 수 있다(`target.status == "approved"` 검증) — 검증되지 않은
-버전으로 롤백하면 운영 배포가 더 나빠질 수 있으므로. 반환값은 별도의 rollback 액션
-레코드(FUT-007 "배포와 롤백을 별도 작업으로 기록")다.
+`rollback_model_version(current, target, *, reason, target_environment, approved_history=None)`은
+target이 **실제로 이전 승인 버전**인지 검증한다 (리뷰 P1):
+
+- `target.status == "approved"` 이고 `current.version != target.version` (자기 롤백 금지)
+- `approved_history`(승인 시각 오름차순 리스트)가 주어지면 target이 그 안에 있고
+  `current`보다 앞 index여야 한다. 없으면 `target.approvedAt < current.approvedAt`를 요구해
+  더 최신/동일 버전으로의 "롤백"을 차단한다.
+- 반환 레코드에 `targetApprovedAt`를 함께 남긴다.
+
+반환값은 별도의 rollback 액션 레코드(FUT-007 "배포와 롤백을 별도 작업으로 기록")다.
 
 ## 기준선 버전 (`BaselineVersion`, FUT-010/011)
 

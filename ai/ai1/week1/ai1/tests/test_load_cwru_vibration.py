@@ -23,6 +23,8 @@ import load_cwru_vibration as loader  # noqa: E402
 from load_cwru_vibration import (  # noqa: E402
     FILE_LABEL_MAP,
     LOAD_RPM_BY_FILE,
+    SPECIMEN_BY_FILE,
+    LOAD_HP_BY_FILE,
     _base_id_from_path,
     _find_de_time_key,
     load_mat_signal,
@@ -95,18 +97,30 @@ class TestRpmFallback(unittest.TestCase):
 
 
 class TestFileLabelMap(unittest.TestCase):
-    def test_16_entries_4_per_label(self):
-        self.assertEqual(len(FILE_LABEL_MAP), 16)
-        by_label = {}
+    def test_40_entries_10_physical_specimens(self):
+        self.assertEqual(len(FILE_LABEL_MAP), 40)
+        self.assertEqual(len(SPECIMEN_BY_FILE), 40)
+        # 10 물리 specimen: NORMAL 1개(건강 베어링) + IR/Ball/OR 각 3개(0.007/0.014/0.021").
+        by_label_specimens = {}
         for filename, label in FILE_LABEL_MAP.items():
-            by_label.setdefault(label, []).append(filename)
-        self.assertEqual(set(by_label), {
-            "NORMAL", "BEARING_FAULT_INNER", "BEARING_FAULT_BALL", "BEARING_FAULT_OUTER"
-        })
-        for label, files in by_label.items():
-            self.assertEqual(len(files), 4, f"{label}: {files}")
+            by_label_specimens.setdefault(label, set()).add(SPECIMEN_BY_FILE[filename])
+        self.assertEqual(len(by_label_specimens["NORMAL"]), 1)
+        for fault in ("BEARING_FAULT_INNER", "BEARING_FAULT_BALL", "BEARING_FAULT_OUTER"):
+            self.assertEqual(len(by_label_specimens[fault]), 3, fault)
+        # specimen 하나당 정확히 4개 파일(0/1/2/3 HP).
+        files_per_specimen = {}
+        for filename, specimen in SPECIMEN_BY_FILE.items():
+            files_per_specimen.setdefault(specimen, []).append(filename)
+        self.assertTrue(all(len(v) == 4 for v in files_per_specimen.values()))
 
-    def test_every_file_has_a_load_rpm(self):
+    def test_load_hp_covers_0_to_3_per_specimen(self):
+        hp_per_specimen = {}
+        for filename, specimen in SPECIMEN_BY_FILE.items():
+            hp_per_specimen.setdefault(specimen, set()).add(LOAD_HP_BY_FILE[filename])
+        for specimen, hps in hp_per_specimen.items():
+            self.assertEqual(hps, {0, 1, 2, 3}, specimen)
+
+    def test_every_file_has_a_load_rpm_fallback(self):
         for filename in FILE_LABEL_MAP:
             self.assertIn(filename.replace(".mat", ""), LOAD_RPM_BY_FILE)
 
@@ -120,19 +134,25 @@ class TestLoadRealCwruData(unittest.TestCase):
     def setUpClass(cls):
         cls.records = load_cwru_dataset(_CWRU_DATA_DIR)
 
-    def test_all_16_files_loaded_with_4_groups_per_label(self):
+    def test_specimens_per_label_normal_one_faults_three(self):
         by_label = {}
         for rec in self.records:
-            by_label.setdefault(rec["label"], set()).add(rec["source_label"])
-        self.assertEqual(len(by_label), 4)
-        for label, sources in by_label.items():
-            self.assertEqual(len(sources), 4, f"{label}: {sorted(sources)}")
+            by_label.setdefault(rec["label"], set()).add(rec["specimen_id"])
+        self.assertEqual(by_label["NORMAL"], {"CWRU-NORMAL-BASELINE"})
+        for fault in ("BEARING_FAULT_INNER", "BEARING_FAULT_BALL", "BEARING_FAULT_OUTER"):
+            self.assertEqual(len(by_label[fault]), 3, f"{fault}: {sorted(by_label[fault])}")
+
+    def test_records_carry_specimen_id_and_load_hp(self):
+        for rec in self.records:
+            self.assertIn(rec["specimen_id"], SPECIMEN_BY_FILE.values())
+            self.assertIn(rec["load_hp"], (0, 1, 2, 3))
+            self.assertEqual(rec["specimen_id"], SPECIMEN_BY_FILE[rec["source_label"]])
 
     def test_every_record_has_a_plausible_rpm(self):
-        # 실측 RPM 키가 있는 파일은 그 값을, 없는 98/99.mat은 부하조건 폴백값(1772/1750)을 쓴다.
         for rec in self.records:
             self.assertIsNotNone(rec["rpm"], rec["source_label"])
-            self.assertTrue(1700 <= rec["rpm"] <= 1800, (rec["source_label"], rec["rpm"]))
+            self.assertTrue(1680 <= rec["rpm"] <= 1810, (rec["source_label"], rec["rpm"]))
+        # 98/99.mat은 RPM 키가 없어 부하조건 폴백값(1772/1750)을 쓴다.
         filled = {r["rpm"] for r in self.records if r["source_label"] in ("98.mat", "99.mat")}
         self.assertEqual(filled, {1772.0, 1750.0})
 

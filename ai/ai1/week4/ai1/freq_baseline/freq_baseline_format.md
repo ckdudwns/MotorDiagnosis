@@ -25,32 +25,43 @@ fieldCalibrationPlan`)를 그대로 따른다.
 `features.py`는 이 둘을 합쳐 **고정된 순서의 숫자 벡터**로 변환하는 `vectorize()`만
 추가한다 (모델 입력은 순서가 고정된 벡터/텐서여야 하므로).
 
-## 데이터 분할 — 3주차 group_split 배정을 두 후보 모두 따른다
+## 데이터 분할 — specimen 독립이 원칙, CWRU 데모는 비독립 홀드아웃
 
-3주차 `DATA_EXPORT_01`이 `source_file`(=CWRU 부하 조건) 단위 `group_split`으로 각 원본
-파일을 통째로 한 split에만 배정한다 (test = 0HP, validation = 1HP, train = 2HP+3HP).
-두 후보 모두 이 배정을 그대로 따르되 입력 단위만 다르다:
+**중요 한계 (리뷰 P1 반영).** CWRU 부하별 `.mat` 4개(0/1/2/3 HP)는 서로 다른 자산이
+아니라 **같은 물리 베어링(specimen)**을 부하만 바꿔 측정한 파일 묶음이다. 데이터셋
+계층(`DATASET_MODEL_01`)의 기본 분할은 물리 specimen 단위(`specimen_group`)이고,
+CWRU는 **건강한 베어링이 1개뿐**이라(NORMAL specimen 1개) 3-way specimen 독립 분할이
+불가능하다 — `build_manifest` 기본값은 `InsufficientAssetGroupsError`로 정직하게 실패한다.
 
-| 후보 모델 | 입력 단위 | 특징 소스 | 비고 |
-|---|---|---|---|
-| Dense Autoencoder | 윈도우(개별 특징 벡터) | **동결 매니페스트 rows의 inline 특징값을 직접 사용** (재윈도우/재계산 없음) | 학습 입력이 `datasetId`가 가리키는 데이터와 정확히 일치한다 |
-| LSTM Autoencoder | 연속 윈도우 시퀀스(길이 5) | **동결 매니페스트 rows의 inline 특징값**을 `sample_id` 윈도우 순번으로 정렬해 시퀀스로 묶음 (원본 재로드·재계산 없음) | 한 원본 파일의 모든 시퀀스는 그 파일이 배정된 한 split에만 들어간다 (파일 내부 재분할 없음) |
+이 문서의 베이스라인 실행 결과는 **`operating_condition_holdout`**(부하조건 기준:
+test=0HP, validation=1HP, train=2·3HP)으로 얻은 것이며, 같은 물리 베어링이
+train/validation/test에 함께 들어간다. 따라서 **`independentHoldout=false`**이고,
+지표는 "specimen 독립 일반화 성능"이 아니라 **운전조건 기준 in-distribution 평가**다.
+결함 클래스(IR/Ball/OR)는 0.007/0.014/0.021" 3개 specimen을 확보해 결함 간에는 specimen
+독립 분할이 가능하지만, NORMAL 제약으로 전체 3-way는 여전히 불가하다.
 
-예전 구현은 Dense가 `split` 컬럼만 읽고 원본을 다시 잘라 특징을 재계산했고(전처리
-설정이 어긋나면 `datasetId`가 거짓말), LSTM은 파일별 `split` 배정만 재사용하고
-원본 CWRU를 기본 윈도우(2048)로 다시 읽어 특징을 재계산했다 — 매니페스트가
-다른 `window`/`hop`으로 동결됐거나 원본 `.mat`이 바뀌면 LSTM 입력의 윈도우 수와
-같은 `sample_id`의 특징값이 `datasetId`가 가리키는 데이터와 어긋났다. 이제 두 후보
-모두 동결본만 입력으로 쓴다(`run_training_job`에서 원본 경로 인자 자체를 제거).
+두 후보 모두 동결 매니페스트 rows의 inline 특징값만 입력으로 쓴다(원본 재로드·재계산 없음):
+
+| 후보 모델 | 입력 단위 | 특징 소스 |
+|---|---|---|
+| Dense Autoencoder | 윈도우(개별 특징 벡터) | 동결 매니페스트 rows의 inline 특징값 직접 사용 |
+| LSTM Autoencoder | 연속 윈도우 시퀀스(길이 5) | 동결 rows를 `sample_id` 윈도우 순번으로 정렬해 시퀀스로 묶음 (한 파일의 모든 시퀀스는 한 split에만) |
+
+`run_training_job`은 학습 시작 전에 `verify_frozen_integrity()`로 동결본이 변조되지
+않았는지(snapshotDigest 재계산·비교) 확인하고, artifact는 작업별 유일 `job_id` 아래
+불변 경로에 저장하며(`<artifact_dir>/<job_id>/<name>.pt`, 덮어쓰기 금지) 보고서에
+`artifactChecksum`을 함께 남긴다.
 
 ### 모델 입력 특징 — 27개 중 26개
 
 매니페스트 row에는 27개 특징이 있지만 **모델 입력은 `vibration_peak_hz`를 뺀 26개**다.
-리크 없는 `group_split`은 사실상 부하 조건별 분리라, 피크 주파수(샤프트 회전수 프록시)는
-train과 val/test의 값 범위가 겹치지 않는다 — z-score가 발산해 재구성 오차·임계값 보정이
-망가진다(포함 시 f1 0, 제외 시 test AUC 1.0). 데이터셋 산출물은 완전해야 하므로
-매니페스트에는 27개를 남기고 모델 입력만 좁혔다. `candidate.normalization.featureOrder`에
-실제 사용한 26개 순서가 기록된다.
+`vibration_peak_hz ≈ 회전 주파수 = RPM/60`이고 CWRU는 부하조건별 RPM이 고정
+(0HP≈1797 / 3HP≈1730)이다. `operating_condition_holdout`은 바로 그 부하조건 기준 분할이라
+이 특징의 값 범위가 **train과 validation에서 이미 겹치지 않는다**(z-score 발산 → 재구성
+오차·임계값 보정 붕괴). 이 제외 결정은 **train/validation 관찰 + 물리 근거**로 했고
+test 평가 전에 동결했다 — test split은 이 결정에 쓰지 않았다. 데이터셋 산출물은 완전해야
+하므로 매니페스트에는 27개를 남기고 모델 입력만 좁혔다.
+`candidate.normalization.featureOrder`에 실제 사용한 26개 순서가 기록된다.
 
 ## 학습 방식 — 비지도 이상탐지 (Autoencoder)
 
@@ -89,13 +100,23 @@ test split에서 `predicted = error > threshold` vs `true = (common_label == "AN
 계산한다. 오류 사례(`errorCases`)는 FP(정상인데 이상으로 오판)와 FN(결함인데 정상으로
 오판) 각각 `sample_id`/`known_label`/재구성오차/threshold를 최대 10건까지 기록한다.
 
-## 모델 아티팩트 (`.pt`) — 정규화 상태 포함
+## 모델 아티팩트 (`.pt`) — 정규화 상태 포함, 작업별 불변 경로
 
 각 후보의 `.pt`는 가중치만이 아니라 학습 당시 입력 변환을 복원할 수 있는 dict를
 저장한다: `model_type`, `state_dict`, `input_dim`, `seq_len`, `feature_names`(26개
 순서), `scaler_mean`/`scaler_std`(z-score 정규화 상태), `threshold`, `sigma`.
-`score_from_artifact()`가 이 dict만으로 재구성 오차·이상 판정을 재현하며, 재로딩
-전후 같은 입력에 대한 판정이 학습 때 test 지표와 정확히 일치함을 테스트로 검증한다.
+
+**작업별 불변 경로 (리뷰 P1).** artifact는 `<artifact_dir>/<job_id>/<name>.pt`에
+저장되고 `job_id`는 작업마다 유일하다(`TJ-<UTC타임스탬프>-<uuid8>`). 같은 경로가
+이미 존재하면 저장을 거부한다 — 다음 학습이 이전 모델을 덮어써 보고서의
+`artifactUri`가 나중 모델을 가리키는 문제를 막는다. 보고서의 각 candidate에는 파일
+sha256(`artifactChecksum`)이, 최상위에는 검증에 쓴 `datasetSnapshotDigest`가 기록된다.
+
+**추론 스키마 검증 (리뷰 P1).** `score_from_artifact(path, matrix, *, input_feature_names)`는
+입력 열 이름을 **필수**로 받아 artifact에 저장된 학습 시점 순서와 대조한다: 특징
+집합이 다르면 거부, 순서만 다르면 이름 기준 재정렬, 열 개수 불일치·NaN/Inf도 거부.
+이름 없이 shape만 맞는 입력을 넘겨 열이 뒤바뀌어도 조용히 다른 판정이 나오던 문제를
+막는다. 재로딩 전후 판정이 학습 때 (비독립) test 지표와 일치함을 테스트로 검증한다.
 
 ## 도메인 차이·현장 보정 계획 (`domainGap` / `fieldCalibrationPlan`)
 
@@ -106,9 +127,12 @@ MVP 기획서(v1.2) "8. AI 및 데이터 기획"의 "AI 보장 범위" 문구를
 - 샘플링률: CWRU 12kHz vs 대상 설비 미확정
 - 설치 위치: CWRU는 Drive-End 베어링 하우징 고정식 가속도계 vs 대상 설비 미확정
 - 운전 조건: CWRU는 파일별 고정 부하(0~3HP)/고정 RPM 근사 vs 대상 설비는 가변 부하·RPM 예상
-  - 리크 없는 `group_split`이 사실상 부하 조건별 분리라, 정상 재구성 임계값이 train에
-    없던 부하 조건에서는 보정되지 않는다. RPM 결합 특징(`vibration_peak_hz`)은 모델
-    입력에서 제외했고, 현장에서는 운전 조건별로 임계값을 재보정해야 한다
+  - **이 베이스라인 지표는 `operating_condition_holdout`(부하조건 기준) 평가이며 specimen
+    독립 검증이 아니다** — 같은 물리 베어링이 train/validation/test에 함께 들어간다.
+    CWRU는 건강한 베어링이 1개뿐이라 specimen 독립 holdout 자체가 불가능하다. 정상
+    재구성 임계값이 train에 없던 부하 조건에서는 보정되지 않고, RPM 결합 특징
+    (`vibration_peak_hz`)은 모델 입력에서 제외했다. 현장 데이터 또는 추가 독립 베어링
+    확보 후 specimen 독립 평가로 재검증하고 운전 조건별 임계값을 재보정해야 한다
     (`domainGap.operatingConditions.note`, `fieldCalibrationPlan`에 기록).
 - 라벨: CWRU 베어링 결함 3종 vs 대상 설비 고장 유형 미확정 (도서발전소 환경 특유의
   염분·진동원 혼입 가능성)
@@ -127,7 +151,15 @@ MVP 기획서(v1.2) "8. AI 및 데이터 기획"의 "AI 보장 범위" 문구를
     {"name": "dense_autoencoder", "splitStrategy": "...", "metrics": {...}},
     {"name": "lstm_autoencoder", "splitStrategy": "...", "metrics": {...}}
   ],
-  "metrics": { "bestCandidate": "dense_autoencoder", "...": "..." },
+  "datasetSnapshotDigest": "sha256:...",
+  "metrics": {
+    "bestCandidate": "dense_autoencoder",
+    "selectionCriterion": "validation_f1",
+    "independentHoldout": false,
+    "holdoutType": "operating_condition",
+    "evaluation": "operating_condition_holdout — NOT specimen-independent",
+    "validation": {"...": "..."}, "f1": 0.0, "...": "..."
+  },
   "errorCases": {"dense_autoencoder": [...], "lstm_autoencoder": [...]},
   "domainGap": {...},
   "fieldCalibrationPlan": [...],
@@ -138,8 +170,10 @@ MVP 기획서(v1.2) "8. AI 및 데이터 기획"의 "AI 보장 범위" 문구를
 ## 대상 확정 후 보완
 
 - 지금은 진동(vibration) 단일 모달리티 — 음향 데이터 확보 후 같은 구조로 별도 후보 추가
-- 하이퍼파라미터(은닉 차원, 시퀀스 길이, epoch)는 CWRU 규모(16파일, 약 1500윈도우)에
-  맞춘 값이며, 실측 데이터 규모에 맞춰 재튜닝 필요
+- 하이퍼파라미터(은닉 차원, 시퀀스 길이, epoch)는 CWRU 규모(40파일 / 10 물리 specimen,
+  약 3000윈도우)에 맞춘 값이며, 실측 데이터 규모에 맞춰 재튜닝 필요
+- **specimen 독립 평가**: NORMAL 독립 베어링(현장 정상 데이터 또는 추가 CWRU 베이스라인)
+  확보 후 `split_strategy="specimen_group"`로 재검증 — 그때까지 이 지표는 일반화 성능이 아님
 - `artifactUri`(학습된 모델 가중치 저장 경로)는 로컬 파일 경로를 표준 file URI로
   변환한 값(`Path(...).resolve().as_uri()` → `file:///C:/...` 또는 `file:///...`)
   이다. Windows 경로에 `file://`를 그대로 붙인 비표준 URI는 백엔드 모델 등록에서

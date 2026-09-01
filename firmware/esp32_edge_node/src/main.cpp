@@ -1,34 +1,45 @@
 /*
  * MotorDiagnosis Edge Node
  *
- * Firmware Version : v1.2-beta.2
- * Test             : Forced NTP Failure + Backend Time Fallback
+ * Firmware Version : v1.2-beta.11
+ * Revision Summary :
+ *   P1 Atomic Queue Recovery
+ *   P2 Unlabeled Real Telemetry Contract
+ *   P3 API v1.3 Error-Code-Aware HTTP Classification / Rejected Packet Isolation
+ *   P4 Non-Blocking Wi-Fi Recovery
+ *   P5 Synchronized Vibration + Acoustic Acquisition Window
  *
  * Hardware:
  * - ESP32-S3-WROOM-1
  * - ADXL345 (SPI)
  * - INMP441 (I2S)
  *
- * Features:
- * - Concurrent ADXL345 + INMP441 acquisition
- * - Vibration acceleration RMS [g]
- * - Vibration FFT peak [Hz]
- * - Acoustic raw PCM RMS
- * - Acoustic FFT peak [Hz]
- * - Wi-Fi telemetry
- * - Persistent sequence
- * - 256 packet LittleFS offline queue
- * - Reboot recovery / FIFO replay
- * - NTP time synchronization
- * - Backend /api/health time fallback
+ * IMPORTANT:
+ * - P2 is now applied for ordinary ESP32 real telemetry:
+ *   scenarioLabel = null
+ *   knownVibrationLabel = null
+ *   knownAcousticLabel = null
+ * - The ESP32 does not infer or assert ground-truth labels.
+ *   Verified labels are assigned only by trusted external workflows.
+ * - P3 is aligned with API specification v1.3:
+ *   TELEMETRY_LABEL_FORBIDDEN and SEQUENCE_CONFLICT are packet-permanent;
+ *   auth/device/mapping/configuration errors preserve the queue.
+ * - beta.11 replaces one-JSON-file-per-packet buffering with a
+ *   CRC-protected fixed-record binary ring sized for at least 24 h at
+ *   the current cadence. When full, the oldest record is dropped while
+ *   acquisition continues.
+ * - The production ring stores 25,000 x 48-byte records (~1.20 MB),
+ *   which exceeds the 24-hour target at the current acquisition cadence.
+ * - Overflow policy is oldest-drop: acquisition continues and the newest
+ *   retention window is preserved.
  *
- * Unit Policy:
- * vibrationRmsRaw = acceleration RMS [g]
- * vibrationRmsMmS = null
- * acousticRmsRaw  = raw PCM RMS
- * acousticDb      = null
+ * Unit policy:
+ * - vibrationRmsRaw = ADXL345 acceleration RMS [g]
+ * - vibrationRmsMmS = null
+ * - acousticRmsRaw  = INMP441 raw PCM RMS
+ * - acousticDb      = null
  */
-#include "secrets.h"
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -41,27 +52,28 @@
 #include <time.h>
 #include <sys/time.h>
 #include <math.h>
+#include <stddef.h>
+
+#include "secrets.h"
 
 // =====================================================
 // Firmware
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.2-beta.2";
+    "v1.2-beta.11.1";
 
 // =====================================================
-// TEST CONFIG
+// Test Config
 // =====================================================
 
-// true:
-// NTP를 일부러 실패시켜 Backend fallback을 검증
-//
-// false:
-// 실제 운용. NTP → Backend fallback 순서
-constexpr bool TEST_FORCE_NTP_FAIL = false;
+// false = normal operation
+// true  = test backend-time fallback by skipping NTP
+constexpr bool TEST_FORCE_NTP_FAIL =
+    false;
 
 // =====================================================
-// Wi-Fi
+// Wi-Fi / Backend Secrets
 // =====================================================
 
 const char* WIFI_SSID =
@@ -69,10 +81,6 @@ const char* WIFI_SSID =
 
 const char* WIFI_PASSWORD =
     WIFI_PASSWORD_VALUE;
-
-// =====================================================
-// Backend
-// =====================================================
 
 const char* INGEST_URL =
     INGEST_URL_VALUE;
@@ -130,6 +138,8 @@ constexpr uint8_t REG_DATAX0      = 0x32;
 // Sampling
 // =====================================================
 
+// Vibration common window:
+// 512 / 800 Hz = 0.64 s
 constexpr uint16_t VIB_SAMPLES =
     512;
 
@@ -137,34 +147,100 @@ constexpr double VIB_SAMPLE_RATE =
     800.0;
 
 constexpr uint32_t VIB_PERIOD_US =
-    static_cast<uint32_t>(
-        1000000.0 / VIB_SAMPLE_RATE
-    );
+    1250;
 
 constexpr double G_PER_LSB =
     0.0039;
 
-constexpr uint16_t AUDIO_SAMPLES =
+// Acoustic stream:
+// 16 kHz continuous capture.
+//
+// P5:
+// 0.64 s * 16 kHz = 10,240 samples.
+// These 10,240 acoustic samples correspond to the same logical
+// acquisition window used by the 512 vibration samples.
+constexpr uint32_t AUDIO_SAMPLE_RATE =
+    16000;
+
+constexpr size_t COMMON_AUDIO_SAMPLES =
+    10240;
+
+// Ring holds 1.024 s of audio at 16 kHz.
+// This is larger than the 0.64 s synchronized window and provides
+// margin while the main task copies/analyzes a completed window.
+constexpr size_t AUDIO_RING_CAPACITY =
+    16384;
+
+// Continuous I2S reader consumes small blocks to keep DMA backlog low.
+// 128 samples = 8 ms at 16 kHz.
+constexpr size_t AUDIO_DMA_READ_SAMPLES =
+    128;
+
+// Acoustic FFT uses 2048-point blocks.
+// Five blocks exactly cover 10,240 samples.
+// Their magnitude spectra are averaged, so acousticPeakHz represents
+// the entire common 0.64 s window rather than only one 0.128 s slice.
+constexpr size_t AUDIO_FFT_SAMPLES =
     2048;
 
-constexpr double AUDIO_SAMPLE_RATE =
-    16000.0;
+constexpr size_t AUDIO_FFT_BLOCKS =
+    COMMON_AUDIO_SAMPLES /
+    AUDIO_FFT_SAMPLES;
+
+static_assert(
+    AUDIO_FFT_BLOCKS * AUDIO_FFT_SAMPLES ==
+        COMMON_AUDIO_SAMPLES,
+    "Common audio window must be divisible by FFT block size."
+);
+
+static_assert(
+    COMMON_AUDIO_SAMPLES <
+        AUDIO_RING_CAPACITY,
+    "Audio ring must be larger than common acquisition window."
+);
 
 // =====================================================
-// Offline Buffer
+// Offline Buffer - 24H Binary Ring
 // =====================================================
+//
+// Current offline cycle is approximately:
+//   3.0 s measurement interval + ~0.99 s acquisition ~= 3.99 s
+//
+// 25,000 fixed 48-byte records occupy about 1.20 MB and provide
+// roughly 27.7 h at the measured 3.99 s cadence. Even at a 3.64 s
+// lower-bound cycle (3.0 s delay + 0.64 s common signal window),
+// capacity is about 25.3 h.
+//
+// IMPORTANT:
+// - The HTTP/API payload remains JSON and API-v1.3 compatible.
+// - Only the local offline storage representation is binary.
+// - On overflow the OLDEST buffered record is discarded so acquisition
+//   continues and the newest ~24 h window is retained.
+//
 
 constexpr size_t QUEUE_CAPACITY =
-    256;
+    25000;
 
-constexpr char QUEUE_DIR[] =
-    "/telemetry_queue";
+constexpr char RING_FILE[] =
+    "/telemetry_ring.bin";
+
+constexpr char REJECTED_DIR[] =
+    "/telemetry_rejected";
+
+constexpr uint32_t RING_MAGIC =
+    0x4D445231UL; // "MDR1"
+
+constexpr uint16_t RING_SCHEMA_VERSION =
+    1;
 
 constexpr uint32_t MEASUREMENT_INTERVAL_MS =
     3000;
 
 constexpr uint32_t NETWORK_RETRY_MS =
     5000;
+
+constexpr uint32_t WIFI_ATTEMPT_TIMEOUT_MS =
+    10000;
 
 // =====================================================
 // SPI
@@ -179,7 +255,7 @@ SPISettings adxlSettings(
 );
 
 // =====================================================
-// Buffers
+// Vibration Buffers
 // =====================================================
 
 double vibX[VIB_SAMPLES];
@@ -189,13 +265,39 @@ double vibZ[VIB_SAMPLES];
 double vibFFTReal[VIB_SAMPLES];
 double vibFFTImag[VIB_SAMPLES];
 
-int32_t audioRaw[AUDIO_SAMPLES];
+// =====================================================
+// Acoustic Continuous Ring + Analysis Buffers
+// =====================================================
 
-double audioFFTReal[AUDIO_SAMPLES];
-double audioFFTImag[AUDIO_SAMPLES];
+int32_t audioRing[
+    AUDIO_RING_CAPACITY
+];
+
+int32_t commonAudioWindow[
+    COMMON_AUDIO_SAMPLES
+];
+
+double audioFFTReal[
+    AUDIO_FFT_SAMPLES
+];
+
+double audioFFTImag[
+    AUDIO_FFT_SAMPLES
+];
+
+double audioSpectrumAverage[
+    AUDIO_FFT_SAMPLES / 2
+];
+
+// Monotonic count of samples committed to audioRing.
+// It is NOT the ring index. The ring index is total % capacity.
+uint64_t audioTotalSamples =
+    0;
+
+SemaphoreHandle_t audioRingMutex;
 
 // =====================================================
-// FFT
+// FFT Objects
 // =====================================================
 
 ArduinoFFT<double> vibFFT(
@@ -208,74 +310,133 @@ ArduinoFFT<double> vibFFT(
 ArduinoFFT<double> audioFFT(
     audioFFTReal,
     audioFFTImag,
-    AUDIO_SAMPLES,
-    AUDIO_SAMPLE_RATE
+    AUDIO_FFT_SAMPLES,
+    static_cast<double>(
+        AUDIO_SAMPLE_RATE
+    )
 );
 
 // =====================================================
-// Features
+// Feature Structures
 // =====================================================
 
 struct VibrationFeatures
 {
-    double rmsX;
-    double rmsY;
-    double rmsZ;
-
-    double totalRms;
-    double peakHz;
-
-    char fftAxis;
+    double rmsX = 0.0;
+    double rmsY = 0.0;
+    double rmsZ = 0.0;
+    double totalRms = 0.0;
+    double peakHz = 0.0;
+    char fftAxis = 'X';
 };
 
 struct AcousticFeatures
 {
-    double rmsRaw;
-    double peakHz;
-
-    int32_t peakToPeak;
+    double rmsRaw = 0.0;
+    double peakHz = 0.0;
+    int32_t peakToPeak = 0;
 };
 
 struct TelemetryPacket
 {
     uint32_t sequence = 0;
+
+    // Absolute UTC time stored compactly in the offline binary ring.
+    uint64_t epochSeconds = 0;
+
+    float vibrationRmsRaw = 0.0f;
+    float vibrationPeakHz = 0.0f;
+    float acousticRmsRaw = 0.0f;
+    float acousticPeakHz = 0.0f;
+
     String payload;
 };
 
+struct __attribute__((packed)) BinaryTelemetryRecord
+{
+    uint32_t magic = RING_MAGIC;
+    uint16_t schemaVersion = RING_SCHEMA_VERSION;
+    uint16_t flags = 0;
+
+    uint64_t ordinal = 0;
+    uint32_t sequence = 0;
+    uint64_t epochSeconds = 0;
+
+    float vibrationRmsRaw = 0.0f;
+    float vibrationPeakHz = 0.0f;
+    float acousticRmsRaw = 0.0f;
+    float acousticPeakHz = 0.0f;
+
+    uint32_t crc32 = 0;
+};
+
+static_assert(
+    sizeof(BinaryTelemetryRecord) == 48,
+    "BinaryTelemetryRecord must remain 48 bytes."
+);
+
 // =====================================================
-// Persistent Queue Index
+// HTTP Outcome
 // =====================================================
 
-uint32_t queueSequences[
-    QUEUE_CAPACITY
-];
+enum class PostResult
+{
+    SUCCESS,
+    RETRYABLE,
+    PERMANENT_PACKET_REJECT,
+    CONFIGURATION_ERROR
+};
+
+struct PostOutcome
+{
+    PostResult result =
+        PostResult::RETRYABLE;
+
+    int statusCode =
+        -1;
+
+    String response;
+};
+
+// =====================================================
+// Persistent Binary Ring State
+// =====================================================
+//
+// Ordinals are local storage positions, independent of telemetry sequence.
+// This matters because online-success sequences are not written to the ring.
+//
 
 size_t queueCount =
     0;
 
+uint64_t ringHeadOrdinal =
+    0;
+
+uint64_t ringNextOrdinal =
+    0;
+
+uint64_t droppedOldestCount =
+    0;
+
 // =====================================================
-// Shared Results
+// Vibration Task State
 // =====================================================
 
 VibrationFeatures vibrationResult;
-AcousticFeatures acousticResult;
 
-SemaphoreHandle_t resultMutex;
+SemaphoreHandle_t vibrationResultMutex;
 
 TaskHandle_t vibrationTaskHandle =
     nullptr;
 
-TaskHandle_t acousticTaskHandle =
+TaskHandle_t audioCaptureTaskHandle =
     nullptr;
 
 volatile bool vibrationFinished =
     false;
 
-volatile bool acousticFinished =
-    false;
-
 // =====================================================
-// Persistent State
+// Persistent / Network State
 // =====================================================
 
 Preferences preferences;
@@ -288,6 +449,15 @@ bool timeReady =
 
 uint32_t lastNetworkRetry =
     0;
+
+bool wifiReconnectInProgress =
+    false;
+
+uint32_t wifiReconnectStartedAt =
+    0;
+
+bool wifiWasConnected =
+    false;
 
 // =====================================================
 // Prototypes
@@ -440,16 +610,19 @@ bool initADXL345()
         return false;
     }
 
+    // Full resolution, +/-16 g.
     adxlWrite(
         REG_DATA_FORMAT,
         0x0B
     );
 
+    // 800 Hz output data rate.
     adxlWrite(
         REG_BW_RATE,
         0x0D
     );
 
+    // Measurement mode.
     adxlWrite(
         REG_POWER_CTL,
         0x08
@@ -490,8 +663,9 @@ bool initINMP441()
     config.dma_buf_count =
         8;
 
+    // Smaller DMA block lowers the age of unread audio data.
     config.dma_buf_len =
-        256;
+        AUDIO_DMA_READ_SAMPLES;
 
     config.use_apll =
         false;
@@ -554,6 +728,7 @@ bool initINMP441()
         return false;
     }
 
+    // Clear stale DMA data once before continuous capture begins.
     i2s_zero_dma_buffer(
         I2S_PORT
     );
@@ -620,12 +795,12 @@ double calculateRms(
 }
 
 // =====================================================
-// Vibration
+// Vibration Acquisition
 // =====================================================
 
 VibrationFeatures acquireVibration()
 {
-    VibrationFeatures result = {};
+    VibrationFeatures result;
 
     uint32_t nextSample =
         micros();
@@ -789,25 +964,69 @@ VibrationFeatures acquireVibration()
 }
 
 // =====================================================
-// Acoustic
+// P5: Continuous Acoustic Capture
 // =====================================================
 
-AcousticFeatures acquireAudio()
+void appendAudioSamplesToRing(
+    const int32_t* samples,
+    size_t count
+)
 {
-    AcousticFeatures result = {};
+    xSemaphoreTake(
+        audioRingMutex,
+        portMAX_DELAY
+    );
 
-    size_t totalBytes =
-        0;
-
-    uint8_t* buffer =
-        reinterpret_cast<uint8_t*>(
-            audioRaw
-        );
-
-    while (
-        totalBytes <
-        sizeof(audioRaw)
+    for (
+        size_t i = 0;
+        i < count;
+        i++
     )
+    {
+        size_t index =
+            static_cast<size_t>(
+                audioTotalSamples %
+                AUDIO_RING_CAPACITY
+            );
+
+        // Existing code used >>8 for INMP441 scaling.
+        audioRing[index] =
+            samples[i] >> 8;
+
+        audioTotalSamples++;
+    }
+
+    xSemaphoreGive(
+        audioRingMutex
+    );
+}
+
+uint64_t getAudioTotalSamples()
+{
+    xSemaphoreTake(
+        audioRingMutex,
+        portMAX_DELAY
+    );
+
+    uint64_t value =
+        audioTotalSamples;
+
+    xSemaphoreGive(
+        audioRingMutex
+    );
+
+    return value;
+}
+
+void audioCaptureTask(
+    void* parameter
+)
+{
+    int32_t dmaSamples[
+        AUDIO_DMA_READ_SAMPLES
+    ];
+
+    while (true)
     {
         size_t bytesRead =
             0;
@@ -815,10 +1034,8 @@ AcousticFeatures acquireAudio()
         esp_err_t status =
             i2s_read(
                 I2S_PORT,
-                buffer +
-                    totalBytes,
-                sizeof(audioRaw) -
-                    totalBytes,
+                dmaSamples,
+                sizeof(dmaSamples),
                 &bytesRead,
                 portMAX_DELAY
             );
@@ -828,15 +1045,126 @@ AcousticFeatures acquireAudio()
         )
         {
             Serial.printf(
-                "[AUDIO] I2S error: %d\n",
+                "[AUDIO] Continuous I2S read error: %d\n",
                 status
             );
 
-            return result;
+            delay(10);
+            continue;
         }
 
-        totalBytes +=
-            bytesRead;
+        size_t sampleCount =
+            bytesRead /
+            sizeof(int32_t);
+
+        if (
+            sampleCount >
+            0
+        )
+        {
+            appendAudioSamplesToRing(
+                dmaSamples,
+                sampleCount
+            );
+        }
+    }
+}
+
+// =====================================================
+// P5: Copy Exact Audio Sample Range
+// =====================================================
+
+bool copyAudioWindow(
+    uint64_t startSample,
+    size_t sampleCount,
+    int32_t* destination
+)
+{
+    xSemaphoreTake(
+        audioRingMutex,
+        portMAX_DELAY
+    );
+
+    uint64_t availableEnd =
+        audioTotalSamples;
+
+    if (
+        availableEnd <
+        startSample +
+            sampleCount
+    )
+    {
+        xSemaphoreGive(
+            audioRingMutex
+        );
+
+        return false;
+    }
+
+    // If more than a full ring elapsed after the requested start,
+    // the requested samples have already been overwritten.
+    if (
+        availableEnd -
+            startSample >
+        AUDIO_RING_CAPACITY
+    )
+    {
+        xSemaphoreGive(
+            audioRingMutex
+        );
+
+        Serial.println(
+            "[AUDIO] Requested synchronized window was overwritten."
+        );
+
+        return false;
+    }
+
+    for (
+        size_t i = 0;
+        i < sampleCount;
+        i++
+    )
+    {
+        size_t ringIndex =
+            static_cast<size_t>(
+                (
+                    startSample +
+                    i
+                ) %
+                AUDIO_RING_CAPACITY
+            );
+
+        destination[i] =
+            audioRing[
+                ringIndex
+            ];
+    }
+
+    xSemaphoreGive(
+        audioRingMutex
+    );
+
+    return true;
+}
+
+// =====================================================
+// P5: Acoustic Analysis Over Entire 0.64 s Window
+// =====================================================
+
+AcousticFeatures analyzeCommonAudioWindow(
+    const int32_t* samples,
+    size_t count
+)
+{
+    AcousticFeatures result;
+
+    if (
+        count !=
+        COMMON_AUDIO_SAMPLES
+    )
+    {
+        return result;
     }
 
     double mean =
@@ -849,19 +1177,22 @@ AcousticFeatures acquireAudio()
         INT32_MIN;
 
     for (
-        uint16_t i = 0;
-        i < AUDIO_SAMPLES;
+        size_t i = 0;
+        i < count;
         i++
     )
     {
         int32_t sample =
-            audioRaw[i] >> 8;
+            samples[i];
 
         mean +=
-            sample;
+            static_cast<double>(
+                sample
+            );
 
         if (
-            sample < minValue
+            sample <
+            minValue
         )
         {
             minValue =
@@ -869,7 +1200,8 @@ AcousticFeatures acquireAudio()
         }
 
         if (
-            sample > maxValue
+            sample >
+            maxValue
         )
         {
             maxValue =
@@ -878,66 +1210,188 @@ AcousticFeatures acquireAudio()
     }
 
     mean /=
-        AUDIO_SAMPLES;
+        static_cast<double>(
+            count
+        );
 
     double sumSquares =
         0.0;
 
     for (
-        uint16_t i = 0;
-        i < AUDIO_SAMPLES;
+        size_t i = 0;
+        i < count;
         i++
     )
     {
-        double sample =
-            static_cast<double>(
-                audioRaw[i] >> 8
-            );
-
         double centered =
-            sample -
+            static_cast<double>(
+                samples[i]
+            ) -
             mean;
 
         sumSquares +=
             centered *
             centered;
-
-        audioFFTReal[i] =
-            centered;
-
-        audioFFTImag[i] =
-            0.0;
     }
 
     result.rmsRaw =
         sqrt(
             sumSquares /
-            AUDIO_SAMPLES
+            static_cast<double>(
+                count
+            )
         );
 
     result.peakToPeak =
         maxValue -
         minValue;
 
-    audioFFT.windowing(
-        FFTWindow::Hamming,
-        FFTDirection::Forward
-    );
+    // -------------------------------------------------
+    // FFT over full common window via averaged spectra.
+    // 5 x 2048-sample FFT blocks cover all 10,240 samples.
+    // -------------------------------------------------
 
-    audioFFT.compute(
-        FFTDirection::Forward
-    );
+    for (
+        size_t bin = 0;
+        bin <
+            AUDIO_FFT_SAMPLES / 2;
+        bin++
+    )
+    {
+        audioSpectrumAverage[bin] =
+            0.0;
+    }
 
-    audioFFT.complexToMagnitude();
+    for (
+        size_t block = 0;
+        block <
+            AUDIO_FFT_BLOCKS;
+        block++
+    )
+    {
+        size_t offset =
+            block *
+            AUDIO_FFT_SAMPLES;
+
+        // Remove the mean of each FFT block independently.
+        double blockMean =
+            0.0;
+
+        for (
+            size_t i = 0;
+            i <
+                AUDIO_FFT_SAMPLES;
+            i++
+        )
+        {
+            blockMean +=
+                static_cast<double>(
+                    samples[
+                        offset +
+                        i
+                    ]
+                );
+        }
+
+        blockMean /=
+            static_cast<double>(
+                AUDIO_FFT_SAMPLES
+            );
+
+        for (
+            size_t i = 0;
+            i <
+                AUDIO_FFT_SAMPLES;
+            i++
+        )
+        {
+            audioFFTReal[i] =
+                static_cast<double>(
+                    samples[
+                        offset +
+                        i
+                    ]
+                ) -
+                blockMean;
+
+            audioFFTImag[i] =
+                0.0;
+        }
+
+        audioFFT.windowing(
+            FFTWindow::Hamming,
+            FFTDirection::Forward
+        );
+
+        audioFFT.compute(
+            FFTDirection::Forward
+        );
+
+        audioFFT.complexToMagnitude();
+
+        for (
+            size_t bin = 1;
+            bin <
+                AUDIO_FFT_SAMPLES / 2;
+            bin++
+        )
+        {
+            audioSpectrumAverage[bin] +=
+                audioFFTReal[bin];
+        }
+    }
+
+    // Average the spectra and find dominant non-DC bin.
+    size_t peakBin =
+        1;
+
+    double peakMagnitude =
+        0.0;
+
+    for (
+        size_t bin = 1;
+        bin <
+            AUDIO_FFT_SAMPLES / 2;
+        bin++
+    )
+    {
+        double magnitude =
+            audioSpectrumAverage[bin] /
+            static_cast<double>(
+                AUDIO_FFT_BLOCKS
+            );
+
+        if (
+            magnitude >
+            peakMagnitude
+        )
+        {
+            peakMagnitude =
+                magnitude;
+
+            peakBin =
+                bin;
+        }
+    }
 
     result.peakHz =
-        audioFFT.majorPeak();
+        (
+            static_cast<double>(
+                peakBin
+            ) *
+            static_cast<double>(
+                AUDIO_SAMPLE_RATE
+            )
+        ) /
+        static_cast<double>(
+            AUDIO_FFT_SAMPLES
+        );
 
     return result;
 }
 
 // =====================================================
-// Tasks
+// Vibration Task
 // =====================================================
 
 void vibrationTask(
@@ -955,7 +1409,7 @@ void vibrationTask(
             acquireVibration();
 
         xSemaphoreTake(
-            resultMutex,
+            vibrationResultMutex,
             portMAX_DELAY
         );
 
@@ -966,60 +1420,239 @@ void vibrationTask(
             true;
 
         xSemaphoreGive(
-            resultMutex
+            vibrationResultMutex
         );
     }
 }
 
-void acousticTask(
-    void* parameter
+// =====================================================
+// P5: Synchronized Sensor Acquisition
+// =====================================================
+
+bool acquireSynchronizedFeatures(
+    VibrationFeatures& vib,
+    AcousticFeatures& audio
 )
 {
+    Serial.println();
+    Serial.println(
+        "[SYNC] Starting synchronized vibration + acoustic acquisition..."
+    );
+
+    // Snapshot the continuous audio stream before vibration starts.
+    // The audio task continuously drains I2S DMA, so this point is close
+    // to the current acoustic stream position rather than old queued DMA.
+    uint64_t audioWindowStart =
+        getAudioTotalSamples();
+
+    xSemaphoreTake(
+        vibrationResultMutex,
+        portMAX_DELAY
+    );
+
+    vibrationFinished =
+        false;
+
+    xSemaphoreGive(
+        vibrationResultMutex
+    );
+
+    uint32_t startedMs =
+        millis();
+
+    xTaskNotifyGive(
+        vibrationTaskHandle
+    );
+
+    // Wait for the 0.64 s vibration acquisition.
     while (true)
     {
-        ulTaskNotifyTake(
-            pdTRUE,
-            portMAX_DELAY
-        );
-
-        AcousticFeatures local =
-            acquireAudio();
+        bool done;
 
         xSemaphoreTake(
-            resultMutex,
+            vibrationResultMutex,
             portMAX_DELAY
         );
 
-        acousticResult =
-            local;
-
-        acousticFinished =
-            true;
+        done =
+            vibrationFinished;
 
         xSemaphoreGive(
-            resultMutex
+            vibrationResultMutex
         );
+
+        if (done)
+        {
+            break;
+        }
+
+        if (
+            millis() -
+                startedMs >
+            1500
+        )
+        {
+            Serial.println(
+                "[SYNC] Vibration acquisition timeout."
+            );
+
+            return false;
+        }
+
+        delay(1);
     }
+
+    // The common acoustic interval is exactly 10,240 samples = 0.64 s.
+    uint64_t requiredAudioEnd =
+        audioWindowStart +
+        COMMON_AUDIO_SAMPLES;
+
+    uint32_t audioWaitStarted =
+        millis();
+
+    while (
+        getAudioTotalSamples() <
+        requiredAudioEnd
+    )
+    {
+        if (
+            millis() -
+                audioWaitStarted >
+            500
+        )
+        {
+            Serial.println(
+                "[SYNC] Acoustic common-window timeout."
+            );
+
+            return false;
+        }
+
+        delay(1);
+    }
+
+    if (
+        !copyAudioWindow(
+            audioWindowStart,
+            COMMON_AUDIO_SAMPLES,
+            commonAudioWindow
+        )
+    )
+    {
+        Serial.println(
+            "[SYNC] Failed to copy synchronized acoustic window."
+        );
+
+        return false;
+    }
+
+    xSemaphoreTake(
+        vibrationResultMutex,
+        portMAX_DELAY
+    );
+
+    vib =
+        vibrationResult;
+
+    xSemaphoreGive(
+        vibrationResultMutex
+    );
+
+    audio =
+        analyzeCommonAudioWindow(
+            commonAudioWindow,
+            COMMON_AUDIO_SAMPLES
+        );
+
+    uint32_t elapsed =
+        millis() -
+        startedMs;
+
+    Serial.println();
+    Serial.println(
+        "========== EDGE FEATURES =========="
+    );
+
+    Serial.printf(
+        "Firmware            : %s\n",
+        FIRMWARE_VERSION
+    );
+
+    Serial.printf(
+        "Common window       : 640 ms\n"
+    );
+
+    Serial.printf(
+        "Acquisition         : %lu ms\n",
+        static_cast<unsigned long>(
+            elapsed
+        )
+    );
+
+    Serial.printf(
+        "vibrationRmsRaw     : %.6f g\n",
+        vib.totalRms
+    );
+
+    Serial.printf(
+        "vibrationPeakHz     : %.2f Hz\n",
+        vib.peakHz
+    );
+
+    Serial.printf(
+        "acousticRmsRaw      : %.2f\n",
+        audio.rmsRaw
+    );
+
+    Serial.printf(
+        "acousticPeakHz      : %.2f Hz\n",
+        audio.peakHz
+    );
+
+    Serial.println(
+        "==================================="
+    );
+
+    return true;
 }
 
 // =====================================================
-// Wi-Fi
+// Wi-Fi: Non-Blocking Recovery
 // =====================================================
 
-bool connectWiFi()
+void startWiFiReconnect()
 {
     if (
         WiFi.status() ==
         WL_CONNECTED
     )
     {
-        return true;
+        return;
     }
+
+    if (
+        wifiReconnectInProgress
+    )
+    {
+        return;
+    }
+
+    if (
+        millis() -
+            lastNetworkRetry <
+        NETWORK_RETRY_MS
+    )
+    {
+        return;
+    }
+
+    lastNetworkRetry =
+        millis();
 
     Serial.println();
 
     Serial.printf(
-        "[WiFi] Connecting to %s\n",
+        "[WiFi] Starting non-blocking connection to %s\n",
         WIFI_SSID
     );
 
@@ -1032,53 +1665,82 @@ bool connectWiFi()
         WIFI_PASSWORD
     );
 
-    uint32_t started =
+    wifiReconnectInProgress =
+        true;
+
+    wifiReconnectStartedAt =
         millis();
+}
 
-    while (
-        WiFi.status() !=
-            WL_CONNECTED &&
-        millis() -
-            started <
-            10000
-    )
-    {
-        Serial.print(".");
-        delay(500);
-    }
-
-    Serial.println();
+void serviceWiFi()
+{
+    wl_status_t status =
+        WiFi.status();
 
     if (
-        WiFi.status() !=
+        status ==
         WL_CONNECTED
     )
     {
-        Serial.println(
-            "[WiFi] Connection unavailable."
-        );
+        if (
+            !wifiWasConnected
+        )
+        {
+            Serial.println(
+                "[OK] Wi-Fi connected."
+            );
 
-        return false;
+            Serial.print(
+                "[WiFi] IP   : "
+            );
+
+            Serial.println(
+                WiFi.localIP()
+            );
+
+            Serial.printf(
+                "[WiFi] RSSI : %d dBm\n",
+                WiFi.RSSI()
+            );
+        }
+
+        wifiWasConnected =
+            true;
+
+        wifiReconnectInProgress =
+            false;
+
+        return;
     }
 
-    Serial.println(
-        "[OK] Wi-Fi connected."
-    );
+    if (
+        wifiWasConnected
+    )
+    {
+        Serial.println(
+            "[WiFi] Connection lost."
+        );
 
-    Serial.print(
-        "[WiFi] IP   : "
-    );
+        wifiWasConnected =
+            false;
+    }
 
-    Serial.println(
-        WiFi.localIP()
-    );
+    if (
+        wifiReconnectInProgress &&
+        millis() -
+            wifiReconnectStartedAt >=
+            WIFI_ATTEMPT_TIMEOUT_MS
+    )
+    {
+        Serial.println(
+            "[WiFi] Reconnect attempt timed out."
+        );
 
-    Serial.printf(
-        "[WiFi] RSSI : %d dBm\n",
-        WiFi.RSSI()
-    );
+        wifiReconnectInProgress =
+            false;
+    }
 
-    return true;
+    startWiFiReconnect();
 }
 
 // =====================================================
@@ -1102,6 +1764,45 @@ String getTimestamp()
 
     gmtime_r(
         &now,
+        &info
+    );
+
+    char buffer[32];
+
+    strftime(
+        buffer,
+        sizeof(buffer),
+        "%Y-%m-%dT%H:%M:%SZ",
+        &info
+    );
+
+    return String(
+        buffer
+    );
+}
+
+
+String formatTimestampFromEpoch(
+    uint64_t epochSeconds
+)
+{
+    if (
+        epochSeconds <
+        1700000000ULL
+    )
+    {
+        return "";
+    }
+
+    time_t value =
+        static_cast<time_t>(
+            epochSeconds
+        );
+
+    struct tm info;
+
+    gmtime_r(
+        &value,
         &info
     );
 
@@ -1299,20 +2000,12 @@ bool syncTimeFromBackend()
 
 bool syncTime()
 {
-    // -------------------------------------------------
-    // TEST MODE
-    // -------------------------------------------------
-
     if (
         TEST_FORCE_NTP_FAIL
     )
     {
         Serial.println(
             "[TEST] Forced NTP failure enabled."
-        );
-
-        Serial.println(
-            "[TIME] Skipping NTP."
         );
 
         Serial.println(
@@ -1329,16 +2022,8 @@ bool syncTime()
         timeReady =
             false;
 
-        Serial.println(
-            "[ERROR] Backend time fallback failed."
-        );
-
         return false;
     }
-
-    // -------------------------------------------------
-    // NORMAL MODE
-    // -------------------------------------------------
 
     Serial.println(
         "[TIME] Synchronizing NTP..."
@@ -1374,7 +2059,6 @@ bool syncTime()
 
     Serial.println();
 
-    // NTP success
     if (
         now >=
         1700000000
@@ -1391,7 +2075,6 @@ bool syncTime()
         return true;
     }
 
-    // NTP failure
     Serial.println(
         "[WARNING] NTP unavailable."
     );
@@ -1435,6 +2118,13 @@ uint32_t allocateSequence()
 
 // =====================================================
 // JSON
+// =====================================================
+//
+// P2 label contract:
+// - scenarioLabel is REQUIRED by API but nullable.
+// - Ordinary ESP32/MQTT real telemetry sends explicit null.
+// - knownVibrationLabel and knownAcousticLabel also remain null.
+// - The device never promotes model/rule output to ground truth.
 // =====================================================
 
 String createTelemetryPayload(
@@ -1506,7 +2196,11 @@ String createTelemetryPayload(
     );
     json += ",";
 
-    json += "\"scenarioLabel\":\"normal\",";
+    // P2:
+    // Ordinary ESP32 real telemetry is unlabeled.
+    // Ground-truth labels must be supplied only by trusted external
+    // experiment/replay/import workflows with provenance.
+    json += "\"scenarioLabel\":null,";
     json += "\"knownVibrationLabel\":null,";
     json += "\"knownAcousticLabel\":null,";
 
@@ -1525,10 +2219,10 @@ String createTelemetryPayload(
 }
 
 // =====================================================
-// LittleFS Paths
+// Rejected Storage Paths
 // =====================================================
 
-String packetFilePath(
+String rejectedPacketFilePath(
     uint32_t sequence
 )
 {
@@ -1538,170 +2232,603 @@ String packetFilePath(
         path,
         sizeof(path),
         "%s/%010lu.json",
-        QUEUE_DIR,
+        REJECTED_DIR,
         static_cast<unsigned long>(
             sequence
         )
     );
 
-    return String(
-        path
+    return String(path);
+}
+
+String rejectedMetaFilePath(
+    uint32_t sequence
+)
+{
+    char path[64];
+
+    snprintf(
+        path,
+        sizeof(path),
+        "%s/%010lu.meta",
+        REJECTED_DIR,
+        static_cast<unsigned long>(
+            sequence
+        )
+    );
+
+    return String(path);
+}
+
+// =====================================================
+// Binary Ring CRC32
+// =====================================================
+
+uint32_t crc32Update(
+    uint32_t crc,
+    const uint8_t* data,
+    size_t length
+)
+{
+    crc =
+        ~crc;
+
+    for (
+        size_t i = 0;
+        i < length;
+        i++
+    )
+    {
+        crc ^=
+            data[i];
+
+        for (
+            uint8_t bit = 0;
+            bit < 8;
+            bit++
+        )
+        {
+            uint32_t mask =
+                static_cast<uint32_t>(
+                    -static_cast<int32_t>(
+                        crc & 1U
+                    )
+                );
+
+            crc =
+                (crc >> 1) ^
+                (0xEDB88320UL & mask);
+        }
+    }
+
+    return ~crc;
+}
+
+uint32_t calculateRecordCrc(
+    const BinaryTelemetryRecord& record
+)
+{
+    return crc32Update(
+        0,
+        reinterpret_cast<const uint8_t*>(
+            &record
+        ),
+        offsetof(
+            BinaryTelemetryRecord,
+            crc32
+        )
+    );
+}
+
+bool recordIsValid(
+    const BinaryTelemetryRecord& record
+)
+{
+    if (
+        record.magic !=
+            RING_MAGIC ||
+        record.schemaVersion !=
+            RING_SCHEMA_VERSION ||
+        record.ordinal == 0 ||
+        record.sequence == 0 ||
+        record.epochSeconds <
+            1700000000ULL
+    )
+    {
+        return false;
+    }
+
+    if (
+        !isfinite(
+            record.vibrationRmsRaw
+        ) ||
+        !isfinite(
+            record.vibrationPeakHz
+        ) ||
+        !isfinite(
+            record.acousticRmsRaw
+        ) ||
+        !isfinite(
+            record.acousticPeakHz
+        )
+    )
+    {
+        return false;
+    }
+
+    return (
+        record.crc32 ==
+        calculateRecordCrc(
+            record
+        )
     );
 }
 
 // =====================================================
-// Flash Write
+// Binary Ring File
 // =====================================================
 
-bool savePacketToFlash(
-    const TelemetryPacket& packet
+uint64_t ringFileSizeBytes()
+{
+    return (
+        static_cast<uint64_t>(
+            QUEUE_CAPACITY
+        ) *
+        sizeof(
+            BinaryTelemetryRecord
+        )
+    );
+}
+
+uint32_t ringSlotFromOrdinal(
+    uint64_t ordinal
 )
 {
-    String path =
-        packetFilePath(
-            packet.sequence
+    return static_cast<uint32_t>(
+        (ordinal - 1ULL) %
+        QUEUE_CAPACITY
+    );
+}
+
+uint64_t ringOffsetForOrdinal(
+    uint64_t ordinal
+)
+{
+    return (
+        static_cast<uint64_t>(
+            ringSlotFromOrdinal(
+                ordinal
+            )
+        ) *
+        sizeof(
+            BinaryTelemetryRecord
+        )
+    );
+}
+
+bool ensureRingFile()
+{
+    bool recreate =
+        false;
+
+    if (
+        LittleFS.exists(
+            RING_FILE
+        )
+    )
+    {
+        File existing =
+            LittleFS.open(
+                RING_FILE,
+                FILE_READ
+            );
+
+        if (!existing)
+        {
+            return false;
+        }
+
+        uint64_t existingSize =
+            existing.size();
+
+        existing.close();
+
+        if (
+            existingSize !=
+            ringFileSizeBytes()
+        )
+        {
+            recreate =
+                true;
+        }
+    }
+    else
+    {
+        recreate =
+            true;
+    }
+
+    if (!recreate)
+    {
+        return true;
+    }
+
+    if (
+        LittleFS.exists(
+            RING_FILE
+        )
+    )
+    {
+        LittleFS.remove(
+            RING_FILE
+        );
+    }
+
+    Serial.printf(
+        "[RING] Initializing %llu-byte binary ring (%u records)...\n",
+        static_cast<unsigned long long>(
+            ringFileSizeBytes()
+        ),
+        static_cast<unsigned int>(
+            QUEUE_CAPACITY
+        )
+    );
+
+    File file =
+        LittleFS.open(
+            RING_FILE,
+            FILE_WRITE
+        );
+
+    if (!file)
+    {
+        return false;
+    }
+
+    uint64_t remaining =
+        ringFileSizeBytes();
+
+    if (
+        remaining == 0
+    )
+    {
+        file.close();
+        return false;
+    }
+
+    uint8_t zeroBlock[512] = {};
+
+    while (
+        remaining > 0
+    )
+    {
+        size_t chunk =
+            remaining >
+                sizeof(zeroBlock)
+                ? sizeof(zeroBlock)
+                : static_cast<size_t>(
+                      remaining
+                  );
+
+        if (
+            file.write(
+                zeroBlock,
+                chunk
+            ) !=
+            chunk
+        )
+        {
+            file.close();
+            return false;
+        }
+
+        remaining -=
+            chunk;
+
+        // Avoid starving system tasks during one-time ~1.2 MB creation.
+        delay(0);
+    }
+
+    file.flush();
+    file.close();
+
+    Serial.println(
+        "[RING] Binary ring initialized."
+    );
+
+    return true;
+}
+
+bool readRingRecord(
+    uint64_t ordinal,
+    BinaryTelemetryRecord& record
+)
+{
+    if (
+        ordinal == 0
+    )
+    {
+        return false;
+    }
+
+    File file =
+        LittleFS.open(
+            RING_FILE,
+            "r"
+        );
+
+    if (!file)
+    {
+        return false;
+    }
+
+    if (
+        !file.seek(
+            ringOffsetForOrdinal(
+                ordinal
+            )
+        )
+    )
+    {
+        file.close();
+        return false;
+    }
+
+    size_t bytes =
+        file.read(
+            reinterpret_cast<uint8_t*>(
+                &record
+            ),
+            sizeof(record)
+        );
+
+    file.close();
+
+    if (
+        bytes !=
+        sizeof(record)
+    )
+    {
+        return false;
+    }
+
+    return (
+        record.ordinal ==
+            ordinal &&
+        recordIsValid(
+            record
+        )
+    );
+}
+
+bool writeRingRecord(
+    BinaryTelemetryRecord record
+)
+{
+    record.magic =
+        RING_MAGIC;
+
+    record.schemaVersion =
+        RING_SCHEMA_VERSION;
+
+    record.crc32 =
+        calculateRecordCrc(
+            record
         );
 
     File file =
         LittleFS.open(
-            path,
-            FILE_WRITE
+            RING_FILE,
+            "r+"
         );
 
-    if (
-        !file
-    )
+    if (!file)
     {
-        Serial.println(
-            "[FLASH] File create failed."
-        );
-
         return false;
     }
 
-    size_t written =
-        file.print(
-            packet.payload
+    if (
+        !file.seek(
+            ringOffsetForOrdinal(
+                record.ordinal
+            )
+        )
+    )
+    {
+        file.close();
+        return false;
+    }
+
+    size_t bytes =
+        file.write(
+            reinterpret_cast<const uint8_t*>(
+                &record
+            ),
+            sizeof(record)
         );
 
     file.flush();
     file.close();
 
     if (
-        written !=
-        packet.payload.length()
+        bytes !=
+        sizeof(record)
     )
     {
-        LittleFS.remove(
-            path
-        );
-
         return false;
     }
 
-    Serial.printf(
-        "[FLASH] Saved Sequence %lu\n",
-        static_cast<unsigned long>(
-            packet.sequence
-        )
-    );
+    // Read-after-write protects against torn/corrupt local persistence
+    // before the record becomes part of the active queue.
+    BinaryTelemetryRecord verify;
 
-    return true;
+    return (
+        readRingRecord(
+            record.ordinal,
+            verify
+        ) &&
+        verify.sequence ==
+            record.sequence
+    );
+}
+
+bool invalidateRingRecord(
+    uint64_t ordinal
+)
+{
+    File file =
+        LittleFS.open(
+            RING_FILE,
+            "r+"
+        );
+
+    if (!file)
+    {
+        return false;
+    }
+
+    if (
+        !file.seek(
+            ringOffsetForOrdinal(
+                ordinal
+            )
+        )
+    )
+    {
+        file.close();
+        return false;
+    }
+
+    // Zeroing magic invalidates the slot. A power loss during this small
+    // update is also detected by the record CRC on the next boot.
+    uint32_t zero =
+        0;
+
+    size_t bytes =
+        file.write(
+            reinterpret_cast<const uint8_t*>(
+                &zero
+            ),
+            sizeof(zero)
+        );
+
+    file.flush();
+    file.close();
+
+    return (
+        bytes ==
+        sizeof(zero)
+    );
 }
 
 // =====================================================
-// Flash Read
+// Binary <-> HTTP Packet
 // =====================================================
 
-bool readPacketFromFlash(
-    uint32_t sequence,
+BinaryTelemetryRecord packetToRecord(
+    const TelemetryPacket& packet,
+    uint64_t ordinal
+)
+{
+    BinaryTelemetryRecord record;
+
+    record.ordinal =
+        ordinal;
+
+    record.sequence =
+        packet.sequence;
+
+    record.epochSeconds =
+        packet.epochSeconds;
+
+    record.vibrationRmsRaw =
+        packet.vibrationRmsRaw;
+
+    record.vibrationPeakHz =
+        packet.vibrationPeakHz;
+
+    record.acousticRmsRaw =
+        packet.acousticRmsRaw;
+
+    record.acousticPeakHz =
+        packet.acousticPeakHz;
+
+    return record;
+}
+
+bool recordToPacket(
+    const BinaryTelemetryRecord& record,
     TelemetryPacket& packet
 )
 {
-    String path =
-        packetFilePath(
-            sequence
-        );
-
-    File file =
-        LittleFS.open(
-            path,
-            FILE_READ
-        );
-
     if (
-        !file
+        !recordIsValid(
+            record
+        )
     )
     {
         return false;
     }
 
-    String payload =
-        file.readString();
-
-    file.close();
+    String timestamp =
+        formatTimestampFromEpoch(
+            record.epochSeconds
+        );
 
     if (
-        payload.length() ==
-        0
+        timestamp.length() == 0
     )
     {
         return false;
     }
+
+    VibrationFeatures vib;
+
+    vib.totalRms =
+        record.vibrationRmsRaw;
+
+    vib.peakHz =
+        record.vibrationPeakHz;
+
+    AcousticFeatures audio;
+
+    audio.rmsRaw =
+        record.acousticRmsRaw;
+
+    audio.peakHz =
+        record.acousticPeakHz;
 
     packet.sequence =
-        sequence;
+        record.sequence;
+
+    packet.epochSeconds =
+        record.epochSeconds;
+
+    packet.vibrationRmsRaw =
+        record.vibrationRmsRaw;
+
+    packet.vibrationPeakHz =
+        record.vibrationPeakHz;
+
+    packet.acousticRmsRaw =
+        record.acousticRmsRaw;
+
+    packet.acousticPeakHz =
+        record.acousticPeakHz;
 
     packet.payload =
-        payload;
+        createTelemetryPayload(
+            packet.sequence,
+            timestamp,
+            vib,
+            audio
+        );
 
     return true;
 }
 
 // =====================================================
-// Flash Delete
-// =====================================================
-
-bool deletePacketFromFlash(
-    uint32_t sequence
-)
-{
-    String path =
-        packetFilePath(
-            sequence
-        );
-
-    if (
-        !LittleFS.exists(
-            path
-        )
-    )
-    {
-        return true;
-    }
-
-    bool removed =
-        LittleFS.remove(
-            path
-        );
-
-    if (
-        removed
-    )
-    {
-        Serial.printf(
-            "[FLASH] Deleted Sequence %lu\n",
-            static_cast<unsigned long>(
-                sequence
-            )
-        );
-    }
-
-    return removed;
-}
-
-// =====================================================
-// Queue
+// Ring Queue
 // =====================================================
 
 bool queueIsEmpty()
@@ -1720,62 +2847,160 @@ bool queueIsFull()
     );
 }
 
-void sortQueueSequences()
-{
-    for (
-        size_t i = 1;
-        i < queueCount;
-        i++
-    )
-    {
-        uint32_t key =
-            queueSequences[i];
-
-        int j =
-            static_cast<int>(
-                i
-            ) - 1;
-
-        while (
-            j >= 0 &&
-            queueSequences[j] >
-                key
-        )
-        {
-            queueSequences[
-                j + 1
-            ] =
-                queueSequences[j];
-
-            j--;
-        }
-
-        queueSequences[
-            j + 1
-        ] =
-            key;
-    }
-}
-
-bool addSequenceToQueue(
-    uint32_t sequence
+bool readOldestPersistent(
+    TelemetryPacket& packet,
+    uint64_t& ordinal
 )
 {
+    while (
+        !queueIsEmpty()
+    )
+    {
+        ordinal =
+            ringHeadOrdinal;
+
+        BinaryTelemetryRecord record;
+
+        if (
+            readRingRecord(
+                ordinal,
+                record
+            )
+        )
+        {
+            return recordToPacket(
+                record,
+                packet
+            );
+        }
+
+        Serial.printf(
+            "[RECOVERY] Invalid/corrupt ring ordinal %llu discarded.\n",
+            static_cast<unsigned long long>(
+                ordinal
+            )
+        );
+
+        invalidateRingRecord(
+            ordinal
+        );
+
+        ringHeadOrdinal++;
+        queueCount--;
+    }
+
+    return false;
+}
+
+bool removeOldestPersistent()
+{
     if (
-        queueIsFull()
+        queueIsEmpty()
     )
     {
         return false;
     }
 
-    queueSequences[
-        queueCount
-    ] =
-        sequence;
+    uint64_t ordinal =
+        ringHeadOrdinal;
 
-    queueCount++;
+    BinaryTelemetryRecord record;
 
-    sortQueueSequences();
+    uint32_t sequence =
+        0;
+
+    if (
+        readRingRecord(
+            ordinal,
+            record
+        )
+    )
+    {
+        sequence =
+            record.sequence;
+    }
+
+    if (
+        !invalidateRingRecord(
+            ordinal
+        )
+    )
+    {
+        return false;
+    }
+
+    ringHeadOrdinal++;
+    queueCount--;
+
+    if (
+        sequence >
+        0
+    )
+    {
+        Serial.printf(
+            "[RING] Deleted Sequence %lu\n",
+            static_cast<unsigned long>(
+                sequence
+            )
+        );
+    }
+
+    return true;
+}
+
+bool dropOldestForOverflow()
+{
+    if (
+        queueIsEmpty()
+    )
+    {
+        return true;
+    }
+
+    BinaryTelemetryRecord oldest;
+
+    uint32_t sequence =
+        0;
+
+    if (
+        readRingRecord(
+            ringHeadOrdinal,
+            oldest
+        )
+    )
+    {
+        sequence =
+            oldest.sequence;
+    }
+
+    if (
+        !invalidateRingRecord(
+            ringHeadOrdinal
+        )
+    )
+    {
+        return false;
+    }
+
+    ringHeadOrdinal++;
+    queueCount--;
+
+    droppedOldestCount++;
+
+    preferences.putULong64(
+        "ringDropped",
+        droppedOldestCount
+    );
+
+    Serial.printf(
+        "[BUFFER] Capacity reached. Dropped oldest Sequence %lu. Total dropped: %llu\n",
+        static_cast<unsigned long>(
+            sequence
+        ),
+        static_cast<unsigned long long>(
+            droppedOldestCount
+        )
+    );
 
     return true;
 }
@@ -1788,16 +3013,34 @@ bool enqueuePersistent(
         queueIsFull()
     )
     {
-        Serial.println(
-            "[BUFFER] QUEUE FULL."
-        );
-
-        return false;
+        if (
+            !dropOldestForOverflow()
+        )
+        {
+            return false;
+        }
     }
 
+    uint64_t ordinal =
+        ringNextOrdinal;
+
     if (
-        !savePacketToFlash(
-            packet
+        ordinal == 0
+    )
+    {
+        ordinal =
+            1;
+    }
+
+    BinaryTelemetryRecord record =
+        packetToRecord(
+            packet,
+            ordinal
+        );
+
+    if (
+        !writeRingRecord(
+            record
         )
     )
     {
@@ -1805,73 +3048,43 @@ bool enqueuePersistent(
     }
 
     if (
-        !addSequenceToQueue(
-            packet.sequence
-        )
+        queueCount == 0
     )
     {
-        LittleFS.remove(
-            packetFilePath(
-                packet.sequence
-            )
-        );
-
-        return false;
+        ringHeadOrdinal =
+            ordinal;
     }
+
+    ringNextOrdinal =
+        ordinal + 1;
+
+    queueCount++;
 
     Serial.printf(
-        "[BUFFER] Queue : %u / %u\n",
+        "[BUFFER] Queue : %u / %u | approx %.1f h retained | dropped=%llu\n",
         static_cast<unsigned int>(
             queueCount
         ),
         static_cast<unsigned int>(
             QUEUE_CAPACITY
+        ),
+        (
+            static_cast<double>(
+                queueCount
+            ) *
+            3.99
+        ) /
+            3600.0,
+        static_cast<unsigned long long>(
+            droppedOldestCount
         )
     );
 
     return true;
 }
 
-bool removeOldestPersistent()
-{
-    if (
-        queueIsEmpty()
-    )
-    {
-        return false;
-    }
-
-    uint32_t sequence =
-        queueSequences[0];
-
-    if (
-        !deletePacketFromFlash(
-            sequence
-        )
-    )
-    {
-        return false;
-    }
-
-    for (
-        size_t i = 1;
-        i < queueCount;
-        i++
-    )
-    {
-        queueSequences[
-            i - 1
-        ] =
-            queueSequences[i];
-    }
-
-    queueCount--;
-
-    return true;
-}
-
 // =====================================================
-// Restore Queue
+// Ring Recovery
 // =====================================================
 
 void restoreQueueFromFlash()
@@ -1879,105 +3092,152 @@ void restoreQueueFromFlash()
     queueCount =
         0;
 
-    File dir =
-        LittleFS.open(
-            QUEUE_DIR
+    ringHeadOrdinal =
+        0;
+
+    ringNextOrdinal =
+        1;
+
+    droppedOldestCount =
+        preferences.getULong64(
+            "ringDropped",
+            0
         );
 
     if (
-        !dir ||
-        !dir.isDirectory()
+        !ensureRingFile()
     )
     {
+        Serial.println(
+            "[RING] Ring file initialization failed."
+        );
+
         return;
     }
 
     File file =
-        dir.openNextFile();
+        LittleFS.open(
+            RING_FILE,
+            "r"
+        );
 
-    while (
-        file
-    )
+    if (!file)
     {
-        if (
-            !file.isDirectory()
-        )
-        {
-            String name =
-                String(
-                    file.name()
-                );
-
-            int slash =
-                name.lastIndexOf('/');
-
-            String fileName =
-                slash >= 0
-                ? name.substring(
-                    slash + 1
-                )
-                : name;
-
-            int dot =
-                fileName.indexOf('.');
-
-            String seqText =
-                dot > 0
-                ? fileName.substring(
-                    0,
-                    dot
-                )
-                : fileName;
-
-            uint32_t sequence =
-                static_cast<uint32_t>(
-                    strtoul(
-                        seqText.c_str(),
-                        nullptr,
-                        10
-                    )
-                );
-
-            if (
-                sequence > 0 &&
-                queueCount <
-                    QUEUE_CAPACITY
-            )
-            {
-                queueSequences[
-                    queueCount
-                ] =
-                    sequence;
-
-                queueCount++;
-
-                if (
-                    sequence >
-                    telemetrySequence
-                )
-                {
-                    telemetrySequence =
-                        sequence;
-                }
-
-                Serial.printf(
-                    "[RECOVERY] Found Sequence %lu\n",
-                    static_cast<unsigned long>(
-                        sequence
-                    )
-                );
-            }
-        }
-
-        file.close();
-
-        file =
-            dir.openNextFile();
+        return;
     }
 
-    dir.close();
+    uint64_t minimumOrdinal =
+        UINT64_MAX;
 
-    sortQueueSequences();
+    uint64_t maximumOrdinal =
+        0;
+
+    size_t validCount =
+        0;
+
+    size_t corruptCount =
+        0;
+
+    for (
+        size_t slot = 0;
+        slot < QUEUE_CAPACITY;
+        slot++
+    )
+    {
+        BinaryTelemetryRecord record;
+
+        size_t bytes =
+            file.read(
+                reinterpret_cast<uint8_t*>(
+                    &record
+                ),
+                sizeof(record)
+            );
+
+        if (
+            bytes !=
+            sizeof(record)
+        )
+        {
+            break;
+        }
+
+        // Empty / invalidated slot.
+        if (
+            record.magic == 0
+        )
+        {
+            continue;
+        }
+
+        if (
+            !recordIsValid(
+                record
+            )
+        )
+        {
+            corruptCount++;
+            continue;
+        }
+
+        validCount++;
+
+        if (
+            record.ordinal <
+            minimumOrdinal
+        )
+        {
+            minimumOrdinal =
+                record.ordinal;
+        }
+
+        if (
+            record.ordinal >
+            maximumOrdinal
+        )
+        {
+            maximumOrdinal =
+                record.ordinal;
+        }
+
+        if (
+            record.sequence >
+            telemetrySequence
+        )
+        {
+            telemetrySequence =
+                record.sequence;
+        }
+    }
+
+    file.close();
+
+    if (
+        validCount >
+        0
+    )
+    {
+        ringHeadOrdinal =
+            minimumOrdinal;
+
+        ringNextOrdinal =
+            maximumOrdinal + 1;
+
+        // Valid records should form one continuous FIFO interval.
+        // Any missing/torn slot is skipped lazily by readOldestPersistent().
+        uint64_t span =
+            maximumOrdinal -
+            minimumOrdinal +
+            1;
+
+        queueCount =
+            static_cast<size_t>(
+                span >
+                    QUEUE_CAPACITY
+                    ? QUEUE_CAPACITY
+                    : span
+            );
+    }
 
     preferences.putUInt(
         "sequence",
@@ -1985,10 +3245,445 @@ void restoreQueueFromFlash()
     );
 
     Serial.printf(
-        "[RECOVERY] Restored %u packet(s).\n",
+        "[RECOVERY] Binary ring restored %u queued slot(s).\n",
         static_cast<unsigned int>(
             queueCount
         )
+    );
+
+    Serial.printf(
+        "[RECOVERY] CRC-invalid/torn slots observed: %u.\n",
+        static_cast<unsigned int>(
+            corruptCount
+        )
+    );
+
+    Serial.printf(
+        "[RECOVERY] Ring capacity: %u records, %llu bytes (~25+ h minimum target).\n",
+        static_cast<unsigned int>(
+            QUEUE_CAPACITY
+        ),
+        static_cast<unsigned long long>(
+            ringFileSizeBytes()
+        )
+    );
+
+    Serial.printf(
+        "[RECOVERY] Oldest-drop count: %llu.\n",
+        static_cast<unsigned long long>(
+            droppedOldestCount
+        )
+    );
+}
+
+// =====================================================
+// P3: HTTP Classification
+// =====================================================
+
+bool responseHasErrorCode(
+    const String& response,
+    const char* errorCode
+)
+{
+    if (
+        errorCode == nullptr ||
+        response.length() == 0
+    )
+    {
+        return false;
+    }
+
+    String quoted =
+        "\"" +
+        String(errorCode) +
+        "\"";
+
+    return (
+        response.indexOf(
+            quoted
+        ) >= 0
+    );
+}
+
+PostResult classifyHttpOutcome(
+    int statusCode,
+    const String& response
+)
+{
+    // -------------------------------------------------
+    // Success / idempotent duplicate
+    // API v1.3:
+    // 201 = newly stored
+    // 200 = identical replay, duplicate=true
+    // -------------------------------------------------
+    if (
+        statusCode >= 200 &&
+        statusCode <= 299
+    )
+    {
+        return PostResult::SUCCESS;
+    }
+
+    // -------------------------------------------------
+    // Temporary transport / server conditions
+    // -------------------------------------------------
+    if (
+        statusCode < 0 ||
+        statusCode == 408 ||
+        statusCode == 425 ||
+        statusCode == 429 ||
+        (
+            statusCode >= 500 &&
+            statusCode <= 599
+        )
+    )
+    {
+        return PostResult::RETRYABLE;
+    }
+
+    // -------------------------------------------------
+    // API v1.3 packet-specific permanent failures
+    // -------------------------------------------------
+
+    // Invalid telemetry/raw-only/body contract cannot be repaired by
+    // sending the same payload again.
+    if (
+        statusCode == 400 ||
+        statusCode == 413
+    )
+    {
+        return PostResult::PERMANENT_PACKET_REJECT;
+    }
+
+    // The API explicitly requires ordinary ESP/MQTT non-null labels
+    // to be isolated as a permanent error and not retried.
+    if (
+        statusCode == 403 &&
+        responseHasErrorCode(
+            response,
+            "TELEMETRY_LABEL_FORBIDDEN"
+        )
+    )
+    {
+        return PostResult::PERMANENT_PACKET_REJECT;
+    }
+
+    // A reused (deviceId, sequence) with a different payload can never
+    // succeed while replaying this same packet.
+    if (
+        statusCode == 409 &&
+        responseHasErrorCode(
+            response,
+            "SEQUENCE_CONFLICT"
+        )
+    )
+    {
+        return PostResult::PERMANENT_PACKET_REJECT;
+    }
+
+    // -------------------------------------------------
+    // Device/server configuration or authorization errors
+    //
+    // Preserve queued data instead of discarding it. These may become
+    // valid after token, device registration, endpoint or mapping repair.
+    // -------------------------------------------------
+    if (
+        statusCode == 401 ||
+        statusCode == 403 ||
+        statusCode == 404 ||
+        statusCode == 405 ||
+        statusCode == 415 ||
+        (
+            statusCode == 409 &&
+            responseHasErrorCode(
+                response,
+                "DEVICE_MAPPING_MISMATCH"
+            )
+        ) ||
+        (
+            statusCode >= 300 &&
+            statusCode <= 399
+        )
+    )
+    {
+        return PostResult::CONFIGURATION_ERROR;
+    }
+
+    // Unknown 409 or other 4xx are preserved rather than silently
+    // discarded. Add a specific rule only after the API contract defines
+    // the error as packet-permanent.
+    if (
+        statusCode >= 400 &&
+        statusCode <= 499
+    )
+    {
+        return PostResult::CONFIGURATION_ERROR;
+    }
+
+    return PostResult::RETRYABLE;
+}
+
+
+// =====================================================
+// LittleFS Quiet Existence Helper
+// =====================================================
+
+bool fileExistsQuiet(
+    const String& absolutePath
+)
+{
+    if (
+        absolutePath.length() == 0
+    )
+    {
+        return false;
+    }
+
+    String path =
+        absolutePath;
+
+    if (
+        path[0] != '/'
+    )
+    {
+        path =
+            "/" +
+            path;
+    }
+
+    int slash =
+        path.lastIndexOf('/');
+
+    if (
+        slash < 0 ||
+        slash ==
+            static_cast<int>(
+                path.length() - 1
+            )
+    )
+    {
+        return false;
+    }
+
+    String directoryPath =
+        slash == 0
+            ? "/"
+            : path.substring(
+                  0,
+                  slash
+              );
+
+    String expectedName =
+        path.substring(
+            slash + 1
+        );
+
+    File directory =
+        LittleFS.open(
+            directoryPath
+        );
+
+    if (
+        !directory ||
+        !directory.isDirectory()
+    )
+    {
+        if (directory)
+        {
+            directory.close();
+        }
+
+        return false;
+    }
+
+    File entry =
+        directory.openNextFile();
+
+    while (entry)
+    {
+        if (
+            !entry.isDirectory()
+        )
+        {
+            String entryName =
+                String(
+                    entry.name()
+                );
+
+            int entrySlash =
+                entryName.lastIndexOf('/');
+
+            if (
+                entrySlash >= 0
+            )
+            {
+                entryName =
+                    entryName.substring(
+                        entrySlash + 1
+                    );
+            }
+
+            if (
+                entryName ==
+                expectedName
+            )
+            {
+                entry.close();
+                directory.close();
+                return true;
+            }
+        }
+
+        entry.close();
+
+        entry =
+            directory.openNextFile();
+    }
+
+    directory.close();
+
+    return false;
+}
+
+bool writeRejectedMeta(
+    uint32_t sequence,
+    const PostOutcome& outcome
+)
+{
+    File metaFile =
+        LittleFS.open(
+            rejectedMetaFilePath(
+                sequence
+            ),
+            FILE_WRITE
+        );
+
+    if (!metaFile)
+    {
+        return false;
+    }
+
+    metaFile.print(
+        "sequence="
+    );
+
+    metaFile.println(
+        sequence
+    );
+
+    metaFile.print(
+        "httpStatus="
+    );
+
+    metaFile.println(
+        outcome.statusCode
+    );
+
+    metaFile.print(
+        "response="
+    );
+
+    metaFile.println(
+        outcome.response
+    );
+
+    metaFile.print(
+        "recordedAt="
+    );
+
+    String timestamp =
+        getTimestamp();
+
+    metaFile.println(
+        timestamp.length() > 0
+            ? timestamp
+            : "time-unavailable"
+    );
+
+    metaFile.flush();
+    metaFile.close();
+
+    return true;
+}
+
+bool saveImmediateRejectedPacket(
+    const TelemetryPacket& packet,
+    const PostOutcome& outcome
+)
+{
+    String path =
+        rejectedPacketFilePath(
+            packet.sequence
+        );
+
+    if (
+        fileExistsQuiet(
+            path
+        )
+    )
+    {
+        path +=
+            "." +
+            String(
+                millis()
+            ) +
+            ".rejected";
+    }
+
+    File file =
+        LittleFS.open(
+            path,
+            FILE_WRITE
+        );
+
+    if (!file)
+    {
+        return false;
+    }
+
+    size_t written =
+        file.print(
+            packet.payload
+        );
+
+    file.flush();
+    file.close();
+
+    if (
+        written !=
+        packet.payload.length()
+    )
+    {
+        return false;
+    }
+
+    bool metaOk =
+        writeRejectedMeta(
+            packet.sequence,
+            outcome
+        );
+
+    Serial.printf(
+        "[REJECT] Preserved Sequence %lu (HTTP %d)\n",
+        static_cast<unsigned long>(
+            packet.sequence
+        ),
+        outcome.statusCode
+    );
+
+    return metaOk;
+}
+
+bool moveQueuedPacketToRejected(
+    const TelemetryPacket& packet,
+    const PostOutcome& outcome
+)
+{
+    // Binary-ring packets are reconstructed into the exact API JSON payload
+    // before preservation in the rejected archive.
+    return saveImmediateRejectedPacket(
+        packet,
+        outcome
     );
 }
 
@@ -1996,16 +3691,27 @@ void restoreQueueFromFlash()
 // HTTP POST
 // =====================================================
 
-bool postPacket(
+PostOutcome postPacket(
     const TelemetryPacket& packet
 )
 {
+    PostOutcome outcome;
+
     if (
         WiFi.status() !=
         WL_CONNECTED
     )
     {
-        return false;
+        outcome.result =
+            PostResult::RETRYABLE;
+
+        outcome.statusCode =
+            -1;
+
+        outcome.response =
+            "wifi-disconnected";
+
+        return outcome;
     }
 
     HTTPClient http;
@@ -2024,7 +3730,16 @@ bool postPacket(
         )
     )
     {
-        return false;
+        outcome.result =
+            PostResult::RETRYABLE;
+
+        outcome.statusCode =
+            -1;
+
+        outcome.response =
+            "http-begin-failed";
+
+        return outcome;
     }
 
     http.addHeader(
@@ -2039,6 +3754,7 @@ bool postPacket(
     );
 
     Serial.println();
+
     Serial.println(
         "========== POST =========="
     );
@@ -2065,31 +3781,53 @@ bool postPacket(
             packet.payload
         );
 
-    Serial.printf(
-        "HTTP     : %d\n",
-        statusCode
-    );
+    outcome.statusCode =
+        statusCode;
 
     if (
         statusCode >
         0
     )
     {
+        outcome.response =
+            http.getString();
+    }
+    else
+    {
+        outcome.response =
+            http.errorToString(
+                statusCode
+            );
+    }
+
+    Serial.printf(
+        "HTTP     : %d\n",
+        statusCode
+    );
+
+    if (
+        outcome.response.length() >
+        0
+    )
+    {
         Serial.println(
-            http.getString()
+            outcome.response
         );
     }
 
     http.end();
 
-    return (
-        statusCode == 200 ||
-        statusCode == 201
-    );
+    outcome.result =
+        classifyHttpOutcome(
+            statusCode,
+            outcome.response
+        );
+
+    return outcome;
 }
 
 // =====================================================
-// Replay
+// P1 + P3: Replay
 // =====================================================
 
 void flushQueue()
@@ -2104,6 +3842,7 @@ void flushQueue()
     }
 
     Serial.println();
+
     Serial.println(
         "[BUFFER] Persistent Replay Started"
     );
@@ -2112,36 +3851,69 @@ void flushQueue()
         !queueIsEmpty()
     )
     {
-        uint32_t sequence =
-            queueSequences[0];
-
         TelemetryPacket packet;
 
+        uint64_t ordinal =
+            0;
+
         if (
-            !readPacketFromFlash(
-                sequence,
-                packet
+            !readOldestPersistent(
+                packet,
+                ordinal
             )
         )
         {
             return;
         }
 
+        uint32_t sequence =
+            packet.sequence;
+
         Serial.printf(
-            "[BUFFER] Replaying Sequence %lu\n",
+            "[BUFFER] Replaying Sequence %lu (ring ordinal %llu)\n",
             static_cast<unsigned long>(
                 sequence
+            ),
+            static_cast<unsigned long long>(
+                ordinal
             )
         );
 
-        if (
-            !postPacket(
+        PostOutcome outcome =
+            postPacket(
                 packet
-            )
+            );
+
+        if (
+            outcome.result ==
+            PostResult::SUCCESS
         )
         {
             Serial.printf(
-                "[BUFFER] Replay stopped at Sequence %lu\n",
+                "[BUFFER] ACK Sequence %lu\n",
+                static_cast<unsigned long>(
+                    sequence
+                )
+            );
+
+            if (
+                !removeOldestPersistent()
+            )
+            {
+                return;
+            }
+
+            delay(100);
+            continue;
+        }
+
+        if (
+            outcome.result ==
+            PostResult::RETRYABLE
+        )
+        {
+            Serial.printf(
+                "[BUFFER] Retryable failure at Sequence %lu; replay paused.\n",
                 static_cast<unsigned long>(
                     sequence
                 )
@@ -2150,154 +3922,60 @@ void flushQueue()
             return;
         }
 
-        Serial.printf(
-            "[BUFFER] ACK Sequence %lu\n",
-            static_cast<unsigned long>(
-                sequence
-            )
-        );
-
         if (
-            !removeOldestPersistent()
+            outcome.result ==
+            PostResult::CONFIGURATION_ERROR
         )
         {
+            Serial.printf(
+                "[BUFFER] Configuration/protocol error at Sequence %lu (HTTP %d); queue preserved.\n",
+                static_cast<unsigned long>(
+                    sequence
+                ),
+                outcome.statusCode
+            );
+
             return;
         }
 
-        delay(
-            100
-        );
+        if (
+            outcome.result ==
+            PostResult::PERMANENT_PACKET_REJECT
+        )
+        {
+            Serial.printf(
+                "[BUFFER] Permanent packet reject Sequence %lu (HTTP %d).\n",
+                static_cast<unsigned long>(
+                    sequence
+                ),
+                outcome.statusCode
+            );
+
+            if (
+                !moveQueuedPacketToRejected(
+                    packet,
+                    outcome
+                )
+            )
+            {
+                return;
+            }
+
+            if (
+                !removeOldestPersistent()
+            )
+            {
+                return;
+            }
+
+            Serial.println(
+                "[BUFFER] Continuing with next queued packet."
+            );
+        }
     }
 
     Serial.println(
         "[BUFFER] Persistent Replay Completed."
-    );
-}
-
-// =====================================================
-// Sensor Cycle
-// =====================================================
-
-void acquireSensorFeatures(
-    VibrationFeatures& vib,
-    AcousticFeatures& audio
-)
-{
-    xSemaphoreTake(
-        resultMutex,
-        portMAX_DELAY
-    );
-
-    vibrationFinished =
-        false;
-
-    acousticFinished =
-        false;
-
-    xSemaphoreGive(
-        resultMutex
-    );
-
-    Serial.println();
-    Serial.println(
-        "[SYNC] Starting sensor acquisition..."
-    );
-
-    uint32_t started =
-        millis();
-
-    xTaskNotifyGive(
-        vibrationTaskHandle
-    );
-
-    xTaskNotifyGive(
-        acousticTaskHandle
-    );
-
-    while (true)
-    {
-        bool vibDone;
-        bool audioDone;
-
-        xSemaphoreTake(
-            resultMutex,
-            portMAX_DELAY
-        );
-
-        vibDone =
-            vibrationFinished;
-
-        audioDone =
-            acousticFinished;
-
-        xSemaphoreGive(
-            resultMutex
-        );
-
-        if (
-            vibDone &&
-            audioDone
-        )
-        {
-            break;
-        }
-
-        delay(1);
-    }
-
-    uint32_t elapsed =
-        millis() -
-        started;
-
-    xSemaphoreTake(
-        resultMutex,
-        portMAX_DELAY
-    );
-
-    vib =
-        vibrationResult;
-
-    audio =
-        acousticResult;
-
-    xSemaphoreGive(
-        resultMutex
-    );
-
-    Serial.println();
-    Serial.println(
-        "========== EDGE FEATURES =========="
-    );
-
-    Serial.printf(
-        "Acquisition       : %lu ms\n",
-        static_cast<unsigned long>(
-            elapsed
-        )
-    );
-
-    Serial.printf(
-        "vibrationRmsRaw   : %.6f g\n",
-        vib.totalRms
-    );
-
-    Serial.printf(
-        "vibrationPeakHz   : %.2f Hz\n",
-        vib.peakHz
-    );
-
-    Serial.printf(
-        "acousticRmsRaw    : %.2f\n",
-        audio.rmsRaw
-    );
-
-    Serial.printf(
-        "acousticPeakHz    : %.2f Hz\n",
-        audio.peakHz
-    );
-
-    Serial.println(
-        "==================================="
     );
 }
 
@@ -2318,8 +3996,26 @@ bool createPacket(
         return false;
     }
 
+    time_t now =
+        time(nullptr);
+
+    if (
+        now <
+        1700000000
+    )
+    {
+        timeReady =
+            false;
+
+        return false;
+    }
+
     String timestamp =
-        getTimestamp();
+        formatTimestampFromEpoch(
+            static_cast<uint64_t>(
+                now
+            )
+        );
 
     if (
         timestamp.length() ==
@@ -2335,6 +4031,31 @@ bool createPacket(
     packet.sequence =
         allocateSequence();
 
+    packet.epochSeconds =
+        static_cast<uint64_t>(
+            now
+        );
+
+    packet.vibrationRmsRaw =
+        static_cast<float>(
+            vib.totalRms
+        );
+
+    packet.vibrationPeakHz =
+        static_cast<float>(
+            vib.peakHz
+        );
+
+    packet.acousticRmsRaw =
+        static_cast<float>(
+            audio.rmsRaw
+        );
+
+    packet.acousticPeakHz =
+        static_cast<float>(
+            audio.peakHz
+        );
+
     packet.payload =
         createTelemetryPayload(
             packet.sequence,
@@ -2347,7 +4068,7 @@ bool createPacket(
 }
 
 // =====================================================
-// LittleFS Init
+// LittleFS
 // =====================================================
 
 bool initPersistentStorage()
@@ -2378,18 +4099,21 @@ bool initPersistentStorage()
 
     if (
         !LittleFS.exists(
-            QUEUE_DIR
+            REJECTED_DIR
+        ) &&
+        !LittleFS.mkdir(
+            REJECTED_DIR
         )
     )
     {
-        if (
-            !LittleFS.mkdir(
-                QUEUE_DIR
-            )
-        )
-        {
-            return false;
-        }
+        return false;
+    }
+
+    if (
+        !ensureRingFile()
+    )
+    {
+        return false;
     }
 
     Serial.printf(
@@ -2424,8 +4148,9 @@ void setup()
     );
 
     Serial.println();
+
     Serial.println(
-        "=============================================="
+        "=============================================================="
     );
 
     Serial.println(
@@ -2438,11 +4163,11 @@ void setup()
     );
 
     Serial.println(
-        " Test : Forced NTP Failure + Backend Fallback"
+        " Fix : 24H Binary Ring + Oldest-Drop + P1-P5"
     );
 
     Serial.println(
-        "=============================================="
+        "=============================================================="
     );
 
     preferences.begin(
@@ -2456,13 +4181,6 @@ void setup()
             0
         );
 
-    Serial.printf(
-        "[SYSTEM] Last Sequence : %lu\n",
-        static_cast<unsigned long>(
-            telemetrySequence
-        )
-    );
-
     if (
         !initPersistentStorage()
     )
@@ -2472,7 +4190,9 @@ void setup()
         );
 
         while (true)
+        {
             delay(1000);
+        }
     }
 
     restoreQueueFromFlash();
@@ -2503,12 +4223,10 @@ void setup()
         );
 
         while (true)
+        {
             delay(1000);
+        }
     }
-
-    Serial.println(
-        "[OK] ADXL345 initialized."
-    );
 
     if (
         !initINMP441()
@@ -2519,27 +4237,32 @@ void setup()
         );
 
         while (true)
+        {
             delay(1000);
+        }
     }
 
-    Serial.println(
-        "[OK] INMP441 initialized."
-    );
+    vibrationResultMutex =
+        xSemaphoreCreateMutex();
 
-    resultMutex =
+    audioRingMutex =
         xSemaphoreCreateMutex();
 
     if (
-        resultMutex ==
-        nullptr
+        vibrationResultMutex ==
+            nullptr ||
+        audioRingMutex ==
+            nullptr
     )
     {
         Serial.println(
-            "[FATAL] Mutex failed."
+            "[FATAL] Mutex creation failed."
         );
 
         while (true)
+        {
             delay(1000);
+        }
     }
 
     xTaskCreatePinnedToCore(
@@ -2552,13 +4275,16 @@ void setup()
         0
     );
 
+    // P5:
+    // Continuous audio task never waits for per-cycle notification.
+    // It continuously drains I2S so stale DMA samples do not accumulate.
     xTaskCreatePinnedToCore(
-        acousticTask,
-        "AcousticTask",
+        audioCaptureTask,
+        "AudioCaptureTask",
         8192,
         nullptr,
-        2,
-        &acousticTaskHandle,
+        3,
+        &audioCaptureTaskHandle,
         1
     );
 
@@ -2567,14 +4293,56 @@ void setup()
     );
 
     Serial.println(
-        "[OK] Acoustic Task  -> Core 1"
+        "[OK] Continuous Audio Task -> Core 1"
     );
 
+    // P4 non-blocking Wi-Fi startup.
+    lastNetworkRetry =
+        millis() -
+        NETWORK_RETRY_MS;
+
+    startWiFiReconnect();
+
+    // Small startup observation window only.
+    // This is intentionally NOT the old 10-second blocking reconnect.
+    uint32_t startupWindow =
+        millis();
+
+    while (
+        millis() -
+            startupWindow <
+            500
+    )
+    {
+        serviceWiFi();
+
+        if (
+            WiFi.status() ==
+            WL_CONNECTED
+        )
+        {
+            break;
+        }
+
+        delay(10);
+    }
+
     if (
-        connectWiFi()
+        WiFi.status() ==
+        WL_CONNECTED
     )
     {
         syncTime();
+    }
+    else
+    {
+        Serial.println(
+            "[WiFi] Startup continues offline."
+        );
+
+        Serial.println(
+            "[TIME] New telemetry will wait until a valid clock is obtained."
+        );
     }
 
     Serial.printf(
@@ -2598,32 +4366,13 @@ void setup()
 
 void loop()
 {
-    // Wi-Fi recovery
-    if (
-        WiFi.status() !=
-        WL_CONNECTED
-    )
-    {
-        if (
-            millis() -
-                lastNetworkRetry >=
-            NETWORK_RETRY_MS
-        )
-        {
-            lastNetworkRetry =
-                millis();
+    // =================================================
+    // P4: Wi-Fi service never waits for connection.
+    // =================================================
 
-            if (
-                connectWiFi() &&
-                !timeReady
-            )
-            {
-                syncTime();
-            }
-        }
-    }
+    serviceWiFi();
 
-    // Time recovery
+    // Recover absolute time when network becomes available.
     if (
         WiFi.status() ==
             WL_CONNECTED &&
@@ -2633,7 +4382,7 @@ void loop()
         syncTime();
     }
 
-    // Replay first
+    // Replay old data first whenever the backend is reachable.
     if (
         WiFi.status() ==
             WL_CONNECTED &&
@@ -2643,35 +4392,17 @@ void loop()
         flushQueue();
     }
 
-    // No clock
+    // Cold boot without any valid absolute time source:
+    // do not invent timestamps.
+    //
+    // After time has synchronized once, ordinary Wi-Fi loss does not
+    // set timeReady=false; the ESP system clock continues locally.
     if (
         !timeReady
     )
     {
         Serial.println(
-            "[TIME] No valid clock."
-        );
-
-        Serial.println(
-            "[TIME] New telemetry acquisition paused."
-        );
-
-        delay(3000);
-
-        return;
-    }
-
-    // Queue full protection
-    if (
-        queueIsFull()
-    )
-    {
-        Serial.println(
-            "[BUFFER] QUEUE FULL."
-        );
-
-        Serial.println(
-            "[BUFFER] New acquisition paused."
+            "[TIME] No valid clock. New telemetry acquisition paused."
         );
 
         delay(
@@ -2681,25 +4412,48 @@ void loop()
         return;
     }
 
-    // New measurement
+    // =================================================
+    // P5: one common 0.64 s vibration/acoustic window
+    // =================================================
+
     VibrationFeatures vib;
     AcousticFeatures audio;
 
-    acquireSensorFeatures(
-        vib,
-        audio
-    );
-
-    // Basic validation
     if (
-        !isfinite(vib.totalRms) ||
-        !isfinite(vib.peakHz) ||
-        !isfinite(audio.rmsRaw) ||
-        !isfinite(audio.peakHz)
+        !acquireSynchronizedFeatures(
+            vib,
+            audio
+        )
     )
     {
         Serial.println(
-            "[SENSOR] Invalid measurement."
+            "[SENSOR] Synchronized acquisition failed."
+        );
+
+        delay(
+            MEASUREMENT_INTERVAL_MS
+        );
+
+        return;
+    }
+
+    if (
+        !isfinite(
+            vib.totalRms
+        ) ||
+        !isfinite(
+            vib.peakHz
+        ) ||
+        !isfinite(
+            audio.rmsRaw
+        ) ||
+        !isfinite(
+            audio.peakHz
+        )
+    )
+    {
+        Serial.println(
+            "[SENSOR] Invalid NaN/Inf measurement."
         );
 
         delay(
@@ -2737,18 +4491,21 @@ void loop()
         )
     );
 
-    // Existing backlog
+    // Existing backlog always wins FIFO.
     if (
         !queueIsEmpty()
     )
     {
-        Serial.println(
-            "[BUFFER] Older telemetry pending."
-        );
-
-        enqueuePersistent(
-            packet
-        );
+        if (
+            !enqueuePersistent(
+                packet
+            )
+        )
+        {
+            Serial.println(
+                "[CRITICAL] Telemetry persistence failed."
+            );
+        }
 
         delay(
             MEASUREMENT_INTERVAL_MS
@@ -2757,11 +4514,46 @@ void loop()
         return;
     }
 
-    // Immediate POST
+    // P4:
+    // Wi-Fi offline after clock sync -> store immediately.
     if (
+        WiFi.status() !=
+        WL_CONNECTED
+    )
+    {
+        Serial.printf(
+            "[OFFLINE] Wi-Fi unavailable. Storing Sequence %lu locally.\n",
+            static_cast<unsigned long>(
+                packet.sequence
+            )
+        );
+
+        if (
+            !enqueuePersistent(
+                packet
+            )
+        )
+        {
+            Serial.println(
+                "[CRITICAL] Telemetry persistence failed."
+            );
+        }
+
+        delay(
+            MEASUREMENT_INTERVAL_MS
+        );
+
+        return;
+    }
+
+    PostOutcome outcome =
         postPacket(
             packet
-        )
+        );
+
+    if (
+        outcome.result ==
+        PostResult::SUCCESS
     )
     {
         Serial.printf(
@@ -2778,9 +4570,74 @@ void loop()
         return;
     }
 
-    // POST failure
+    if (
+        outcome.result ==
+        PostResult::PERMANENT_PACKET_REJECT
+    )
+    {
+        Serial.printf(
+            "[REJECT] Sequence %lu permanently rejected (HTTP %d).\n",
+            static_cast<unsigned long>(
+                packet.sequence
+            ),
+            outcome.statusCode
+        );
+
+        if (
+            !saveImmediateRejectedPacket(
+                packet,
+                outcome
+            )
+        )
+        {
+            Serial.println(
+                "[CRITICAL] Rejected telemetry preservation failed."
+            );
+        }
+
+        delay(
+            MEASUREMENT_INTERVAL_MS
+        );
+
+        return;
+    }
+
+    if (
+        outcome.result ==
+        PostResult::CONFIGURATION_ERROR
+    )
+    {
+        // Preserve packet in normal queue because this failure affects
+        // the endpoint/auth/configuration rather than this one packet.
+        Serial.printf(
+            "[HTTP] Configuration/protocol error (HTTP %d). Preserving Sequence %lu for later retry.\n",
+            outcome.statusCode,
+            static_cast<unsigned long>(
+                packet.sequence
+            )
+        );
+
+        if (
+            !enqueuePersistent(
+                packet
+            )
+        )
+        {
+            Serial.println(
+                "[CRITICAL] Telemetry persistence failed."
+            );
+        }
+
+        delay(
+            MEASUREMENT_INTERVAL_MS
+        );
+
+        return;
+    }
+
+    // Retryable network/server error.
     Serial.printf(
-        "[OFFLINE] Sequence %lu failed.\n",
+        "[OFFLINE] Sequence %lu retryable transmission failure.\n",
         static_cast<unsigned long>(
             packet.sequence
         )

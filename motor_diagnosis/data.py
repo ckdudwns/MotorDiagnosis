@@ -5833,8 +5833,10 @@ def _live_dataset_export_snapshot(
     list[dict[str, Any]],
     list[dict[str, Any]],
     dict[str, str],
+    dict[str, Any],
 ]:
     with STORE_LOCK:
+        asset = copy_payload(get_asset(site_id, asset_id))
         points = telemetry_for(
             site_id,
             asset_id,
@@ -5846,7 +5848,7 @@ def _live_dataset_export_snapshot(
         )
         taxonomies = copy_payload(ACOUSTIC_TAXONOMY_VERSIONS)
         units = copy_payload(telemetry_units(site_id, asset_id))
-    return points, events, taxonomies, units
+    return points, events, taxonomies, units, asset
 
 
 def _dataset_rows_for_points(
@@ -6055,7 +6057,7 @@ def dataset_export_for(
         rows = _rows_in_time_range(snapshot[snapshot_key], from_timestamp, to_timestamp)
         source_record_count = len(rows)
     else:
-        points, events, taxonomies, units = _live_dataset_export_snapshot(
+        points, events, taxonomies, units, live_asset = _live_dataset_export_snapshot(
             site["id"],
             asset["id"],
             from_timestamp,
@@ -6105,7 +6107,7 @@ def dataset_export_for(
                 "samplingRateHz": None,
                 "units": units,
                 "operatingConditions": {
-                    "ratedRpm": asset.get("ratedRpm"),
+                    "ratedRpm": live_asset.get("ratedRpm"),
                     "source": "live_or_demo_telemetry",
                 },
             }

@@ -718,6 +718,67 @@ class DatasetLabelPolicyTest(unittest.TestCase):
         self.assertEqual(result["manifest"]["labelCounts"]["weak"], 2)
         self.assertEqual(result["manifest"]["trainingEligibleCount"], 0)
 
+    def test_live_export_uses_one_asset_snapshot_during_rpm_update(self) -> None:
+        data.EVENTS.clear()
+        data.TELEMETRY_RECORDS.clear()
+        data.update_asset(
+            self.admin,
+            "SITE-01",
+            "SITE-01-MOT-02",
+            {"ratedRpm": 1450},
+        )
+
+        rows_ready = threading.Event()
+        continue_export = threading.Event()
+        original_rows_for_points = data._dataset_rows_for_points
+
+        def pause_after_snapshot(*args, **kwargs):
+            rows = original_rows_for_points(*args, **kwargs)
+            rows_ready.set()
+            self.assertTrue(continue_export.wait(timeout=2))
+            return rows
+
+        result: dict[str, object] = {}
+        failure: list[BaseException] = []
+
+        def run_export() -> None:
+            try:
+                result.update(
+                    data.dataset_export_for(
+                        self.admin,
+                        "SITE-01",
+                        "SITE-01-MOT-02",
+                    )
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                failure.append(error)
+
+        with patch(
+            "motor_diagnosis.data._dataset_rows_for_points",
+            side_effect=pause_after_snapshot,
+        ):
+            export_thread = threading.Thread(target=run_export)
+            export_thread.start()
+            self.assertTrue(rows_ready.wait(timeout=2))
+            data.update_asset(
+                self.admin,
+                "SITE-01",
+                "SITE-01-MOT-02",
+                {"ratedRpm": 1950},
+            )
+            continue_export.set()
+            export_thread.join(timeout=2)
+
+        self.assertFalse(export_thread.is_alive())
+        if failure:
+            raise failure[0]
+        self.assertEqual(
+            result["manifest"]["compatibility"]["operatingConditions"]["ratedRpm"],
+            1450,
+        )
+        self.assertEqual(data.get_asset("SITE-01", "SITE-01-MOT-02")["ratedRpm"], 1950)
+        self.assertTrue(all(1400 <= row["rpm"] < 1500 for row in result["rows"]))
+
     def test_dataset_fingerprint_includes_policy_and_snapshot_versions(self) -> None:
         source = {
             "type": "external",

@@ -61,7 +61,7 @@
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.2-beta.11.1";
+    "v1.2-beta.11.2";
 
 // =====================================================
 // Test Config
@@ -232,6 +232,18 @@ constexpr uint32_t RING_MAGIC =
 
 constexpr uint16_t RING_SCHEMA_VERSION =
     1;
+
+// Fast replay:
+// Successful ACKs no longer rewrite + flush the 1.2 MB LittleFS ring
+// for every single packet. Instead, consumed ordinals are tracked by a
+// durable NVS watermark in batches.
+//
+// If power is lost before the next watermark commit, at most the uncommitted
+// batch can replay once more. The backend already handles duplicate sequence
+// IDs idempotently (HTTP 200 duplicate:true), so this is safe at-least-once
+// delivery behavior.
+constexpr size_t ACK_WATERMARK_BATCH_SIZE =
+    32;
 
 constexpr uint32_t MEASUREMENT_INTERVAL_MS =
     3000;
@@ -416,6 +428,19 @@ uint64_t ringNextOrdinal =
     0;
 
 uint64_t droppedOldestCount =
+    0;
+
+// Highest ring ordinal durably known to be consumed.
+// Stored in Preferences key "ringConsumed".
+uint64_t committedConsumedOrdinal =
+    0;
+
+// Highest consumed ordinal in RAM. This may be ahead of the durable
+// watermark by at most ACK_WATERMARK_BATCH_SIZE - 1 during replay.
+uint64_t pendingConsumedOrdinal =
+    0;
+
+size_t pendingConsumedCount =
     0;
 
 // =====================================================
@@ -2722,6 +2747,111 @@ bool invalidateRingRecord(
 }
 
 // =====================================================
+// Consumed-Ordinal Watermark
+// =====================================================
+//
+// Why this exists:
+// invalidateRingRecord() changes only 4 bytes, but LittleFS.flush() on the
+// 1.2 MB preallocated ring was measured at ~10.4-10.6 seconds per ACK.
+// That made a 650-record recovery take roughly two hours.
+//
+// New behavior:
+// - ACK/reject/corrupt-skip advances the in-RAM FIFO head immediately.
+// - Every 32 consumed records (or when replay pauses/completes), the highest
+//   consumed ordinal is committed to NVS Preferences.
+// - Recovery ignores valid ring records with ordinal <= this watermark.
+// - Physical ring slots are naturally overwritten as the circular ring wraps.
+//
+// Crash safety:
+// If power is lost before a pending watermark commit, those few already-ACKed
+// records can replay after reboot. The backend duplicate-sequence contract
+// safely ACKs them again, so no accepted telemetry is lost.
+
+bool commitConsumedWatermark()
+{
+    if (
+        pendingConsumedOrdinal <=
+            committedConsumedOrdinal
+    )
+    {
+        pendingConsumedCount =
+            0;
+
+        return true;
+    }
+
+    size_t written =
+        preferences.putULong64(
+            "ringConsumed",
+            pendingConsumedOrdinal
+        );
+
+    if (
+        written !=
+        sizeof(uint64_t)
+    )
+    {
+        Serial.printf(
+            "[WATERMARK] Commit FAILED at ordinal %llu. "
+            "Safe fallback: duplicates may replay after reboot.\n",
+            static_cast<unsigned long long>(
+                pendingConsumedOrdinal
+            )
+        );
+
+        return false;
+    }
+
+    committedConsumedOrdinal =
+        pendingConsumedOrdinal;
+
+    pendingConsumedCount =
+        0;
+
+    Serial.printf(
+        "[WATERMARK] Committed consumed ordinal %llu.\n",
+        static_cast<unsigned long long>(
+            committedConsumedOrdinal
+        )
+    );
+
+    return true;
+}
+
+void noteConsumedOrdinal(
+    uint64_t ordinal,
+    bool forceCommit = false
+)
+{
+    if (
+        ordinal == 0
+    )
+    {
+        return;
+    }
+
+    if (
+        ordinal >
+        pendingConsumedOrdinal
+    )
+    {
+        pendingConsumedOrdinal =
+            ordinal;
+    }
+
+    pendingConsumedCount++;
+
+    if (
+        forceCommit ||
+        pendingConsumedCount >=
+            ACK_WATERMARK_BATCH_SIZE
+    )
+    {
+        commitConsumedWatermark();
+    }
+}
+
+// =====================================================
 // Binary <-> HTTP Packet
 // =====================================================
 
@@ -2881,12 +3011,17 @@ bool readOldestPersistent(
             )
         );
 
-        invalidateRingRecord(
-            ordinal
-        );
-
+        // Do NOT perform the old 1.2 MB LittleFS flush here.
+        // Persist the skipped position with the watermark instead.
         ringHeadOrdinal++;
         queueCount--;
+
+        // Corruption is rare, so commit immediately to avoid repeatedly
+        // rediscovering the same bad ordinal after reboot.
+        noteConsumedOrdinal(
+            ordinal,
+            true
+        );
     }
 
     return false;
@@ -2920,17 +3055,17 @@ bool removeOldestPersistent()
             record.sequence;
     }
 
-    if (
-        !invalidateRingRecord(
-            ordinal
-        )
-    )
-    {
-        return false;
-    }
-
+    // FAST PATH:
+    // Do not zero/flush the 1.2 MB ring file per ACK.
+    // Advance RAM FIFO state immediately and batch-persist a consumed
+    // ordinal watermark to NVS.
     ringHeadOrdinal++;
     queueCount--;
+
+    noteConsumedOrdinal(
+        ordinal,
+        queueIsEmpty()
+    );
 
     if (
         sequence >
@@ -2938,9 +3073,12 @@ bool removeOldestPersistent()
     )
     {
         Serial.printf(
-            "[RING] Deleted Sequence %lu\n",
+            "[RING] Consumed Sequence %lu (ordinal %llu)\n",
             static_cast<unsigned long>(
                 sequence
+            ),
+            static_cast<unsigned long long>(
+                ordinal
             )
         );
     }
@@ -2957,6 +3095,9 @@ bool dropOldestForOverflow()
         return true;
     }
 
+    uint64_t ordinal =
+        ringHeadOrdinal;
+
     BinaryTelemetryRecord oldest;
 
     uint32_t sequence =
@@ -2964,7 +3105,7 @@ bool dropOldestForOverflow()
 
     if (
         readRingRecord(
-            ringHeadOrdinal,
+            ordinal,
             oldest
         )
     )
@@ -2973,17 +3114,15 @@ bool dropOldestForOverflow()
             oldest.sequence;
     }
 
-    if (
-        !invalidateRingRecord(
-            ringHeadOrdinal
-        )
-    )
-    {
-        return false;
-    }
-
+    // The next enqueue at full capacity naturally overwrites this oldest
+    // physical ring slot. Avoid the old per-drop LittleFS invalidation flush.
     ringHeadOrdinal++;
     queueCount--;
+
+    noteConsumedOrdinal(
+        ordinal,
+        true
+    );
 
     droppedOldestCount++;
 
@@ -3104,6 +3243,18 @@ void restoreQueueFromFlash()
             0
         );
 
+    committedConsumedOrdinal =
+        preferences.getULong64(
+            "ringConsumed",
+            0
+        );
+
+    pendingConsumedOrdinal =
+        committedConsumedOrdinal;
+
+    pendingConsumedCount =
+        0;
+
     if (
         !ensureRingFile()
     )
@@ -3126,13 +3277,21 @@ void restoreQueueFromFlash()
         return;
     }
 
-    uint64_t minimumOrdinal =
+    uint64_t minimumActiveOrdinal =
         UINT64_MAX;
 
-    uint64_t maximumOrdinal =
+    uint64_t maximumActiveOrdinal =
         0;
 
-    size_t validCount =
+    // Must include stale-but-valid consumed slots so a reboot never reuses
+    // an ordinal lower than the durable watermark.
+    uint64_t maximumOrdinalSeen =
+        committedConsumedOrdinal;
+
+    size_t activeValidCount =
+        0;
+
+    size_t ignoredConsumedCount =
         0;
 
     size_t corruptCount =
@@ -3162,7 +3321,7 @@ void restoreQueueFromFlash()
             break;
         }
 
-        // Empty / invalidated slot.
+        // Empty / legacy-invalidated slot.
         if (
             record.magic == 0
         )
@@ -3180,23 +3339,12 @@ void restoreQueueFromFlash()
             continue;
         }
 
-        validCount++;
-
-        if (
-            record.ordinal <
-            minimumOrdinal
-        )
-        {
-            minimumOrdinal =
-                record.ordinal;
-        }
-
         if (
             record.ordinal >
-            maximumOrdinal
+            maximumOrdinalSeen
         )
         {
-            maximumOrdinal =
+            maximumOrdinalSeen =
                 record.ordinal;
         }
 
@@ -3208,26 +3356,67 @@ void restoreQueueFromFlash()
             telemetrySequence =
                 record.sequence;
         }
+
+        // New fast-replay rule:
+        // valid bytes can remain in the ring after ACK. The durable watermark
+        // is authoritative for whether that ordinal is still queued.
+        if (
+            record.ordinal <=
+            committedConsumedOrdinal
+        )
+        {
+            ignoredConsumedCount++;
+            continue;
+        }
+
+        activeValidCount++;
+
+        if (
+            record.ordinal <
+            minimumActiveOrdinal
+        )
+        {
+            minimumActiveOrdinal =
+                record.ordinal;
+        }
+
+        if (
+            record.ordinal >
+            maximumActiveOrdinal
+        )
+        {
+            maximumActiveOrdinal =
+                record.ordinal;
+        }
     }
 
     file.close();
 
+    // Never reuse an ordinal at or below the consumed watermark.
+    ringNextOrdinal =
+        maximumOrdinalSeen + 1;
+
     if (
-        validCount >
+        ringNextOrdinal == 0
+    )
+    {
+        ringNextOrdinal =
+            1;
+    }
+
+    if (
+        activeValidCount >
         0
     )
     {
         ringHeadOrdinal =
-            minimumOrdinal;
-
-        ringNextOrdinal =
-            maximumOrdinal + 1;
+            minimumActiveOrdinal;
 
         // Valid records should form one continuous FIFO interval.
         // Any missing/torn slot is skipped lazily by readOldestPersistent().
         uint64_t span =
-            maximumOrdinal -
-            minimumOrdinal +
+            maximumActiveOrdinal -
+            minimumActiveOrdinal +
             1;
 
         queueCount =
@@ -3248,6 +3437,23 @@ void restoreQueueFromFlash()
         "[RECOVERY] Binary ring restored %u queued slot(s).\n",
         static_cast<unsigned int>(
             queueCount
+        )
+    );
+
+    Serial.printf(
+        "[RECOVERY] Watermark ignored %u already-consumed valid slot(s).\n",
+        static_cast<unsigned int>(
+            ignoredConsumedCount
+        )
+    );
+
+    Serial.printf(
+        "[RECOVERY] Consumed watermark: %llu | next ordinal: %llu.\n",
+        static_cast<unsigned long long>(
+            committedConsumedOrdinal
+        ),
+        static_cast<unsigned long long>(
+            ringNextOrdinal
         )
     );
 
@@ -3863,6 +4069,7 @@ void flushQueue()
             )
         )
         {
+            commitConsumedWatermark();
             return;
         }
 
@@ -3900,6 +4107,7 @@ void flushQueue()
                 !removeOldestPersistent()
             )
             {
+                commitConsumedWatermark();
                 return;
             }
 
@@ -3919,6 +4127,7 @@ void flushQueue()
                 )
             );
 
+            commitConsumedWatermark();
             return;
         }
 
@@ -3935,6 +4144,7 @@ void flushQueue()
                 outcome.statusCode
             );
 
+            commitConsumedWatermark();
             return;
         }
 
@@ -3958,6 +4168,7 @@ void flushQueue()
                 )
             )
             {
+                commitConsumedWatermark();
                 return;
             }
 
@@ -3965,6 +4176,7 @@ void flushQueue()
                 !removeOldestPersistent()
             )
             {
+                commitConsumedWatermark();
                 return;
             }
 
@@ -3973,6 +4185,8 @@ void flushQueue()
             );
         }
     }
+
+    commitConsumedWatermark();
 
     Serial.println(
         "[BUFFER] Persistent Replay Completed."
@@ -4163,7 +4377,7 @@ void setup()
     );
 
     Serial.println(
-        " Fix : 24H Binary Ring + Oldest-Drop + P1-P5"
+        " Fix : 24H Ring + Fast Replay + P1-P5"
     );
 
     Serial.println(

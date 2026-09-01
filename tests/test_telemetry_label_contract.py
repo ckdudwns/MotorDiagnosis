@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import unittest
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -554,6 +555,168 @@ class DatasetLabelPolicyTest(unittest.TestCase):
         self.assertEqual(rows[0]["ground_truth_source"], "event_review")
         self.assertEqual(rows[0]["target_label"], "BEARING_SUSPECT")
         self.assertTrue(rows[0]["training_eligible"])
+
+    def test_live_export_uses_one_taxonomy_snapshot_during_update(self) -> None:
+        data.EVENTS.clear()
+        base = datetime.now(timezone.utc) - timedelta(minutes=2)
+        for sequence in (1, 2):
+            sample_time = data.format_rfc3339(base + timedelta(seconds=sequence))
+            data.TELEMETRY_RECORDS.append(
+                self.point(
+                    sample_time,
+                    sequence,
+                    scenarioLabel="normal",
+                    labelProvenance=self.provenance(sample_time, "scenarioLabel"),
+                )
+            )
+
+        first_row_started = threading.Event()
+        continue_export = threading.Event()
+        original_ground_truth = data._dataset_ground_truth
+        first_call = True
+
+        def pause_after_snapshot(*args, **kwargs):
+            nonlocal first_call
+            ground_truth = original_ground_truth(*args, **kwargs)
+            if first_call:
+                first_call = False
+                first_row_started.set()
+                self.assertTrue(continue_export.wait(timeout=2))
+            return ground_truth
+
+        result: dict[str, object] = {}
+        failure: list[BaseException] = []
+
+        def run_export() -> None:
+            try:
+                result.update(
+                    data.dataset_export_for(
+                        self.admin,
+                        "SITE-01",
+                        "SITE-01-MOT-02",
+                    )
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                failure.append(error)
+
+        with patch(
+            "motor_diagnosis.data._dataset_ground_truth",
+            side_effect=pause_after_snapshot,
+        ):
+            export_thread = threading.Thread(target=run_export)
+            export_thread.start()
+            self.assertTrue(first_row_started.wait(timeout=2))
+            data.update_acoustic_taxonomy(
+                self.admin,
+                {
+                    "version": "ACOUSTIC-V2",
+                    "reason": "Exercise concurrent live export",
+                    "labels": [
+                        {
+                            "code": "OTHER",
+                            "name": "Other",
+                            "criteria": "Replacement taxonomy label",
+                            "sampleRefs": [],
+                        }
+                    ],
+                },
+            )
+            continue_export.set()
+            export_thread.join(timeout=2)
+
+        self.assertFalse(export_thread.is_alive())
+        if failure:
+            raise failure[0]
+        rows = result["rows"]
+        self.assertEqual(
+            [row["target_label_taxonomy_version"] for row in rows],
+            ["ACOUSTIC-V1", "ACOUSTIC-V1"],
+        )
+        self.assertEqual(result["manifest"]["labelTaxonomyVersion"], "ACOUSTIC-V1")
+
+    def test_live_export_uses_one_event_snapshot_during_review(self) -> None:
+        data.EVENTS.clear()
+        base = datetime.now(timezone.utc) - timedelta(minutes=2)
+        event = {
+            "id": "EV-CONCURRENT-REVIEW",
+            "siteId": "SITE-01",
+            "assetId": "SITE-01-MOT-02",
+            "deviceId": "DEV-01-MOT-02",
+            "severity": "warning",
+            "eventType": "anomaly",
+            "title": "Pending concurrent review",
+            "occurredAt": data.format_rfc3339(base),
+            "time": data.format_rfc3339(base),
+            "durationSec": 120,
+            "label": "needs_review",
+            "note": "",
+            "reviewed": False,
+        }
+        data.EVENTS.append(event)
+        for sequence in (1, 2):
+            data.TELEMETRY_RECORDS.append(
+                self.point(
+                    data.format_rfc3339(base + timedelta(seconds=sequence)),
+                    sequence,
+                )
+            )
+
+        first_row_started = threading.Event()
+        continue_export = threading.Event()
+        original_ground_truth = data._dataset_ground_truth
+        first_call = True
+
+        def pause_after_snapshot(*args, **kwargs):
+            nonlocal first_call
+            ground_truth = original_ground_truth(*args, **kwargs)
+            if first_call:
+                first_call = False
+                first_row_started.set()
+                self.assertTrue(continue_export.wait(timeout=2))
+            return ground_truth
+
+        result: dict[str, object] = {}
+        failure: list[BaseException] = []
+
+        def run_export() -> None:
+            try:
+                result.update(
+                    data.dataset_export_for(
+                        self.admin,
+                        "SITE-01",
+                        "SITE-01-MOT-02",
+                    )
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                failure.append(error)
+
+        with patch(
+            "motor_diagnosis.data._dataset_ground_truth",
+            side_effect=pause_after_snapshot,
+        ):
+            export_thread = threading.Thread(target=run_export)
+            export_thread.start()
+            self.assertTrue(first_row_started.wait(timeout=2))
+            data.review_event(
+                self.admin,
+                event["id"],
+                {
+                    "label": "confirmed_anomaly",
+                    "note": "Reviewed while export is running",
+                    "reason": "Exercise concurrent live export",
+                },
+            )
+            continue_export.set()
+            export_thread.join(timeout=2)
+
+        self.assertFalse(export_thread.is_alive())
+        if failure:
+            raise failure[0]
+        rows = result["rows"]
+        self.assertEqual([row["label_status"] for row in rows], ["weak", "weak"])
+        self.assertEqual([row["event_reviewed"] for row in rows], [False, False])
+        self.assertEqual(result["manifest"]["labelCounts"]["weak"], 2)
+        self.assertEqual(result["manifest"]["trainingEligibleCount"], 0)
 
     def test_dataset_fingerprint_includes_policy_and_snapshot_versions(self) -> None:
         source = {

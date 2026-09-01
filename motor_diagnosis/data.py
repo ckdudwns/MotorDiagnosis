@@ -5593,9 +5593,14 @@ def _dataset_export_window(
     )
 
 
-def _active_dataset_taxonomy() -> dict[str, Any] | None:
+def _active_dataset_taxonomy(
+    taxonomies: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    taxonomy_versions = (
+        ACOUSTIC_TAXONOMY_VERSIONS if taxonomies is None else taxonomies
+    )
     return next(
-        (item for item in reversed(ACOUSTIC_TAXONOMY_VERSIONS) if item.get("active")),
+        (item for item in reversed(taxonomy_versions) if item.get("active")),
         None,
     )
 
@@ -5635,7 +5640,9 @@ def _dataset_label_for_event(
 
 
 def _dataset_target_label(
-    dataset: dict[str, Any] | None, source_label: Any
+    dataset: dict[str, Any] | None,
+    source_label: Any,
+    taxonomies: list[dict[str, Any]] | None = None,
 ) -> tuple[str | None, str | None]:
     normalized = str(source_label or "").strip()
     if not normalized:
@@ -5651,13 +5658,17 @@ def _dataset_target_label(
         taxonomy = next(
             (
                 item
-                for item in ACOUSTIC_TAXONOMY_VERSIONS
+                for item in (
+                    ACOUSTIC_TAXONOMY_VERSIONS
+                    if taxonomies is None
+                    else taxonomies
+                )
                 if item["version"] == dataset["labelTaxonomyVersion"]
             ),
             None,
         )
     else:
-        taxonomy = _active_dataset_taxonomy()
+        taxonomy = _active_dataset_taxonomy(taxonomies)
     taxonomy_codes = {
         str(item["code"]).strip().upper() for item in (taxonomy or {}).get("labels", [])
     }
@@ -5671,10 +5682,13 @@ def _dataset_ground_truth(
     dataset: dict[str, Any] | None,
     point: dict[str, Any],
     matching_event: dict[str, Any] | None,
+    taxonomies: list[dict[str, Any]] | None = None,
 ) -> tuple[str | None, str | None, str | None, str | None]:
     if _dataset_event_has_verified_label(matching_event):
         raw_label = str(matching_event["label"]).strip()
-        target_label, taxonomy_version = _dataset_target_label(dataset, raw_label)
+        target_label, taxonomy_version = _dataset_target_label(
+            dataset, raw_label, taxonomies
+        )
         return (
             raw_label,
             "event_review",
@@ -5693,7 +5707,9 @@ def _dataset_ground_truth(
         raw_label = str(point.get(field) or "").strip()
         if not raw_label:
             continue
-        target_label, taxonomy_version = _dataset_target_label(dataset, raw_label)
+        target_label, taxonomy_version = _dataset_target_label(
+            dataset, raw_label, taxonomies
+        )
         return raw_label, source, target_label, taxonomy_version
     return None, None, None, None
 
@@ -5807,14 +5823,44 @@ def _safe_tabular_value(value: Any) -> Any:
     return value
 
 
+def _live_dataset_export_snapshot(
+    site_id: str,
+    asset_id: str,
+    from_timestamp: str | None,
+    to_timestamp: str | None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, str],
+]:
+    with STORE_LOCK:
+        points = telemetry_for(
+            site_id,
+            asset_id,
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+        )
+        events = copy_payload(
+            [item for item in EVENTS if item["assetId"] == asset_id]
+        )
+        taxonomies = copy_payload(ACOUSTIC_TAXONOMY_VERSIONS)
+        units = copy_payload(telemetry_units(site_id, asset_id))
+    return points, events, taxonomies, units
+
+
 def _dataset_rows_for_points(
     dataset: dict[str, Any] | None,
     site_id: str,
     asset_id: str,
     points: list[dict[str, Any]],
+    *,
+    events: list[dict[str, Any]] | None = None,
+    taxonomies: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    event_source = EVENTS if events is None else events
     asset_events = sorted(
-        (item for item in EVENTS if item["assetId"] == asset_id),
+        (item for item in event_source if item["assetId"] == asset_id),
         key=lambda item: (
             _dataset_event_has_verified_label(item),
             parse_rfc3339("event.occurredAt", item["occurredAt"]),
@@ -5833,7 +5879,7 @@ def _dataset_rows_for_points(
             ground_truth_source,
             target_label,
             target_label_taxonomy_version,
-        ) = _dataset_ground_truth(dataset, point, matching_event)
+        ) = _dataset_ground_truth(dataset, point, matching_event, taxonomies)
         trusted_fields = _trusted_telemetry_label_fields(point)
         event_reviewed = bool(matching_event and matching_event.get("reviewed"))
         if ground_truth_label:
@@ -6009,13 +6055,20 @@ def dataset_export_for(
         rows = _rows_in_time_range(snapshot[snapshot_key], from_timestamp, to_timestamp)
         source_record_count = len(rows)
     else:
-        points = telemetry_for(
+        points, events, taxonomies, units = _live_dataset_export_snapshot(
             site["id"],
             asset["id"],
-            from_timestamp=from_timestamp,
-            to_timestamp=to_timestamp,
+            from_timestamp,
+            to_timestamp,
         )
-        rows = _dataset_rows_for_points(None, site["id"], asset["id"], points)
+        rows = _dataset_rows_for_points(
+            None,
+            site["id"],
+            asset["id"],
+            points,
+            events=events,
+            taxonomies=taxonomies,
+        )
         _assign_dataset_splits(rows, split, require_complete=False)
         source_record_count = len(points)
     split_counts = {name: 0 for name in ("train", "validation", "test")}
@@ -6048,9 +6101,9 @@ def dataset_export_for(
             dataset["compatibility"]
             if dataset
             else {
-                "signalType": sorted(telemetry_units(site["id"], asset["id"])),
+                "signalType": sorted(units),
                 "samplingRateHz": None,
-                "units": telemetry_units(site["id"], asset["id"]),
+                "units": units,
                 "operatingConditions": {
                     "ratedRpm": asset.get("ratedRpm"),
                     "source": "live_or_demo_telemetry",
@@ -6060,7 +6113,7 @@ def dataset_export_for(
         "labelTaxonomyVersion": (
             dataset["labelTaxonomyVersion"]
             if dataset
-            else (_active_dataset_taxonomy() or {}).get("version")
+            else (_active_dataset_taxonomy(taxonomies) or {}).get("version")
         ),
         "labelMapping": dataset["labelMapping"] if dataset else {},
         "labelPriority": copy_payload(

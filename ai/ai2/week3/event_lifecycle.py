@@ -55,11 +55,15 @@ class EventLifecycleConfig:
 class _AssetState:
     candidate_count: int = 0
     candidate_start_at: str | None = None
+    candidate_start_model_version: str | None = None
     candidate_max_score: float = 0.0
+    candidate_max_score_model_version: str | None = None
     exit_count: int = 0
     exit_start_at: str | None = None
     open_event: dict[str, Any] | None = None
     latest_closed_event: dict[str, Any] | None = None
+    last_processed_at: datetime | None = None
+    last_point_identity: tuple[object, ...] | None = None
 
 
 def _finite_score(point: dict[str, Any]) -> float | None:
@@ -90,6 +94,25 @@ def _parse_timestamp(value: object) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("timestamp must include a timezone.")
     return parsed.astimezone(timezone.utc)
+
+
+def _point_identity(
+    point: dict[str, Any], timestamp: datetime, sensor_fault: bool, reason: str | None
+) -> tuple[object, ...]:
+    """Return the stable identity used to ignore an immediate retransmission."""
+    sequence = point.get("sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        sequence = None
+    score = point.get("anomalyScore", point.get("score"))
+    return (
+        timestamp,
+        point.get("deviceId") if isinstance(point.get("deviceId"), str) else None,
+        sequence,
+        repr(score),
+        str(point.get("anomalyModel") or "unknown"),
+        sensor_fault,
+        reason or "",
+    )
 
 
 class AnomalyEventLifecycle:
@@ -123,9 +146,24 @@ class AnomalyEventLifecycle:
         if not isinstance(asset_id, str) or not asset_id.strip():
             raise ValueError("assetId must be a non-empty string.")
         timestamp = point.get("timestamp")
-        _parse_timestamp(timestamp)
+        parsed_timestamp = _parse_timestamp(timestamp)
         asset_id = asset_id.strip().upper()
         state = self._states.setdefault(asset_id, _AssetState())
+        point_identity = _point_identity(
+            point, parsed_timestamp, sensor_fault, sensor_fault_reason
+        )
+        if (
+            state.last_processed_at is not None
+            and parsed_timestamp < state.last_processed_at
+        ):
+            raise ValueError("timestamp must not be earlier than the last point for assetId.")
+        if (
+            parsed_timestamp == state.last_processed_at
+            and point_identity == state.last_point_identity
+        ):
+            return []
+        state.last_processed_at = parsed_timestamp
+        state.last_point_identity = point_identity
 
         if sensor_fault:
             return self._suppress_for_sensor_fault(
@@ -137,9 +175,7 @@ class AnomalyEventLifecycle:
 
         score = _finite_score(point)
         if score is None:
-            state.candidate_count = 0
-            state.candidate_start_at = None
-            state.candidate_max_score = 0.0
+            self._reset_entry_candidate(state)
             state.exit_count = 0
             state.exit_start_at = None
             return []
@@ -157,24 +193,26 @@ class AnomalyEventLifecycle:
         point: dict[str, Any],
     ) -> list[dict[str, Any]]:
         if score < self.config.score_enter:
-            state.candidate_count = 0
-            state.candidate_start_at = None
-            state.candidate_max_score = 0.0
+            self._reset_entry_candidate(state)
             return []
 
         state.candidate_count += 1
-        state.candidate_max_score = max(state.candidate_max_score, score)
+        model_version = str(point.get("anomalyModel") or "unknown")
         if state.candidate_start_at is None:
             state.candidate_start_at = timestamp
+            state.candidate_start_model_version = model_version
+        if score > state.candidate_max_score:
+            state.candidate_max_score = score
+            state.candidate_max_score_model_version = model_version
         if state.candidate_count < self.config.min_consecutive_enter:
             return []
 
         start_at = state.candidate_start_at
+        start_model_version = state.candidate_start_model_version
         candidate_count = state.candidate_count
         candidate_max_score = state.candidate_max_score
-        state.candidate_count = 0
-        state.candidate_start_at = None
-        state.candidate_max_score = 0.0
+        candidate_max_score_model_version = state.candidate_max_score_model_version
+        self._reset_entry_candidate(state)
         event, is_merge = self._open_or_merge_event(
             state,
             asset_id,
@@ -183,7 +221,8 @@ class AnomalyEventLifecycle:
             score,
             candidate_max_score,
             candidate_count,
-            point,
+            start_model_version or "unknown",
+            candidate_max_score_model_version or "unknown",
         )
         state.open_event = event
         state.exit_count = 0
@@ -204,7 +243,8 @@ class AnomalyEventLifecycle:
         score: float,
         candidate_max_score: float,
         candidate_count: int,
-        point: dict[str, Any],
+        start_model_version: str,
+        candidate_max_score_model_version: str,
     ) -> tuple[dict[str, Any], bool]:
         previous = state.latest_closed_event
         if previous and previous.get("endAt"):
@@ -219,13 +259,12 @@ class AnomalyEventLifecycle:
                 self._update_open_event(
                     previous,
                     score,
-                    point,
                     sample_count=candidate_count,
                     max_score=candidate_max_score,
+                    max_score_model_version=candidate_max_score_model_version,
                 )
                 return previous, True
 
-        model_version = str(point.get("anomalyModel") or "unknown")
         event = {
             "id": f"AI2-EVENT-{uuid4()}",
             "assetId": asset_id,
@@ -238,8 +277,8 @@ class AnomalyEventLifecycle:
             "sampleCount": candidate_count,
             "mergeCount": 0,
             "thresholdVersion": self.config.rule_version,
-            "modelVersion": model_version,
-            "maxScoreModelVersion": model_version,
+            "modelVersion": start_model_version,
+            "maxScoreModelVersion": candidate_max_score_model_version,
             "classification": "asset_anomaly",
         }
         return event, False
@@ -250,7 +289,11 @@ class AnomalyEventLifecycle:
         event = state.open_event
         if event is None:
             return []
-        self._update_open_event(event, score, point)
+        self._update_open_event(
+            event,
+            score,
+            max_score_model_version=str(point.get("anomalyModel") or "unknown"),
+        )
         if score >= self.config.score_exit:
             state.exit_count = 0
             state.exit_start_at = None
@@ -262,7 +305,7 @@ class AnomalyEventLifecycle:
         if state.exit_count < self.config.min_consecutive_exit:
             return [{"kind": "asset_event_updated", "event": event.copy()}]
 
-        event["endAt"] = state.exit_start_at
+        event["endAt"] = timestamp
         event["status"] = "closed"
         event["endReason"] = "score_recovered"
         state.latest_closed_event = event
@@ -278,9 +321,7 @@ class AnomalyEventLifecycle:
         timestamp: str,
         reason: str,
     ) -> list[dict[str, Any]]:
-        state.candidate_count = 0
-        state.candidate_start_at = None
-        state.candidate_max_score = 0.0
+        self._reset_entry_candidate(state)
         state.exit_count = 0
         state.exit_start_at = None
         updates = [
@@ -308,19 +349,25 @@ class AnomalyEventLifecycle:
         return updates
 
     @staticmethod
+    def _reset_entry_candidate(state: _AssetState) -> None:
+        state.candidate_count = 0
+        state.candidate_start_at = None
+        state.candidate_start_model_version = None
+        state.candidate_max_score = 0.0
+        state.candidate_max_score_model_version = None
+
+    @staticmethod
     def _update_open_event(
         event: dict[str, Any],
         score: float,
-        point: dict[str, Any],
         *,
         sample_count: int = 1,
         max_score: float | None = None,
+        max_score_model_version: str,
     ) -> None:
         event["lastScore"] = round(score)
         next_max_score = round(max_score if max_score is not None else score)
         if next_max_score > int(event["maxScore"]):
             event["maxScore"] = next_max_score
-            event["maxScoreModelVersion"] = str(
-                point.get("anomalyModel") or "unknown"
-            )
+            event["maxScoreModelVersion"] = max_score_model_version
         event["sampleCount"] = int(event["sampleCount"]) + sample_count

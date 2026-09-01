@@ -47,7 +47,7 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
         closed = self.lifecycle.process_point(point("2026-08-31T00:00:15Z", 40))
 
         self.assertEqual(closed[0]["kind"], "asset_event_closed")
-        self.assertEqual(closed[0]["event"]["endAt"], "2026-08-31T00:00:10Z")
+        self.assertEqual(closed[0]["event"]["endAt"], "2026-08-31T00:00:15Z")
         self.assertEqual(closed[0]["event"]["endReason"], "score_recovered")
 
     def test_merges_a_reopened_event_inside_the_merge_gap(self) -> None:
@@ -157,6 +157,72 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
         self.assertEqual(started["modelVersion"], "model-v1")
         self.assertEqual(updated["modelVersion"], "model-v1")
         self.assertEqual(updated["maxScoreModelVersion"], "model-v1")
+
+    def test_candidate_models_are_preserved_when_starting_an_event(self) -> None:
+        self.lifecycle.process_point(
+            point("2026-08-31T00:00:00Z", 95, anomalyModel="model-v1")
+        )
+
+        started = self.lifecycle.process_point(
+            point("2026-08-31T00:00:05Z", 80, anomalyModel="model-v2")
+        )[0]["event"]
+
+        self.assertEqual(started["modelVersion"], "model-v1")
+        self.assertEqual(started["maxScore"], 95)
+        self.assertEqual(started["maxScoreModelVersion"], "model-v1")
+
+    def test_candidate_models_are_preserved_when_merging_an_event(self) -> None:
+        lifecycle = AnomalyEventLifecycle(
+            EventLifecycleConfig(
+                min_consecutive_enter=2,
+                min_consecutive_exit=1,
+                merge_gap_sec=30,
+            )
+        )
+        lifecycle.process_point(
+            point("2026-08-31T00:00:00Z", 80, anomalyModel="model-v0")
+        )
+        lifecycle.process_point(
+            point("2026-08-31T00:00:01Z", 80, anomalyModel="model-v0")
+        )
+        lifecycle.process_point(point("2026-08-31T00:00:05Z", 40))
+        lifecycle.process_point(
+            point("2026-08-31T00:00:10Z", 95, anomalyModel="model-v1")
+        )
+        merged = lifecycle.process_point(
+            point("2026-08-31T00:00:15Z", 80, anomalyModel="model-v2")
+        )
+
+        self.assertEqual(merged[0]["kind"], "asset_event_merged")
+        self.assertEqual(merged[0]["event"]["modelVersion"], "model-v0")
+        self.assertEqual(merged[0]["event"]["maxScore"], 95)
+        self.assertEqual(merged[0]["event"]["maxScoreModelVersion"], "model-v1")
+
+    def test_ignores_duplicate_point_and_rejects_out_of_order_point(self) -> None:
+        self.assertEqual(
+            self.lifecycle.process_point(point("2026-08-31T00:00:10Z", 80)), []
+        )
+        self.assertEqual(
+            self.lifecycle.process_point(point("2026-08-31T00:00:10Z", 80)), []
+        )
+        with self.assertRaises(ValueError):
+            self.lifecycle.process_point(point("2026-08-31T00:00:05Z", 80))
+
+        started = self.lifecycle.process_point(point("2026-08-31T00:00:15Z", 80))
+        self.assertEqual(started[0]["kind"], "asset_event_started")
+
+    def test_recovery_end_at_and_statistics_use_the_confirmation_point(self) -> None:
+        lifecycle = AnomalyEventLifecycle(
+            EventLifecycleConfig(min_consecutive_enter=1, min_consecutive_exit=2)
+        )
+        lifecycle.process_point(point("2026-08-31T00:00:00Z", 90))
+        lifecycle.process_point(point("2026-08-31T00:00:10Z", 40))
+
+        closed = lifecycle.process_point(point("2026-08-31T00:00:20Z", 30))[0]["event"]
+
+        self.assertEqual(closed["endAt"], "2026-08-31T00:00:20Z")
+        self.assertEqual(closed["lastScore"], 30)
+        self.assertEqual(closed["sampleCount"], 3)
 
     def test_allows_zero_hysteresis_and_zero_merge_gap(self) -> None:
         config = EventLifecycleConfig(

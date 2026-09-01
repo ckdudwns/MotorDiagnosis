@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import ssl
 import threading
@@ -16,8 +17,10 @@ from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .json_validation import loads_strict_json
 
 LOGGER = logging.getLogger("motor_diagnosis.mqtt")
+SUPPORTED_SUBSCRIPTION_QOS = 1
 RETRYABLE_HTTP_STATUSES = {408, 425, 429}
 BACKEND_QUARANTINED_INGEST_ERRORS = frozenset(
     {
@@ -41,6 +44,10 @@ class MqttBridgeError(Exception):
     local: bool = False
 
 
+def _mqtt_text_for_storage(value: str) -> str:
+    return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
 def decode_mqtt_payload(topic: str, message: bytes | str) -> dict[str, Any]:
     parts = [part for part in topic.strip("/").split("/") if part]
     if len(parts) != 3 or parts[0] != "devices" or parts[2] != "telemetry":
@@ -51,10 +58,10 @@ def decode_mqtt_payload(topic: str, message: bytes | str) -> dict[str, Any]:
             local=True,
         )
     try:
-        payload = json.loads(
+        payload = loads_strict_json(
             message.decode("utf-8") if isinstance(message, bytes) else message
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise MqttBridgeError(
             400,
             "INVALID_JSON",
@@ -87,9 +94,19 @@ def post_json(
     *,
     timeout: float,
 ) -> tuple[dict[str, Any], int]:
+    try:
+        request_body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(
+            "utf-8"
+        )
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise MqttBridgeError(
+            400,
+            "INVALID_JSON",
+            "Outbound JSON payload contains invalid Unicode or numeric values.",
+        ) from exc
     request = Request(
         endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        data=request_body,
         method="POST",
         headers={
             "Content-Type": "application/json",
@@ -170,6 +187,7 @@ def quarantine_local_mqtt_message(
     message: bytes | str,
     error: MqttBridgeError,
     *,
+    idempotency_key: str | None = None,
     timeout: float = 10,
 ) -> tuple[dict[str, Any], int]:
     raw_payload = (
@@ -177,15 +195,19 @@ def quarantine_local_mqtt_message(
         if isinstance(message, bytes)
         else str(message)
     )
+    raw_payload = _mqtt_text_for_storage(raw_payload)
+    quarantine_payload = {
+        "topic": _mqtt_text_for_storage(topic),
+        "payload": raw_payload,
+        "reason": error.code,
+        "message": error.message,
+    }
+    if idempotency_key is not None:
+        quarantine_payload["idempotencyKey"] = idempotency_key
     return post_json(
         endpoint,
         token,
-        {
-            "topic": topic,
-            "payload": raw_payload,
-            "reason": error.code,
-            "message": error.message,
-        },
+        quarantine_payload,
         timeout=timeout,
     )
 
@@ -217,6 +239,11 @@ class RetryMessage:
     payload: bytes
     mid: int
     qos: int
+    dup: bool
+    session_epoch: str
+    delivery_id: str = ""
+    delivery_state: str = "active"
+    delivery_outcome: str = ""
 
 
 class MqttRetryQueue:
@@ -232,6 +259,14 @@ class MqttRetryQueue:
         initial_delay: float = 1.0,
         max_delay: float = 120.0,
         poll_interval: float = 0.5,
+        database_timeout: float = 0.25,
+        migration_timeout: float = 5.0,
+        lease_seconds: float = 60.0,
+        generation_retention_seconds: float = 86400.0,
+        max_delivery_generations: int = 65535,
+        generation_gc_interval: float = 60.0,
+        generation_gc_batch_size: int = 1000,
+        session_ready: bool = True,
     ) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,21 +276,47 @@ class MqttRetryQueue:
         self.initial_delay = max(0.0, initial_delay)
         self.max_delay = max(self.initial_delay, max_delay)
         self.poll_interval = max(0.05, poll_interval)
+        self.database_timeout = max(0.05, database_timeout)
+        self.migration_timeout = max(self.database_timeout, migration_timeout)
+        self.lease_seconds = max(1.0, lease_seconds)
+        self.generation_retention_seconds = max(0.0, generation_retention_seconds)
+        self.max_delivery_generations = max(1, int(max_delivery_generations))
+        self.generation_gc_interval = max(0.0, generation_gc_interval)
+        self.generation_gc_batch_size = max(1, int(generation_gc_batch_size))
+        self._claim_owner = secrets.token_hex(16)
+        self._session_epoch = ""
+        self._session_lock = threading.Lock()
+        self._session_fence_lock = threading.Lock()
+        self._subscription_buffer_lock = threading.Lock()
+        self._session_prepared = threading.Event()
+        self._session_ready = threading.Event()
+        if session_ready:
+            self._session_prepared.set()
+            self._session_ready.set()
         self._ack_targets: dict[str, tuple[Any, RetryMessage]] = {}
         self._target_lock = threading.Lock()
+        self._processing_lock = threading.Lock()
+        self._generation_gc_lock = threading.Lock()
+        self._next_generation_gc_at = 0.0
+        self._inflight_message_keys: set[str] = set()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._worker: threading.Thread | None = None
         self._initialize_database()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=5)
+    def _connect(self, *, timeout: float | None = None) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=self.database_timeout if timeout is None else timeout,
+        )
         connection.row_factory = sqlite3.Row
         return connection
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
+    def _connection(
+        self, *, timeout: float | None = None
+    ) -> Iterator[sqlite3.Connection]:
+        connection = self._connect(timeout=timeout)
         try:
             yield connection
             connection.commit()
@@ -266,7 +327,29 @@ class MqttRetryQueue:
             connection.close()
 
     def _initialize_database(self) -> None:
-        with self._connection() as connection:
+        delay = 0.05
+        while True:
+            try:
+                self._migrate_database_once()
+                return
+            except sqlite3.OperationalError as error:
+                if (
+                    "locked" not in str(error).casefold()
+                    and "busy" not in str(error).casefold()
+                ):
+                    raise
+                LOGGER.warning(
+                    "mqtt_retry_migration_wait database=%s delay=%.2f error=%s",
+                    self.database_path,
+                    delay,
+                    error,
+                )
+                time.sleep(delay)
+                delay = min(2.0, delay * 2)
+
+    def _migrate_database_once(self) -> None:
+        with self._connection(timeout=self.migration_timeout) as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mqtt_retry_queue (
@@ -280,27 +363,703 @@ class MqttRetryQueue:
                     next_attempt_at REAL NOT NULL,
                     error_code TEXT NOT NULL,
                     error_message TEXT NOT NULL,
+                    last_error_code TEXT NOT NULL,
+                    last_error_message TEXT NOT NULL,
+                    delivery_completed INTEGER NOT NULL DEFAULT 0,
+                    delivery_outcome TEXT NOT NULL DEFAULT '',
+                    acknowledged INTEGER NOT NULL DEFAULT 0,
+                    ack_attempted INTEGER NOT NULL DEFAULT 0,
+                    awaiting_subscription INTEGER NOT NULL DEFAULT 0,
+                    claim_owner TEXT NOT NULL DEFAULT '',
+                    claim_token INTEGER NOT NULL DEFAULT 0,
+                    claim_until REAL NOT NULL DEFAULT 0,
+                    session_epoch TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(mqtt_retry_queue)"
+                ).fetchall()
+            }
+            migrations = {
+                "last_error_code": "TEXT NOT NULL DEFAULT ''",
+                "last_error_message": "TEXT NOT NULL DEFAULT ''",
+                "delivery_completed": "INTEGER NOT NULL DEFAULT 0",
+                "delivery_outcome": "TEXT NOT NULL DEFAULT ''",
+                "acknowledged": "INTEGER NOT NULL DEFAULT 0",
+                "ack_attempted": "INTEGER NOT NULL DEFAULT 0",
+                "awaiting_subscription": "INTEGER NOT NULL DEFAULT 0",
+                "claim_owner": "TEXT NOT NULL DEFAULT ''",
+                "claim_token": "INTEGER NOT NULL DEFAULT 0",
+                "claim_until": "REAL NOT NULL DEFAULT 0",
+                "session_epoch": "TEXT NOT NULL DEFAULT ''",
+            }
+            added_columns: set[str] = set()
+            for column, definition in migrations.items():
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE mqtt_retry_queue ADD COLUMN {column} {definition}"
+                    )
+                    added_columns.add(column)
+            if "last_error_code" in added_columns:
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_queue
+                    SET last_error_code = error_code
+                    WHERE last_error_code = ''
+                    """
+                )
+            if "last_error_message" in added_columns:
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_queue
+                    SET last_error_message = error_message
+                    WHERE last_error_message = ''
+                    """
+                )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mqtt_retry_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mqtt_delivery_generations (
+                    delivery_id TEXT PRIMARY KEY,
+                    session_epoch TEXT NOT NULL,
+                    mid INTEGER NOT NULL,
+                    topic TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    active_identity INTEGER NOT NULL DEFAULT 1,
+                    state TEXT NOT NULL,
+                    outcome TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            generation_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(mqtt_delivery_generations)"
+                ).fetchall()
+            }
+            if "active_identity" not in generation_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE mqtt_delivery_generations
+                    ADD COLUMN active_identity INTEGER NOT NULL DEFAULT 1
+                    """
+                )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS mqtt_delivery_generation_lookup
+                ON mqtt_delivery_generations (
+                    session_epoch, mid, created_at DESC
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS mqtt_delivery_generation_gc
+                ON mqtt_delivery_generations (
+                    active_identity, state, updated_at, created_at, delivery_id
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO mqtt_retry_state (key, value)
+                VALUES ('session_epoch', ?)
+                """,
+                (secrets.token_hex(16),),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO mqtt_retry_state (key, value)
+                VALUES ('claim_sequence', '0')
+                """
+            )
+            session_epoch = str(
+                connection.execute(
+                    "SELECT value FROM mqtt_retry_state WHERE key = 'session_epoch'"
+                ).fetchone()["value"]
+            )
+            if "session_epoch" in added_columns:
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_queue
+                    SET session_epoch = ?
+                    WHERE session_epoch = ''
+                    """,
+                    (session_epoch,),
+                )
+        with self._session_lock:
+            self._session_epoch = session_epoch
+
+    def begin_session(self, *, session_present: bool) -> str:
+        """Persist the broker session generation used to identify packet IDs."""
+        with self._session_fence_lock:
+            return self._begin_session(session_present=session_present)
+
+    def _begin_session(self, *, session_present: bool) -> str:
+        reset_ack_targets = False
+        with self._connection(timeout=self.migration_timeout) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if session_present:
+                session_epoch = str(
+                    connection.execute(
+                        "SELECT value FROM mqtt_retry_state WHERE key = 'session_epoch'"
+                    ).fetchone()["value"]
+                )
+            else:
+                reset_ack_targets = True
+                session_epoch = secrets.token_hex(16)
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_state
+                    SET value = ?
+                    WHERE key = 'session_epoch'
+                    """,
+                    (session_epoch,),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM mqtt_retry_queue
+                    WHERE session_epoch != ? AND delivery_completed = 1
+                    """,
+                    (session_epoch,),
+                )
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_queue
+                    SET qos = 0
+                    WHERE session_epoch != ?
+                    """,
+                    (session_epoch,),
+                )
+                connection.execute(
+                    """
+                    UPDATE mqtt_delivery_generations
+                    SET active_identity = 0, updated_at = ?
+                    WHERE session_epoch != ?
+                    """,
+                    (time.time(), session_epoch),
+                )
+            self._prune_delivery_generations(connection, force=True)
+        with self._session_lock:
+            self._session_epoch = session_epoch
+        if reset_ack_targets:
+            with self._target_lock:
+                self._ack_targets.clear()
+        self._session_prepared.set()
+        LOGGER.info(
+            "mqtt_session_epoch session_present=%s epoch=%s",
+            session_present,
+            session_epoch,
+        )
+        return session_epoch
+
+    def pause_session(self) -> None:
+        with self._subscription_buffer_lock:
+            self._session_ready.clear()
+            self._session_prepared.clear()
+        with self._target_lock:
+            self._ack_targets.clear()
+
+    def resume_session(self) -> None:
+        # Serialize with early-message enqueue so no row can be left gated by
+        # an INSERT committing just after the successful SUBACK release.
+        with self._subscription_buffer_lock:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                epoch = connection.execute(
+                    "SELECT value FROM mqtt_retry_state WHERE key = 'session_epoch'"
+                ).fetchone()["value"]
+                if epoch != self._session_epoch:
+                    raise sqlite3.OperationalError("MQTT session epoch changed")
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_queue
+                    SET awaiting_subscription = 0,
+                        next_attempt_at = MIN(next_attempt_at, ?)
+                    WHERE awaiting_subscription = 1
+                    """,
+                    (time.time(),),
+                )
+            self._session_ready.set()
+        self._wake_event.set()
+
+    def defer_unapproved_message(self, client: Any, message: Any) -> bool:
+        """Return True when normal processing must wait; never send HTTP/ACK."""
+        with self._subscription_buffer_lock:
+            if self._session_ready.is_set():
+                return False
+            if int(message.qos) != SUPPORTED_SUBSCRIPTION_QOS:
+                LOGGER.info("mqtt_unapproved_qos_dropped qos=%s", message.qos)
+                return True
+            try:
+                prepared = self.prepare_delivery(message, allow_unapproved=True)
+                operation = "ingest"
+                error = MqttBridgeError(
+                    503, "MQTT_SUBSCRIPTION_PENDING", "Waiting for successful SUBACK."
+                )
+                completed = prepared.delivery_state in {"terminal", "acked"}
+                if completed:
+                    if prepared.delivery_outcome == "quarantined":
+                        operation = "quarantine"
+                else:
+                    try:
+                        decode_mqtt_payload(message.topic, message.payload)
+                    except MqttBridgeError as validation_error:
+                        operation = "quarantine"
+                        error = validation_error
+                queued = self.enqueue(
+                    client,
+                    message,
+                    error,
+                    operation=operation,
+                    delivery_completed=completed,
+                    retry_message=prepared,
+                    awaiting_subscription=True,
+                )
+                LOGGER.info(
+                    "mqtt_pre_suback_deferred topic=%s queued=%s", message.topic, queued
+                )
+            except sqlite3.Error:
+                LOGGER.exception("mqtt_pre_suback_defer_failed topic=%s", message.topic)
+            return True
 
     @staticmethod
-    def _snapshot(message: Any) -> RetryMessage:
+    def _payload_hash(topic: str, payload: bytes) -> str:
+        digest = hashlib.sha256()
+        digest.update(topic.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(payload)
+        return digest.hexdigest()
+
+    def _prune_delivery_generations(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        now: float | None = None,
+        force: bool = False,
+    ) -> None:
+        """Run bounded, periodic GC without removing live MQTT identity."""
+        current_time = time.time() if now is None else now
+        gc_clock = time.monotonic()
+        if not force and gc_clock < self._next_generation_gc_at:
+            return
+        if not self._generation_gc_lock.acquire(blocking=False):
+            return
+        try:
+            if not force and gc_clock < self._next_generation_gc_at:
+                return
+            exhausted = self._run_generation_gc(connection, current_time=current_time)
+            delay = self.generation_gc_interval
+            if exhausted:
+                delay = min(delay, self.poll_interval)
+            self._next_generation_gc_at = gc_clock + delay
+        except Exception:
+            self._next_generation_gc_at = 0.0
+            raise
+        finally:
+            self._generation_gc_lock.release()
+
+    def _run_generation_gc(
+        self, connection: sqlite3.Connection, *, current_time: float
+    ) -> bool:
+        unreferenced = """
+            NOT EXISTS (
+                SELECT 1 FROM mqtt_retry_queue AS retry
+                WHERE retry.message_key IN (
+                    'ingest:' || mqtt_delivery_generations.delivery_id,
+                    'quarantine:' || mqtt_delivery_generations.delivery_id
+                )
+            )
+        """
+        active_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM mqtt_delivery_generations
+                WHERE active_identity = 1
+                """
+            ).fetchone()[0]
+        )
+        inactive_limit = max(0, self.max_delivery_generations - active_count)
+        removed = connection.execute(
+            f"""
+            DELETE FROM mqtt_delivery_generations WHERE delivery_id IN (
+                SELECT delivery_id FROM mqtt_delivery_generations
+                WHERE active_identity = 0 AND state != 'acked' AND {unreferenced}
+                ORDER BY updated_at, created_at, delivery_id
+                LIMIT ?
+            )
+            """,
+            (self.generation_gc_batch_size,),
+        )
+        exhausted = removed.rowcount >= self.generation_gc_batch_size
+        if self.generation_retention_seconds > 0:
+            removed = connection.execute(
+                f"""
+                DELETE FROM mqtt_delivery_generations WHERE delivery_id IN (
+                    SELECT delivery_id FROM mqtt_delivery_generations
+                    WHERE active_identity = 0 AND state = 'acked'
+                        AND updated_at < ? AND {unreferenced}
+                    ORDER BY updated_at, created_at, delivery_id
+                    LIMIT ?
+                )
+                """,
+                (
+                    current_time - self.generation_retention_seconds,
+                    self.generation_gc_batch_size,
+                ),
+            )
+            exhausted |= removed.rowcount >= self.generation_gc_batch_size
+        removed = connection.execute(
+            f"""
+            DELETE FROM mqtt_delivery_generations WHERE delivery_id IN (
+                SELECT delivery_id FROM mqtt_delivery_generations
+                WHERE active_identity = 0 AND state = 'acked'
+                    AND {unreferenced}
+                ORDER BY updated_at DESC, created_at DESC, delivery_id DESC
+                LIMIT ? OFFSET ?
+            )
+            """,
+            (self.generation_gc_batch_size, inactive_limit),
+        )
+        return exhausted or removed.rowcount >= self.generation_gc_batch_size
+
+    def _snapshot(
+        self,
+        message: Any,
+        *,
+        delivery_id: str = "",
+        delivery_state: str = "active",
+        delivery_outcome: str = "",
+    ) -> RetryMessage:
         payload = message.payload
         if isinstance(payload, str):
-            payload_bytes = payload.encode("utf-8")
+            payload_bytes = _mqtt_text_for_storage(payload).encode("utf-8")
         else:
             payload_bytes = bytes(payload)
+        with self._session_lock:
+            session_epoch = self._session_epoch
         return RetryMessage(
-            topic=str(message.topic),
+            topic=_mqtt_text_for_storage(str(message.topic)),
             payload=payload_bytes,
             mid=int(message.mid),
             qos=int(message.qos),
+            dup=bool(getattr(message, "dup", False)),
+            session_epoch=session_epoch,
+            delivery_id=delivery_id,
+            delivery_state=delivery_state,
+            delivery_outcome=delivery_outcome,
         )
+
+    def prepare_delivery(
+        self, message: Any, *, allow_unapproved: bool = False
+    ) -> RetryMessage:
+        if not self._session_ready.is_set() and not (
+            allow_unapproved
+            and self._session_prepared.is_set()
+            and int(message.qos) == SUPPORTED_SUBSCRIPTION_QOS
+        ):
+            raise sqlite3.OperationalError("MQTT session state is not ready")
+        retry_message = self._snapshot(message)
+        payload_hash = self._payload_hash(retry_message.topic, retry_message.payload)
+        now = time.time()
+        superseded_delivery_ids: list[str] = []
+        with self._processing_lock:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if retry_message.dup:
+                    generation = connection.execute(
+                        """
+                        SELECT * FROM mqtt_delivery_generations
+                        WHERE session_epoch = ? AND mid = ? AND topic = ?
+                            AND payload_hash = ? AND active_identity = 1
+                        ORDER BY created_at DESC, rowid DESC
+                        LIMIT 1
+                        """,
+                        (
+                            retry_message.session_epoch,
+                            retry_message.mid,
+                            retry_message.topic,
+                            payload_hash,
+                        ),
+                    ).fetchone()
+                    if generation is not None:
+                        return self._snapshot(
+                            message,
+                            delivery_id=str(generation["delivery_id"]),
+                            delivery_state=str(generation["state"]),
+                            delivery_outcome=str(generation["outcome"]),
+                        )
+
+                previous = connection.execute(
+                    """
+                    SELECT delivery_id FROM mqtt_delivery_generations
+                    WHERE session_epoch = ? AND mid = ?
+                        AND active_identity = 1
+                    """,
+                    (retry_message.session_epoch, retry_message.mid),
+                ).fetchall()
+                for row in previous:
+                    delivery_id = str(row["delivery_id"])
+                    superseded_delivery_ids.append(delivery_id)
+                    connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue
+                        SET qos = 0
+                        WHERE message_key IN (?, ?)
+                        """,
+                        (f"ingest:{delivery_id}", f"quarantine:{delivery_id}"),
+                    )
+                connection.execute(
+                    """
+                    UPDATE mqtt_delivery_generations
+                    SET active_identity = 0, updated_at = ?
+                    WHERE session_epoch = ? AND mid = ?
+                        AND active_identity = 1
+                    """,
+                    (now, retry_message.session_epoch, retry_message.mid),
+                )
+                delivery_id = secrets.token_hex(16)
+                connection.execute(
+                    """
+                    INSERT INTO mqtt_delivery_generations (
+                        delivery_id, session_epoch, mid, topic, payload_hash,
+                        state, outcome, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'active', '', ?, ?)
+                    """,
+                    (
+                        delivery_id,
+                        retry_message.session_epoch,
+                        retry_message.mid,
+                        retry_message.topic,
+                        payload_hash,
+                        now,
+                        now,
+                    ),
+                )
+                self._prune_delivery_generations(connection, now=now)
+        if superseded_delivery_ids:
+            with self._target_lock:
+                for old_delivery_id in superseded_delivery_ids:
+                    self._ack_targets.pop(f"ingest:{old_delivery_id}", None)
+                    self._ack_targets.pop(f"quarantine:{old_delivery_id}", None)
+        return self._snapshot(message, delivery_id=delivery_id)
+
+    def _delivery_state_for(self, delivery_id: str) -> tuple[str, str] | None:
+        if not delivery_id:
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT state, outcome FROM mqtt_delivery_generations
+                WHERE delivery_id = ?
+                """,
+                (delivery_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["state"]), str(row["outcome"])
+
+    def _set_delivery_state(
+        self, delivery_id: str, state: str, outcome: str = ""
+    ) -> None:
+        if not delivery_id:
+            return
+        with self._connection() as connection:
+            updated = connection.execute(
+                """
+                UPDATE mqtt_delivery_generations
+                SET state = CASE
+                        WHEN state = 'acked' AND ? = 'terminal' THEN state
+                        ELSE ?
+                    END,
+                    outcome = CASE
+                        WHEN outcome != '' AND ? = '' THEN outcome
+                        ELSE ?
+                    END,
+                    updated_at = ?
+                WHERE delivery_id = ?
+                """,
+                (state, state, outcome, outcome, time.time(), delivery_id),
+            )
+            self._prune_delivery_generations(connection)
+        if updated.rowcount != 1:
+            raise sqlite3.OperationalError("MQTT delivery generation is unavailable")
+
+    def _delivery_is_current(
+        self, delivery_id: str, session_epoch: str, retry_message: RetryMessage
+    ) -> bool:
+        if (
+            not delivery_id
+            or retry_message.delivery_id != delivery_id
+            or retry_message.session_epoch != session_epoch
+        ):
+            return False
+        with self._session_lock:
+            if session_epoch != self._session_epoch:
+                return False
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM mqtt_delivery_generations
+                WHERE delivery_id = ? AND session_epoch = ?
+                    AND active_identity = 1
+                """,
+                (delivery_id, session_epoch),
+            ).fetchone()
+        return row is not None
+
+    def _mark_acknowledged(self, message_key: str) -> bool:
+        with self._connection(timeout=self.migration_timeout) as connection:
+            updated = connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET acknowledged = 1
+                WHERE message_key = ?
+                """,
+                (message_key,),
+            )
+        return updated.rowcount == 1
+
+    def _mark_delivery_ack_attempted(
+        self, delivery_id: str, *, attempted: bool = True
+    ) -> None:
+        if not delivery_id:
+            return
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE mqtt_retry_queue SET ack_attempted = ?
+                WHERE message_key IN (?, ?)
+                """,
+                (int(attempted), f"ingest:{delivery_id}", f"quarantine:{delivery_id}"),
+            )
+
+    def _try_ack_claimed_target(
+        self, row: sqlite3.Row, target: tuple[Any, RetryMessage]
+    ) -> str:
+        """Never wait for Paho's callback mutex while holding a session fence.
+
+        Paho 2.x skips its synchronous loop_write path when _in_callback_mutex
+        is held. Taking it non-blockingly *before* our fence both avoids ABBA
+        with on_connect and keeps a worker ACK on the packet-queue-only path.
+        Callback-owned ACKs use the separate live-message path.
+        """
+        client, message = target
+        callback_mutex = getattr(client, "_in_callback_mutex", None)
+        if callback_mutex is not None and not callback_mutex.acquire(blocking=False):
+            return "retry"
+        try:
+            with self._session_fence_lock:
+                delivery_id = self._delivery_id_from_key(str(row["message_key"]))
+                if delivery_id and not self._delivery_is_current(
+                    delivery_id, str(row["session_epoch"]), message
+                ):
+                    return "stale"
+                if not self._session_ready.is_set():
+                    return "retry"
+                # Commit the uncertain-ACK recovery intent before PUBACK. The
+                # terminal generation remains durable even if every later write
+                # fails; a broker DUP can then ACK without repeating delivery.
+                with self._connection() as connection:
+                    attempted = connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue SET ack_attempted = 1
+                        WHERE message_key = ? AND claim_owner = ?
+                            AND claim_token = ? AND delivery_completed = 1
+                        """,
+                        (row["message_key"], self._claim_owner, row["claim_token"]),
+                    )
+                if attempted.rowcount != 1:
+                    return "retry"
+                if acknowledge_message(client, message):
+                    return "acked"
+                # A definite send failure is not an uncertain successful ACK.
+                # Keep the QoS row waiting for a live target after restart.
+                with self._connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue SET ack_attempted = 0
+                        WHERE message_key = ? AND claim_owner = ? AND claim_token = ?
+                        """,
+                        (row["message_key"], self._claim_owner, row["claim_token"]),
+                    )
+                return "retry"
+        finally:
+            if callback_mutex is not None:
+                callback_mutex.release()
+
+    def _delete_delivery_rows(self, delivery_id: str) -> None:
+        if not delivery_id:
+            return
+        with self._connection() as connection:
+            connection.execute(
+                """
+                DELETE FROM mqtt_retry_queue
+                WHERE message_key IN (?, ?)
+                """,
+                (f"ingest:{delivery_id}", f"quarantine:{delivery_id}"),
+            )
+            self._prune_delivery_generations(connection)
+
+    @staticmethod
+    def _delivery_id_from_key(message_key: str) -> str:
+        operation, separator, delivery_id = message_key.partition(":")
+        if separator and operation in {"ingest", "quarantine"}:
+            return delivery_id
+        return ""
 
     @staticmethod
     def _message_key(operation: str, message: RetryMessage) -> str:
+        if message.delivery_id:
+            return f"{operation}:{message.delivery_id}"
+        digest = hashlib.sha256()
+        digest.update(message.session_epoch.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(operation.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(message.topic.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(message.payload)
+        digest.update(b"\0")
+        digest.update(str(message.mid).encode("ascii"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _pre_epoch_message_key(operation: str, message: RetryMessage) -> str:
+        digest = hashlib.sha256()
+        digest.update(operation.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(message.topic.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(message.payload)
+        digest.update(b"\0")
+        digest.update(str(message.mid).encode("ascii"))
+        return digest.hexdigest()
+
+    def delivery_idempotency_key(
+        self,
+        message: Any,
+        operation: str,
+        retry_message: RetryMessage | None = None,
+    ) -> str:
+        prepared = retry_message or self.prepare_delivery(message)
+        return self._message_key(operation, prepared)
+
+    @staticmethod
+    def _legacy_message_key(operation: str, message: RetryMessage) -> str:
         digest = hashlib.sha256()
         digest.update(operation.encode("utf-8"))
         digest.update(b"\0")
@@ -316,32 +1075,96 @@ class MqttRetryQueue:
         error: MqttBridgeError,
         *,
         operation: str = "ingest",
+        delivery_completed: bool = False,
+        ack_pending: bool = False,
+        retry_message: RetryMessage | None = None,
+        awaiting_subscription: bool = False,
     ) -> bool:
         if operation not in {"ingest", "quarantine"}:
             raise ValueError(f"Unsupported retry operation: {operation}")
-        retry_message = self._snapshot(message)
+        try:
+            prepared_message = retry_message or self.prepare_delivery(message)
+        except sqlite3.Error:
+            LOGGER.exception("mqtt_delivery_prepare_failed topic=%s", message.topic)
+            return False
+        retry_message = prepared_message
         message_key = self._message_key(operation, retry_message)
         now = time.time()
+        delivery_outcome = (
+            ("quarantined" if operation == "quarantine" else "accepted")
+            if delivery_completed
+            else ""
+        )
+        ack_pending = ack_pending or error.code == "MQTT_ACK_FAILED"
+        last_error_code = "MQTT_ACK_FAILED" if ack_pending else error.code
+        last_error_message = "MQTT ACK failed." if ack_pending else error.message
         with self._target_lock:
             self._ack_targets[message_key] = (client, retry_message)
+        if retry_message.dup:
+            conflict_action = """
+                mid = excluded.mid,
+                qos = excluded.qos,
+                next_attempt_at = MIN(
+                    mqtt_retry_queue.next_attempt_at,
+                    excluded.next_attempt_at
+                ),
+                last_error_code = excluded.last_error_code,
+                last_error_message = excluded.last_error_message,
+                delivery_completed = MAX(
+                    mqtt_retry_queue.delivery_completed,
+                    excluded.delivery_completed
+                ),
+                delivery_outcome = CASE
+                    WHEN mqtt_retry_queue.delivery_completed = 1
+                    THEN mqtt_retry_queue.delivery_outcome
+                    ELSE excluded.delivery_outcome
+                END,
+                acknowledged = MAX(
+                    mqtt_retry_queue.acknowledged,
+                    excluded.acknowledged
+                ),
+                awaiting_subscription = MAX(
+                    mqtt_retry_queue.awaiting_subscription,
+                    excluded.awaiting_subscription
+                )
+            """
+        else:
+            conflict_action = """
+                mid = excluded.mid,
+                qos = excluded.qos,
+                attempts = 0,
+                next_attempt_at = excluded.next_attempt_at,
+                error_code = excluded.error_code,
+                error_message = excluded.error_message,
+                last_error_code = excluded.last_error_code,
+                last_error_message = excluded.last_error_message,
+                delivery_completed = excluded.delivery_completed,
+                delivery_outcome = excluded.delivery_outcome,
+                acknowledged = excluded.acknowledged,
+                ack_attempted = excluded.ack_attempted,
+                awaiting_subscription = excluded.awaiting_subscription,
+                claim_owner = '',
+                claim_token = 0,
+                claim_until = 0,
+                created_at = excluded.created_at
+            """
         try:
+            if delivery_completed:
+                self._set_delivery_state(
+                    retry_message.delivery_id, "terminal", delivery_outcome
+                )
             with self._connection() as connection:
                 connection.execute(
-                    """
+                    f"""
                     INSERT INTO mqtt_retry_queue (
                         message_key, operation, topic, payload, mid, qos,
                         attempts, next_attempt_at, error_code, error_message,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                        last_error_code, last_error_message, delivery_completed,
+                        delivery_outcome, acknowledged, session_epoch, created_at,
+                        awaiting_subscription
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                     ON CONFLICT(message_key) DO UPDATE SET
-                        mid = excluded.mid,
-                        qos = excluded.qos,
-                        next_attempt_at = MIN(
-                            mqtt_retry_queue.next_attempt_at,
-                            excluded.next_attempt_at
-                        ),
-                        error_code = excluded.error_code,
-                        error_message = excluded.error_message
+                        {conflict_action}
                     """,
                     (
                         message_key,
@@ -353,7 +1176,13 @@ class MqttRetryQueue:
                         now + self.initial_delay,
                         error.code,
                         error.message,
+                        last_error_code,
+                        last_error_message,
+                        int(delivery_completed),
+                        delivery_outcome,
+                        retry_message.session_epoch,
                         now,
+                        int(awaiting_subscription),
                     ),
                 )
         except sqlite3.Error:
@@ -377,17 +1206,157 @@ class MqttRetryQueue:
             ).fetchone()
         return int(row["count"])
 
-    def _next_due(self, now: float) -> sqlite3.Row | None:
-        with self._connection() as connection:
-            return connection.execute(
-                """
-                SELECT * FROM mqtt_retry_queue
-                WHERE next_attempt_at <= ?
-                ORDER BY next_attempt_at, created_at
-                LIMIT 1
-                """,
-                (now,),
-            ).fetchone()
+    def resume_pending_message(
+        self,
+        client: Any,
+        message: Any,
+        *,
+        retry_message: RetryMessage | None = None,
+    ) -> str | None:
+        retry_message = retry_message or self.prepare_delivery(message)
+        if not retry_message.dup:
+            return None
+        if retry_message.delivery_state in {"terminal", "acked"}:
+            outcome = retry_message.delivery_outcome or "accepted"
+            try:
+                self._mark_delivery_ack_attempted(retry_message.delivery_id)
+            except sqlite3.Error:
+                LOGGER.exception("mqtt_delivery_ack_intent_failed")
+                return "retry"
+            if not acknowledge_message(client, message):
+                try:
+                    self._mark_delivery_ack_attempted(
+                        retry_message.delivery_id, attempted=False
+                    )
+                except sqlite3.Error:
+                    LOGGER.exception("mqtt_delivery_ack_failure_marker_failed")
+                self.enqueue(
+                    client,
+                    message,
+                    MqttBridgeError(503, "MQTT_ACK_FAILED", "MQTT ACK failed."),
+                    operation=("quarantine" if outcome == "quarantined" else "ingest"),
+                    delivery_completed=True,
+                    ack_pending=True,
+                    retry_message=retry_message,
+                )
+                return "retry"
+            try:
+                self._set_delivery_state(retry_message.delivery_id, "acked", outcome)
+                self._delete_delivery_rows(retry_message.delivery_id)
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_delivery_ack_cleanup_failed delivery=%s error=%s",
+                    retry_message.delivery_id,
+                    error,
+                )
+            return outcome
+        message_keys = tuple(
+            self._message_key(operation, retry_message)
+            for operation in ("quarantine", "ingest")
+        )
+        legacy_message_keys = tuple(
+            self._legacy_message_key(operation, retry_message)
+            for operation in ("quarantine", "ingest")
+        )
+        pre_epoch_message_keys = tuple(
+            self._pre_epoch_message_key(operation, retry_message)
+            for operation in ("quarantine", "ingest")
+        )
+        try:
+            with self._processing_lock:
+                with self._connection() as connection:
+                    row = connection.execute(
+                        """
+                        SELECT * FROM mqtt_retry_queue
+                        WHERE message_key IN (?, ?)
+                        ORDER BY delivery_completed DESC, created_at
+                        LIMIT 1
+                        """,
+                        message_keys,
+                    ).fetchone()
+                    if row is None:
+                        row = connection.execute(
+                            """
+                            SELECT * FROM mqtt_retry_queue
+                            WHERE message_key IN (?, ?, ?, ?)
+                                AND mid = ? AND session_epoch = ?
+                            ORDER BY delivery_completed DESC, created_at
+                            LIMIT 1
+                            """,
+                            (
+                                *pre_epoch_message_keys,
+                                *legacy_message_keys,
+                                retry_message.mid,
+                                retry_message.session_epoch,
+                            ),
+                        ).fetchone()
+                    if row is None:
+                        return None
+                    bound_message_key = self._message_key(
+                        str(row["operation"]), retry_message
+                    )
+                    if str(row["message_key"]) != bound_message_key:
+                        rebound = connection.execute(
+                            """
+                            UPDATE mqtt_retry_queue
+                            SET message_key = ?, session_epoch = ?
+                            WHERE message_key = ?
+                            """,
+                            (
+                                bound_message_key,
+                                retry_message.session_epoch,
+                                row["message_key"],
+                            ),
+                        )
+                        if rebound.rowcount != 1:
+                            return "retry"
+                        row = connection.execute(
+                            "SELECT * FROM mqtt_retry_queue WHERE message_key = ?",
+                            (bound_message_key,),
+                        ).fetchone()
+                        if row is None:
+                            return "retry"
+                    connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue
+                        SET qos = ?, next_attempt_at = ?
+                        WHERE message_key = ?
+                        """,
+                        (
+                            retry_message.qos,
+                            time.time(),
+                            row["message_key"],
+                        ),
+                    )
+                with self._target_lock:
+                    message_key = str(row["message_key"])
+                    self._ack_targets[message_key] = (client, retry_message)
+                self._wake_event.set()
+                if bool(row["delivery_completed"]):
+                    if message_key in self._inflight_message_keys:
+                        return "retry"
+                    outcome = str(row["delivery_outcome"]) or (
+                        "quarantined"
+                        if row["operation"] == "quarantine"
+                        else "accepted"
+                    )
+                    return self._complete(row, outcome)
+                LOGGER.info(
+                    "mqtt_retry_reconnected operation=%s topic=%s mid=%s qos=%s",
+                    row["operation"],
+                    retry_message.topic,
+                    retry_message.mid,
+                    retry_message.qos,
+                )
+                return "retry"
+        except sqlite3.Error as error:
+            LOGGER.warning(
+                "mqtt_retry_lookup_failed topic=%s mid=%s error=%s",
+                retry_message.topic,
+                retry_message.mid,
+                error,
+            )
+            return "retry"
 
     def _reschedule(self, row: sqlite3.Row, error: MqttBridgeError) -> None:
         attempts = int(row["attempts"]) + 1
@@ -400,7 +1369,8 @@ class MqttRetryQueue:
                 """
                 UPDATE mqtt_retry_queue
                 SET attempts = ?, next_attempt_at = ?,
-                    error_code = ?, error_message = ?
+                    last_error_code = ?, last_error_message = ?,
+                    claim_owner = '', claim_token = 0, claim_until = 0
                 WHERE message_key = ?
                 """,
                 (
@@ -420,25 +1390,143 @@ class MqttRetryQueue:
             error.code,
         )
 
+    def _mark_delivery_completed(self, row: sqlite3.Row, outcome: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET delivery_completed = 1, delivery_outcome = ?
+                WHERE message_key = ?
+                """,
+                (outcome, row["message_key"]),
+            )
+
+    def _defer_until_ack_target(self, row: sqlite3.Row) -> None:
+        delay = max(0.5, self.poll_interval, self.initial_delay)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET next_attempt_at = ?, claim_owner = '',
+                    claim_token = 0, claim_until = 0
+                WHERE message_key = ?
+                """,
+                (time.time() + delay, row["message_key"]),
+            )
+        LOGGER.info(
+            "mqtt_retry_awaiting_ack_target operation=%s topic=%s qos=%s",
+            row["operation"],
+            row["topic"],
+            row["qos"],
+        )
+
+    def _delete_claimed_row(self, message_key: str, claim_token: int) -> bool:
+        with self._connection() as connection:
+            deleted = connection.execute(
+                """
+                DELETE FROM mqtt_retry_queue
+                WHERE message_key = ? AND claim_owner = ? AND claim_token = ?
+                """,
+                (message_key, self._claim_owner, claim_token),
+            )
+            self._prune_delivery_generations(connection)
+        return deleted.rowcount == 1
+
     def _complete(self, row: sqlite3.Row, outcome: str) -> str:
         message_key = str(row["message_key"])
+        delivery_id = self._delivery_id_from_key(message_key)
+        delivery_state = None
+        if delivery_id:
+            self._set_delivery_state(delivery_id, "terminal", outcome)
+            delivery_state = self._delivery_state_for(delivery_id)
+        if not bool(row["delivery_completed"]) or not str(row["delivery_outcome"]):
+            self._mark_delivery_completed(row, outcome)
         with self._target_lock:
             target = self._ack_targets.get(message_key)
+        if bool(row["acknowledged"]):
+            try:
+                with self._connection() as connection:
+                    connection.execute(
+                        "DELETE FROM mqtt_retry_queue WHERE message_key = ?",
+                        (message_key,),
+                    )
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_retry_terminal_cleanup_failed key=%s error=%s",
+                    message_key,
+                    error,
+                )
+            if delivery_id:
+                try:
+                    self._set_delivery_state(delivery_id, "acked", outcome)
+                except sqlite3.Error as error:
+                    LOGGER.warning(
+                        "mqtt_delivery_ack_state_recovery_failed delivery=%s error=%s",
+                        delivery_id,
+                        error,
+                    )
+            return outcome
+        if target is None and int(row["qos"]) > 0:
+            if delivery_state is None or (
+                delivery_state[0] != "acked" and not bool(row["ack_attempted"])
+            ):
+                self._defer_until_ack_target(row)
+                return "awaiting_ack"
+            try:
+                with self._connection() as connection:
+                    connection.execute(
+                        "DELETE FROM mqtt_retry_queue WHERE message_key = ?",
+                        (message_key,),
+                    )
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_retry_terminal_cleanup_failed key=%s error=%s",
+                    message_key,
+                    error,
+                )
+            return outcome
         if target is not None:
             client, message = target
+            self._mark_delivery_ack_attempted(delivery_id)
             if not acknowledge_message(client, message):
+                self._mark_delivery_ack_attempted(delivery_id, attempted=False)
                 self._reschedule(
                     row,
                     MqttBridgeError(503, "MQTT_ACK_FAILED", "MQTT ACK failed."),
                 )
                 return "retry"
-        with self._connection() as connection:
-            connection.execute(
-                "DELETE FROM mqtt_retry_queue WHERE message_key = ?",
-                (message_key,),
+            try:
+                self._mark_acknowledged(message_key)
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_retry_ack_marker_failed key=%s error=%s",
+                    message_key,
+                    error,
+                )
+                return "retry"
+        try:
+            with self._connection() as connection:
+                connection.execute(
+                    "DELETE FROM mqtt_retry_queue WHERE message_key = ?",
+                    (message_key,),
+                )
+        except sqlite3.Error as error:
+            LOGGER.warning(
+                "mqtt_retry_ack_cleanup_failed key=%s error=%s",
+                message_key,
+                error,
             )
         with self._target_lock:
             self._ack_targets.pop(message_key, None)
+        if delivery_id:
+            try:
+                self._set_delivery_state(delivery_id, "acked", outcome)
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_delivery_ack_cleanup_failed delivery=%s error=%s",
+                    delivery_id,
+                    error,
+                )
         LOGGER.info(
             "mqtt_retry_completed operation=%s topic=%s outcome=%s",
             row["operation"],
@@ -447,11 +1535,402 @@ class MqttRetryQueue:
         )
         return outcome
 
-    def process_due_once(self, *, now: float | None = None) -> str:
-        row = self._next_due(time.time() if now is None else now)
-        if row is None:
-            return "idle"
+    def _claim_next_due(self, now: float) -> sqlite3.Row | None:
+        claimed_at = time.time()
+        claim_until = claimed_at + self.lease_seconds
+        with self._processing_lock:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT * FROM mqtt_retry_queue
+                    WHERE next_attempt_at <= ? AND claim_until <= ?
+                        AND awaiting_subscription = 0
+                    ORDER BY next_attempt_at, created_at, message_key
+                    LIMIT 1
+                    """,
+                    (now, claimed_at),
+                ).fetchone()
+                if row is None:
+                    return None
+                message_key = str(row["message_key"])
+                connection.execute(
+                    """
+                    UPDATE mqtt_retry_state
+                    SET value = CAST(value AS INTEGER) + 1
+                    WHERE key = 'claim_sequence'
+                    """
+                )
+                claim_token = int(
+                    connection.execute(
+                        "SELECT value FROM mqtt_retry_state "
+                        "WHERE key = 'claim_sequence'"
+                    ).fetchone()["value"]
+                )
+                claimed = connection.execute(
+                    """
+                    UPDATE mqtt_retry_queue
+                    SET claim_owner = ?, claim_token = ?, claim_until = ?
+                    WHERE message_key = ? AND claim_until <= ?
+                    """,
+                    (
+                        self._claim_owner,
+                        claim_token,
+                        claim_until,
+                        message_key,
+                        claimed_at,
+                    ),
+                )
+                if claimed.rowcount != 1:
+                    return None
+                row = connection.execute(
+                    """
+                    SELECT * FROM mqtt_retry_queue
+                    WHERE message_key = ? AND claim_owner = ? AND claim_token = ?
+                    """,
+                    (message_key, self._claim_owner, claim_token),
+                ).fetchone()
+                if row is None:
+                    return None
+            self._inflight_message_keys.add(message_key)
+            return row
+
+    def _release_claim(self, row: sqlite3.Row) -> None:
+        with self._processing_lock:
+            message_key = str(row["message_key"])
+            try:
+                with self._connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue
+                        SET claim_owner = '', claim_token = 0, claim_until = 0
+                        WHERE message_key = ? AND claim_owner = ?
+                            AND claim_token = ?
+                        """,
+                        (message_key, self._claim_owner, int(row["claim_token"])),
+                    )
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_retry_claim_release_failed key=%s error=%s",
+                    message_key,
+                    error,
+                )
+            self._inflight_message_keys.discard(message_key)
+
+    def _renew_claim(self, row: sqlite3.Row) -> bool:
+        with self._connection() as connection:
+            renewed = connection.execute(
+                """
+                UPDATE mqtt_retry_queue
+                SET claim_until = ?
+                WHERE message_key = ? AND claim_owner = ? AND claim_token = ?
+                """,
+                (
+                    time.time() + self.lease_seconds,
+                    row["message_key"],
+                    self._claim_owner,
+                    int(row["claim_token"]),
+                ),
+            )
+        return renewed.rowcount == 1
+
+    def _keep_claim_alive(self, row: sqlite3.Row, stop_event: threading.Event) -> None:
+        interval = max(0.1, min(5.0, self.lease_seconds / 4))
+        while not stop_event.wait(interval):
+            try:
+                if not self._renew_claim(row):
+                    LOGGER.warning(
+                        "mqtt_retry_claim_lost key=%s owner=%s",
+                        row["message_key"],
+                        self._claim_owner,
+                    )
+                    return
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_retry_claim_renew_failed key=%s error=%s",
+                    row["message_key"],
+                    error,
+                )
+
+    def _complete_claimed(self, row: sqlite3.Row, outcome: str) -> str:
+        message_key = str(row["message_key"])
+        delivery_id = self._delivery_id_from_key(message_key)
+        delivery_state = None
+        if delivery_id:
+            try:
+                self._set_delivery_state(delivery_id, "terminal", outcome)
+                delivery_state = self._delivery_state_for(delivery_id)
+            except sqlite3.Error as error:
+                LOGGER.warning(
+                    "mqtt_delivery_terminal_failed delivery=%s error=%s",
+                    delivery_id,
+                    error,
+                )
+                return "retry"
+        with self._processing_lock:
+            try:
+                claim_token = int(row["claim_token"])
+                with self._connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = connection.execute(
+                        """
+                        SELECT * FROM mqtt_retry_queue
+                        WHERE message_key = ? AND claim_owner = ?
+                            AND claim_token = ?
+                        """,
+                        (message_key, self._claim_owner, claim_token),
+                    ).fetchone()
+                    if current is None:
+                        return "retry"
+                    completed = connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue
+                        SET delivery_completed = 1, delivery_outcome = ?,
+                            claim_until = ?
+                        WHERE message_key = ? AND claim_owner = ?
+                            AND claim_token = ?
+                        """,
+                        (
+                            outcome,
+                            time.time() + self.lease_seconds,
+                            message_key,
+                            self._claim_owner,
+                            claim_token,
+                        ),
+                    )
+                    if completed.rowcount != 1:
+                        return "retry"
+                with self._target_lock:
+                    target = self._ack_targets.get(message_key)
+                if bool(current["acknowledged"]):
+                    if delivery_id:
+                        try:
+                            self._set_delivery_state(delivery_id, "acked", outcome)
+                        except sqlite3.Error as error:
+                            LOGGER.warning(
+                                "mqtt_delivery_ack_state_recovery_failed "
+                                "delivery=%s error=%s",
+                                delivery_id,
+                                error,
+                            )
+                    if not self._delete_claimed_row(message_key, claim_token):
+                        return "retry"
+                    with self._target_lock:
+                        self._ack_targets.pop(message_key, None)
+                    return outcome
+                if target is None:
+                    if bool(current["ack_attempted"]) and delivery_state is not None:
+                        # PUBACK and SQLite cannot commit atomically. Retire the
+                        # retry work, not its terminal generation: if PUBACK was
+                        # lost, broker redelivery still finds the frozen outcome.
+                        if not self._delete_claimed_row(message_key, claim_token):
+                            return "retry"
+                        return outcome
+                    if int(current["qos"]) > 0 and (
+                        delivery_state is None or delivery_state[0] != "acked"
+                    ):
+                        delay = max(0.5, self.poll_interval, self.initial_delay)
+                        with self._connection() as connection:
+                            deferred = connection.execute(
+                                """
+                                UPDATE mqtt_retry_queue
+                                SET next_attempt_at = ?, claim_owner = '',
+                                    claim_token = 0, claim_until = 0
+                                WHERE message_key = ? AND claim_owner = ?
+                                    AND claim_token = ?
+                                """,
+                                (
+                                    time.time() + delay,
+                                    message_key,
+                                    self._claim_owner,
+                                    claim_token,
+                                ),
+                            )
+                        if deferred.rowcount != 1:
+                            return "retry"
+                        LOGGER.info(
+                            "mqtt_retry_awaiting_ack_target operation=%s "
+                            "topic=%s qos=%s",
+                            current["operation"],
+                            current["topic"],
+                            current["qos"],
+                        )
+                        return "awaiting_ack"
+                    if not self._delete_claimed_row(message_key, claim_token):
+                        return "retry"
+                    return outcome
+                with self._connection() as connection:
+                    fenced = connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue
+                        SET claim_until = ?
+                        WHERE message_key = ? AND claim_owner = ?
+                            AND claim_token = ?
+                        """,
+                        (
+                            time.time() + self.lease_seconds,
+                            message_key,
+                            self._claim_owner,
+                            claim_token,
+                        ),
+                    )
+                if fenced.rowcount != 1:
+                    return "retry"
+                ack_result = self._try_ack_claimed_target(current, target)
+                if ack_result == "stale":
+                    deleted = self._delete_claimed_row(message_key, claim_token)
+                    with self._target_lock:
+                        self._ack_targets.pop(message_key, None)
+                    LOGGER.info(
+                        "mqtt_retry_stale_session_ack_skipped key=%s epoch=%s",
+                        message_key,
+                        current["session_epoch"],
+                    )
+                    return outcome if deleted else "retry"
+                if ack_result != "acked":
+                    attempts = int(current["attempts"]) + 1
+                    delay = min(
+                        self.max_delay,
+                        self.initial_delay * (2 ** min(max(0, attempts - 1), 10)),
+                    )
+                    with self._connection() as connection:
+                        rescheduled = connection.execute(
+                            """
+                            UPDATE mqtt_retry_queue
+                            SET attempts = ?, next_attempt_at = ?,
+                                last_error_code = 'MQTT_ACK_FAILED',
+                                last_error_message = 'MQTT ACK failed.',
+                                claim_owner = '', claim_token = 0,
+                                claim_until = 0
+                            WHERE message_key = ? AND claim_owner = ?
+                                AND claim_token = ?
+                            """,
+                            (
+                                attempts,
+                                time.time() + delay,
+                                message_key,
+                                self._claim_owner,
+                                claim_token,
+                            ),
+                        )
+                    if rescheduled.rowcount != 1:
+                        return "retry"
+                    return "retry"
+                try:
+                    ack_recorded = self._mark_acknowledged(message_key)
+                except sqlite3.Error as error:
+                    ack_recorded = False
+                    LOGGER.warning(
+                        "mqtt_retry_ack_marker_failed key=%s error=%s",
+                        message_key,
+                        error,
+                    )
+                with self._target_lock:
+                    self._ack_targets.pop(message_key, None)
+                if delivery_id:
+                    try:
+                        self._set_delivery_state(delivery_id, "acked", outcome)
+                    except sqlite3.Error as error:
+                        LOGGER.warning(
+                            "mqtt_delivery_ack_state_failed delivery=%s error=%s",
+                            delivery_id,
+                            error,
+                        )
+                        if ack_recorded:
+                            return outcome
+                        return "retry"
+                try:
+                    deleted = self._delete_claimed_row(message_key, claim_token)
+                except sqlite3.Error as error:
+                    deleted = False
+                    LOGGER.warning(
+                        "mqtt_retry_ack_cleanup_failed key=%s error=%s",
+                        message_key,
+                        error,
+                    )
+                if not deleted and not delivery_id:
+                    return "retry"
+                if not deleted:
+                    LOGGER.info("mqtt_retry_ack_cleanup_deferred key=%s", message_key)
+                LOGGER.info(
+                    "mqtt_retry_completed operation=%s topic=%s outcome=%s",
+                    row["operation"],
+                    row["topic"],
+                    outcome,
+                )
+                return outcome
+            finally:
+                self._inflight_message_keys.discard(str(row["message_key"]))
+
+    def _reschedule_claimed(self, row: sqlite3.Row, error: MqttBridgeError) -> str:
+        with self._processing_lock:
+            try:
+                attempts = int(row["attempts"]) + 1
+                delay = min(
+                    self.max_delay,
+                    self.initial_delay * (2 ** min(max(0, attempts - 1), 10)),
+                )
+                with self._connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    updated = connection.execute(
+                        """
+                        UPDATE mqtt_retry_queue
+                        SET attempts = ?, next_attempt_at = ?,
+                            last_error_code = ?, last_error_message = ?,
+                            claim_owner = '', claim_token = 0, claim_until = 0
+                        WHERE message_key = ? AND claim_owner = ?
+                            AND claim_token = ?
+                        """,
+                        (
+                            attempts,
+                            time.time() + delay,
+                            error.code,
+                            error.message,
+                            row["message_key"],
+                            self._claim_owner,
+                            int(row["claim_token"]),
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        return "retry"
+                LOGGER.warning(
+                    "mqtt_retry_scheduled operation=%s topic=%s attempt=%s "
+                    "delay=%.1f code=%s",
+                    row["operation"],
+                    row["topic"],
+                    attempts,
+                    delay,
+                    error.code,
+                )
+                return "retry"
+            finally:
+                self._inflight_message_keys.discard(str(row["message_key"]))
+
+    def _process_due_once(self, row: sqlite3.Row) -> str:
+        lease_stop = threading.Event()
+        lease_worker = threading.Thread(
+            target=self._keep_claim_alive,
+            args=(row, lease_stop),
+            name="mqtt-retry-lease",
+            daemon=True,
+        )
+        lease_worker.start()
         try:
+            delivery_id = self._delivery_id_from_key(str(row["message_key"]))
+            delivery_state = self._delivery_state_for(delivery_id)
+            if delivery_state is not None and delivery_state[0] in {
+                "terminal",
+                "acked",
+            }:
+                outcome = delivery_state[1] or (
+                    "quarantined" if row["operation"] == "quarantine" else "accepted"
+                )
+                return self._complete_claimed(row, outcome)
+            if bool(row["delivery_completed"]):
+                outcome = str(row["delivery_outcome"]) or (
+                    "quarantined" if row["operation"] == "quarantine" else "accepted"
+                )
+                return self._complete_claimed(row, outcome)
             if row["operation"] == "quarantine":
                 quarantine_local_mqtt_message(
                     self.quarantine_endpoint,
@@ -464,8 +1943,9 @@ class MqttRetryQueue:
                         str(row["error_message"]),
                         local=True,
                     ),
+                    idempotency_key=str(row["message_key"]),
                 )
-                return self._complete(row, "quarantined")
+                return self._complete_claimed(row, "quarantined")
 
             forward_mqtt_message(
                 str(row["topic"]),
@@ -473,16 +1953,30 @@ class MqttRetryQueue:
                 endpoint=self.ingest_endpoint,
                 token=self.token,
             )
-            return self._complete(row, "accepted")
+            return self._complete_claimed(row, "accepted")
         except MqttBridgeError as error:
             if row["operation"] == "ingest" and is_permanent_ingest_error(error):
-                return self._complete(row, "quarantined")
-            self._reschedule(row, error)
-            return "retry"
+                return self._complete_claimed(row, "quarantined")
+            return self._reschedule_claimed(row, error)
+        finally:
+            lease_stop.set()
+            lease_worker.join(timeout=1)
+            self._release_claim(row)
+
+    def process_due_once(self, *, now: float | None = None) -> str:
+        if not self._session_ready.is_set():
+            return "idle"
+        row = self._claim_next_due(time.time() if now is None else now)
+        if row is None:
+            return "idle"
+        return self._process_due_once(row)
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
+                if time.monotonic() >= self._next_generation_gc_at:
+                    with self._connection() as connection:
+                        self._prune_delivery_generations(connection)
                 self.process_due_once()
             except (OSError, sqlite3.Error):
                 LOGGER.exception("mqtt_retry_worker_failed")
@@ -506,6 +2000,46 @@ class MqttRetryQueue:
         if self._worker:
             self._worker.join(timeout=5)
 
+    def complete_live_message(
+        self,
+        client: Any,
+        message: Any,
+        retry_message: RetryMessage,
+        *,
+        outcome: str,
+        operation: str,
+        error: MqttBridgeError,
+    ) -> str:
+        try:
+            self._set_delivery_state(retry_message.delivery_id, "terminal", outcome)
+        except sqlite3.Error as state_error:
+            LOGGER.warning(
+                "mqtt_delivery_terminal_failed delivery=%s error=%s",
+                retry_message.delivery_id,
+                state_error,
+            )
+            return "retry"
+        if not acknowledge_message(client, message):
+            self.enqueue(
+                client,
+                message,
+                error,
+                operation=operation,
+                delivery_completed=True,
+                ack_pending=True,
+                retry_message=retry_message,
+            )
+            return "retry"
+        try:
+            self._set_delivery_state(retry_message.delivery_id, "acked", outcome)
+        except sqlite3.Error as state_error:
+            LOGGER.warning(
+                "mqtt_delivery_ack_cleanup_failed delivery=%s error=%s",
+                retry_message.delivery_id,
+                state_error,
+            )
+        return outcome
+
 
 def process_mqtt_message(
     client: Any,
@@ -517,6 +2051,24 @@ def process_mqtt_message(
     retry_queue: MqttRetryQueue | None = None,
 ) -> str:
     """Return accepted, quarantined, or retry based on HTTP processing outcome."""
+    retry_message = None
+    if retry_queue:
+        if retry_queue.defer_unapproved_message(client, message):
+            return "retry"
+        try:
+            retry_message = retry_queue.prepare_delivery(message)
+        except sqlite3.Error as error:
+            LOGGER.warning(
+                "mqtt_delivery_prepare_failed topic=%s error=%s",
+                message.topic,
+                error,
+            )
+            return "retry"
+        resumed = retry_queue.resume_pending_message(
+            client, message, retry_message=retry_message
+        )
+        if resumed is not None:
+            return resumed
     try:
         response, status = forward_mqtt_message(
             message.topic,
@@ -534,12 +2086,20 @@ def process_mqtt_message(
                             "QUARANTINE_ENDPOINT_UNAVAILABLE",
                             "A quarantine endpoint is required before MQTT ACK.",
                         )
+                    idempotency_key = (
+                        retry_queue.delivery_idempotency_key(
+                            message, "quarantine", retry_message
+                        )
+                        if retry_queue
+                        else None
+                    )
                     quarantine_local_mqtt_message(
                         quarantine_endpoint,
                         token,
                         message.topic,
                         message.payload,
                         error,
+                        idempotency_key=idempotency_key,
                     )
                 except MqttBridgeError as quarantine_error:
                     queued = bool(
@@ -549,6 +2109,7 @@ def process_mqtt_message(
                             message,
                             error,
                             operation="quarantine",
+                            retry_message=retry_message,
                         )
                     )
                     LOGGER.warning(
@@ -559,7 +2120,24 @@ def process_mqtt_message(
                         queued,
                     )
                     return "retry"
+            if retry_queue and retry_message:
+                return retry_queue.complete_live_message(
+                    client,
+                    message,
+                    retry_message,
+                    outcome="quarantined",
+                    operation="quarantine",
+                    error=error,
+                )
             acknowledged = acknowledge_message(client, message)
+            if not acknowledged and retry_queue:
+                retry_queue.enqueue(
+                    client,
+                    message,
+                    error,
+                    operation="quarantine",
+                    delivery_completed=True,
+                )
             LOGGER.warning(
                 "mqtt_ingest_quarantined topic=%s status=%s code=%s message=%s",
                 message.topic,
@@ -568,7 +2146,15 @@ def process_mqtt_message(
                 error.message,
             )
             return "quarantined" if acknowledged else "retry"
-        queued = bool(retry_queue and retry_queue.enqueue(client, message, error))
+        queued = bool(
+            retry_queue
+            and retry_queue.enqueue(
+                client,
+                message,
+                error,
+                retry_message=retry_message,
+            )
+        )
         LOGGER.warning(
             "mqtt_ingest_retry topic=%s status=%s code=%s message=%s queued=%s",
             message.topic,
@@ -579,7 +2165,25 @@ def process_mqtt_message(
         )
         return "retry"
 
-    if not acknowledge_message(client, message):
+    if retry_queue and retry_message:
+        outcome = retry_queue.complete_live_message(
+            client,
+            message,
+            retry_message,
+            outcome="accepted",
+            operation="ingest",
+            error=MqttBridgeError(503, "MQTT_ACK_FAILED", "MQTT ACK failed."),
+        )
+        if outcome == "retry":
+            return outcome
+    elif not acknowledge_message(client, message):
+        if retry_queue:
+            retry_queue.enqueue(
+                client,
+                message,
+                MqttBridgeError(503, "MQTT_ACK_FAILED", "MQTT ACK failed."),
+                delivery_completed=True,
+            )
         return "retry"
     LOGGER.info(
         "mqtt_ingest status=%s device=%s sequence=%s duplicate=%s",
@@ -625,7 +2229,13 @@ def parse_args() -> argparse.Namespace:
         "--port", type=int, default=int(os.environ.get("MQTT_PORT", "8883"))
     )
     parser.add_argument("--topic", default="devices/+/telemetry")
-    parser.add_argument("--qos", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--qos",
+        type=int,
+        choices=(SUPPORTED_SUBSCRIPTION_QOS,),
+        default=SUPPORTED_SUBSCRIPTION_QOS,
+        help="Subscription QoS. Only QoS 1 is supported across process restarts.",
+    )
     parser.add_argument("--client-id", default="bind-edge-ai-backend")
     parser.add_argument("--username", default=os.environ.get("MQTT_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("MQTT_PASSWORD"))
@@ -688,6 +2298,14 @@ def mqtt_reason_value(reason_code: Any) -> int | None:
         return None
 
 
+def mqtt_session_present(connect_flags: Any) -> bool:
+    if isinstance(connect_flags, dict):
+        return bool(
+            connect_flags.get("session_present") or connect_flags.get("session present")
+        )
+    return bool(getattr(connect_flags, "session_present", False))
+
+
 def subscription_reason_meets_qos(reason_code: Any, requested_qos: int) -> bool:
     granted_qos = mqtt_reason_value(reason_code)
     if granted_qos is None:
@@ -700,6 +2318,8 @@ def subscription_reason_meets_qos(reason_code: Any, requested_qos: int) -> bool:
 
 
 def subscription_is_granted(reason_code_list: Any, requested_qos: int) -> bool:
+    if requested_qos != SUPPORTED_SUBSCRIPTION_QOS:
+        return False
     reason_codes = list(reason_code_list or [])
     return bool(reason_codes) and all(
         subscription_reason_meets_qos(reason_code, requested_qos)
@@ -712,31 +2332,218 @@ def configure_mqtt_callbacks(
     args: argparse.Namespace,
     retry_queue: MqttRetryQueue,
 ) -> set[int]:
+    if int(args.qos) != SUPPORTED_SUBSCRIPTION_QOS:
+        raise ValueError(
+            "Only MQTT QoS 1 is supported because inbound QoS 2 state is not "
+            "durable across process restarts."
+        )
     pending_subscriptions: set[int] = set()
+    activation_lock = threading.Lock()
+    activation_serial_lock = threading.Lock()
+    subscription_lock = threading.Lock()
+    status_transition_lock = threading.Lock()
+    activation_generation = 0
+    subscription_in_progress: int | None = None
+    pending_subscription_generations: dict[int, int] = {}
+    early_subacks: dict[int, tuple[int, list[Any]]] = {}
 
-    def on_connect(client, _userdata, _flags, reason_code, _properties) -> None:
-        if mqtt_reason_failed(reason_code):
-            LOGGER.error("mqtt_connect_failed reason=%s", reason_code)
+    def current_activation_generation() -> int:
+        nonlocal activation_generation
+        with activation_lock:
+            return activation_generation
+
+    def advance_activation_generation() -> int:
+        nonlocal activation_generation
+        with activation_lock:
+            activation_generation += 1
+            return activation_generation
+
+    def reset_subscription_tracking() -> None:
+        nonlocal subscription_in_progress
+        with subscription_lock:
+            pending_subscriptions.clear()
+            pending_subscription_generations.clear()
+            early_subacks.clear()
+            subscription_in_progress = None
+
+    def handle_suback(
+        mid: int, reason_codes: list[Any], generation: int, attempt: int = 0
+    ) -> None:
+        with status_transition_lock:
+            if generation != current_activation_generation():
+                LOGGER.info(
+                    "mqtt_suback_stale mid=%s generation=%s",
+                    mid,
+                    generation,
+                )
+                return
+            if not subscription_is_granted(reason_codes, args.qos):
+                retry_queue.pause_session()
+                reasons = ", ".join(str(code) for code in reason_codes)
+                broker_rejected = not reason_codes or any(
+                    mqtt_reason_failed(code) for code in reason_codes
+                )
+                if broker_rejected:
+                    error_code = "MQTT_SUBSCRIBE_REJECTED"
+                    detail = (
+                        "Broker rejected subscription: "
+                        f"{reasons or 'missing SUBACK code'}"
+                    )
+                    LOGGER.error(
+                        "mqtt_suback_rejected topic=%s mid=%s reasons=%s",
+                        args.topic,
+                        mid,
+                        reasons or "missing",
+                    )
+                else:
+                    granted_qos = [mqtt_reason_value(code) for code in reason_codes]
+                    error_code = "MQTT_SUBSCRIBE_QOS_DOWNGRADED"
+                    detail = (
+                        f"Broker granted QoS {granted_qos} below requested "
+                        f"QoS {args.qos}."
+                    )
+                    LOGGER.error(
+                        "mqtt_suback_qos_downgraded topic=%s mid=%s "
+                        "requested=%s granted=%s",
+                        args.topic,
+                        mid,
+                        args.qos,
+                        granted_qos,
+                    )
+                report_mqtt_status_safely(
+                    endpoint=args.health_endpoint,
+                    token=args.ingest_token,
+                    status="degraded",
+                    detail=detail,
+                    error_code=error_code,
+                )
+                return
+            try:
+                retry_queue.resume_session()
+            except sqlite3.Error as error:
+                delay = min(30.0, 0.25 * (2 ** min(attempt, 7)))
+                LOGGER.warning(
+                    "mqtt_suback_release_failed error=%s retry_in=%.2f", error, delay
+                )
+                report_mqtt_status_safely(
+                    endpoint=args.health_endpoint,
+                    token=args.ingest_token,
+                    status="degraded",
+                    detail=f"SUBACK queue release failed: {error}",
+                    error_code="MQTT_RETRY_STATE_FAILED",
+                )
+                timer = threading.Timer(
+                    delay,
+                    handle_suback,
+                    args=(mid, reason_codes, generation, attempt + 1),
+                )
+                timer.daemon = True
+                timer.start()
+                return
             report_mqtt_status_safely(
                 endpoint=args.health_endpoint,
                 token=args.ingest_token,
-                status="degraded",
-                detail=f"Broker connection refused: {reason_code}",
-                error_code="MQTT_CONNECT_REFUSED",
+                status="healthy",
+                detail=f"Subscribed to {args.topic} with QoS {args.qos}",
             )
-            return
-        result, mid = client.subscribe(args.topic, qos=args.qos)
-        if int(result) != 0:
-            LOGGER.error("mqtt_subscribe_failed topic=%s result=%s", args.topic, result)
-            report_mqtt_status_safely(
-                endpoint=args.health_endpoint,
-                token=args.ingest_token,
-                status="degraded",
-                detail=f"Broker subscription request failed: {result}",
-                error_code="MQTT_SUBSCRIBE_FAILED",
+            LOGGER.info(
+                "mqtt_subscribed topic=%s qos=%s mid=%s",
+                args.topic,
+                args.qos,
+                mid,
             )
+
+    def activate_session(
+        client: Any,
+        flags: Any,
+        generation: int,
+        attempt: int = 0,
+    ) -> None:
+        nonlocal subscription_in_progress
+        early_suback = None
+        with activation_serial_lock:
+            if generation != current_activation_generation():
+                return
+            try:
+                retry_queue.begin_session(session_present=mqtt_session_present(flags))
+            except sqlite3.Error as error:
+                retry_queue.pause_session()
+                delay = min(30.0, 0.25 * (2 ** min(attempt, 7)))
+                LOGGER.error(
+                    "mqtt_session_epoch_failed error=%s retry_in=%.2f",
+                    error,
+                    delay,
+                )
+                report_mqtt_status_safely(
+                    endpoint=args.health_endpoint,
+                    token=args.ingest_token,
+                    status="degraded",
+                    detail=f"MQTT retry session state failed: {error}",
+                    error_code="MQTT_RETRY_STATE_FAILED",
+                )
+                timer = threading.Timer(
+                    delay,
+                    activate_session,
+                    args=(client, flags, generation, attempt + 1),
+                )
+                timer.daemon = True
+                timer.start()
+                return
+            if generation != current_activation_generation():
+                retry_queue.pause_session()
+                return
+            with subscription_lock:
+                subscription_in_progress = generation
+            try:
+                result, mid = client.subscribe(args.topic, qos=args.qos)
+            except Exception as error:
+                with subscription_lock:
+                    if subscription_in_progress == generation:
+                        subscription_in_progress = None
+                retry_queue.pause_session()
+                LOGGER.error(
+                    "mqtt_subscribe_failed topic=%s error=%s", args.topic, error
+                )
+                report_mqtt_status_safely(
+                    endpoint=args.health_endpoint,
+                    token=args.ingest_token,
+                    status="degraded",
+                    detail=f"Broker subscription request failed: {error}",
+                    error_code="MQTT_SUBSCRIBE_FAILED",
+                )
+                return
+            mid = int(mid)
+            if generation != current_activation_generation():
+                with subscription_lock:
+                    if subscription_in_progress == generation:
+                        subscription_in_progress = None
+                    early_subacks.pop(mid, None)
+                retry_queue.pause_session()
+                return
+            with subscription_lock:
+                if subscription_in_progress == generation:
+                    subscription_in_progress = None
+                early_suback = early_subacks.pop(mid, None)
+                if int(result) == 0 and early_suback is None:
+                    pending_subscriptions.add(mid)
+                    pending_subscription_generations[mid] = generation
+            if int(result) != 0:
+                retry_queue.pause_session()
+                LOGGER.error(
+                    "mqtt_subscribe_failed topic=%s result=%s", args.topic, result
+                )
+                report_mqtt_status_safely(
+                    endpoint=args.health_endpoint,
+                    token=args.ingest_token,
+                    status="degraded",
+                    detail=f"Broker subscription request failed: {result}",
+                    error_code="MQTT_SUBSCRIBE_FAILED",
+                )
+                return
+        if early_suback is not None:
+            suback_generation, early_reason_codes = early_suback
+            handle_suback(mid, early_reason_codes, suback_generation)
             return
-        pending_subscriptions.add(int(mid))
         LOGGER.info(
             "mqtt_subscribe_pending topic=%s qos=%s mid=%s",
             args.topic,
@@ -744,61 +2551,42 @@ def configure_mqtt_callbacks(
             mid,
         )
 
+    def on_connect(client, _userdata, flags, reason_code, _properties) -> None:
+        with status_transition_lock:
+            retry_queue.pause_session()
+            generation = advance_activation_generation()
+            reset_subscription_tracking()
+            if mqtt_reason_failed(reason_code):
+                LOGGER.error("mqtt_connect_failed reason=%s", reason_code)
+                report_mqtt_status_safely(
+                    endpoint=args.health_endpoint,
+                    token=args.ingest_token,
+                    status="degraded",
+                    detail=f"Broker connection refused: {reason_code}",
+                    error_code="MQTT_CONNECT_REFUSED",
+                )
+                return
+        activate_session(client, flags, generation)
+
     def on_subscribe(_client, _userdata, mid, reason_code_list, _properties) -> None:
-        pending_subscriptions.discard(int(mid))
+        mid = int(mid)
         reason_codes = list(reason_code_list or [])
-        if not subscription_is_granted(reason_codes, args.qos):
-            reasons = ", ".join(str(code) for code in reason_codes)
-            broker_rejected = not reason_codes or any(
-                mqtt_reason_failed(code) for code in reason_codes
-            )
-            if broker_rejected:
-                error_code = "MQTT_SUBSCRIBE_REJECTED"
-                detail = (
-                    "Broker rejected subscription: "
-                    f"{reasons or 'missing SUBACK code'}"
-                )
-                LOGGER.error(
-                    "mqtt_suback_rejected topic=%s mid=%s reasons=%s",
-                    args.topic,
-                    mid,
-                    reasons or "missing",
-                )
+        suback_generation = None
+        with subscription_lock:
+            if mid in pending_subscriptions:
+                pending_subscriptions.discard(mid)
+                suback_generation = pending_subscription_generations.pop(mid, None)
+            elif subscription_in_progress == current_activation_generation():
+                suback_generation = subscription_in_progress
+                early_subacks[mid] = (suback_generation, reason_codes)
+                return
             else:
-                granted_qos = [mqtt_reason_value(code) for code in reason_codes]
-                error_code = "MQTT_SUBSCRIBE_QOS_DOWNGRADED"
-                detail = (
-                    f"Broker granted QoS {granted_qos} below requested "
-                    f"QoS {args.qos}."
-                )
-                LOGGER.error(
-                    "mqtt_suback_qos_downgraded topic=%s mid=%s "
-                    "requested=%s granted=%s",
-                    args.topic,
-                    mid,
-                    args.qos,
-                    granted_qos,
-                )
-            report_mqtt_status_safely(
-                endpoint=args.health_endpoint,
-                token=args.ingest_token,
-                status="degraded",
-                detail=detail,
-                error_code=error_code,
-            )
+                LOGGER.info("mqtt_suback_stale mid=%s", mid)
+                return
+        if suback_generation is None:
+            LOGGER.info("mqtt_suback_stale mid=%s", mid)
             return
-        report_mqtt_status_safely(
-            endpoint=args.health_endpoint,
-            token=args.ingest_token,
-            status="healthy",
-            detail=f"Subscribed to {args.topic} with QoS {args.qos}",
-        )
-        LOGGER.info(
-            "mqtt_subscribed topic=%s qos=%s mid=%s",
-            args.topic,
-            args.qos,
-            mid,
-        )
+        handle_suback(mid, reason_codes, suback_generation)
 
     def on_connect_fail(_client, _userdata) -> None:
         LOGGER.error("mqtt_connect_failed reason=network")
@@ -813,15 +2601,18 @@ def configure_mqtt_callbacks(
     def on_disconnect(
         _client, _userdata, _disconnect_flags, reason_code, _properties
     ) -> None:
-        pending_subscriptions.clear()
-        LOGGER.warning("mqtt_disconnected reason=%s", reason_code)
-        report_mqtt_status_safely(
-            endpoint=args.health_endpoint,
-            token=args.ingest_token,
-            status="degraded",
-            detail=f"Broker disconnected: {reason_code}",
-            error_code="MQTT_DISCONNECTED",
-        )
+        with status_transition_lock:
+            advance_activation_generation()
+            retry_queue.pause_session()
+            reset_subscription_tracking()
+            LOGGER.warning("mqtt_disconnected reason=%s", reason_code)
+            report_mqtt_status_safely(
+                endpoint=args.health_endpoint,
+                token=args.ingest_token,
+                status="degraded",
+                detail=f"Broker disconnected: {reason_code}",
+                error_code="MQTT_DISCONNECTED",
+            )
 
     def on_message(client, _userdata, message) -> None:
         process_mqtt_message(
@@ -879,6 +2670,7 @@ def main() -> None:
         ingest_endpoint=args.ingest_endpoint,
         quarantine_endpoint=args.quarantine_endpoint,
         token=args.ingest_token,
+        session_ready=False,
     )
     configure_mqtt_callbacks(client, args, retry_queue)
     retry_queue.start()

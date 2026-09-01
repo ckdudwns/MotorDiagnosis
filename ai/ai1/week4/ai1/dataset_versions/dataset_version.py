@@ -89,5 +89,12 @@ def verify_reproducibility(frozen_manifest: dict, recomputed_manifest: dict) -> 
 
 
 def dataset_version_summary(manifest: dict) -> dict:
-    """GET /api/datasets/{id} 응답에 가까운, rows를 뺀 요약 뷰."""
-    return {k: v for k, v in manifest.items() if k != "rows"}
+    """GET /api/datasets/{id} 응답에 가까운, rows를 뺀 요약 뷰.
+
+    얕은 dict comprehension은 labelMapping·split 같은 중첩 객체를 원본과 공유한다
+    — 호출자가 요약 결과의 labelMapping만 바꿔도 frozen·approved 매니페스트의
+    라벨 매핑이 함께 변하는데 status/datasetChecksum은 그대로라, 승인 내용과
+    체크섬이 조용히 어긋난다. 깊은 복사로 요약 뷰를 원본과 완전히 분리한다
+    (rows를 이미 뺐으므로 비용도 작다).
+    """
+    return copy.deepcopy({k: v for k, v in manifest.items() if k != "rows"})

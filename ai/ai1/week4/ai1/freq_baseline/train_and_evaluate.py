@@ -11,24 +11,21 @@ freq_baseline_format.md 참고.
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import torch
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_WEEK1_SCRIPTS_DIR = os.path.normpath(
-    os.path.join(_THIS_DIR, "..", "..", "..", "week1", "ai1", "scripts")
-)
+# __main__ 배선에서 register_dataset.build_manifest / dataset_version.freeze를
+# 쓸 때만 필요하다. 학습 파이프라인 자체(run_training_job)는 동결 매니페스트
+# dict만 받아 원본 CWRU를 다시 읽지 않는다.
 _WEEK3_DATASETS_DIR = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "..", "week3", "ai1", "datasets")
 )
-sys.path.insert(0, _WEEK1_SCRIPTS_DIR)
 sys.path.insert(0, _WEEK3_DATASETS_DIR)
 sys.path.insert(0, _THIS_DIR)
 
-from load_cwru_vibration import load_cwru_dataset  # noqa: E402
-from register_dataset import DATASET_LABEL_MAPPING  # noqa: E402
-from features import build_feature_dict, vectorize, canonical_feature_names  # noqa: E402
 from models import (  # noqa: E402
     DenseAutoencoder,
     LstmAutoencoder,
@@ -67,8 +64,10 @@ DENSE_SPLIT_STRATEGY = (
     "데이터와 정확히 일치)"
 )
 LSTM_SPLIT_STRATEGY = (
-    f"동일 group_split 파일→split 배정 안에서만 길이 {SEQ_LEN} 비중첩 시퀀스를 "
-    "구성 (한 원본 파일의 모든 시퀀스는 한 split에만 — 파일 내부 재분할 없음)"
+    f"동일 group_split 파일→split 배정 안에서만 동결 매니페스트 rows(inline 특징)를 "
+    f"윈도우 순번으로 정렬해 길이 {SEQ_LEN} 비중첩 시퀀스를 구성 (원본 재로드·재계산 "
+    "없음 — dense 경로와 동일하게 학습 입력이 datasetId가 가리키는 데이터와 정확히 "
+    "일치, 한 원본 파일의 모든 시퀀스는 한 split에만)"
 )
 
 
@@ -137,49 +136,70 @@ def prepare_dense_splits(frozen_manifest: dict):
     return names, samples_by_split
 
 
-def prepare_lstm_chunks(cwru_dir: str, frozen_manifest: dict, names: list):
+def _window_index(sample_id: str) -> int:
+    """'97_0007' -> 7 (원본 파일 안에서의 윈도우 순번).
+
+    load_cwru_vibration이 '<파일번호>_<4자리 순번>' 규칙으로 sample_id를 만든다.
+    파일 내부에서 이 순번으로 정렬해야 시퀀스가 동결 시점과 같은 신호 구간
+    순서를 덮는다.
+    """
+    try:
+        return int(sample_id.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        raise ValueError(
+            f"sample_id에서 윈도우 순번을 읽을 수 없습니다: {sample_id!r} "
+            "('<파일번호>_<순번>' 형식이어야 합니다)."
+        )
+
+
+def prepare_lstm_chunks(frozen_manifest: dict, names: list):
     """group_split이 배정한 파일→split 안에서만 길이 SEQ_LEN 비중첩 시퀀스를 만든다.
 
-    한 원본 파일은 통째로 하나의 split에만 들어가므로(group_split 불변식),
-    파일 내부 청크를 다시 나누지 않는다 — 그 파일의 모든 시퀀스를 파일이
-    배정된 split에 그대로 넣는다. 윈도우/홉은 매니페스트 생성 기본값(2048)과
-    같아야 시퀀스가 동결 rows와 동일한 신호 구간을 덮는다.
+    동결 매니페스트 rows의 inline 특징값을 그대로 시퀀스로 묶는다 — 원본 CWRU를
+    다시 읽지 않는다. 예전 구현은 cwru_dir을 기본 윈도우(2048/2048)로 재분할하고
+    특징을 재계산해서, 매니페스트가 다른 window/hop으로 동결됐거나 원본 .mat이
+    바뀌면 LSTM 입력이 datasetId가 가리키는 데이터와 어긋났다(윈도우 수·같은
+    sample_id의 특징값 모두 불일치). 이제 dense 경로와 똑같이 동결본만 입력으로
+    쓴다.
+
+    한 원본 파일은 통째로 하나의 split에만 들어가므로(group_split 불변식) 파일
+    내부를 다시 나누지 않는다 — 파일 안에서는 sample_id의 윈도우 순번으로
+    정렬해 그 파일의 모든 시퀀스를 배정된 split에 넣는다.
     """
-    split_of_file: dict = {}
+    if frozen_manifest.get("status") != "frozen":
+        raise ValueError(
+            f"frozen 상태의 매니페스트가 필요합니다 (status={frozen_manifest.get('status')!r})."
+        )
+
+    rows_by_file: dict = {}
     for row in frozen_manifest["rows"]:
-        prev = split_of_file.setdefault(row["source_file"], row["split"])
-        if prev != row["split"]:
-            raise ValueError(
-                f"{row['source_file']} 가 여러 split({prev}, {row['split']})에 걸쳐 있습니다 "
-                "— group_split 불변식 위반."
-            )
-
-    records = load_cwru_dataset(cwru_dir)
-    sample_rate = records[0]["sample_rate"]
-
-    by_file: dict = {}
-    for rec in records:
-        by_file.setdefault(rec["source_label"], []).append(rec)
+        rows_by_file.setdefault(row["source_file"], []).append(row)
 
     samples_by_split = {"train": [], "validation": [], "test": []}
 
-    for source_file, file_records in by_file.items():
-        split = split_of_file.get(source_file)
+    for source_file, file_rows in rows_by_file.items():
+        file_splits = {r["split"] for r in file_rows}
+        if len(file_splits) > 1:
+            raise ValueError(
+                f"{source_file} 가 여러 split({sorted(file_splits)})에 걸쳐 있습니다 "
+                "— group_split 불변식 위반."
+            )
+        split = next(iter(file_splits))
         if split not in samples_by_split:
-            continue
+            continue  # train 전용 등 3-way가 아닌 매니페스트는 해당 split만 사용
+
+        file_rows = sorted(file_rows, key=lambda r: _window_index(r["sample_id"]))
         vectors = [
-            vectorize(build_feature_dict(r["signal"], sample_rate), names)
-            for r in file_records
+            np.array([row[n] for n in names], dtype=np.float64) for row in file_rows
         ]
         for start in range(0, len(vectors) - SEQ_LEN + 1, SEQ_LEN):
-            chunk_records = file_records[start : start + SEQ_LEN]
-            matrix = np.stack(vectors[start : start + SEQ_LEN])
+            chunk = file_rows[start : start + SEQ_LEN]
             samples_by_split[split].append(
                 {
-                    "sample_id": "+".join(r["sample_id"] for r in chunk_records),
-                    "known_label": chunk_records[0]["label"],
-                    "common_label": DATASET_LABEL_MAPPING[chunk_records[0]["label"]],
-                    "vector": matrix,
+                    "sample_id": "+".join(r["sample_id"] for r in chunk),
+                    "known_label": chunk[0]["known_label"],
+                    "common_label": chunk[0]["common_label"],
+                    "vector": np.stack(vectors[start : start + SEQ_LEN]),
                 }
             )
 
@@ -311,7 +331,10 @@ def _evaluate_candidate(
         "testSampleCount": len(samples_by_split["test"]),
         "threshold": threshold,
         "trainLossFinal": float(losses[-1]),
-        "artifactUri": f"file://{artifact_path}" if artifact_path else None,
+        # file://C:\... 같은 비표준 URI는 백엔드 모델 등록에서 400
+        # INVALID_ARTIFACT_URI로 거부된다. 표준 파일 URI로 변환한다
+        # (Windows: file:///C:/..., POSIX: file:///...).
+        "artifactUri": Path(artifact_path).resolve().as_uri() if artifact_path else None,
         "normalization": {
             "featureOrder": list(feature_names),
             "mean": scaler_mean,
@@ -394,7 +417,6 @@ def select_best(candidates: list) -> dict:
 
 
 def run_training_job(
-    cwru_dir: str,
     frozen_manifest: dict,
     *,
     seed: int = 42,
@@ -408,25 +430,24 @@ def run_training_job(
         )
     torch.manual_seed(seed)
 
-    dense_names, dense_splits = prepare_dense_splits(frozen_manifest)
+    # dense와 lstm 모두 동결 매니페스트 rows의 inline 특징값만 입력으로 쓴다
+    # (원본 CWRU 재로드·재계산 없음). 같은 feature_names로 두 경로를 묶는다.
+    feature_names, dense_splits = prepare_dense_splits(frozen_manifest)
     dense_candidate, dense_errors = _evaluate_candidate(
         "dense_autoencoder",
         DENSE_SPLIT_STRATEGY,
         dense_splits,
-        feature_names=dense_names,
+        feature_names=feature_names,
         epochs=dense_epochs,
         artifact_path=os.path.join(artifact_dir, "dense_autoencoder.pt") if artifact_dir else None,
     )
 
-    lstm_names = model_feature_names(
-        canonical_feature_names(frozen_manifest["rows"][0]["sample_rate_hz"])
-    )
-    lstm_splits = prepare_lstm_chunks(cwru_dir, frozen_manifest, lstm_names)
+    lstm_splits = prepare_lstm_chunks(frozen_manifest, feature_names)
     lstm_candidate, lstm_errors = _evaluate_candidate(
         "lstm_autoencoder",
         LSTM_SPLIT_STRATEGY,
         lstm_splits,
-        feature_names=lstm_names,
+        feature_names=feature_names,
         epochs=lstm_epochs,
         artifact_path=os.path.join(artifact_dir, "lstm_autoencoder.pt") if artifact_dir else None,
     )
@@ -487,7 +508,6 @@ if __name__ == "__main__":
     frozen = freeze_dataset_version(manifest)
 
     report = run_training_job(
-        args.cwru_dir,
         frozen,
         dense_epochs=args.dense_epochs,
         lstm_epochs=args.lstm_epochs,

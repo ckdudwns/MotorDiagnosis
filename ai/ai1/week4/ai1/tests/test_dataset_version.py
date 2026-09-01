@@ -135,6 +135,30 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         self.assertNotIn("rows", summary)
         self.assertEqual(summary["status"], "frozen")
 
+    def test_summary_deep_copies_nested_objects_frozen(self):
+        # frozen 요약 결과의 중첩 객체(labelMapping/split)를 수정해도 동결본과
+        # 저장된 체크섬이 그대로여야 한다 — 안 그러면 status=frozen인데 내용과
+        # 체크섬이 어긋난다.
+        frozen = freeze_dataset_version(_draft_manifest())
+        summary = dataset_version_summary(frozen)
+        summary["labelMapping"]["NORMAL"] = "TAMPERED"
+        summary["split"]["train"] = 0.999
+        self.assertEqual(frozen["labelMapping"]["NORMAL"], "NORMAL")
+        self.assertEqual(frozen["split"]["train"], 0.7)
+        self.assertEqual(frozen["datasetChecksum"], compute_dataset_checksum(frozen))
+
+    def test_summary_deep_copies_nested_objects_approved(self):
+        # approved 요약 결과의 labelMapping만 바꿔도 승인본이 함께 변하면,
+        # 승인 내용과 datasetChecksum(승인본이 그대로 물려받음)이 불일치한다.
+        approved = approve_dataset_version(
+            freeze_dataset_version(_draft_manifest()),
+            approved_by="mgr", reason="검증 완료",
+        )
+        summary = dataset_version_summary(approved)
+        summary["labelMapping"]["FAULT"] = "TAMPERED"
+        self.assertEqual(approved["labelMapping"]["FAULT"], "ANOMALY")
+        self.assertEqual(approved["datasetChecksum"], compute_dataset_checksum(approved))
+
 
 class TestModelVersionLifecycle(unittest.TestCase):
     def test_register_starts_as_registered(self):

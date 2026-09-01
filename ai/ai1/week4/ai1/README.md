@@ -111,6 +111,7 @@ CWRU 실데이터가 없는 환경에서도 합성(fixture) 데이터 기반 테
 - LSTM 후보는 CWRU 규모에서 시퀀스 청크 수가 적어(train NORMAL 94개) Dense보다 표본이
   적다 — 실측 데이터로 늘어나면 재검증 필요
 - 음향(acoustic) 모달리티는 아직 없음 — MIMII 데이터 확보 후 같은 구조로 별도 후보 추가
-- `artifactUri`는 로컬 파일 경로 — 운영 전 오브젝트 스토리지로 교체
+- `artifactUri`는 로컬 파일을 가리키는 표준 `file://` URI(`Path(...).resolve().as_uri()`)
+  — 운영 전 오브젝트 스토리지 URI로 교체
 - 대상 모터·센서 확정 후 전이학습, 임계값 재보정, 드리프트 모니터링 진행
   (`freq_baseline/freq_baseline_format.md`의 "현장 보정 계획" 참고)

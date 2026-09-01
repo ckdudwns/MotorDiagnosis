@@ -59,7 +59,7 @@ checksum = "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 ```json
 {
   "version": "cwru-vibration-dense-ae-v1",
-  "artifactUri": "file://.../model.pt",
+  "artifactUri": "file:///C:/.../model.pt",
   "datasetId": "DS-CWRU-VIBRATION-20260824",
   "baselineVersion": "2026-08-21T08:17:43.221079+00:00",
   "metrics": {"precision": 0.98, "recall": 1.0, "f1": 0.99},
@@ -104,5 +104,6 @@ week2 `baseline.json`과 같은 구조(`mean`/`std`/`normal_range`)를 `features
 - 지금은 데이터셋이 CWRU 하나뿐이라 `rollback`은 모델 버전에만 의미가 있다. 실제
   현장 데이터가 여러 데이터셋 버전으로 쌓이면 데이터셋 버전 자체의 rollback/활성화
   개념도 필요할 수 있다.
-- `artifactUri`는 지금은 로컬 파일 경로 문자열이다 — 실제 운영에서는 오브젝트 스토리지
-  URI로 교체.
+- `artifactUri`는 지금은 로컬 파일을 가리키는 표준 `file://` URI다(train_and_evaluate가
+  `Path(...).resolve().as_uri()`로 생성 — Windows 경로도 `file:///C:/...` 형태의 유효한
+  URI가 된다). 실제 운영에서는 오브젝트 스토리지 URI로 교체.

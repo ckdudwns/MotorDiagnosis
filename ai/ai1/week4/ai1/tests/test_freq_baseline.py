@@ -39,6 +39,7 @@ from train_and_evaluate import (  # noqa: E402
     compute_metrics,
     collect_error_cases,
     run_training_job,
+    prepare_lstm_chunks,
     _evaluate_candidate,
     select_best,
     score_from_artifact,
@@ -259,6 +260,174 @@ class TestValidationBasedSelection(unittest.TestCase):
         self.assertEqual(best["metrics"]["f1"], 0.2)
 
 
+_SYNTH_FEATURE_COLS = (
+    "kurtosis_mean",
+    "rms_mean",
+    "spectral_centroid_mean",
+    "vibration_peak_hz",
+)
+
+
+def _synthetic_frozen_manifest(windows_per_file=10, sample_rate_hz=12000, seed=0):
+    """실제 CWRU/torch 없이 동결 매니페스트 모양만 만든다.
+
+    파일당 windows_per_file개 윈도우 — 기본 window/hop(2048)이 아닌 값(예:
+    window=hop=1024)으로 동결한 매니페스트를 흉내낸다. 파일→split 배정은
+    group_split 불변식(한 원본 파일 전체가 하나의 split)을 지킨다.
+    """
+    files = [
+        ("97.mat", "NORMAL", "NORMAL", "train"),
+        ("98.mat", "NORMAL", "NORMAL", "train"),
+        ("99.mat", "NORMAL", "NORMAL", "validation"),
+        ("105.mat", "BEARING_FAULT_INNER", "ANOMALY", "validation"),
+        ("100.mat", "NORMAL", "NORMAL", "test"),
+        ("106.mat", "BEARING_FAULT_INNER", "ANOMALY", "test"),
+    ]
+    rng = np.random.default_rng(seed)
+    rows = []
+    for source_file, known, common, split in files:
+        base = source_file.replace(".mat", "")
+        offset = 6.0 if common == "ANOMALY" else 0.0
+        for i in range(windows_per_file):
+            row = {
+                "sample_id": f"{base}_{i:04d}",
+                "source_file": source_file,
+                "known_label": known,
+                "common_label": common,
+                "split": split,
+                "sample_rate_hz": sample_rate_hz,
+                "rpm": 1797,
+            }
+            for col in _SYNTH_FEATURE_COLS:
+                row[col] = float(rng.normal(scale=0.1) + offset)
+            rows.append(row)
+    return {
+        "id": "DS-SYNTH-FROZEN-001",
+        "status": "frozen",
+        "datasetChecksum": "sha256:synthetic",
+        "labelMapping": {"NORMAL": "NORMAL", "BEARING_FAULT_INNER": "ANOMALY"},
+        "split": {"train": 0.5, "validation": 0.3, "test": 0.2},
+        "rows": rows,
+    }
+
+
+class TestLstmInputMatchesFrozenDataset(unittest.TestCase):
+    """[리뷰 P2] LSTM 입력도 동결 데이터셋과 일치해야 한다. 예전 구현은 파일별
+    split 배정만 재사용하고 원본 CWRU를 기본 2048 윈도우로 다시 읽어, 비기본
+    window/hop으로 동결한 매니페스트에서는 윈도우 수(예: 320→160)와 같은
+    sample_id의 특징값이 datasetId가 가리키는 데이터와 어긋났다."""
+
+    def test_sequences_cover_all_frozen_rows_for_nondefault_window(self):
+        manifest = _synthetic_frozen_manifest(windows_per_file=10)  # window=hop=1024 흉내
+        names = feature_names_from_manifest(manifest)
+        chunks = prepare_lstm_chunks(manifest, names)
+        for split in ("train", "validation", "test"):
+            self.assertEqual(len(chunks[split]), 4, split)  # 파일당 10//5=2, split당 파일 2개
+            for seq in chunks[split]:
+                self.assertEqual(seq["vector"].shape, (5, len(names)))
+        # 예전 구현식 축소(윈도우 절반만 사용)가 없어야 한다: 시퀀스가 덮는
+        # 윈도우 총수 == 동결 rows 총수.
+        covered = sum(
+            len(seq["sample_id"].split("+"))
+            for split in ("train", "validation", "test")
+            for seq in chunks[split]
+        )
+        self.assertEqual(covered, len(manifest["rows"]))
+
+    def test_sequence_vectors_are_frozen_inline_values_not_recomputed(self):
+        manifest = _synthetic_frozen_manifest(windows_per_file=5)
+        names = feature_names_from_manifest(manifest)
+        rows_by_id = {r["sample_id"]: r for r in manifest["rows"]}
+        chunks = prepare_lstm_chunks(manifest, names)
+        for split in ("train", "validation", "test"):
+            for seq in chunks[split]:
+                ids = seq["sample_id"].split("+")
+                expected = np.array(
+                    [[rows_by_id[i][n] for n in names] for i in ids], dtype=np.float64
+                )
+                np.testing.assert_array_equal(seq["vector"], expected)
+
+    def test_changed_source_rows_change_lstm_input(self):
+        names = feature_names_from_manifest(_synthetic_frozen_manifest())
+        base = prepare_lstm_chunks(_synthetic_frozen_manifest(), names)
+        tampered_manifest = _synthetic_frozen_manifest()
+        for row in tampered_manifest["rows"]:
+            row["rms_mean"] += 100.0
+        tampered = prepare_lstm_chunks(tampered_manifest, names)
+        self.assertFalse(
+            np.allclose(base["train"][0]["vector"], tampered["train"][0]["vector"])
+        )
+
+    def test_windows_ordered_by_sample_id_index_even_if_rows_shuffled(self):
+        import random as _random
+
+        manifest = _synthetic_frozen_manifest(windows_per_file=10)
+        names = feature_names_from_manifest(manifest)
+        _random.Random(3).shuffle(manifest["rows"])
+        chunks = prepare_lstm_chunks(manifest, names)
+        for split in ("train", "validation", "test"):
+            for seq in chunks[split]:
+                ids = seq["sample_id"].split("+")
+                self.assertEqual(ids, sorted(ids, key=lambda s: int(s.split("_")[1])))
+
+    def test_file_spanning_two_splits_is_rejected(self):
+        manifest = _synthetic_frozen_manifest()
+        manifest["rows"][0]["split"] = "test"  # 97.mat 일부 윈도우만 다른 split으로
+        with self.assertRaises(ValueError):
+            prepare_lstm_chunks(manifest, feature_names_from_manifest(manifest))
+
+    def test_run_training_job_trains_both_candidates_from_frozen_only(self):
+        # 동결본 dict만으로 dense/lstm 두 후보가 학습된다 — 원본 .mat 경로 인자
+        # 자체가 사라졌다(이 환경엔 CWRU가 없다).
+        manifest = _synthetic_frozen_manifest(windows_per_file=10)
+        report = run_training_job(manifest, dense_epochs=5, lstm_epochs=5)
+        self.assertEqual(
+            {c["name"] for c in report["candidates"]},
+            {"dense_autoencoder", "lstm_autoencoder"},
+        )
+        lstm = next(c for c in report["candidates"] if c["name"] == "lstm_autoencoder")
+        self.assertEqual(lstm["testSampleCount"], 4)  # test 파일 2개 * 파일당 2 시퀀스
+        self.assertEqual(report["datasetId"], "DS-SYNTH-FROZEN-001")
+
+
+class TestArtifactUriIsRegistrableFileUri(unittest.TestCase):
+    """[리뷰 P2] file://C:\\... 형태의 비표준 URI는 백엔드 모델 등록에서
+    400 INVALID_ARTIFACT_URI로 거부된다. 표준 file URI로 생성해야 한다."""
+
+    def test_artifact_uri_is_standard_and_roundtrips_to_saved_path(self):
+        import tempfile
+        from urllib.parse import urlparse
+        from urllib.request import url2pathname
+
+        splits = _synthetic_split(seq=None)
+        names = [f"f{i}" for i in range(4)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "dense_autoencoder.pt")
+            candidate, _ = _evaluate_candidate(
+                "dense_autoencoder", "x", splits, feature_names=names,
+                epochs=3, artifact_path=path,
+            )
+            uri = candidate["artifactUri"]
+            parsed = urlparse(uri)
+            self.assertEqual(parsed.scheme, "file")
+            # 표준 file URI: 경로부가 '/'로 시작하고 역슬래시가 없다.
+            self.assertTrue(parsed.path.startswith("/"))
+            self.assertNotIn("\\", uri)
+            # URI -> 경로 복원이 실제 저장 위치와 같아야 등록된 모델을 찾는다.
+            self.assertEqual(
+                os.path.normcase(os.path.realpath(url2pathname(parsed.path))),
+                os.path.normcase(os.path.realpath(path)),
+            )
+
+    def test_none_when_no_artifact_saved(self):
+        splits = _synthetic_split(seq=None)
+        candidate, _ = _evaluate_candidate(
+            "dense_autoencoder", "x", splits,
+            feature_names=[f"f{i}" for i in range(4)], epochs=2,
+        )
+        self.assertIsNone(candidate["artifactUri"])
+
+
 @unittest.skipUnless(
     os.path.exists(os.path.join(_CWRU_DATA_DIR, "97.mat")),
     f"CWRU 실데이터 없음: {os.path.join(_CWRU_DATA_DIR, '97.mat')}",
@@ -272,7 +441,7 @@ class TestRunTrainingJobWithRealCwruData(unittest.TestCase):
         manifest = build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
         cls.frozen = freeze_dataset_version(manifest)
         cls.report = run_training_job(
-            _CWRU_DATA_DIR, cls.frozen, dense_epochs=60, lstm_epochs=60
+            cls.frozen, dense_epochs=60, lstm_epochs=60
         )
 
     def test_report_has_both_candidates(self):
@@ -328,8 +497,7 @@ class TestRunTrainingJobWithRealCwruData(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             report = run_training_job(
-                _CWRU_DATA_DIR, self.frozen, dense_epochs=20, lstm_epochs=20,
-                artifact_dir=tmp,
+                self.frozen, dense_epochs=20, lstm_epochs=20, artifact_dir=tmp,
             )
             for name in ("dense_autoencoder", "lstm_autoencoder"):
                 payload = torch.load(os.path.join(tmp, f"{name}.pt"), weights_only=False)
@@ -375,7 +543,7 @@ class TestMainPipelineIntegrationRealCwru(unittest.TestCase):
         frozen = freeze_dataset_version(build_manifest(data_dir=_CWRU_DATA_DIR))
         with tempfile.TemporaryDirectory() as tmp:
             report = run_training_job(
-                _CWRU_DATA_DIR, frozen, dense_epochs=20, lstm_epochs=20, artifact_dir=tmp,
+                frozen, dense_epochs=20, lstm_epochs=20, artifact_dir=tmp,
             )
             self.assertEqual(report["datasetId"], frozen["id"])
             self.assertEqual(

@@ -22,6 +22,28 @@ constexpr const char* ASSET_ID =
 constexpr const char* TIMESTAMP =
     "2026-09-02T07:52:36Z";
 
+#pragma pack(push, 1)
+struct LegacyV1RingRecordFixture
+{
+    std::uint32_t magic = 0x4D445231UL;
+    std::uint16_t schemaVersion = 1;
+    std::uint16_t flags = 1;
+    std::uint64_t ordinal = 821;
+    std::uint32_t sequence = 4073;
+    std::uint64_t epochSeconds = 0;
+    float vibrationRmsRaw = 0.014f;
+    float vibrationPeakHz = 40.42f;
+    float acousticRmsRaw = 112325.0f;
+    float acousticPeakHz = 7.81f;
+    std::uint32_t crc32 = 0;
+};
+#pragma pack(pop)
+
+static_assert(
+    sizeof(LegacyV1RingRecordFixture) == 48,
+    "Legacy v1 ring fixture must match the persisted 48-byte record layout."
+);
+
 void assertAckResult(
     AckValidationResult expected,
     int status,
@@ -386,6 +408,108 @@ void testCrcCorruptionCanBeConsumedAsUnrecoverable()
     );
 }
 
+void testLegacyV1SerializedUnresolvedRecordIsRecognizedForMigration()
+{
+    LegacyV1RingRecordFixture previousFirmwareRecord;
+
+    std::uint8_t serialized[
+        sizeof(previousFirmwareRecord)
+    ] = {};
+
+    std::memcpy(
+        serialized,
+        &previousFirmwareRecord,
+        sizeof(previousFirmwareRecord)
+    );
+
+    LegacyV1RingRecordFixture restored;
+
+    std::memcpy(
+        &restored,
+        serialized,
+        sizeof(restored)
+    );
+
+    TEST_ASSERT_EQUAL_INT(
+        static_cast<int>(
+            RingRecordTimeEncoding::LEGACY_UNRESOLVED_V1
+        ),
+        static_cast<int>(
+            classifyRingRecordTimeEncoding(
+                restored.schemaVersion,
+                restored.flags,
+                restored.epochSeconds,
+                1,
+                2,
+                1,
+                1700000000ULL
+            )
+        )
+    );
+
+    TEST_ASSERT_EQUAL_INT(
+        static_cast<int>(
+            RingRecoveryDisposition::LEGACY_ISOLATION
+        ),
+        static_cast<int>(
+            classifyRingRecordForRecovery(
+                restored.schemaVersion,
+                restored.flags,
+                restored.epochSeconds,
+                true,
+                true,
+                1,
+                2,
+                1,
+                1700000000ULL
+            )
+        )
+    );
+}
+
+void testSchemaV1PackedTransitionAndV2PackedRecordsRemainReadable()
+{
+    const std::uint64_t packed =
+        packOfflineCaptureMetadata(
+            42,
+            123456
+        );
+
+    TEST_ASSERT_EQUAL_INT(
+        static_cast<int>(
+            RingRecordTimeEncoding::PACKED_UNRESOLVED
+        ),
+        static_cast<int>(
+            classifyRingRecordTimeEncoding(
+                1,
+                1,
+                packed,
+                1,
+                2,
+                1,
+                1700000000ULL
+            )
+        )
+    );
+
+    TEST_ASSERT_EQUAL_INT(
+        static_cast<int>(
+            RingRecordTimeEncoding::PACKED_UNRESOLVED
+        ),
+        static_cast<int>(
+            classifyRingRecordTimeEncoding(
+                2,
+                1,
+                packed,
+                1,
+                2,
+                1,
+                1700000000ULL
+            )
+        )
+    );
+}
+
 void testOfflineMetadataRoundTrip()
 {
     const std::uint64_t packed =
@@ -698,16 +822,47 @@ void testArchiveCleanupWorkIsBoundedPerPass()
     );
 }
 
-void testRejectedArchiveFailureFallsBackToRingQueue()
+void testImmediateRejectArchiveRequiresDurableRingSource()
 {
-    TEST_ASSERT_TRUE(
-        shouldFallbackRejectedPacketToQueue(
+    TEST_ASSERT_FALSE(
+        shouldAttemptRejectedArchiveAfterDurableRingWrite(
             false
         )
     );
 
+    TEST_ASSERT_TRUE(
+        shouldAttemptRejectedArchiveAfterDurableRingWrite(
+            true
+        )
+    );
+}
+
+void testPowerCutAfterIsolationDestinationDeleteKeepsRingSource()
+{
+    // Model the exact review cut point: the packet is already durable in
+    // the ring, the archive replacement has not completed (for example,
+    // power loss after deleting destination but before rename). The source
+    // ring record must not be consumed.
     TEST_ASSERT_FALSE(
-        shouldFallbackRejectedPacketToQueue(
+        shouldConsumeRejectedRingAfterArchive(
+            true,
+            false
+        )
+    );
+}
+
+void testSuccessfulIsolationReplacementAllowsRingConsume()
+{
+    TEST_ASSERT_TRUE(
+        shouldConsumeRejectedRingAfterArchive(
+            true,
+            true
+        )
+    );
+
+    TEST_ASSERT_FALSE(
+        shouldConsumeRejectedRingAfterArchive(
+            false,
             true
         )
     );
@@ -800,6 +955,8 @@ int main(
 
     RUN_TEST(testTransientRingIoFailureDoesNotConsume);
     RUN_TEST(testCrcCorruptionCanBeConsumedAsUnrecoverable);
+    RUN_TEST(testLegacyV1SerializedUnresolvedRecordIsRecognizedForMigration);
+    RUN_TEST(testSchemaV1PackedTransitionAndV2PackedRecordsRemainReadable);
 
     RUN_TEST(testOfflineMetadataRoundTrip);
     RUN_TEST(testOfflineTimestampUsesMeasuredMonotonicDeltaNotFixedCadence);
@@ -820,7 +977,9 @@ int main(
     RUN_TEST(testArchiveCapEvictsAtBound);
     RUN_TEST(testArchiveCleanupLeavesRoomForPendingWrite);
     RUN_TEST(testArchiveCleanupWorkIsBoundedPerPass);
-    RUN_TEST(testRejectedArchiveFailureFallsBackToRingQueue);
+    RUN_TEST(testImmediateRejectArchiveRequiresDurableRingSource);
+    RUN_TEST(testPowerCutAfterIsolationDestinationDeleteKeepsRingSource);
+    RUN_TEST(testSuccessfulIsolationReplacementAllowsRingConsume);
 
     RUN_TEST(testHttpsAllowedByDefault);
     RUN_TEST(testPlainHttpRejectedByDefault);

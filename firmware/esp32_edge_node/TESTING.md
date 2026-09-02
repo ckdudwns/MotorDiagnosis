@@ -1,4 +1,4 @@
-# ESP32 firmware regression testing — v1.2-beta.11.8
+# ESP32 firmware regression testing — v1.2-beta.11.8.5
 
 This revision addresses the second PR #13 data-integrity review round. The native test suite exercises production helper code used directly by `main.cpp`.
 
@@ -12,7 +12,7 @@ Remove-Item -Recurse -Force .pio\build\native -ErrorAction SilentlyContinue
 & "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" test -e native
 ```
 
-Expected suite size for this revision: **51 tests**.
+Expected suite size for this revision: **55 tests**.
 
 Coverage includes:
 
@@ -21,11 +21,12 @@ Coverage includes:
 - bounded replay for a full backlog;
 - sequence write/read-back gating;
 - transient LittleFS read I/O vs proven CRC/schema corruption policy;
+- backward-compatible schema-v1 unresolved-ring migration (`epochSeconds=0`) plus schema-v1 transitional packed metadata and schema-v2 reads;
 - per-boot offline session metadata and exact monotonic-delta UTC reconstruction;
 - stale/previous-session anchor rejection and multi-reboot behavior;
 - ACK-loss/power-cut watermark recovery;
 - one-spare-slot full-ring write-first transaction and power-cut recovery;
-- bounded rejected/isolation archive, single-scan/bounded cleanup work, and archive-failure fallback;
+- bounded rejected/isolation archive, single-scan/bounded cleanup work, and ring-first power-cut safety for immediate permanent rejects;
 - RFC3339 `/api/health` parsing using the v1.3 response shape;
 - HTTPS-by-default transport policy with explicit local-development HTTP opt-in only.
 
@@ -55,7 +56,9 @@ The automated tests model the state transitions below; hardware power-cut tests 
 2. **Full-ring spare write power cut** — if power fails after the new spare record is verified but before the oldest logical consume is durable, recovery retains the newest logical capacity and advances only the safe boundary.
 3. **Offline boot with no UTC, then same-boot time sync** — the durable session anchor reconstructs capture time from the actual `millis()` delta, not a nominal 3.99 s cadence.
 4. **Offline boot with no UTC, power cut before any time anchor, then reboot** — old-session records must never receive the new boot's anchor. They are isolated as UTC-unresolvable raw captures rather than assigned a fabricated timestamp.
-5. **Partially written/corrupt time anchor** — anchor blob magic/version/session/epoch/CRC validation rejects it.
+5. **Upgrade from legacy PR #13 unresolved ring format** — schema-v1 records with `RING_FLAG_TIME_UNRESOLVED` and `epochSeconds=0` remain recoverable, are not counted as corruption, and are isolated before their ring source is consumed.
+6. **Immediate permanent reject + power cut during isolation replacement** — the packet is first write/read-back verified in the ring; a cut after destination deletion but before rename leaves the ring source recoverable.
+7. **Partially written/corrupt time anchor** — anchor blob magic/version/session/epoch/CRC validation rejects it.
 
 ## Backend `/api/health` dependency
 

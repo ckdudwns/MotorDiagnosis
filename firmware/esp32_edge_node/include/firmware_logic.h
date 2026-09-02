@@ -25,6 +25,21 @@ enum class RingReadClass
     IO_ERROR
 };
 
+enum class RingRecordTimeEncoding
+{
+    RESOLVED,
+    LEGACY_UNRESOLVED_V1,
+    PACKED_UNRESOLVED,
+    INVALID
+};
+
+enum class RingRecoveryDisposition
+{
+    ACTIVE,
+    LEGACY_ISOLATION,
+    CORRUPT
+};
+
 enum class OfflineTimestampResult
 {
     RESOLVED,
@@ -113,6 +128,28 @@ bool shouldConsumeAfterReadFailure(
     RingReadClass readClass
 );
 
+RingRecordTimeEncoding classifyRingRecordTimeEncoding(
+    std::uint16_t schemaVersion,
+    std::uint16_t flags,
+    std::uint64_t epochSeconds,
+    std::uint16_t legacySchemaVersion,
+    std::uint16_t currentSchemaVersion,
+    std::uint16_t unresolvedFlag,
+    std::uint64_t minimumResolvedEpochSeconds
+);
+
+RingRecoveryDisposition classifyRingRecordForRecovery(
+    std::uint16_t schemaVersion,
+    std::uint16_t flags,
+    std::uint64_t epochSeconds,
+    bool crcMatches,
+    bool measurementsFinite,
+    std::uint16_t legacySchemaVersion,
+    std::uint16_t currentSchemaVersion,
+    std::uint16_t unresolvedFlag,
+    std::uint64_t minimumResolvedEpochSeconds
+);
+
 std::uint64_t packOfflineCaptureMetadata(
     std::uint32_t sessionId,
     std::uint32_t captureMonotonicMs
@@ -194,7 +231,12 @@ std::size_t calculateArchiveEvictionCount(
     std::size_t maximumEvictionsPerPass
 );
 
-bool shouldFallbackRejectedPacketToQueue(
+bool shouldAttemptRejectedArchiveAfterDurableRingWrite(
+    bool ringWriteSucceeded
+);
+
+bool shouldConsumeRejectedRingAfterArchive(
+    bool ringWriteSucceeded,
     bool archiveWriteSucceeded
 );
 

@@ -1408,6 +1408,132 @@ bool shouldConsumeAfterReadFailure(
     );
 }
 
+RingRecordTimeEncoding classifyRingRecordTimeEncoding(
+    std::uint16_t schemaVersion,
+    std::uint16_t flags,
+    std::uint64_t epochSeconds,
+    std::uint16_t legacySchemaVersion,
+    std::uint16_t currentSchemaVersion,
+    std::uint16_t unresolvedFlag,
+    std::uint64_t minimumResolvedEpochSeconds
+)
+{
+    if (
+        schemaVersion != legacySchemaVersion &&
+        schemaVersion != currentSchemaVersion
+    )
+    {
+        return RingRecordTimeEncoding::INVALID;
+    }
+
+    if (
+        (
+            flags &
+            static_cast<std::uint16_t>(
+                ~unresolvedFlag
+            )
+        ) != 0
+    )
+    {
+        return RingRecordTimeEncoding::INVALID;
+    }
+
+    if (
+        (
+            flags &
+            unresolvedFlag
+        ) != 0
+    )
+    {
+        // PR #13 firmware before the session/monotonic migration used the
+        // same schema version but persisted unresolved records as epoch=0.
+        // Treat that exact legacy encoding as migratable data, not damage.
+        if (
+            schemaVersion == legacySchemaVersion &&
+            epochSeconds == 0
+        )
+        {
+            return RingRecordTimeEncoding::LEGACY_UNRESOLVED_V1;
+        }
+
+        std::uint32_t sessionId = 0;
+        std::uint32_t captureMonotonicMs = 0;
+
+        if (
+            !unpackOfflineCaptureMetadata(
+                epochSeconds,
+                sessionId,
+                captureMonotonicMs
+            )
+        )
+        {
+            return RingRecordTimeEncoding::INVALID;
+        }
+
+        return RingRecordTimeEncoding::PACKED_UNRESOLVED;
+    }
+
+    if (
+        epochSeconds <
+        minimumResolvedEpochSeconds
+    )
+    {
+        return RingRecordTimeEncoding::INVALID;
+    }
+
+    return RingRecordTimeEncoding::RESOLVED;
+}
+
+RingRecoveryDisposition classifyRingRecordForRecovery(
+    std::uint16_t schemaVersion,
+    std::uint16_t flags,
+    std::uint64_t epochSeconds,
+    bool crcMatches,
+    bool measurementsFinite,
+    std::uint16_t legacySchemaVersion,
+    std::uint16_t currentSchemaVersion,
+    std::uint16_t unresolvedFlag,
+    std::uint64_t minimumResolvedEpochSeconds
+)
+{
+    if (
+        !crcMatches ||
+        !measurementsFinite
+    )
+    {
+        return RingRecoveryDisposition::CORRUPT;
+    }
+
+    const RingRecordTimeEncoding encoding =
+        classifyRingRecordTimeEncoding(
+            schemaVersion,
+            flags,
+            epochSeconds,
+            legacySchemaVersion,
+            currentSchemaVersion,
+            unresolvedFlag,
+            minimumResolvedEpochSeconds
+        );
+
+    if (
+        encoding ==
+        RingRecordTimeEncoding::INVALID
+    )
+    {
+        return RingRecoveryDisposition::CORRUPT;
+    }
+
+    if (
+        encoding ==
+        RingRecordTimeEncoding::LEGACY_UNRESOLVED_V1
+    )
+    {
+        return RingRecoveryDisposition::LEGACY_ISOLATION;
+    }
+
+    return RingRecoveryDisposition::ACTIVE;
+}
+
 std::uint64_t packOfflineCaptureMetadata(
     std::uint32_t sessionId,
     std::uint32_t captureMonotonicMs
@@ -1776,12 +1902,23 @@ std::size_t calculateArchiveEvictionCount(
     );
 }
 
-bool shouldFallbackRejectedPacketToQueue(
+bool shouldAttemptRejectedArchiveAfterDurableRingWrite(
+    bool ringWriteSucceeded
+)
+{
+    return ringWriteSucceeded;
+}
+
+bool shouldConsumeRejectedRingAfterArchive(
+    bool ringWriteSucceeded,
     bool archiveWriteSucceeded
 )
 {
+    // The ring copy is the power-cut safety source. It may be consumed only
+    // after the isolation archive has been durably written and verified.
     return (
-        !archiveWriteSucceeded
+        ringWriteSucceeded &&
+        archiveWriteSucceeded
     );
 }
 

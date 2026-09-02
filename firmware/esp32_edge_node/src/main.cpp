@@ -1,7 +1,7 @@
 /*
  * MotorDiagnosis Edge Node
  *
- * Firmware Version : v1.2-beta.11
+ * Firmware Version : v1.2-beta.11.8.5
  * Revision Summary :
  *   P1 Atomic Queue Recovery
  *   P2 Unlabeled Real Telemetry Contract
@@ -71,7 +71,7 @@
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.2-beta.11.8.3";
+    "v1.2-beta.11.8.5";
 
 // =====================================================
 // Test Config
@@ -297,14 +297,24 @@ constexpr size_t MAX_ISOLATION_BACKEND_RESPONSE_CHARS =
 constexpr uint32_t RING_MAGIC =
     0x4D445231UL; // "MDR1"
 
-constexpr uint16_t RING_SCHEMA_VERSION =
+constexpr uint16_t RING_LEGACY_SCHEMA_VERSION =
     1;
+
+// v2 makes the session/monotonic unresolved-time encoding explicit.
+// Recovery remains backward compatible with schema-v1 records:
+// - v1 resolved records are replayed normally.
+// - v1 unresolved records with epochSeconds=0 are recognized as the
+//   pre-migration format and moved to isolation without fabricating UTC.
+// - v1 unresolved records that already contain packed session metadata
+//   (beta.11.8.x transition builds) remain readable.
+constexpr uint16_t RING_SCHEMA_VERSION =
+    2;
 
 // Cold-boot timestamp handling:
 //
 // No RTC means absolute UTC before the first network time sync is unknown.
-// Such records are persisted immediately, but epochSeconds is repurposed
-// while RING_FLAG_TIME_UNRESOLVED is set:
+// Such records are persisted immediately. In schema v2, epochSeconds is
+// repurposed while RING_FLAG_TIME_UNRESOLVED is set:
 //
 //   high 32 bits = durable boot session ID
 //   low  32 bits = millis() at capture
@@ -2632,86 +2642,89 @@ bool recordHasUnresolvedTimestamp(
     ) != 0;
 }
 
-bool recordIsValid(
+FirmwareLogic::RingRecordTimeEncoding recordTimeEncoding(
+    const BinaryTelemetryRecord& record
+)
+{
+    return FirmwareLogic::classifyRingRecordTimeEncoding(
+        record.schemaVersion,
+        record.flags,
+        record.epochSeconds,
+        RING_LEGACY_SCHEMA_VERSION,
+        RING_SCHEMA_VERSION,
+        RING_FLAG_TIME_UNRESOLVED,
+        1700000000ULL
+    );
+}
+
+bool recordHasLegacyUnresolvedTimestamp(
+    const BinaryTelemetryRecord& record
+)
+{
+    return (
+        recordTimeEncoding(
+            record
+        ) ==
+        FirmwareLogic::RingRecordTimeEncoding::LEGACY_UNRESOLVED_V1
+    );
+}
+
+FirmwareLogic::RingRecoveryDisposition recordRecoveryDisposition(
     const BinaryTelemetryRecord& record
 )
 {
     if (
         record.magic !=
             RING_MAGIC ||
-        record.schemaVersion !=
-            RING_SCHEMA_VERSION ||
         record.ordinal == 0 ||
         record.sequence == 0
     )
     {
-        return false;
+        return FirmwareLogic::RingRecoveryDisposition::CORRUPT;
     }
 
-    // Current schema recognizes only the cold-boot unresolved-time flag.
-    if (
-        (
-            record.flags &
-            static_cast<uint16_t>(
-                ~RING_FLAG_TIME_UNRESOLVED
-            )
-        ) != 0
-    )
-    {
-        return false;
-    }
-
-    if (
-        recordHasUnresolvedTimestamp(
-            record
-        )
-    )
-    {
-        uint32_t sessionId = 0;
-        uint32_t captureMonotonicMs = 0;
-
-        if (
-            !FirmwareLogic::unpackOfflineCaptureMetadata(
-                record.epochSeconds,
-                sessionId,
-                captureMonotonicMs
-            )
-        )
-        {
-            return false;
-        }
-    }
-    else if (
-        record.epochSeconds <
-            1700000000ULL
-    )
-    {
-        return false;
-    }
-
-    if (
-        !isfinite(
+    const bool measurementsFinite =
+        isfinite(
             record.vibrationRmsRaw
-        ) ||
-        !isfinite(
+        ) &&
+        isfinite(
             record.vibrationPeakHz
-        ) ||
-        !isfinite(
+        ) &&
+        isfinite(
             record.acousticRmsRaw
-        ) ||
-        !isfinite(
+        ) &&
+        isfinite(
             record.acousticPeakHz
-        )
-    )
-    {
-        return false;
-    }
+        );
 
-    return (
+    const bool crcMatches =
         record.crc32 ==
         calculateRecordCrc(
             record
-        )
+        );
+
+    return FirmwareLogic::classifyRingRecordForRecovery(
+        record.schemaVersion,
+        record.flags,
+        record.epochSeconds,
+        crcMatches,
+        measurementsFinite,
+        RING_LEGACY_SCHEMA_VERSION,
+        RING_SCHEMA_VERSION,
+        RING_FLAG_TIME_UNRESOLVED,
+        1700000000ULL
+    );
+}
+
+bool recordIsValid(
+    const BinaryTelemetryRecord& record
+)
+{
+    return (
+        recordRecoveryDisposition(
+            record
+        ) !=
+        FirmwareLogic::RingRecoveryDisposition::CORRUPT
     );
 }
 
@@ -3518,6 +3531,7 @@ enum class RecordToPacketResult
     READY,
     WAITING_FOR_TIME_ANCHOR,
     PREVIOUS_SESSION_TIME_UNRESOLVABLE,
+    LEGACY_UNRESOLVED_TIME,
     INVALID_RECORD
 };
 
@@ -3600,25 +3614,32 @@ RecordToPacketResult recordToPacket(
     packet.acousticPeakHz =
         record.acousticPeakHz;
 
-    if (
-        !recordHasUnresolvedTimestamp(
+    const FirmwareLogic::RingRecordTimeEncoding timeEncoding =
+        recordTimeEncoding(
             record
-        )
+        );
+
+    if (
+        timeEncoding ==
+        FirmwareLogic::RingRecordTimeEncoding::LEGACY_UNRESOLVED_V1
+    )
+    {
+        // The pre-migration PR #13 format contains no boot generation or
+        // monotonic capture time. Preserve it in isolation instead of
+        // interpreting epochSeconds=0 as packed metadata or inventing UTC.
+        return RecordToPacketResult::LEGACY_UNRESOLVED_TIME;
+    }
+
+    if (
+        timeEncoding ==
+        FirmwareLogic::RingRecordTimeEncoding::RESOLVED
     )
     {
         packet.epochSeconds =
             record.epochSeconds;
 
         packet.timestampResolved =
-            packet.epochSeconds >=
-            1700000000ULL;
-
-        if (
-            !packet.timestampResolved
-        )
-        {
-            return RecordToPacketResult::INVALID_RECORD;
-        }
+            true;
     }
     else
     {
@@ -3629,6 +3650,8 @@ RecordToPacketResult recordToPacket(
             0;
 
         if (
+            timeEncoding !=
+                FirmwareLogic::RingRecordTimeEncoding::PACKED_UNRESOLVED ||
             !FirmwareLogic::unpackOfflineCaptureMetadata(
                 record.epochSeconds,
                 recordSessionId,
@@ -3724,7 +3747,8 @@ enum class QueueReadResult
     EMPTY,
     IO_ERROR,
     WAITING_FOR_TIME_ANCHOR,
-    PREVIOUS_SESSION_TIME_UNRESOLVABLE
+    PREVIOUS_SESSION_TIME_UNRESOLVABLE,
+    LEGACY_UNRESOLVED_TIME
 };
 
 bool queueIsEmpty()
@@ -3889,6 +3913,14 @@ QueueReadResult readOldestPersistent(
         )
         {
             return QueueReadResult::PREVIOUS_SESSION_TIME_UNRESOLVABLE;
+        }
+
+        if (
+            conversion ==
+            RecordToPacketResult::LEGACY_UNRESOLVED_TIME
+        )
+        {
+            return QueueReadResult::LEGACY_UNRESOLVED_TIME;
         }
 
         // The file read succeeded but the record cannot satisfy the schema.
@@ -4174,6 +4206,9 @@ bool restoreQueueFromFlash()
     size_t corruptCount =
         0;
 
+    size_t legacyUnresolvedCount =
+        0;
+
     for (
         size_t slot = 0;
         slot < RING_SLOT_COUNT;
@@ -4262,6 +4297,15 @@ bool restoreQueueFromFlash()
         )
         {
             unresolvedTimestampCount++;
+
+            if (
+                recordHasLegacyUnresolvedTimestamp(
+                    record
+                )
+            )
+            {
+                legacyUnresolvedCount++;
+            }
         }
 
         minimumActiveOrdinal =
@@ -4359,6 +4403,13 @@ bool restoreQueueFromFlash()
         "[RECOVERY] Active unresolved timestamps: %u.\n",
         static_cast<unsigned int>(
             unresolvedTimestampCount
+        )
+    );
+
+    Serial.printf(
+        "[RECOVERY] Legacy v1 unresolved records pending migration: %u.\n",
+        static_cast<unsigned int>(
+            legacyUnresolvedCount
         )
     );
 
@@ -5132,8 +5183,8 @@ bool writeIsolationEnvelopeAtomic(
     // Avoid noisy VFS errors when the fixed-slot temp file does not
     // exist yet. This is expected on the first use of a slot.
     if (
-        LittleFS.exists(
-            tempPath.c_str()
+        fileExistsQuiet(
+            tempPath
         )
     )
     {
@@ -5209,20 +5260,54 @@ bool writeIsolationEnvelopeAtomic(
         unresolvedRecord != nullptr
     )
     {
+        const bool legacyV1 =
+            recordHasLegacyUnresolvedTimestamp(
+                *unresolvedRecord
+            );
+
         uint32_t sessionId = 0;
         uint32_t captureMonotonicMs = 0;
 
-        FirmwareLogic::unpackOfflineCaptureMetadata(
-            unresolvedRecord->epochSeconds,
-            sessionId,
-            captureMonotonicMs
-        );
+        if (!legacyV1)
+        {
+            FirmwareLogic::unpackOfflineCaptureMetadata(
+                unresolvedRecord->epochSeconds,
+                sessionId,
+                captureMonotonicMs
+            );
+        }
 
         file.print(",\n  \"unresolvedCapture\": {");
-        file.print("\n    \"sessionId\": ");
-        file.print(sessionId);
+        file.print("\n    \"ringSchemaVersion\": ");
+        file.print(unresolvedRecord->schemaVersion);
+        file.print(",\n    \"legacyV1\": ");
+        file.print(
+            legacyV1
+                ? "true"
+                : "false"
+        );
+        file.print(",\n    \"sessionId\": ");
+
+        if (legacyV1)
+        {
+            file.print("null");
+        }
+        else
+        {
+            file.print(sessionId);
+        }
+
         file.print(",\n    \"captureMonotonicMs\": ");
-        file.print(captureMonotonicMs);
+
+        if (legacyV1)
+        {
+            file.print("null");
+        }
+        else
+        {
+            file.print(captureMonotonicMs);
+        }
+
         file.print(",\n    \"vibrationRmsRaw\": ");
         file.print(unresolvedRecord->vibrationRmsRaw, 6);
         file.print(",\n    \"vibrationPeakHz\": ");
@@ -5275,13 +5360,18 @@ bool writeIsolationEnvelopeAtomic(
     verify.close();
 
     // Fixed-slot archive: the new temp file is fully written and verified
-    // before replacing the previous diagnostic occupying this slot. The
-    // source telemetry stays queued until rename succeeds.
+    // before replacing the previous diagnostic occupying this slot.
+    //
+    // Power-cut safety does NOT depend on this rename being atomic: every
+    // caller now owns a durable ring source and consumes it only after this
+    // function reports a verified successful replacement. Therefore a cut
+    // after destination deletion but before rename cannot lose telemetry.
+    //
     // The fixed slot may be unused on its first write. Only remove an
     // existing destination so LittleFS does not emit a false error log.
     if (
-        LittleFS.exists(
-            finalPath.c_str()
+        fileExistsQuiet(
+            finalPath
         )
     )
     {
@@ -5351,6 +5441,19 @@ bool saveUnresolvedRecordToIsolation(
     return writeIsolationEnvelopeAtomic(
         record.sequence,
         "UTC_UNRESOLVABLE_AFTER_REBOOT",
+        nullptr,
+        nullptr,
+        &record
+    );
+}
+
+bool saveLegacyUnresolvedRecordToIsolation(
+    const BinaryTelemetryRecord& record
+)
+{
+    return writeIsolationEnvelopeAtomic(
+        record.sequence,
+        "LEGACY_V1_UNRESOLVED_TIMESTAMP",
         nullptr,
         nullptr,
         &record
@@ -5594,6 +5697,49 @@ void replayQueueBatch()
 
             commitConsumedWatermark();
             return;
+        }
+
+        if (
+            readResult ==
+            QueueReadResult::LEGACY_UNRESOLVED_TIME
+        )
+        {
+            Serial.printf(
+                "[MIGRATION] Sequence %lu uses legacy schema-v1 unresolved timestamp encoding; preserving raw capture in isolation before consuming the ring source.\n",
+                static_cast<unsigned long>(
+                    rawRecord.sequence
+                )
+            );
+
+            if (
+                !saveLegacyUnresolvedRecordToIsolation(
+                    rawRecord
+                )
+            )
+            {
+                Serial.println(
+                    "[MIGRATION] Legacy isolation write failed; source record remains in ring."
+                );
+
+                commitConsumedWatermark();
+                return;
+            }
+
+            if (
+                !consumeHeadOrdinal(
+                    ordinal,
+                    true,
+                    rawRecord.sequence,
+                    false
+                )
+            )
+            {
+                commitConsumedWatermark();
+                return;
+            }
+
+            consumedThisBatch++;
+            continue;
         }
 
         if (
@@ -6531,6 +6677,38 @@ void loop()
             outcome.statusCode
         );
 
+        // Power-cut safety invariant:
+        // A freshly rejected packet has no ring source yet. Persist and
+        // read-back verify it in the ring BEFORE touching the replaceable
+        // isolation slot. If power fails while temp->final replacement is
+        // in progress, reboot recovery still owns the ring copy.
+        const bool ringDurable =
+            enqueuePersistent(
+                packet
+            );
+
+        if (
+            !FirmwareLogic::shouldAttemptRejectedArchiveAfterDurableRingWrite(
+                ringDurable
+            )
+        )
+        {
+            Serial.println(
+                "[CRITICAL] Rejected packet could not be made durable in the ring; isolation replacement was not attempted."
+            );
+
+            delay(
+                MEASUREMENT_INTERVAL_MS
+            );
+
+            return;
+        }
+
+        // This direct-send path is entered only when the backlog was empty,
+        // so the newly persisted packet is now the ring head.
+        const uint64_t durableOrdinal =
+            ringHeadOrdinal;
+
         const bool archived =
             saveImmediateRejectedPacket(
                 packet,
@@ -6538,25 +6716,37 @@ void loop()
             );
 
         if (
-            FirmwareLogic::shouldFallbackRejectedPacketToQueue(
+            !FirmwareLogic::shouldConsumeRejectedRingAfterArchive(
+                ringDurable,
                 archived
             )
         )
         {
             Serial.println(
-                "[REJECT] Isolation archive failed; preserving packet in the persistent ring instead of losing it."
+                "[REJECT] Isolation replacement incomplete; durable ring source remains queued for reboot/retry."
             );
 
-            if (
-                !enqueuePersistent(
-                    packet
-                )
+            delay(
+                MEASUREMENT_INTERVAL_MS
+            );
+
+            return;
+        }
+
+        if (
+            !consumeHeadOrdinal(
+                durableOrdinal,
+                false,
+                packet.sequence,
+                true
             )
-            {
-                Serial.println(
-                    "[CRITICAL] Rejected packet could not be archived OR queued."
-                );
-            }
+        )
+        {
+            // Archive is already durable. Leaving an extra ring copy is safe
+            // and recovery may replay/isolate it again idempotently.
+            Serial.println(
+                "[REJECT] Archive is durable but ring consume did not complete; duplicate recovery is safe."
+            );
         }
 
         delay(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import threading
 import unittest
 
@@ -281,12 +282,39 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
             "deviceId": "DEVICE-01",
             "vibrationRmsRaw": 3.0,
             "source": "prototype",
+            "rpm": None,
         }
 
         lifecycle.process_point(first_point, telemetry_payload=first_payload)
         self.assertEqual(
             lifecycle.process_point(first_point, telemetry_payload=retried_payload), []
         )
+
+    def test_same_device_orders_sequence_before_received_at(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=2))
+        lifecycle.process_point(
+            point(
+                "2026-08-31T00:00:00Z",
+                80,
+                deviceId="DEVICE-01",
+                sequence=1,
+                receivedAt="2026-08-31T00:00:10Z",
+                vibrationRmsRaw=3.0,
+            )
+        )
+
+        started = lifecycle.process_point(
+            point(
+                "2026-08-31T00:00:00Z",
+                80,
+                deviceId="DEVICE-01",
+                sequence=2,
+                receivedAt="2026-08-31T00:00:05Z",
+                vibrationRmsRaw=4.0,
+            )
+        )
+
+        self.assertEqual(started[0]["kind"], "asset_event_started")
 
     def test_persistence_failure_does_not_commit_idempotency_checkpoint(self) -> None:
         lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
@@ -490,6 +518,56 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
 
         self.assertEqual(updates[0]["kind"], "sensor_fault_suppressed")
         self.assertEqual(updates[1]["kind"], "asset_event_closed")
+
+    def test_sensor_fault_default_reason_matches_explicit_reason_identity(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        record = point("2026-08-31T00:00:00Z", 80)
+
+        lifecycle.process_point(record, sensor_fault=True)
+        self.assertEqual(
+            lifecycle.process_point(
+                record,
+                sensor_fault=True,
+                sensor_fault_reason="sensor_fault_detected",
+            ),
+            [],
+        )
+
+    def test_snapshot_version_two_rejects_missing_and_invalid_state(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        lifecycle.process_point(point("2026-08-31T00:00:00Z", 80))
+        snapshot = lifecycle.snapshot()
+
+        missing_history = copy.deepcopy(snapshot)
+        del missing_history["processedTelemetry"]
+        with self.assertRaises(ValueError):
+            AnomalyEventLifecycle.from_snapshot(missing_history)
+
+        invalid_candidate = copy.deepcopy(snapshot)
+        invalid_candidate["assets"]["SITE-01-MOT-02"]["candidateCount"] = -1
+        with self.assertRaises(ValueError):
+            AnomalyEventLifecycle.from_snapshot(invalid_candidate)
+
+        invalid_event = copy.deepcopy(snapshot)
+        invalid_event["assets"]["SITE-01-MOT-02"]["openEvent"][
+            "endAt"
+        ] = "2026-08-31T00:00:00Z"
+        with self.assertRaises(ValueError):
+            AnomalyEventLifecycle.from_snapshot(invalid_event)
+
+    def test_persistence_callback_reentry_is_rejected_without_overwriting_state(
+        self,
+    ) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        record = point("2026-08-31T00:00:00Z", 80)
+
+        def persist(_: dict[str, object], __: list[dict[str, object]]) -> None:
+            with self.assertRaisesRegex(RuntimeError, "cannot be called"):
+                lifecycle.process_point(point("2026-08-31T00:00:05Z", 90))
+
+        lifecycle.process_point(record, persist_transaction=persist)
+        state = lifecycle.snapshot()["assets"]["SITE-01-MOT-02"]
+        self.assertEqual(state["openEvent"]["startAt"], "2026-08-31T00:00:00Z")
 
     def test_expected_revision_provides_compare_and_swap_boundary(self) -> None:
         lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))

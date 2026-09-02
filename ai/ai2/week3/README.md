@@ -42,9 +42,12 @@ AI-1이 계산한 기준선·임계값과 AI-2 2주차의 `anomalyScore`를 입�
 - 동시성: 단일 프로세스에서는 read-copy-persist-commit 구간을 lifecycle lock으로 직렬화한다.
   저장 콜백에는 다음 revision과 `expectedRevision`이 포함된 checkpoint가 전달된다. 다중
   프로세스 저장소는 이 값을 CAS 조건으로 사용하고, 충돌 시 최신 snapshot을 복구한 후 재시도한다.
-- 동일 시각: 자산별 처리 순서는 `(timestamp, receivedAt, deviceId, sequence)` 오름차순이다.
-  이 순서를 벗어난 point는 거부한다. 규칙 설정이 달라진 snapshot을 복구하면 pending entry와
-  exit streak를 초기화한다.
+- 동일 시각: 같은 장치는 `(sequence, receivedAt)` 순서를, 서로 다른 장치는
+  `(receivedAt, deviceId, sequence)` 순서를 적용한다. 이 순서를 벗어난 point는 거부한다.
+  규칙 설정이 달라진 snapshot을 복구하면 pending entry와 exit streak를 초기화한다.
+- snapshot: schema version 2는 revision·config·assets·전역 멱등성 이력·watermark를 모두
+  필수로 저장하며, 복구 시 RFC3339 시각·유한 점수·이벤트 상태 불변식을 검증한다. persistence
+  callback 안에서 같은 lifecycle의 `process_point()` 재호출은 실패 처리한다.
 
 실제 값은 AI-1의 설비별 `scoreThreshold`, 지속 조건, 히스테리시스 규칙을 받아
 `EventLifecycleConfig`로 주입한다.

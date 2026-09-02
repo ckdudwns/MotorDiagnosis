@@ -164,7 +164,7 @@ def _point_identity(
 
 def _normalize_api_telemetry_identity(payload: dict[str, Any]) -> dict[str, Any]:
     """Mirror the API v1.2 normalization used before its payload hash."""
-    normalized = dict(payload)
+    normalized = {key: payload.get(key) for key in RAW_TELEMETRY_FIELDS}
     for key in ("siteId", "assetId", "deviceId"):
         value = normalized.get(key)
         if isinstance(value, str):
@@ -185,6 +185,8 @@ def _normalize_api_telemetry_identity(payload: dict[str, Any]) -> dict[str, Any]
         value = normalized.get(key)
         if isinstance(value, str):
             normalized[key] = value.strip() or None
+    normalized["vibrationRmsMmS"] = None
+    normalized["acousticDb"] = None
     return normalized
 
 
@@ -245,6 +247,22 @@ def _processing_key(
     return timestamp, received_timestamp, normalized_device_id, normalized_sequence
 
 
+def _is_processing_key_ordered(
+    previous: tuple[datetime, datetime, str, int],
+    current: tuple[datetime, datetime, str, int],
+) -> bool:
+    """Apply the contract order without comparing sequences across devices."""
+    if current[0] != previous[0]:
+        return current[0] > previous[0]
+    if current[2] == previous[2]:
+        return (current[3], current[1]) > (previous[3], previous[1])
+    return (current[1], current[2], current[3]) > (
+        previous[1],
+        previous[2],
+        previous[3],
+    )
+
+
 def _event_view(event: dict[str, Any]) -> dict[str, Any]:
     """Return an external event without lifecycle-only precision fields."""
     return {key: value for key, value in event.items() if not key.startswith("_")}
@@ -276,6 +294,8 @@ def _history_from_snapshot(
             or isinstance(sequence, bool)
             or not isinstance(sequence, int)
             or not isinstance(identity, list)
+            or len(identity) != 2
+            or not all(isinstance(value, str) for value in identity)
         ):
             raise ValueError("snapshot processedTelemetry entry is invalid.")
         history[(device_id, sequence)] = tuple(identity)
@@ -352,6 +372,95 @@ def _snapshot_revision(snapshot: dict[str, Any]) -> int:
     return revision
 
 
+def _snapshot_count(stored: dict[str, Any], key: str) -> int:
+    value = stored.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"snapshot {key} must be a non-negative integer.")
+    return value
+
+
+def _snapshot_score(stored: dict[str, Any], key: str) -> float:
+    value = stored.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"snapshot {key} must be a finite score.")
+    score = float(value)
+    if not math.isfinite(score) or not 0 <= score <= 100:
+        raise ValueError(f"snapshot {key} must be a finite score from 0 to 100.")
+    return score
+
+
+def _snapshot_optional_timestamp(stored: dict[str, Any], key: str) -> str | None:
+    value = stored.get(key)
+    if value is None:
+        return None
+    _parse_timestamp(value)
+    return value
+
+
+def _snapshot_event(value: object, expected_status: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("snapshot event must be an object or null.")
+    required = {
+        "id",
+        "assetId",
+        "startAt",
+        "endAt",
+        "status",
+        "endReason",
+        "maxScore",
+        "_maxScoreRaw",
+        "lastScore",
+        "sampleCount",
+        "mergeCount",
+        "thresholdVersion",
+        "modelVersion",
+        "maxScoreModelVersion",
+        "classification",
+    }
+    if not required.issubset(value):
+        raise ValueError("snapshot event is missing required fields.")
+    if value["status"] != expected_status:
+        raise ValueError("snapshot event status is invalid for its state.")
+    for key in (
+        "id",
+        "assetId",
+        "startAt",
+        "thresholdVersion",
+        "modelVersion",
+        "maxScoreModelVersion",
+        "classification",
+    ):
+        if not isinstance(value[key], str) or not value[key].strip():
+            raise ValueError(f"snapshot event {key} must be a non-empty string.")
+    _parse_timestamp(value["startAt"])
+    _snapshot_score(value, "maxScore")
+    _snapshot_score(value, "_maxScoreRaw")
+    _snapshot_score(value, "lastScore")
+    if round(float(value["_maxScoreRaw"])) != value["maxScore"]:
+        raise ValueError("snapshot event maxScore does not match _maxScoreRaw.")
+    for key in ("sampleCount", "mergeCount"):
+        if (
+            isinstance(value[key], bool)
+            or not isinstance(value[key], int)
+            or value[key] < 0
+        ):
+            raise ValueError(f"snapshot event {key} must be a non-negative integer.")
+    if value["sampleCount"] < 1:
+        raise ValueError("snapshot event sampleCount must be at least one.")
+    if expected_status == "open":
+        if value["endAt"] is not None or value["endReason"] is not None:
+            raise ValueError("snapshot open event must not have end fields.")
+    else:
+        _parse_timestamp(value["endAt"])
+        if not isinstance(value["endReason"], str) or not value["endReason"].strip():
+            raise ValueError("snapshot closed event must have endReason.")
+        if _parse_timestamp(value["endAt"]) < _parse_timestamp(value["startAt"]):
+            raise ValueError("snapshot event endAt must not precede startAt.")
+    return copy.deepcopy(value)
+
+
 class AnomalyEventLifecycle:
     """Create, merge, and close asset events from chronological score points.
 
@@ -373,6 +482,7 @@ class AnomalyEventLifecycle:
         self._sequence_watermarks: OrderedDict[str, tuple[datetime, int]] = (
             OrderedDict()
         )
+        self._is_persisting = False
 
     def snapshot(self) -> dict[str, Any]:
         """Return a JSON-serializable checkpoint for durable lifecycle storage."""
@@ -393,6 +503,16 @@ class AnomalyEventLifecycle:
         """Restore a lifecycle after restart from :meth:`snapshot` output."""
         if not isinstance(snapshot, dict) or snapshot.get("schemaVersion") != 2:
             raise ValueError("snapshot schemaVersion must be 2.")
+        required_snapshot_fields = {
+            "schemaVersion",
+            "revision",
+            "config",
+            "assets",
+            "processedTelemetry",
+            "sequenceWatermarks",
+        }
+        if not required_snapshot_fields.issubset(snapshot):
+            raise ValueError("snapshot is missing required version 2 fields.")
         snapshot_config = snapshot.get("config")
         if not isinstance(snapshot_config, dict):
             raise ValueError("snapshot config is required.")
@@ -407,6 +527,12 @@ class AnomalyEventLifecycle:
             if not isinstance(asset_id, str) or not isinstance(stored_state, dict):
                 raise ValueError("snapshot asset state is invalid.")
             restored_state = lifecycle._state_from_snapshot(stored_state)
+            for event in (
+                restored_state.open_event,
+                restored_state.latest_closed_event,
+            ):
+                if event is not None and event["assetId"] != asset_id:
+                    raise ValueError("snapshot event assetId does not match its state.")
             if config != snapshot_rule:
                 lifecycle._reset_entry_candidate(restored_state)
                 restored_state.exit_count = 0
@@ -474,32 +600,92 @@ class AnomalyEventLifecycle:
 
     @staticmethod
     def _state_from_snapshot(stored: dict[str, Any]) -> _AssetState:
-        last_processed_at = stored.get("lastProcessedAt")
+        required_state_fields = {
+            "candidateCount",
+            "candidateStartAt",
+            "candidateStartModelVersion",
+            "candidateMaxScore",
+            "candidateMaxScoreModelVersion",
+            "exitCount",
+            "exitStartAt",
+            "openEvent",
+            "latestClosedEvent",
+            "lastProcessedAt",
+            "lastPointIdentity",
+            "lastProcessingKey",
+        }
+        if not required_state_fields.issubset(stored):
+            raise ValueError("snapshot asset state is missing required fields.")
+        candidate_count = _snapshot_count(stored, "candidateCount")
+        exit_count = _snapshot_count(stored, "exitCount")
+        candidate_start_at = _snapshot_optional_timestamp(stored, "candidateStartAt")
+        exit_start_at = _snapshot_optional_timestamp(stored, "exitStartAt")
+        candidate_start_model = stored["candidateStartModelVersion"]
+        candidate_max_model = stored["candidateMaxScoreModelVersion"]
+        for value in (candidate_start_model, candidate_max_model):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError("snapshot candidate model version is invalid.")
+        candidate_max_score = _snapshot_score(stored, "candidateMaxScore")
+        if candidate_count == 0 and any(
+            value is not None
+            for value in (
+                candidate_start_at,
+                candidate_start_model,
+                candidate_max_model,
+            )
+        ):
+            raise ValueError(
+                "snapshot empty candidate must not retain candidate fields."
+            )
+        if candidate_count > 0 and any(
+            value is None
+            for value in (
+                candidate_start_at,
+                candidate_start_model,
+                candidate_max_model,
+            )
+        ):
+            raise ValueError("snapshot pending candidate is incomplete.")
+        open_event = _snapshot_event(stored["openEvent"], "open")
+        latest_closed_event = _snapshot_event(stored["latestClosedEvent"], "closed")
+        if exit_count > 0 and (open_event is None or exit_start_at is None):
+            raise ValueError("snapshot exit streak is incomplete.")
+        if exit_count == 0 and exit_start_at is not None:
+            raise ValueError("snapshot empty exit streak must not have a start time.")
+        last_processed_at = _snapshot_optional_timestamp(stored, "lastProcessedAt")
+        identity = stored["lastPointIdentity"]
+        if identity is not None and (
+            not isinstance(identity, list)
+            or len(identity) != 2
+            or not all(isinstance(value, str) for value in identity)
+        ):
+            raise ValueError("snapshot lastPointIdentity is invalid.")
+        last_processing_key = _processing_key_from_snapshot(stored["lastProcessingKey"])
+        if (last_processed_at is None) != (last_processing_key is None):
+            raise ValueError(
+                "snapshot lastProcessedAt and order key must both be present."
+            )
+        if last_processed_at is not None and (
+            _parse_timestamp(last_processed_at) != last_processing_key[0]
+        ):
+            raise ValueError("snapshot lastProcessedAt and order key do not match.")
         return _AssetState(
-            candidate_count=int(stored.get("candidateCount", 0)),
-            candidate_start_at=stored.get("candidateStartAt"),
-            candidate_start_model_version=stored.get("candidateStartModelVersion"),
-            candidate_max_score=float(stored.get("candidateMaxScore", 0.0)),
-            candidate_max_score_model_version=stored.get(
-                "candidateMaxScoreModelVersion"
-            ),
-            exit_count=int(stored.get("exitCount", 0)),
-            exit_start_at=stored.get("exitStartAt"),
-            open_event=copy.deepcopy(stored.get("openEvent")),
-            latest_closed_event=copy.deepcopy(stored.get("latestClosedEvent")),
+            candidate_count=candidate_count,
+            candidate_start_at=candidate_start_at,
+            candidate_start_model_version=candidate_start_model,
+            candidate_max_score=candidate_max_score,
+            candidate_max_score_model_version=candidate_max_model,
+            exit_count=exit_count,
+            exit_start_at=exit_start_at,
+            open_event=open_event,
+            latest_closed_event=latest_closed_event,
             last_processed_at=(
                 _parse_timestamp(last_processed_at)
                 if last_processed_at is not None
                 else None
             ),
-            last_point_identity=(
-                tuple(stored["lastPointIdentity"])
-                if isinstance(stored.get("lastPointIdentity"), list)
-                else None
-            ),
-            last_processing_key=_processing_key_from_snapshot(
-                stored.get("lastProcessingKey")
-            ),
+            last_point_identity=tuple(identity) if identity is not None else None,
+            last_processing_key=last_processing_key,
         )
 
     def _remember_telemetry(
@@ -558,18 +744,29 @@ class AnomalyEventLifecycle:
         score = _finite_score(point)
         asset_id = asset_id.strip().upper()
         idempotency_payload = telemetry_payload or point
+        effective_sensor_fault_reason = (
+            sensor_fault_reason.strip()
+            if sensor_fault
+            and isinstance(sensor_fault_reason, str)
+            and sensor_fault_reason.strip()
+            else "sensor_fault_detected"
+        )
         point_identity = _point_identity(
             idempotency_payload,
             point,
             parsed_timestamp,
             score,
             sensor_fault,
-            sensor_fault_reason,
+            effective_sensor_fault_reason if sensor_fault else None,
         )
         telemetry_key = _telemetry_key(idempotency_payload)
         processing_key = _processing_key(point, idempotency_payload, parsed_timestamp)
 
         with self._lock:
+            if self._is_persisting:
+                raise RuntimeError(
+                    "process_point cannot be called from persist_transaction."
+                )
             if expected_revision is not None and expected_revision != self._revision:
                 raise ValueError(
                     "expectedRevision does not match the current checkpoint."
@@ -595,23 +792,26 @@ class AnomalyEventLifecycle:
                         "sequence must not decrease for the same device and timestamp."
                     )
             if (
-                state.last_processing_key is not None
-                and processing_key < state.last_processing_key
-            ):
-                raise ValueError(
-                    "point order must increase by timestamp, receivedAt, deviceId, sequence."
-                )
-            if (
                 processing_key == state.last_processing_key
                 and point_identity == state.last_point_identity
             ):
                 return []
+            if (
+                state.last_processing_key is not None
+                and processing_key != state.last_processing_key
+                and not _is_processing_key_ordered(
+                    state.last_processing_key, processing_key
+                )
+            ):
+                raise ValueError(
+                    "point order must increase by timestamp, receivedAt, deviceId, sequence."
+                )
             if sensor_fault:
                 updates = self._suppress_for_sensor_fault(
                     state,
                     asset_id,
                     str(timestamp),
-                    sensor_fault_reason or "sensor_fault_detected",
+                    effective_sensor_fault_reason,
                 )
             elif score is None:
                 self._reset_entry_candidate(state)
@@ -645,7 +845,11 @@ class AnomalyEventLifecycle:
             )
             checkpoint["expectedRevision"] = self._revision
             if persist_transaction is not None:
-                persist_transaction(checkpoint, copy.deepcopy(updates))
+                self._is_persisting = True
+                try:
+                    persist_transaction(checkpoint, copy.deepcopy(updates))
+                finally:
+                    self._is_persisting = False
             self._states = candidate_states
             self._processed_telemetry = history
             self._sequence_watermarks = watermarks

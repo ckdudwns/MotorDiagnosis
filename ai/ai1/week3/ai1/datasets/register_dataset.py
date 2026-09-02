@@ -645,6 +645,7 @@ def build_manifest(
         holdout_type = "specimen"
         independent_holdout = True
         recorded_split_ratios = split_ratios
+        recorded_seed = seed
     else:  # operating_condition_holdout
         # [리뷰 P1] operating_condition_split은 부하 tier로 배정을 고정하고
         # split_ratios 인자를 완전히 무시한다(시그니처 호환용). 그런데 예전
@@ -656,6 +657,12 @@ def build_manifest(
         holdout_type = "operating_condition"
         independent_holdout = False
         recorded_split_ratios = None  # split_counts 계산 후 채운다
+        # [리뷰 P2] operating_condition_split은 seed를 전혀 쓰지 않는다(부하 tier로
+        # 배정이 고정). 그런데 체크섬 payload에는 호출자의 seed가 그대로 들어가서,
+        # 실제 rows/split이 완전히 동일해도 seed만 바꾸면 다른 checksum/id가 나왔다
+        # (버전 identity가 결과에 영향 없는 입력에 좌우됨). 이 전략에서는 seed를
+        # canonical 값(None)으로 정규화해 checksum 입력에서 사실상 제외한다.
+        recorded_seed = None
 
     rows = []
     for rec, split in zip(records, splits):
@@ -694,16 +701,17 @@ def build_manifest(
             name: split_counts[name] / total for name in ("train", "validation", "test")
         }
 
+    feature_output_fingerprint = compute_feature_output_fingerprint(rows)
     version_checksum = compute_version_checksum(
         source["files"],
         window_size,
         hop_size,
         recorded_split_ratios,
-        seed,
+        recorded_seed,
         LABEL_TAXONOMY_VERSION,
         DATASET_LABEL_MAPPING,
         config,
-        compute_feature_output_fingerprint(rows),
+        feature_output_fingerprint,
         label_policy_version=LABEL_POLICY_VERSION,
         snapshot_schema_version=SNAPSHOT_SCHEMA_VERSION,
         split_strategy=split_strategy,
@@ -727,6 +735,11 @@ def build_manifest(
         "labelMapping": DATASET_LABEL_MAPPING,
         "labelPolicyVersion": LABEL_POLICY_VERSION,
         "snapshotSchemaVersion": SNAPSHOT_SCHEMA_VERSION,
+        # [리뷰 P1, 2차] rows만으로 재계산 가능한 fingerprint. dataset_version.py의
+        # freeze_dataset_version()이 동결 직전에 이 값을 rows에서 다시 계산해
+        # 대조한다 — build 이후 rows/라벨이 바뀐 draft가 (재계산 없이 복사된) 이전
+        # source.checksum/id로 동결·승인되는 것을 막는다.
+        "featureOutputFingerprint": feature_output_fingerprint,
         "split": recorded_split_ratios,
         "splitStrategy": _SPLIT_STRATEGY_TEXT[split_strategy],
         "holdoutType": holdout_type,

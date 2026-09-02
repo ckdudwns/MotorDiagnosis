@@ -78,14 +78,32 @@ draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다
 ### 신규 동결 필수 필드 · v1 호환 (리뷰 P1)
 
 `freeze_dataset_version()`은 **신규 draft에 `labelPolicyVersion`·`snapshotSchemaVersion`·
-`source.checksum`이 없으면 거부**한다 — "이미 동결된 v1을 유지"하는 것과 "구형 draft를
-지금 새로 동결"하는 것은 다른 요구사항이다. 이미 커밋된 v1 frozen(이 필드·`snapshotDigest`
-없음)은 재동결하지 않고 `approve`/`verify_reproducibility`/`dataset_version_summary`가
-관용 처리한다. `is_legacy_v1_frozen(frozen)`은 **`snapshotSchemaVersion` 필드의 존재
-여부만으로** v1/v1.3을 구분한다(별도 migration 함수는 없음) — `snapshotDigest`의 존재
-여부로 판별하면 v1.3 동결본에서 digest만 지워서 legacy 관용 경로(느슨한 `datasetChecksum`
-검증)로 강등시킬 수 있어(리뷰 P1) 의도적으로 이 필드는 판별 기준에서 뺐다. v1.3 동결본은
-`snapshotDigest`가 없는 것 자체가 무결성 오류다.
+`source.checksum`·`featureOutputFingerprint`가 없으면 거부**한다 — "이미 동결된 v1을
+유지"하는 것과 "구형 draft를 지금 새로 동결"하는 것은 다른 요구사항이다.
+
+**legacy(v1) 판별은 매니페스트 필드로 하지 않는다 (리뷰 P1, 2차).** 처음엔 `snapshotDigest`
+부재로, 그다음엔 `snapshotSchemaVersion` 부재로 legacy를 판별했는데, 두 시도 모두
+"매니페스트에서 그 필드(들)만 지우면 legacy 관용 경로로 강등된다"는 같은 구조의 우회를
+허용했다(매니페스트는 호출자가 자유롭게 수정 가능한 데이터라서, 판별 기준으로 쓰는 필드가
+무엇이든 함께 지우면 우회된다). 그래서 `approve_dataset_version`/`verify_frozen_integrity`/
+`verify_reproducibility`는 이제 매니페스트를 보고 추정하지 않고, 호출자가 매니페스트
+**바깥의** 신뢰 가능한 저장소(최초 동결 시점에 별도로 기록해 둔 스키마 버전 메타데이터 등)
+에서 확인한 사실을 `trusted_legacy=True`로 명시적으로 전달할 때만 legacy 완화 검증
+(`datasetChecksum` 폴백)을 적용한다. 기본값(`trusted_legacy=False`)에서는 항상 v1.3 엄격
+검증을 적용하므로, schema/digest가 없는 레코드는 legacy로 봐주지 않고 무조건 거부한다.
+`is_legacy_v1_frozen(frozen)`은 이제 순수 정보성 추정 함수로만 남는다(무결성 검증에는
+쓰이지 않음).
+
+### `featureOutputFingerprint` — draft의 id/checksum이 현재 rows를 정직하게 반영하는지 (리뷰 P1, 2차)
+
+`build_manifest()`가 계산하는 `source.checksum`(및 거기서 파생된 `id`)은 원본 파일·전처리
+설정·**실제 산출된 rows**로 결정된다. 그런데 `freeze_dataset_version()`은 이 값을
+재검증 없이 그대로 복사만 했다 — draft를 만든 뒤 `id`/`source.checksum`은 그대로 둔 채
+`rows`(라벨 등)만 바꿔도 동결이 통과해서, 서로 다른 rows(그래서 다른 `datasetChecksum`)를
+가진 두 데이터셋이 같은 `id`·`snapshotChecksum`으로 모두 승인될 수 있었다.
+`featureOutputFingerprint`는 rows만으로 결정되는 값(원본 파일 접근 불필요)이라, freeze
+시점에 draft가 신고한 값과 현재 rows에서 다시 계산한 값을 대조해 build 이후 rows가 바뀐
+draft의 동결을 거부한다.
 
 ## `snapshotDigest` — 전체 불변 필드 변조 탐지 (리뷰 P1)
 
@@ -99,14 +117,14 @@ draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다
 - `freeze`가 `frozen["snapshotDigest"]`를 저장한다(v1.3 필드 세팅 후).
 - `approve`는 `datasetChecksum`(v1 호환) **+** `snapshotDigest`를 모두 재검증하고,
   둘 중 하나라도 어긋나면 승인을 거부한다.
-- `verify_frozen_integrity(frozen)`는 같은 검증을 학습·배포 시작 전에 하도록 노출한
-  함수다 — 하류(`train_and_evaluate.run_training_job`)가 `status=="frozen"`만 보지 않고
-  이걸 호출한다. v1(legacy) frozen에만 `datasetChecksum`으로 폴백하고, v1.3
-  동결본(`snapshotSchemaVersion` 보유)은 `snapshotDigest`가 없으면 그 자체로 거부한다.
-- `verify_reproducibility(frozen, recomputed)`도 v1.3 동결본에는 `datasetChecksum`뿐
-  아니라 `labelPolicyVersion`/`snapshotSchemaVersion`/원본 `source.checksum`까지 함께
-  대조한다 — rows/labelMapping/split만 같고 원본·정책 버전이 다른 데이터셋을 "재현
-  성공"으로 오판하지 않도록.
+- `verify_frozen_integrity(frozen, *, trusted_legacy=False)`는 같은 검증을 학습·배포
+  시작 전에 하도록 노출한 함수다 — 하류(`train_and_evaluate.run_training_job`)가
+  `status=="frozen"`만 보지 않고 이걸 호출한다. `trusted_legacy=True`일 때만
+  `datasetChecksum`으로 폴백하고, 기본값에서는 `snapshotDigest`가 없으면 그 자체로 거부한다.
+- `verify_reproducibility(frozen, recomputed, *, trusted_legacy=False)`도 기본값에서는
+  `datasetChecksum`뿐 아니라 `labelPolicyVersion`/`snapshotSchemaVersion`/원본
+  `source.checksum`까지 함께 대조한다 — rows/labelMapping/split만 같고 원본·정책 버전이
+  다른 데이터셋을 "재현 성공"으로 오판하지 않도록.
 
 ## `checksum` vs `digest` 역할 구분
 
@@ -145,11 +163,16 @@ P1) — 불완전한 레코드가 승인 상태까지 조용히 전이되는 것
 target이 **실제로 이전 승인 버전**인지 검증한다 (리뷰 P1):
 
 - `target.status == "approved"` 이고 `current.version != target.version` (자기 롤백 금지)
-- `approved_history`가 주어지면 target/current가 그 안에서 유일한 버전으로 존재해야
-  하고, **배열의 index 순서가 아니라 각 항목의 `approvedAt`을 실제로 파싱해(UTC 정규화)
-  시간순으로 비교**한다 — history가 시간 역순으로 전달돼도 forward rollback을 막는다
-  (예전에는 배열 index로 계보 순서를 판단해 역순 배열을 넘기면 우회됐다). `approved_history`가
-  없으면 `target.approvedAt < current.approvedAt`(마찬가지로 실제 파싱값)를 요구해 더
+- `approved_history`가 주어지면 target/current가 그 안에서 **정확히 한 건의 승인
+  (`status == "approved"`) canonical 레코드**로 존재해야 한다(리뷰 P1, 2차) — 계보에
+  없으면 호출자가 넘긴 current/target 객체 자체의 값으로 대체하지 않고 무조건 거부한다
+  (예전에는 current가 계보에 없으면 current 객체 자체의 `approvedAt`으로 대체해서,
+  실제로는 `registered` 상태인 current에 `approvedAt`만 위조해 넣고 history에는 target만
+  넣는 방식으로 계보 검증 전체를 우회할 수 있었다). 그다음 각 항목의 `approvedAt`을
+  실제로 파싱해(UTC 정규화) **배열의 index 순서가 아니라 시간순으로 비교**한다 — history가
+  시간 역순으로 전달돼도 forward rollback을 막는다(이전에는 배열 index로 계보 순서를
+  판단해 역순 배열을 넘기면 우회됐다). `approved_history`가 없으면 `target.approvedAt <
+  current.approvedAt`(마찬가지로 실제 파싱값)를 요구해 더
   최신/동일 버전으로의 "롤백"을 차단한다.
 - 반환 레코드에 `targetApprovedAt`를 함께 남긴다.
 

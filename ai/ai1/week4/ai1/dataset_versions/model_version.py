@@ -154,37 +154,40 @@ def rollback_model_version(
         if len(set(versions)) != len(versions):
             raise ValueError(f"approved_history에 중복 버전이 있습니다: {versions}")
 
-        target_entries = [
-            item for item in approved_history if item.get("version") == target["version"]
-        ]
-        if not target_entries:
-            raise ValueError(
-                f"target {target['version']!r}이 승인 계보에 없습니다: {versions}"
-            )
-        target_approved_at_raw = target_entries[0].get("approvedAt")
+        def _canonical_entry(label: str, subject: dict) -> dict:
+            # [리뷰 P1, 2차] history가 주어지면 current/target 모두 그 안에서
+            # 정확히 한 건의 **승인된** canonical 레코드로 존재해야 한다. 이전에는
+            # current가 계보에 없으면 호출자가 넘긴 current 객체 자체의
+            # approvedAt으로 대체했는데, 그러면 실제로는 registered 상태인
+            # current에 approvedAt만 위조해 심어 놓고 history에는 target만 넣는
+            # 방식으로 계보 검증을 완전히 우회할 수 있었다. 계보가 주어졌다면
+            # 계보 밖 값으로 대체하지 않고 무조건 거부한다.
+            entries = [
+                item for item in approved_history if item.get("version") == subject.get("version")
+            ]
+            if not entries:
+                raise ValueError(
+                    f"{label} {subject.get('version')!r}이 승인 계보에 없습니다: {versions}. "
+                    "계보가 주어지면 호출자 객체 자체의 값으로 대체하지 않습니다."
+                )
+            entry = entries[0]
+            if entry.get("status") != "approved":
+                raise ValueError(
+                    f"{label} {subject.get('version')!r}의 계보 레코드가 승인(approved) "
+                    f"상태가 아닙니다 (status={entry.get('status')!r})."
+                )
+            return entry
+
+        target_entry = _canonical_entry("target", target)
+        current_entry = _canonical_entry("current", current)
+
+        target_approved_at_raw = target_entry.get("approvedAt")
         target_approved_at_dt = _parse_utc(
             target_approved_at_raw, context=f"target({target['version']!r})"
         )
-
-        current_entries = [
-            item for item in approved_history if item.get("version") == current["version"]
-        ]
-        if current_entries:
-            current_approved_at_dt = _parse_utc(
-                current_entries[0].get("approvedAt"),
-                context=f"current({current['version']!r})",
-            )
-        elif current.get("approvedAt"):
-            # current가 계보 목록에 없으면(예: 아직 목록에 반영 안 된 최신 배포)
-            # 자체 approvedAt으로 비교한다.
-            current_approved_at_dt = _parse_utc(
-                current.get("approvedAt"), context=f"current({current['version']!r})"
-            )
-        else:
-            raise ValueError(
-                f"current {current['version']!r}가 승인 계보에 없고 자체 approvedAt도 "
-                "없어 계보를 검증할 수 없습니다."
-            )
+        current_approved_at_dt = _parse_utc(
+            current_entry.get("approvedAt"), context=f"current({current['version']!r})"
+        )
 
         if target_approved_at_dt >= current_approved_at_dt:
             raise ValueError(

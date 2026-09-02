@@ -125,8 +125,12 @@ sha256(`artifactChecksum`)이, 최상위에는 검증에 쓴 `datasetSnapshotDig
 `torch.load()`는 threshold 등 내용이 변조된 아티팩트도 오류 없이 그대로 읽어버리므로,
 checksum 검증 없이는 변조된 임계값·가중치가 그대로 추론에 쓰인다. 이어서 입력 열 이름을
 artifact에 저장된 학습 시점 순서와 대조한다: 특징 집합이 다르면 거부, 순서만 다르면 이름
-기준 재정렬, 열 개수 불일치·NaN/Inf도 거부. 재로딩 전후 판정이 학습 때 (비독립) test
-지표와 일치함을 테스트로 검증한다.
+기준 재정렬, 열 개수 불일치·NaN/Inf도 거부. 모델별 입력 **rank(차원 수)**도 검증한다
+(리뷰 P1, 2차) — `dense_autoencoder`는 `ndim == 2`, `lstm_autoencoder`는 `ndim == 3`
+**및** 시퀀스 길이(`shape[-2]`)가 아티팩트에 저장된 `seq_len`과 같아야 한다. 이전에는
+마지막(특징) 축만 봐서 Dense에 1차원/3차원 입력을, LSTM에 다른 길이의 시퀀스를 넣어도
+조용히 판정이 나왔다. 재로딩 전후 판정이 학습 때 (비독립) test 지표와 일치함을 테스트로
+검증한다.
 
 ## 도메인 차이·현장 보정 계획 (`domainGap` / `fieldCalibrationPlan`)
 

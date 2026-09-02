@@ -800,6 +800,42 @@ class TestExportDatasetSynthetic(unittest.TestCase):
             exported["trainingEligibleCount"],
         )
 
+    def test_exported_manifest_label_summary_matches_csv_not_stale_cache(self):
+        """[리뷰 P2] JSON manifest의 labelCounts/trainingEligibleCount는
+        build_manifest 시점에 캐시된 값이 아니라 export 시점 (rows, labelMapping)
+        으로 다시 계산해야 한다. labelMapping을 export 직전에 바꾸면 CSV/XLSX
+        행은 새 매핑을 반영하는데 JSON은 예전 집계값을 그대로 보고하던 문제를
+        고정한다."""
+        manifest = self._synthetic_manifest()
+        # BEARING_FAULT_INNER 매핑을 빼서 두 번째 행(105_0000)이 unmapped가
+        # 되도록 한다 — labelMapping은 새 dict로 교체(공유 전역 객체를
+        # 직접 변형하지 않음).
+        manifest["labelMapping"] = {"NORMAL": "NORMAL"}
+        # manifest["labelCounts"]/trainingEligibleCount는 (의도적으로) 예전
+        # 매핑 기준의 오래된 값 그대로 둔다 — export_dataset이 이를 신뢰하지
+        # 않아야 한다.
+        self.assertEqual(manifest["labelCounts"]["verified"], 2)  # 오래된(잘못된) 캐시
+
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_stale_labels_")
+        try:
+            result = export_dataset(manifest, tmp_dir)
+            with open(result["csv_path"], newline="", encoding="utf-8") as f:
+                csv_rows = {row["sample_id"]: row for row in csv.DictReader(f)}
+            with open(result["manifest_path"], encoding="utf-8") as f:
+                exported = json.load(f)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual(csv_rows["97_0000"]["label_status"], "verified")
+        self.assertEqual(csv_rows["105_0000"]["label_status"], "unmapped")
+        self.assertEqual(csv_rows["105_0000"]["training_eligible"], "False")
+
+        # JSON은 CSV와 같은(export 시점 재계산) 집계를 보고해야 한다 — 오래된
+        # "verified: 2" 캐시가 아니라.
+        self.assertEqual(exported["labelCounts"]["verified"], 1)
+        self.assertEqual(exported["labelCounts"]["unmapped"], 1)
+        self.assertEqual(exported["trainingEligibleCount"], 1)
+
     def test_failed_export_does_not_corrupt_previous_version(self):
         """CSV/XLSX/manifest를 output_dir에 바로 순차 기록하면, 뒤쪽 파일
         생성이 실패했을 때 앞서 이미 덮어쓴 파일만 새 버전이고 나머지는
@@ -1056,6 +1092,21 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
         for filename, info in self.manifest["source"]["files"].items():
             recomputed = sha256_of_file(os.path.join(_CWRU_DATA_DIR, filename))
             self.assertEqual(info["sha256"], recomputed)
+
+    def test_manifest_has_feature_output_fingerprint(self):
+        self.assertIn("featureOutputFingerprint", self.manifest)
+        self.assertTrue(self.manifest["featureOutputFingerprint"].startswith("sha256:"))
+
+    def test_operating_condition_holdout_checksum_independent_of_unused_seed(self):
+        """[리뷰 P2] operating_condition_split은 seed를 전혀 쓰지 않는다. 실제
+        rows/split이 동일하면 seed만 바꿔도 checksum/id가 달라지면 안 된다."""
+        other = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            seed=999,
+            split_strategy="operating_condition_holdout",
+        )
+        self.assertEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])
+        self.assertEqual(self.manifest["id"], other["id"])
 
     def test_id_and_source_checksum_change_with_real_config_change(self):
         # window_size는 operating_condition_holdout에서도 실제로 rows/특징을

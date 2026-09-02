@@ -68,26 +68,56 @@ def compute_snapshot_digest(manifest: dict) -> str:
 
 
 def is_legacy_v1_frozen(frozen_manifest: dict) -> bool:
-    """v1.3 이전(schema 미표기)의 구(v1) 동결본인지 판별한다.
+    """매니페스트 내용만 보고 v1(legacy) 동결본"처럼 보이는지" 추정한다 — 정보성
+    보조 함수일 뿐, 무결성 검증의 신뢰 판단에는 쓰지 않는다.
 
-    [리뷰 P1] 이전에는 "snapshotDigest 없음"을 legacy 판정 기준으로 썼다 — 그러면
-    v1.3 동결본에서 snapshotDigest **필드만 지워도** legacy로 오인되어, 무결성
-    검사가 datasetChecksum(rows/labelMapping/split)만으로 관대하게 통과했다(즉
-    source.license/checksum, samplingRate, labelPolicyVersion 변조를 못 잡는다).
-    freeze_dataset_version()이 신규 동결에 snapshotSchemaVersion을 항상 필수로
-    요구하므로, 이 필드의 **존재 여부**만으로 legacy를 판별한다 — snapshotDigest를
-    나중에 지워도 legacy로 강등되지 않는다.
+    [리뷰 P1, 2차] 매니페스트는 호출자가 자유롭게 수정 가능한 데이터다. 처음에는
+    "snapshotDigest 없음"을 legacy 판정 기준으로 썼는데, digest 필드만 지우면
+    legacy로 오인됐다. 그래서 "snapshotSchemaVersion 없음"으로 바꿨더니, 이번에는
+    schemaVersion과 digest를 **함께** 지우면 여전히 legacy로 오인됐다 — 매니페스트
+    안의 어떤 필드 조합을 기준으로 삼아도 공격자가 그 필드들을 함께 지우면 우회된다.
+    그래서 `verify_frozen_integrity`/`approve_dataset_version`/`verify_reproducibility`는
+    이 함수가 아니라, 호출자가 매니페스트 **바깥의** 신뢰 가능한 저장소(최초 동결
+    시점에 별도로 기록해 둔 스키마 버전 메타데이터 등)에서 확인한 사실을 실어 보내는
+    `trusted_legacy` 인자로만 legacy를 인정한다(기본값 False = 항상 v1.3 엄격 검증).
     """
     return "snapshotSchemaVersion" not in frozen_manifest
+
+
+def compute_rows_fingerprint(rows: list) -> str:
+    """rows 배열(실제 산출된 특징값) 자체의 canonical sha256.
+
+    week3 `register_dataset.compute_feature_output_fingerprint()`와 동일한
+    알고리즘을 이 모듈 안에서 독립적으로 재구현한다 — week4의 이 모듈은 특정
+    데이터셋 소스(CWRU)에 결합된 week3 모듈을 import하지 않는다는 기존 설계를
+    유지하면서도, freeze 시점에 draft가 스스로 신고한 `featureOutputFingerprint`가
+    실제 rows와 여전히 일치하는지 대조하는 데 쓴다.
+    """
+    payload = [{name: row[name] for name in sorted(row)} for row in rows]
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def freeze_dataset_version(manifest: dict) -> dict:
     """status가 draft인 매니페스트를 frozen으로 전이한다. 원본은 변경하지 않는다.
 
     **신규 동결은 API 명세서 v1.3을 준수해야 한다** — `labelPolicyVersion`,
-    `snapshotSchemaVersion`, `source.checksum`이 없으면 거부한다. 이미 커밋된 구(v1)
-    frozen 산출물은 이 함수를 다시 거치지 않으며, approve/verify/summary가 관용
-    처리한다(is_legacy_v1_frozen).
+    `snapshotSchemaVersion`, `source.checksum`, `featureOutputFingerprint`가 없으면
+    거부한다. 이미 커밋된 구(v1) frozen 산출물은 이 함수를 다시 거치지 않으며,
+    approve/verify/summary가 `trusted_legacy=True`를 명시적으로 받을 때만 관용
+    처리한다.
+
+    [리뷰 P1, 2차] `build_manifest()`가 만든 draft의 `source.checksum`(및 거기서
+    파생된 `id`)은 원본 파일·전처리 설정·**실제 산출된 rows**로 계산된다. 그런데
+    `freeze_dataset_version`은 이 값을 재검증 없이 그대로 복사만 했다 — draft를
+    만든 뒤 `id`/`source.checksum`은 그대로 둔 채 `rows`(라벨 등)만 바꿔도 동결이
+    통과해서, 서로 다른 rows(그래서 다른 `datasetChecksum`)를 가진 두 데이터셋이
+    같은 `id`·`snapshotChecksum`으로 승인될 수 있었다. `featureOutputFingerprint`는
+    rows만으로 결정되는 값이라(원본 파일 접근 불필요) draft가 신고한 값과 현재
+    rows에서 다시 계산한 값을 여기서 대조해, build 이후 rows가 바뀐 draft의 동결을
+    거부한다.
     """
     if manifest.get("status") != "draft":
         raise ValueError(
@@ -96,7 +126,7 @@ def freeze_dataset_version(manifest: dict) -> dict:
 
     missing = [
         key
-        for key in ("labelPolicyVersion", "snapshotSchemaVersion")
+        for key in ("labelPolicyVersion", "snapshotSchemaVersion", "featureOutputFingerprint")
         if not manifest.get(key)
     ]
     if not (manifest.get("source") or {}).get("checksum"):
@@ -106,6 +136,16 @@ def freeze_dataset_version(manifest: dict) -> dict:
             "신규 데이터셋 동결에는 API 명세서 v1.3 필드가 필수입니다 "
             f"(누락: {missing}). 3주차 build_manifest()가 채운 draft를 사용하세요. "
             "이미 동결된 v1 데이터셋은 재동결하지 않습니다."
+        )
+
+    current_fingerprint = compute_rows_fingerprint(manifest.get("rows") or [])
+    if current_fingerprint != manifest["featureOutputFingerprint"]:
+        raise ValueError(
+            "draft의 featureOutputFingerprint가 현재 rows와 일치하지 않습니다 "
+            f"(신고={manifest['featureOutputFingerprint']!r}, "
+            f"실제={current_fingerprint!r}). build_manifest() 이후 rows/라벨이 "
+            "변경된 것으로 보입니다 — id/source.checksum도 이 rows를 정직하게 "
+            "반영하지 않을 수 있으니 매니페스트를 다시 생성하세요."
         )
 
     # 얕은 dict()는 중첩 rows 리스트를 원본과 공유한다 — 동결 후 원본 rows를
@@ -124,8 +164,17 @@ def freeze_dataset_version(manifest: dict) -> dict:
     return frozen
 
 
-def approve_dataset_version(frozen_manifest: dict, *, approved_by: str, reason: str) -> dict:
-    """status가 frozen인 데이터셋 버전만 승인할 수 있다."""
+def approve_dataset_version(
+    frozen_manifest: dict, *, approved_by: str, reason: str, trusted_legacy: bool = False
+) -> dict:
+    """status가 frozen인 데이터셋 버전만 승인할 수 있다.
+
+    `trusted_legacy=True`는 매니페스트 안의 어떤 필드로도 추정하지 않는다 — 호출자가
+    매니페스트 바깥의 신뢰 가능한 저장소에서 "이건 v1.3 이전에 이미 동결된 레코드다"를
+    확인했을 때만 명시적으로 전달해야 한다(리뷰 P1, 2차). 기본값(False)에서는 언제나
+    v1.3 엄격 검증(`snapshotDigest` 필수)을 적용하므로, schema/digest가 없는 신규
+    레코드는 legacy로 봐주지 않고 무조건 거부한다.
+    """
     if frozen_manifest.get("status") != "frozen":
         raise ValueError(
             f"frozen 상태만 승인할 수 있습니다 (현재 status={frozen_manifest.get('status')!r})."
@@ -146,15 +195,13 @@ def approve_dataset_version(frozen_manifest: dict, *, approved_by: str, reason: 
         )
     # (2) v2: 매니페스트 전체 불변 필드 digest — source.license/checksum, samplingRate,
     #     labelPolicyVersion, splitStrategy 등 freeze 이후 변조까지 잡는다.
-    # [리뷰 P1] v1.3(snapshotSchemaVersion 보유) 동결본은 snapshotDigest가 반드시
-    # 있어야 한다 — digest가 없다고 legacy로 관용 처리하면 digest 필드만 지워서
-    # 이 검사 전체를 우회할 수 있다.
-    if not is_legacy_v1_frozen(frozen_manifest):
+    if not trusted_legacy:
         stored_digest = frozen_manifest.get("snapshotDigest")
         if stored_digest is None:
             raise ValueError(
-                "v1.3 동결본에 snapshotDigest가 없어 승인할 수 없습니다 "
-                "(무결성 검증을 우회할 수 없습니다)."
+                "snapshotDigest가 없어 승인할 수 없습니다 (무결성 검증을 우회할 수 "
+                "없습니다). legacy(v1) 레코드라면 신뢰 가능한 외부 저장소로 확인한 "
+                "뒤 trusted_legacy=True를 명시적으로 전달하세요."
             )
         current_digest = compute_snapshot_digest(frozen_manifest)
         if current_digest != stored_digest:
@@ -171,19 +218,23 @@ def approve_dataset_version(frozen_manifest: dict, *, approved_by: str, reason: 
     return approved
 
 
-def verify_frozen_integrity(frozen_manifest: dict) -> None:
+def verify_frozen_integrity(frozen_manifest: dict, *, trusted_legacy: bool = False) -> None:
     """동결본이 동결 시점 이후 변조되지 않았는지 검증한다. 불일치면 ValueError.
 
     학습·배포처럼 동결본을 입력으로 쓰는 쪽이 status=="frozen"만 확인하지 말고 이걸
     호출해야 한다 — 그래야 freeze 이후 row 값이 바뀌었는데 같은 datasetId로 학습이
     완료되는 상황을 막는다.
+
+    `trusted_legacy=True`는 매니페스트 안의 필드로 추정하지 않는다 — 호출자가
+    매니페스트 바깥의 신뢰 가능한 저장소에서 확인한 사실을 명시적으로 전달할
+    때만 legacy(v1) 완화 검증(datasetChecksum 폴백)을 적용한다(리뷰 P1, 2차).
+    기본값(False)에서는 schema/digest가 없는 레코드를 무조건 거부한다.
     """
     if frozen_manifest.get("status") not in ("frozen", "approved"):
         raise ValueError(
             f"frozen/approved 상태가 아닙니다 (status={frozen_manifest.get('status')!r})."
         )
-    if is_legacy_v1_frozen(frozen_manifest):
-        # v1 관용: snapshotSchemaVersion이 없는 구 동결본은 datasetChecksum으로라도 검증.
+    if trusted_legacy:
         stored_checksum = frozen_manifest.get("datasetChecksum")
         if stored_checksum is None:
             raise ValueError("동결본에 무결성 검증값(snapshotDigest/datasetChecksum)이 없습니다.")
@@ -194,13 +245,12 @@ def verify_frozen_integrity(frozen_manifest: dict) -> None:
                 f"(datasetChecksum frozen={stored_checksum!r}, current={current!r})."
             )
         return
-    # [리뷰 P1] v1.3 동결본은 snapshotDigest가 반드시 있어야 한다 — 없다고 legacy로
-    # 관용 처리하면 digest 필드만 지워서 source.license 등 불변 필드 변조를
-    # datasetChecksum(rows/labelMapping/split만 봄)로는 잡지 못한 채 통과시킨다.
     stored_digest = frozen_manifest.get("snapshotDigest")
     if stored_digest is None:
         raise ValueError(
-            "v1.3 동결본에 snapshotDigest가 없습니다 — 무결성 검증을 우회할 수 없습니다."
+            "snapshotDigest가 없습니다 — 무결성 검증을 우회할 수 없습니다. legacy(v1) "
+            "레코드라면 신뢰 가능한 외부 저장소로 확인한 뒤 trusted_legacy=True를 "
+            "명시적으로 전달하세요."
         )
     current = compute_snapshot_digest(frozen_manifest)
     if current != stored_digest:
@@ -210,19 +260,23 @@ def verify_frozen_integrity(frozen_manifest: dict) -> None:
         )
 
 
-def verify_reproducibility(frozen_manifest: dict, recomputed_manifest: dict) -> bool:
+def verify_reproducibility(
+    frozen_manifest: dict, recomputed_manifest: dict, *, trusted_legacy: bool = False
+) -> bool:
     """동일 조건(같은 seed)으로 다시 만든 draft 매니페스트가 frozen 시점과 같은
     체크섬을 내는지 검증한다 (DATASET_MODEL_01 수용 기준: "동일 데이터셋 버전을
     재현할 수 있다").
 
     [리뷰 P1] datasetChecksum은 rows+labelMapping+split만 본다 — source(원본 파일)
     checksum이나 labelPolicyVersion/snapshotSchemaVersion이 다른 데이터셋도 rows만
-    우연히 같으면 "재현 성공"으로 오판될 수 있다. v1.3(snapshotSchemaVersion 보유)
-    동결본은 이 snapshot identity까지 함께 검증한다.
+    우연히 같으면 "재현 성공"으로 오판될 수 있다. v1.3 동결본은 이 snapshot
+    identity까지 함께 검증한다. `trusted_legacy=True`(매니페스트 바깥에서 확인한
+    사실)일 때만 이 추가 검증을 생략한다(리뷰 P1, 2차 — 매니페스트 필드로는
+    legacy 여부를 추정하지 않는다).
     """
     if frozen_manifest["datasetChecksum"] != compute_dataset_checksum(recomputed_manifest):
         return False
-    if is_legacy_v1_frozen(frozen_manifest):
+    if trusted_legacy:
         return True
 
     for field in ("labelPolicyVersion", "snapshotSchemaVersion"):

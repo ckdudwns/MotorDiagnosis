@@ -25,6 +25,7 @@ from openpyxl import Workbook, load_workbook
 from register_dataset import (  # noqa: E402
     build_manifest,
     dataset_export_label_fields,
+    summarize_dataset_labels,
     DATASET_EXPORT_LABEL_FIELDS,
     SPLIT_STRATEGIES,
     _DEFAULT_DATA_DIR,
@@ -51,10 +52,21 @@ def _replace_with_retry(src: str, dst: str, attempts: int = 10, delay: float = 0
             time.sleep(delay)
 
 
-def _manifest_without_rows(manifest: dict, artifact_refs: dict) -> dict:
-    """GET /api/datasets/{id} 응답 형태 (rows 제외, artifactRefs 포함)."""
+def _manifest_without_rows(manifest: dict, artifact_refs: dict, label_summary: dict) -> dict:
+    """GET /api/datasets/{id} 응답 형태 (rows 제외, artifactRefs 포함).
+
+    [리뷰 P2] labelCounts/trainingEligibleCount/trainingEligibleSplitCounts는
+    manifest에 저장된(build_manifest 시점) 값이 아니라, export 시점에 rows·
+    labelMapping으로 다시 계산한 `label_summary`로 덮어쓴다 — CSV/XLSX 행은
+    이미 export 시점 값(dataset_export_label_fields)으로 계산하므로, 호출자가
+    export 전에 manifest["labelMapping"]을 바꾸면 manifest에 캐시된 집계값과
+    실제 내보낸 행이 서로 다른 라벨 상태를 보고하게 된다.
+    """
     result = {k: v for k, v in manifest.items() if k != "rows"}
     result["artifactRefs"] = artifact_refs
+    result["labelCounts"] = label_summary["labelCounts"]
+    result["trainingEligibleCount"] = label_summary["trainingEligibleCount"]
+    result["trainingEligibleSplitCounts"] = label_summary["trainingEligibleSplitCounts"]
     return result
 
 
@@ -92,6 +104,9 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
         }
         for row in rows
     ]
+    # CSV/XLSX 행과 정확히 같은 (label_mapping, taxonomy_version)으로 다시 집계한다
+    # — manifest에 캐시된 labelCounts 등을 그대로 신뢰하지 않는다(리뷰 P2).
+    label_summary = summarize_dataset_labels(rows, label_mapping, taxonomy_version)
 
     version_id = manifest["id"]
     version_dir = os.path.join(versions_dir, version_id)
@@ -150,15 +165,12 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
         manifest_sheet.append(["rowCount", manifest["rowCount"]])
         for split_name, count in manifest["splitCounts"].items():
             manifest_sheet.append([f"splitCounts.{split_name}", count])
-        for status, count in (manifest.get("labelCounts") or {}).items():
+        for status, count in label_summary["labelCounts"].items():
             manifest_sheet.append([f"labelCounts.{status}", count])
-        if "trainingEligibleCount" in manifest:
-            manifest_sheet.append(
-                ["trainingEligibleCount", manifest["trainingEligibleCount"]]
-            )
-        for split_name, count in (
-            manifest.get("trainingEligibleSplitCounts") or {}
-        ).items():
+        manifest_sheet.append(
+            ["trainingEligibleCount", label_summary["trainingEligibleCount"]]
+        )
+        for split_name, count in label_summary["trainingEligibleSplitCounts"].items():
             manifest_sheet.append(
                 [f"trainingEligibleSplitCounts.{split_name}", count]
             )
@@ -178,7 +190,7 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
         manifest_path = os.path.join(staging_dir, "dataset_manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(
-                _manifest_without_rows(manifest, artifact_refs),
+                _manifest_without_rows(manifest, artifact_refs, label_summary),
                 f,
                 ensure_ascii=False,
                 indent=2,

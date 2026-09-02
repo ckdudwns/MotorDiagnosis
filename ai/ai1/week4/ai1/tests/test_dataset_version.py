@@ -30,6 +30,7 @@ from dataset_version import (  # noqa: E402
     verify_frozen_integrity,
     compute_dataset_checksum,
     compute_snapshot_digest,
+    compute_rows_fingerprint,
     dataset_version_summary,
     is_legacy_v1_frozen,
 )
@@ -45,6 +46,10 @@ from model_version import (  # noqa: E402
 
 def _draft_manifest() -> dict:
     """API 명세서 v1.3 build_manifest() 출력을 흉내낸 draft (신규 필수 필드 포함)."""
+    rows = [
+        {"sample_id": "A", "common_label": "NORMAL"},
+        {"sample_id": "B", "common_label": "ANOMALY"},
+    ]
     return {
         "id": "DS-TEST-001",
         "name": "test-dataset",
@@ -60,14 +65,14 @@ def _draft_manifest() -> dict:
         "labelMapping": {"NORMAL": "NORMAL", "FAULT": "ANOMALY"},
         "labelPolicyVersion": "LABEL-POLICY-V2",
         "snapshotSchemaVersion": "2",
+        # rows에서 다시 계산 가능한 fingerprint. build_manifest()가 실제로 채우는
+        # 값을 흉내낸다 — freeze_dataset_version()이 이 값을 rows와 대조한다.
+        "featureOutputFingerprint": compute_rows_fingerprint(rows),
         "split": {"train": 0.7, "validation": 0.2, "test": 0.1},
         "splitStrategy": "operating_condition_holdout: ...",
         "holdoutType": "operating_condition",
         "independentHoldout": False,
-        "rows": [
-            {"sample_id": "A", "common_label": "NORMAL"},
-            {"sample_id": "B", "common_label": "ANOMALY"},
-        ],
+        "rows": rows,
     }
 
 
@@ -189,12 +194,14 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         other["snapshotSchemaVersion"] = "99"
         self.assertFalse(verify_reproducibility(frozen, other))
 
-    def test_verify_reproducibility_legacy_ignores_snapshot_identity(self):
-        """legacy(v1) 동결본은 snapshot identity 필드가 없으므로 datasetChecksum만
-        본다 — 관용 처리를 유지한다."""
+    def test_verify_reproducibility_legacy_ignores_snapshot_identity_with_trusted_legacy(self):
+        """호출자가 trusted_legacy=True를 명시하면 legacy(v1) 동결본은
+        datasetChecksum만 본다 — 관용 처리를 유지한다."""
         legacy = _legacy_frozen()
         recomputed = _draft_manifest_legacy()
-        self.assertTrue(verify_reproducibility(legacy, recomputed))
+        self.assertTrue(
+            verify_reproducibility(legacy, recomputed, trusted_legacy=True)
+        )
 
     def test_summary_excludes_rows(self):
         frozen = freeze_dataset_version(_draft_manifest())
@@ -231,7 +238,7 @@ class TestFreezeRequiresV13Fields(unittest.TestCase):
             freeze_dataset_version(_draft_manifest_legacy())
 
     def test_each_required_field_missing_rejects(self):
-        for drop in ("labelPolicyVersion", "snapshotSchemaVersion"):
+        for drop in ("labelPolicyVersion", "snapshotSchemaVersion", "featureOutputFingerprint"):
             draft = _draft_manifest()
             del draft[drop]
             with self.assertRaises(ValueError, msg=drop):
@@ -240,6 +247,37 @@ class TestFreezeRequiresV13Fields(unittest.TestCase):
         draft["source"].pop("checksum")
         with self.assertRaises(ValueError):
             freeze_dataset_version(draft)
+
+
+class TestFreezeRejectsStaleFeatureOutputFingerprint(unittest.TestCase):
+    """[리뷰 P1, 2차] build_manifest() 이후 rows/라벨이 바뀐 draft를 동결하면
+    (재계산되지 않은) 예전 source.checksum/id가 새 rows에 그대로 붙는다 — 서로
+    다른 rows를 가진 두 데이터셋이 같은 id/snapshotChecksum으로 승인될 수 있었다.
+    featureOutputFingerprint가 현재 rows와 대조되어 이를 막아야 한다."""
+
+    def test_rows_changed_after_build_rejects_freeze(self):
+        draft = _draft_manifest()
+        draft["rows"][0]["common_label"] = "TAMPERED"  # build 이후 라벨 변경
+        # id/source.checksum은 (실수로든 의도적으로든) 예전 값 그대로 방치.
+        with self.assertRaises(ValueError):
+            freeze_dataset_version(draft)
+
+    def test_two_different_drafts_cannot_share_id_via_stale_fingerprint(self):
+        """서로 다른 rows를 가진 두 draft가 같은 id/source.checksum을 그대로
+        복사해 왔다면(예: 후처리 스크립트가 rows만 바꾸고 id는 안 바꿈), 최소한
+        하나는 동결이 거부되어야 한다 — featureOutputFingerprint는 원본 rows
+        기준으로 한 번만 유효하다."""
+        draft_a = _draft_manifest()
+        draft_b = _draft_manifest()
+        draft_b["rows"][1]["common_label"] = "NORMAL"  # 다른 내용, 같은 id/checksum/fingerprint 신고
+
+        frozen_a = freeze_dataset_version(draft_a)  # draft_a는 자기 rows와 일치 -> 통과
+        self.assertEqual(frozen_a["datasetChecksum"], compute_dataset_checksum(draft_a))
+        with self.assertRaises(ValueError):
+            freeze_dataset_version(draft_b)  # draft_b는 신고된 fingerprint와 불일치 -> 거부
+
+    def test_untampered_draft_still_freezes(self):
+        freeze_dataset_version(_draft_manifest())  # no raise
 
 
 class TestV13FrozenFields(unittest.TestCase):
@@ -336,6 +374,33 @@ class TestSnapshotDigestProtectsApproval(unittest.TestCase):
         with self.assertRaises(ValueError):
             approve_dataset_version(frozen, approved_by="mgr", reason="ok")
 
+    def test_deleting_both_schema_version_and_digest_still_rejected(self):
+        """[리뷰 P1, 2차] snapshotSchemaVersion과 snapshotDigest를 **함께** 지워도
+        legacy 관용 경로로 강등되지 않는다. legacy 취급은 이제 매니페스트 필드가
+        아니라 호출자가 명시하는 `trusted_legacy`로만 결정되므로, 기본값(False)에서는
+        두 필드를 모두 지운 v1.3 레코드도 무조건 거부된다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        frozen["source"]["license"] = "CHANGED-BY-ATTACKER"
+        del frozen["snapshotSchemaVersion"]
+        del frozen["snapshotDigest"]
+
+        with self.assertRaises(ValueError):
+            verify_frozen_integrity(frozen)  # trusted_legacy 기본값(False)
+        with self.assertRaises(ValueError):
+            approve_dataset_version(frozen, approved_by="mgr", reason="ok")
+
+    def test_trusted_legacy_true_is_required_for_legacy_fallback(self):
+        """호출자가 `trusted_legacy=True`를 명시적으로 전달할 때만 legacy(v1)
+        완화 검증(datasetChecksum 폴백)이 적용된다."""
+        legacy = _legacy_frozen()
+        with self.assertRaises(ValueError):
+            verify_frozen_integrity(legacy)  # 기본값 False -> snapshotDigest 없음 거부
+        verify_frozen_integrity(legacy, trusted_legacy=True)  # no raise
+        approved = approve_dataset_version(
+            legacy, approved_by="mgr", reason="ok", trusted_legacy=True
+        )
+        self.assertEqual(approved["status"], "approved")
+
 
 class TestFrozenIntegrityVerification(unittest.TestCase):
     """[리뷰 P1] verify_frozen_integrity: 학습·배포처럼 동결본을 입력으로 쓰는 쪽이
@@ -362,30 +427,41 @@ class TestFrozenIntegrityVerification(unittest.TestCase):
 
 
 class TestLegacyV1FrozenTolerance(unittest.TestCase):
-    """이미 동결된 v1(snapshotDigest 없음)은 재동결하지 않고 관용 처리한다."""
+    """이미 동결된 v1(snapshotDigest 없음)은 재동결하지 않고, 호출자가
+    `trusted_legacy=True`를 명시할 때만 관용 처리한다 (리뷰 P1, 2차 — legacy
+    여부는 매니페스트 필드로 추정하지 않는다)."""
 
     def test_is_legacy_v1_frozen(self):
+        # 정보성 추정일 뿐 — 무결성 검증의 신뢰 판단에는 쓰이지 않는다.
         self.assertTrue(is_legacy_v1_frozen(_legacy_frozen()))
         self.assertFalse(is_legacy_v1_frozen(freeze_dataset_version(_draft_manifest())))
 
-    def test_v1_frozen_approve_still_works(self):
+    def test_v1_frozen_approve_still_works_with_trusted_legacy(self):
         approved = approve_dataset_version(
-            _legacy_frozen(), approved_by="mgr", reason="기존 승인"
+            _legacy_frozen(), approved_by="mgr", reason="기존 승인", trusted_legacy=True
         )
         self.assertEqual(approved["status"], "approved")
+
+    def test_v1_frozen_approve_without_trusted_legacy_rejected(self):
+        # trusted_legacy를 명시하지 않으면 v1.3 엄격 검증(snapshotDigest 필수)이
+        # 적용돼 legacy 레코드도 거부된다 — 매니페스트 필드로 legacy를 봐주지 않는다.
+        with self.assertRaises(ValueError):
+            approve_dataset_version(_legacy_frozen(), approved_by="mgr", reason="x")
 
     def test_v1_frozen_approve_rejects_row_tamper(self):
         frozen = _legacy_frozen()
         frozen["rows"][0]["common_label"] = "TAMPERED"
         with self.assertRaises(ValueError):
-            approve_dataset_version(frozen, approved_by="mgr", reason="x")
+            approve_dataset_version(
+                frozen, approved_by="mgr", reason="x", trusted_legacy=True
+            )
 
-    def test_v1_frozen_integrity_falls_back_to_dataset_checksum(self):
-        verify_frozen_integrity(_legacy_frozen())  # no raise
+    def test_v1_frozen_integrity_falls_back_to_dataset_checksum_with_trusted_legacy(self):
+        verify_frozen_integrity(_legacy_frozen(), trusted_legacy=True)  # no raise
         frozen = _legacy_frozen()
         frozen["rows"][0]["common_label"] = "TAMPERED"
         with self.assertRaises(ValueError):
-            verify_frozen_integrity(frozen)
+            verify_frozen_integrity(frozen, trusted_legacy=True)
 
     def test_v1_frozen_summary_still_works(self):
         summary = dataset_version_summary(_legacy_frozen())
@@ -627,6 +703,37 @@ class TestRollbackLineage(unittest.TestCase):
             rollback_model_version(
                 v2, v1, reason="x", target_environment="prod",
                 approved_history=[v1, dup_v1],
+            )
+
+    def test_current_not_in_history_rejected_even_with_forged_approvedAt(self):
+        """[리뷰 P1, 2차] history가 주어지면 current 자체 객체의 approvedAt으로
+        대체하면 안 된다. 실제로는 registered 상태인 current에 approvedAt만
+        위조해 넣고, history에는 target(v1)만 전달해도 예전에는 v2->v1 롤백이
+        만들어졌다."""
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2_unapproved = register_model_version(
+            version="v2", artifact_uri="file:///v2.pt", dataset_id="d",
+            baseline_version="b", metrics={"f1": 0.9},
+        )
+        self.assertEqual(v2_unapproved["status"], "registered")
+        v2_unapproved["approvedAt"] = "2026-08-10T00:00:00+00:00"  # 위조된 승인 시각
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v2_unapproved, v1, reason="x", target_environment="prod",
+                approved_history=[v1],  # v2는 계보에 없음
+            )
+
+    def test_current_history_entry_must_be_approved_status(self):
+        """history 안의 current 레코드 자체가 승인 상태가 아니면(계보가 변조됐거나
+        오염됐다면) 거부한다."""
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        tampered_v2_entry = dict(v2)
+        tampered_v2_entry["status"] = "registered"
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v2, v1, reason="x", target_environment="prod",
+                approved_history=[v1, tampered_v2_entry],
             )
 
 

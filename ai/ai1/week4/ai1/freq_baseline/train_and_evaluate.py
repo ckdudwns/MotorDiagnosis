@@ -422,10 +422,19 @@ def score_from_artifact(
     임계값·가중치가 그대로 추론에 쓰인다. 선택적 인자로 두면 호출자가 잊고
     누락하기 쉬우므로 아예 필수로 강제한다.
 
+    [리뷰 P1, 2차] 모델별 입력 rank(차원 수)와 LSTM 시퀀스 길이도 검증한다 —
+    이전에는 마지막(특징) 축만 검사해서, Dense 아티팩트에 1차원(단일 샘플이
+    스칼라처럼 취급됨)이나 3차원 입력을 넣어도, LSTM 아티팩트에 저장된
+    `seq_len`과 다른 길이의 시퀀스를 넣어도 조용히 판정이 나왔다. 학습 때
+    보정한 입력 단위(개별 벡터 vs 길이 `seq_len` 시퀀스)와 다르면 재구성 오차
+    자체가 의미 없어진다.
+
     - checksum 불일치 → ValueError (load 전에 거부)
     - 특징 집합이 아티팩트와 다르면 → ValueError
     - 순서만 다르면 → 아티팩트 순서로 열 재정렬
     - 열 개수 불일치 / NaN·Inf → ValueError
+    - dense_autoencoder인데 입력 ndim != 2, 또는 lstm_autoencoder인데
+      ndim != 3이거나 시퀀스 길이(shape[-2])가 저장된 seq_len과 다르면 → ValueError
     """
     actual_checksum = _sha256_of_file(artifact_path)
     if actual_checksum != expected_checksum:
@@ -448,6 +457,22 @@ def score_from_artifact(
         )
 
     arr = np.asarray(matrix, dtype=np.float64)
+
+    model_type = payload["model_type"]
+    expected_ndim = 3 if model_type == "lstm_autoencoder" else 2
+    if arr.ndim != expected_ndim:
+        raise ValueError(
+            f"입력 배열 차원(ndim={arr.ndim}, shape={arr.shape})이 model_type="
+            f"{model_type!r}에 맞지 않습니다 (기대 ndim={expected_ndim})."
+        )
+    if model_type == "lstm_autoencoder":
+        expected_seq_len = payload.get("seq_len")
+        if arr.shape[-2] != expected_seq_len:
+            raise ValueError(
+                f"입력 시퀀스 길이(shape[-2]={arr.shape[-2]})가 아티팩트의 "
+                f"seq_len({expected_seq_len})과 다릅니다 (shape={arr.shape})."
+            )
+
     if arr.shape[-1] != len(artifact_names):
         raise ValueError(
             f"입력 열 개수({arr.shape[-1]})가 아티팩트 특징 수({len(artifact_names)})와 "

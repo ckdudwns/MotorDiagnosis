@@ -48,7 +48,7 @@ from train_and_evaluate import (  # noqa: E402
     feature_names_from_manifest,
     _sha256_of_file as _sha256,
 )
-from dataset_version import freeze_dataset_version  # noqa: E402
+from dataset_version import freeze_dataset_version, compute_rows_fingerprint  # noqa: E402
 
 
 class TestComputeMetrics(unittest.TestCase):
@@ -388,6 +388,101 @@ class TestScoreFromArtifactChecksumRequired(unittest.TestCase):
                 )
 
 
+class TestScoreFromArtifactRankValidation(unittest.TestCase):
+    """[리뷰 P1, 2차] 모델별 입력 rank(ndim)와 LSTM 시퀀스 길이를 검증한다.
+    이전에는 마지막(특징) 축만 확인해서, Dense 아티팩트에 1차원/3차원 입력을
+    넣거나 LSTM 아티팩트에 저장된 seq_len과 다른 길이의 시퀀스를 넣어도 조용히
+    판정이 나왔다."""
+
+    def _dense_artifact(self, tmp):
+        splits = _synthetic_split(seq=None)
+        names = ["f0", "f1", "f2", "f3"]
+        path = os.path.join(tmp, "dense_autoencoder.pt")
+        candidate, _ = _train_validate_and_finalize(
+            "dense_autoencoder", "x", splits, feature_names=names, epochs=10,
+            artifact_path=path,
+        )
+        matrix = np.stack([s["vector"] for s in splits["test"]])  # (N, 4)
+        return path, names, matrix, candidate["artifactChecksum"]
+
+    def _lstm_artifact(self, tmp):
+        splits = _synthetic_split(seq=5)
+        names = ["f0", "f1", "f2", "f3"]
+        path = os.path.join(tmp, "lstm_autoencoder.pt")
+        candidate, _ = _train_validate_and_finalize(
+            "lstm_autoencoder", "x", splits, feature_names=names, epochs=10,
+            artifact_path=path,
+        )
+        matrix = np.stack([s["vector"] for s in splits["test"]])  # (N, 5, 4)
+        return path, names, matrix, candidate["artifactChecksum"]
+
+    def test_dense_rejects_1d_input(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._dense_artifact(tmp)
+            with self.assertRaises(ValueError):
+                score_from_artifact(
+                    path, matrix[0], input_feature_names=names,
+                    expected_checksum=checksum,
+                )
+
+    def test_dense_rejects_3d_input(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._dense_artifact(tmp)
+            matrix_3d = matrix[:, np.newaxis, :]  # (N, 1, F)
+            with self.assertRaises(ValueError):
+                score_from_artifact(
+                    path, matrix_3d, input_feature_names=names,
+                    expected_checksum=checksum,
+                )
+
+    def test_dense_accepts_2d_input(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._dense_artifact(tmp)
+            result = score_from_artifact(
+                path, matrix, input_feature_names=names, expected_checksum=checksum
+            )
+            self.assertEqual(len(result["verdict"]), matrix.shape[0])
+
+    def test_lstm_rejects_shorter_sequence_length(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._lstm_artifact(tmp)
+            short = matrix[:, :4, :]  # seq_len 저장값 5 -> 입력 4
+            with self.assertRaises(ValueError):
+                score_from_artifact(
+                    path, short, input_feature_names=names, expected_checksum=checksum
+                )
+
+    def test_lstm_rejects_2d_input(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._lstm_artifact(tmp)
+            flattened = matrix[:, 0, :]  # (N, F) — 시퀀스 축이 아예 없음
+            with self.assertRaises(ValueError):
+                score_from_artifact(
+                    path, flattened, input_feature_names=names,
+                    expected_checksum=checksum,
+                )
+
+    def test_lstm_accepts_correct_sequence_length(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._lstm_artifact(tmp)
+            result = score_from_artifact(
+                path, matrix, input_feature_names=names, expected_checksum=checksum
+            )
+            self.assertEqual(len(result["verdict"]), matrix.shape[0])
+
+
 class TestValidationBasedSelection(unittest.TestCase):
     def test_select_best_uses_validation_not_test(self):
         cand_a = {"name": "a", "validationMetrics": {"f1": 0.9}, "metrics": {"f1": 0.2}}
@@ -450,6 +545,7 @@ def _synthetic_frozen_manifest(windows_per_file=10, sample_rate_hz=12000, seed=0
         "labelMapping": {"NORMAL": "NORMAL", "BEARING_FAULT_INNER": "ANOMALY"},
         "labelPolicyVersion": "LABEL-POLICY-V2",
         "snapshotSchemaVersion": "2",
+        "featureOutputFingerprint": compute_rows_fingerprint(rows),
         "split": {"train": 0.5, "validation": 0.3, "test": 0.2},
         "splitStrategy": "operating_condition_holdout: synthetic",
         "holdoutType": "operating_condition",
@@ -493,6 +589,7 @@ def _frozen_manifest_from_files(files, *, independent_holdout, windows_per_file=
         "labelMapping": {"NORMAL": "NORMAL", "BEARING_FAULT_INNER": "ANOMALY"},
         "labelPolicyVersion": "LABEL-POLICY-V2",
         "snapshotSchemaVersion": "2",
+        "featureOutputFingerprint": compute_rows_fingerprint(rows),
         "split": {"train": 0.5, "validation": 0.3, "test": 0.2},
         "splitStrategy": "custom: synthetic",
         "holdoutType": "specimen" if independent_holdout else "operating_condition",

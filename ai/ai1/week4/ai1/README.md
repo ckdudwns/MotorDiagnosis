@@ -55,20 +55,28 @@ API 명세서 v1.3에서 추가된 `labelPolicyVersion`(`LABEL-POLICY-V2`)·`sna
   버전·splitStrategy·rows 등)를 해시한다. `approve_dataset_version`은 동결 이후 어떤
   불변 필드가 변조돼도 승인을 거부하고, `verify_frozen_integrity`는 학습 시작 전에
   같은 검증을 한다.
-- 신규 동결은 v1.3 필수 필드(`labelPolicyVersion`/`snapshotSchemaVersion`/`source.checksum`)를
-  요구한다. 이미 동결된 v1은 재동결하지 않고 관용 처리한다(`is_legacy_v1_frozen`). legacy 판별은
-  `snapshotSchemaVersion` **필드의 존재 여부**로만 한다 — `snapshotDigest`를 나중에 지운다고
-  legacy로 강등되지 않는다(v1.3 동결본은 digest가 없으면 그 자체로 무결성 오류).
-- `verify_reproducibility`는 v1.3 동결본에 대해 `datasetChecksum`(rows/labelMapping/split)뿐
-  아니라 `labelPolicyVersion`/`snapshotSchemaVersion`/원본 `source.checksum`까지 함께 검증한다.
+- 신규 동결은 v1.3 필수 필드(`labelPolicyVersion`/`snapshotSchemaVersion`/`source.checksum`/
+  `featureOutputFingerprint`)를 요구한다. `featureOutputFingerprint`는 rows만으로 재계산
+  가능한 값이라, freeze 시점에 draft가 신고한 값과 현재 rows를 대조해 build 이후 rows/라벨이
+  바뀐 draft가 예전 `id`/`source.checksum`을 그대로 단 채 동결되는 것을 막는다(리뷰 P1, 2차).
+- **legacy(v1) 취급은 매니페스트 필드로 추정하지 않는다(리뷰 P1, 2차)** — 매니페스트는
+  호출자가 자유롭게 고칠 수 있는 데이터라서, `snapshotDigest` 부재로도 `snapshotSchemaVersion`
+  부재로도 판별해봤지만 둘 다 "그 필드(들)만 지우면 우회된다"는 같은 구조로 뚫렸다.
+  `approve_dataset_version`/`verify_frozen_integrity`/`verify_reproducibility`는 이제 호출자가
+  매니페스트 바깥의 신뢰 가능한 저장소에서 확인한 사실을 `trusted_legacy=True`로 명시할
+  때만 legacy 완화 검증을 적용한다(기본값 False = 항상 v1.3 엄격 검증).
+- `verify_reproducibility`는 기본값에서 `datasetChecksum`(rows/labelMapping/split)뿐 아니라
+  `labelPolicyVersion`/`snapshotSchemaVersion`/원본 `source.checksum`까지 함께 검증한다.
 - `register_model_version`은 필수 문자열(version/artifactUri/datasetId/baselineVersion)의
   nonblank와 `metrics`가 dict인지 검증한다. `approve_model_version`은 `approved_by`와
   명시적인 `metric_snapshot`을 모두 필수로 받는다(등록 시점 metrics를 암묵적으로 재사용하지
   않는다) — 누가, 어떤 지표를 보고 승인했는지 감사 가능해야 한다.
-- `rollback_model_version`은 target이 **실제로 current보다 앞선 승인 버전**인지
-  (`approved_history` 계보 또는 `approvedAt` 비교) 검증하고 자기 자신·더 최신 버전으로의
-  롤백을 거부한다. 계보 검증은 `approved_history` **배열 순서가 아니라 각 항목의 실제
-  `approvedAt`**을 파싱·비교한다 — 배열이 역순으로 전달돼도 forward rollback을 막는다.
+- `rollback_model_version`은 target이 **실제로 current보다 앞선 승인 버전**인지 검증한다.
+  `approved_history`가 주어지면 target/current 모두 그 안에서 정확히 한 건의 **승인
+  (`status=="approved"`)** canonical 레코드로 존재해야 하며(계보 누락 시 호출자 객체 자체의
+  값으로 대체하지 않는다 — 그러면 registered 상태에 `approvedAt`만 위조해 계보 검증을
+  우회할 수 있다, 리뷰 P1 2차), **배열 순서가 아니라 각 항목의 실제 `approvedAt`**을
+  UTC로 파싱해 시간순으로 비교한다 — 배열이 역순으로 전달돼도 forward rollback을 막는다.
 
 **재현성:** 같은 입력·`split_strategy`로 `build_manifest`를 두 번 생성해 체크섬이
 동일함을 확인한다. `split_strategy`가 다르면(specimen_group vs operating_condition_holdout)
@@ -118,7 +126,10 @@ epoch·시드에 따라 값이 흔들리며, 이 수치를 일반화 성능으�
 artifact는 작업별 유일 `job_id` 아래 불변 경로에 저장하며(덮어쓰기 금지) 보고서에
 `artifactChecksum`·`datasetSnapshotDigest`를 남긴다. 추론(`score_from_artifact`)은
 `input_feature_names`와 `expected_checksum`을 모두 필수로 받아, 열 순서를 검증·재정렬하고
-파일을 읽기 전에 SHA-256을 대조해 변조된 아티팩트(예: threshold 변경)를 거부한다.
+파일을 읽기 전에 SHA-256을 대조해 변조된 아티팩트(예: threshold 변경)를 거부한다. 모델별
+입력 rank도 검증한다(리뷰 P1, 2차) — dense는 `ndim==2`, lstm은 `ndim==3` 및
+`shape[-2]==seq_len`을 강제해, 1차원/3차원 입력이나 다른 길이의 시퀀스가 조용히 판정되는
+것을 막는다.
 
 ```bash
 # 기본(specimen_group)은 CWRU에서 InsufficientAssetGroupsError로 정직하게 실패

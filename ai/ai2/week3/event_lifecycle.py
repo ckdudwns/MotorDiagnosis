@@ -185,6 +185,9 @@ def _normalize_api_telemetry_identity(payload: dict[str, Any]) -> dict[str, Any]
         value = normalized.get(key)
         if isinstance(value, str):
             normalized[key] = value.strip() or None
+    scenario_label = normalized.get("scenarioLabel")
+    if isinstance(scenario_label, str):
+        normalized["scenarioLabel"] = scenario_label.strip()
     normalized["vibrationRmsMmS"] = None
     normalized["acousticDb"] = None
     return normalized
@@ -474,7 +477,7 @@ class AnomalyEventLifecycle:
         self._sequence_watermarks: OrderedDict[str, tuple[datetime, int]] = (
             OrderedDict()
         )
-        self._is_persisting = False
+        self._persistence_owner_thread_id: int | None = None
 
     def snapshot(self) -> dict[str, Any]:
         """Return a JSON-serializable checkpoint for durable lifecycle storage."""
@@ -778,7 +781,7 @@ class AnomalyEventLifecycle:
         ``(deviceId, sequence)`` idempotency comparison; score/model fields
         are intentionally excluded from that comparison.
         """
-        if self._is_persisting:
+        if self._persistence_owner_thread_id == threading.get_ident():
             raise RuntimeError(
                 "process_point cannot be called from persist_transaction."
             )
@@ -813,7 +816,7 @@ class AnomalyEventLifecycle:
         processing_key = _processing_key(point, idempotency_payload, parsed_timestamp)
 
         with self._lock:
-            if self._is_persisting:
+            if self._persistence_owner_thread_id == threading.get_ident():
                 raise RuntimeError(
                     "process_point cannot be called from persist_transaction."
                 )
@@ -895,11 +898,11 @@ class AnomalyEventLifecycle:
             )
             checkpoint["expectedRevision"] = self._revision
             if persist_transaction is not None:
-                self._is_persisting = True
+                self._persistence_owner_thread_id = threading.get_ident()
                 try:
                     persist_transaction(checkpoint, copy.deepcopy(updates))
                 finally:
-                    self._is_persisting = False
+                    self._persistence_owner_thread_id = None
             self._states = candidate_states
             self._processed_telemetry = history
             self._sequence_watermarks = watermarks

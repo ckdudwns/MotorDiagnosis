@@ -294,6 +294,21 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
             lifecycle.process_point(first_point, telemetry_payload=retried_payload), []
         )
 
+    def test_normalizes_scenario_label_for_idempotency(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        first = point(
+            "2026-08-31T00:00:00Z",
+            80,
+            deviceId="DEVICE-01",
+            sequence=1,
+            vibrationRmsRaw=3.0,
+            scenarioLabel=" normal ",
+        )
+        retried = {**first, "scenarioLabel": "normal"}
+
+        lifecycle.process_point(first)
+        self.assertEqual(lifecycle.process_point(retried), [])
+
     def test_same_device_orders_sequence_before_received_at(self) -> None:
         lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=2))
         lifecycle.process_point(
@@ -606,29 +621,40 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
         state = lifecycle.snapshot()["assets"]["SITE-01-MOT-02"]
         self.assertEqual(state["openEvent"]["startAt"], "2026-08-31T00:00:00Z")
 
-    def test_worker_thread_reentry_is_rejected_without_deadlock(self) -> None:
+    def test_independent_worker_waits_for_persistence_and_then_processes(self) -> None:
         lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
         errors: list[Exception] = []
         completed = threading.Event()
+        worker: threading.Thread | None = None
 
         def persist(_: dict[str, object], __: list[dict[str, object]]) -> None:
-            def reenter() -> None:
+            def process_other_asset() -> None:
                 try:
-                    lifecycle.process_point(point("2026-08-31T00:00:05Z", 90))
+                    lifecycle.process_point(
+                        point(
+                            "2026-08-31T00:00:05Z",
+                            90,
+                            assetId="SITE-01-MOT-03",
+                        )
+                    )
                 except Exception as error:
                     errors.append(error)
                 finally:
                     completed.set()
 
-            worker = threading.Thread(target=reenter)
+            nonlocal worker
+            worker = threading.Thread(target=process_other_asset)
             worker.start()
-            worker.join(timeout=1)
-            self.assertTrue(completed.is_set())
+            self.assertFalse(completed.wait(timeout=0.05))
 
         lifecycle.process_point(
             point("2026-08-31T00:00:00Z", 80), persist_transaction=persist
         )
-        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertIsNotNone(worker)
+        worker.join(timeout=1)
+        self.assertTrue(completed.is_set())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(lifecycle.snapshot()["assets"]), 2)
 
     def test_rejects_mismatched_point_and_telemetry_payload_before_consuming_key(
         self,

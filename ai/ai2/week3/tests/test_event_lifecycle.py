@@ -71,6 +71,10 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
         self.assertEqual(merged[0]["event"]["id"], event_id)
         self.assertEqual(merged[0]["event"]["mergeCount"], 1)
         self.assertEqual(merged[0]["event"]["maxScore"], 90)
+        restored = AnomalyEventLifecycle.from_snapshot(lifecycle.snapshot())
+        restored_state = restored.snapshot()["assets"]["SITE-01-MOT-02"]
+        self.assertEqual(restored_state["openEvent"]["id"], event_id)
+        self.assertIsNone(restored_state["latestClosedEvent"])
 
     def test_sensor_fault_never_creates_an_asset_event(self) -> None:
         updates = self.lifecycle.process_point(
@@ -491,6 +495,39 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
                 )
             )
 
+    def test_same_timestamp_uses_one_transitive_order_for_all_devices(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        ordered = [
+            point(
+                "2026-08-31T00:00:00Z",
+                10,
+                deviceId="DEVICE-A",
+                sequence=1,
+                receivedAt="2026-08-31T00:00:20Z",
+            ),
+            point(
+                "2026-08-31T00:00:00Z",
+                90,
+                deviceId="DEVICE-A",
+                sequence=2,
+                receivedAt="2026-08-31T00:00:05Z",
+            ),
+            point(
+                "2026-08-31T00:00:00Z",
+                10,
+                deviceId="DEVICE-B",
+                sequence=1,
+                receivedAt="2026-08-31T00:00:01Z",
+            ),
+        ]
+        for record in ordered:
+            lifecycle.process_point(record)
+
+        reverse = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        reverse.process_point(ordered[-1])
+        with self.assertRaisesRegex(ValueError, "point order must increase"):
+            reverse.process_point(ordered[0])
+
     def test_config_change_resets_pending_candidate_after_snapshot_restore(
         self,
     ) -> None:
@@ -568,6 +605,74 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
         lifecycle.process_point(record, persist_transaction=persist)
         state = lifecycle.snapshot()["assets"]["SITE-01-MOT-02"]
         self.assertEqual(state["openEvent"]["startAt"], "2026-08-31T00:00:00Z")
+
+    def test_worker_thread_reentry_is_rejected_without_deadlock(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        errors: list[Exception] = []
+        completed = threading.Event()
+
+        def persist(_: dict[str, object], __: list[dict[str, object]]) -> None:
+            def reenter() -> None:
+                try:
+                    lifecycle.process_point(point("2026-08-31T00:00:05Z", 90))
+                except Exception as error:
+                    errors.append(error)
+                finally:
+                    completed.set()
+
+            worker = threading.Thread(target=reenter)
+            worker.start()
+            worker.join(timeout=1)
+            self.assertTrue(completed.is_set())
+
+        lifecycle.process_point(
+            point("2026-08-31T00:00:00Z", 80), persist_transaction=persist
+        )
+        self.assertIsInstance(errors[0], RuntimeError)
+
+    def test_rejects_mismatched_point_and_telemetry_payload_before_consuming_key(
+        self,
+    ) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        record = point(
+            "2026-08-31T00:00:00Z",
+            80,
+            assetId="SITE-01-MOT-02",
+            deviceId="DEVICE-01",
+            sequence=1,
+        )
+        wrong_payload = {
+            "timestamp": "2026-08-31T00:00:00Z",
+            "assetId": "SITE-01-MOT-03",
+            "deviceId": "DEVICE-01",
+            "sequence": 1,
+        }
+        with self.assertRaisesRegex(ValueError, "assetId must match"):
+            lifecycle.process_point(record, telemetry_payload=wrong_payload)
+
+        correct_payload = {**wrong_payload, "assetId": "SITE-01-MOT-02"}
+        started = lifecycle.process_point(record, telemetry_payload=correct_payload)
+        self.assertEqual(started[0]["kind"], "asset_event_started")
+
+    def test_snapshot_config_and_last_markers_must_be_complete(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        lifecycle.process_point(point("2026-08-31T00:00:00Z", 80))
+        snapshot = lifecycle.snapshot()
+
+        missing_config = copy.deepcopy(snapshot)
+        del missing_config["config"]["score_enter"]
+        with self.assertRaises(ValueError):
+            AnomalyEventLifecycle.from_snapshot(missing_config)
+
+        unknown_config = copy.deepcopy(snapshot)
+        unknown_config["config"]["unexpected"] = True
+        with self.assertRaises(ValueError):
+            AnomalyEventLifecycle.from_snapshot(unknown_config)
+
+        incomplete_marker = copy.deepcopy(snapshot)
+        incomplete_marker["assets"]["SITE-01-MOT-02"]["lastPointIdentity"] = None
+        with self.assertRaises(ValueError):
+            AnomalyEventLifecycle.from_snapshot(incomplete_marker)
 
     def test_expected_revision_provides_compare_and_swap_boundary(self) -> None:
         lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))

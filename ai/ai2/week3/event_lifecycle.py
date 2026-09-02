@@ -104,7 +104,7 @@ class _AssetState:
     latest_closed_event: dict[str, Any] | None = None
     last_processed_at: datetime | None = None
     last_point_identity: tuple[object, ...] | None = None
-    last_processing_key: tuple[datetime, datetime, str, int] | None = None
+    last_processing_key: tuple[datetime, str, int, datetime] | None = None
 
 
 def _finite_score(point: dict[str, Any]) -> float | None:
@@ -229,7 +229,7 @@ def _telemetry_key(payload: dict[str, Any]) -> tuple[str, int] | None:
 
 def _processing_key(
     point: dict[str, Any], payload: dict[str, Any], timestamp: datetime
-) -> tuple[datetime, datetime, str, int]:
+) -> tuple[datetime, str, int, datetime]:
     """Return the required deterministic per-asset processing order."""
     received_at = payload.get("receivedAt", point.get("receivedAt"))
     try:
@@ -244,23 +244,15 @@ def _processing_key(
     normalized_sequence = (
         sequence if isinstance(sequence, int) and not isinstance(sequence, bool) else -1
     )
-    return timestamp, received_timestamp, normalized_device_id, normalized_sequence
+    return timestamp, normalized_device_id, normalized_sequence, received_timestamp
 
 
 def _is_processing_key_ordered(
-    previous: tuple[datetime, datetime, str, int],
-    current: tuple[datetime, datetime, str, int],
+    previous: tuple[datetime, str, int, datetime],
+    current: tuple[datetime, str, int, datetime],
 ) -> bool:
-    """Apply the contract order without comparing sequences across devices."""
-    if current[0] != previous[0]:
-        return current[0] > previous[0]
-    if current[2] == previous[2]:
-        return (current[3], current[1]) > (previous[3], previous[1])
-    return (current[1], current[2], current[3]) > (
-        previous[1],
-        previous[2],
-        previous[3],
-    )
+    """Apply one transitive order to every point in the timestamp bucket."""
+    return current > previous
 
 
 def _event_view(event: dict[str, Any]) -> dict[str, Any]:
@@ -337,31 +329,31 @@ def _watermarks_from_snapshot(
 
 
 def _processing_key_to_snapshot(
-    key: tuple[datetime, datetime, str, int] | None,
+    key: tuple[datetime, str, int, datetime] | None,
 ) -> list[object] | None:
     if key is None:
         return None
-    return [key[0].isoformat(), key[1].isoformat(), key[2], key[3]]
+    return [key[0].isoformat(), key[1], key[2], key[3].isoformat()]
 
 
 def _processing_key_from_snapshot(
     stored: object,
-) -> tuple[datetime, datetime, str, int] | None:
+) -> tuple[datetime, str, int, datetime] | None:
     if stored is None:
         return None
     if (
         not isinstance(stored, list)
         or len(stored) != 4
-        or not isinstance(stored[2], str)
-        or isinstance(stored[3], bool)
-        or not isinstance(stored[3], int)
+        or not isinstance(stored[1], str)
+        or isinstance(stored[2], bool)
+        or not isinstance(stored[2], int)
     ):
         raise ValueError("snapshot lastProcessingKey is invalid.")
     return (
         _parse_timestamp(stored[0]),
-        _parse_timestamp(stored[1]),
+        stored[1],
         stored[2],
-        stored[3],
+        _parse_timestamp(stored[3]),
     )
 
 
@@ -516,6 +508,19 @@ class AnomalyEventLifecycle:
         snapshot_config = snapshot.get("config")
         if not isinstance(snapshot_config, dict):
             raise ValueError("snapshot config is required.")
+        config_keys = {
+            "score_enter",
+            "score_exit",
+            "min_consecutive_enter",
+            "min_consecutive_exit",
+            "merge_gap_sec",
+            "idempotency_cache_size",
+            "rule_version",
+        }
+        if set(snapshot_config) != config_keys:
+            raise ValueError(
+                "snapshot config fields must exactly match schema version 2."
+            )
         if config is None:
             config = EventLifecycleConfig(**snapshot_config)
         snapshot_rule = EventLifecycleConfig(**snapshot_config)
@@ -665,6 +670,14 @@ class AnomalyEventLifecycle:
             raise ValueError(
                 "snapshot lastProcessedAt and order key must both be present."
             )
+        marker_count = sum(
+            value is not None
+            for value in (last_processed_at, last_processing_key, identity)
+        )
+        if marker_count not in (0, 3):
+            raise ValueError(
+                "snapshot last processing markers must be all present or absent."
+            )
         if last_processed_at is not None and (
             _parse_timestamp(last_processed_at) != last_processing_key[0]
         ):
@@ -713,6 +726,35 @@ class AnomalyEventLifecycle:
         while len(self._processed_telemetry) > self.config.idempotency_cache_size:
             self._processed_telemetry.popitem(last=False)
 
+    @staticmethod
+    def _validate_telemetry_payload_match(
+        point: dict[str, Any], payload: dict[str, Any], point_timestamp: datetime
+    ) -> None:
+        payload_asset_id = payload.get("assetId")
+        if not isinstance(payload_asset_id, str) or not payload_asset_id.strip():
+            raise ValueError("telemetry_payload assetId must be a non-empty string.")
+        point_asset_id = point.get("assetId")
+        if payload_asset_id.strip().upper() != str(point_asset_id).strip().upper():
+            raise ValueError("point and telemetry_payload assetId must match.")
+        if _parse_timestamp(payload.get("timestamp")) != point_timestamp:
+            raise ValueError("point and telemetry_payload timestamp must match.")
+        for key in ("siteId", "deviceId", "sequence"):
+            if key not in point:
+                continue
+            if key not in payload:
+                raise ValueError(f"telemetry_payload {key} must match point.")
+            point_value = point[key]
+            payload_value = payload[key]
+            if key in ("siteId", "deviceId"):
+                if not isinstance(point_value, str) or not isinstance(
+                    payload_value, str
+                ):
+                    raise ValueError(f"point and telemetry_payload {key} must match.")
+                if point_value.strip().upper() != payload_value.strip().upper():
+                    raise ValueError(f"point and telemetry_payload {key} must match.")
+            elif point_value != payload_value:
+                raise ValueError("point and telemetry_payload sequence must match.")
+
     def process_point(
         self,
         point: dict[str, Any],
@@ -736,6 +778,10 @@ class AnomalyEventLifecycle:
         ``(deviceId, sequence)`` idempotency comparison; score/model fields
         are intentionally excluded from that comparison.
         """
+        if self._is_persisting:
+            raise RuntimeError(
+                "process_point cannot be called from persist_transaction."
+            )
         asset_id = point.get("assetId")
         if not isinstance(asset_id, str) or not asset_id.strip():
             raise ValueError("assetId must be a non-empty string.")
@@ -744,6 +790,10 @@ class AnomalyEventLifecycle:
         score = _finite_score(point)
         asset_id = asset_id.strip().upper()
         idempotency_payload = telemetry_payload or point
+        if telemetry_payload is not None:
+            self._validate_telemetry_payload_match(
+                point, telemetry_payload, parsed_timestamp
+            )
         effective_sensor_fault_reason = (
             sensor_fault_reason.strip()
             if sensor_fault
@@ -935,6 +985,7 @@ class AnomalyEventLifecycle:
                     max_score=candidate_max_score,
                     max_score_model_version=candidate_max_score_model_version,
                 )
+                state.latest_closed_event = None
                 return previous, True
 
         event = {

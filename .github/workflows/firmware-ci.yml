@@ -1,0 +1,67 @@
+name: Firmware CI
+
+on:
+  pull_request:
+    paths:
+      - "firmware/esp32_edge_node/**"
+      - ".github/workflows/firmware-ci.yml"
+  push:
+    paths:
+      - "firmware/esp32_edge_node/**"
+      - ".github/workflows/firmware-ci.yml"
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade platformio
+
+      - name: Run native firmware logic tests
+        run: pio test -d firmware/esp32_edge_node -e native
+
+      - name: Verify fail-safe source policies
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          main = Path("firmware/esp32_edge_node/src/main.cpp").read_text(encoding="utf-8")
+
+          if re.search(r"LittleFS\.begin\s*\(\s*true\s*\)", main):
+              raise SystemExit("Automatic LittleFS format-on-fail must remain disabled.")
+
+          if '#if __has_include("secrets.h")' not in main:
+              raise SystemExit("Clean-checkout secrets fallback is missing.")
+
+          if '#include "secrets.example.h"' not in main:
+              raise SystemExit("secrets.example.h fallback is missing.")
+
+          print("Fail-safe source policy checks passed.")
+          PY
+
+      - name: Discover ESP32 environment
+        id: esp_env
+        shell: bash
+        run: |
+          ESP_ENV="$(sed -n 's/^\[env:\([^]]*\)\].*/\1/p' firmware/esp32_edge_node/platformio.ini | grep -v '^native$' | head -n 1)"
+          if [ -z "$ESP_ENV" ]; then
+            echo "No non-native PlatformIO environment found."
+            exit 1
+          fi
+          echo "name=$ESP_ENV" >> "$GITHUB_OUTPUT"
+          echo "ESP32 environment: $ESP_ENV"
+
+      - name: Clean-checkout ESP32 build without secrets.h
+        run: |
+          test ! -f firmware/esp32_edge_node/include/secrets.h
+          pio run -d firmware/esp32_edge_node -e "${{ steps.esp_env.outputs.name }}"

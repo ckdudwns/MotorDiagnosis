@@ -54,14 +54,20 @@
 #include <math.h>
 #include <stddef.h>
 
+#include "firmware_logic.h"
+
+#if __has_include("secrets.h")
 #include "secrets.h"
+#else
+#include "secrets.example.h"
+#endif
 
 // =====================================================
 // Firmware
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.2-beta.11.2";
+    "v1.2-beta.11.7";
 
 // =====================================================
 // Test Config
@@ -70,6 +76,19 @@ constexpr char FIRMWARE_VERSION[] =
 // false = normal operation
 // true  = test backend-time fallback by skipping NTP
 constexpr bool TEST_FORCE_NTP_FAIL =
+    false;
+
+// false = production behavior
+// true  = simulate an NVS sequence write failure before a new sequence is
+//         allowed to become a packet.
+constexpr bool TEST_FORCE_SEQUENCE_NVS_FAIL =
+    false;
+
+// false = production behavior
+// true  = simulate repeated LittleFS mount failure. The firmware must stop
+//         without calling format; after setting this back to false, the
+//         previous backlog should still recover.
+constexpr bool TEST_FORCE_LITTLEFS_MOUNT_FAIL =
     false;
 
 // =====================================================
@@ -213,6 +232,9 @@ static_assert(
 //
 // IMPORTANT:
 // - The HTTP/API payload remains JSON and API-v1.3 compatible.
+// - First-send and replay JSON use one canonical serializer fed only by
+//   fields preserved in the binary ring, so ACK loss cannot change the
+//   payload merely because RAM sensor values had higher precision.
 // - Only the local offline storage representation is binary.
 // - On overflow the OLDEST buffered record is discarded so acquisition
 //   continues and the newest ~24 h window is retained.
@@ -233,6 +255,28 @@ constexpr uint32_t RING_MAGIC =
 constexpr uint16_t RING_SCHEMA_VERSION =
     1;
 
+// Cold-boot timestamp handling:
+//
+// A device with no RTC cannot know absolute UTC during a true offline
+// cold boot. We still acquire and persist the measurement immediately.
+// Such records carry this flag and epochSeconds=0 until network time is
+// available.
+//
+// At the first successful time sync, one durable NVS anchor maps ring
+// ordinal -> UTC. Every unresolved record is then serialized from that
+// same persisted anchor. This makes replay deterministic across reboots
+// and avoids changing the JSON body for an already-used sequence.
+//
+// The measured offline production cadence is approximately 3.99 s.
+constexpr uint16_t RING_FLAG_TIME_UNRESOLVED =
+    0x0001U;
+
+constexpr uint64_t UNRESOLVED_NOMINAL_PERIOD_MS =
+    3990ULL;
+
+constexpr uint8_t LITTLEFS_MOUNT_ATTEMPTS =
+    3;
+
 // Fast replay:
 // Successful ACKs no longer rewrite + flush the 1.2 MB LittleFS ring
 // for every single packet. Instead, consumed ordinals are tracked by a
@@ -244,6 +288,22 @@ constexpr uint16_t RING_SCHEMA_VERSION =
 // delivery behavior.
 constexpr size_t ACK_WATERMARK_BATCH_SIZE =
     32;
+
+// Backlog replay is deliberately bounded per loop iteration.
+//
+// Previous behavior drained the entire persistent queue before taking
+// another sensor measurement. A 24-hour backlog could therefore block
+// fresh acquisition for hours.
+//
+// With this limit, each loop:
+//   1. replays at most four oldest records,
+//   2. returns to synchronized sensor acquisition,
+//   3. appends the fresh packet to the tail if backlog still exists.
+//
+// FIFO order is preserved, while new measurements continue throughout
+// catch-up.
+constexpr size_t REPLAY_MAX_RECORDS_PER_LOOP =
+    4;
 
 constexpr uint32_t MEASUREMENT_INTERVAL_MS =
     3000;
@@ -353,8 +413,15 @@ struct TelemetryPacket
 {
     uint32_t sequence = 0;
 
-    // Absolute UTC time stored compactly in the offline binary ring.
+    // Resolved packet:
+    //   timestampResolved=true, epochSeconds=absolute UTC.
+    //
+    // Offline cold-boot packet:
+    //   timestampResolved=false, epochSeconds=0 until replay resolves
+    //   it from the durable ordinal->UTC NVS anchor.
     uint64_t epochSeconds = 0;
+
+    bool timestampResolved = false;
 
     float vibrationRmsRaw = 0.0f;
     float vibrationPeakHz = 0.0f;
@@ -467,6 +534,33 @@ volatile bool vibrationFinished =
 Preferences preferences;
 
 uint32_t telemetrySequence =
+    0;
+
+// True only when the current sequence floor is known durable in NVS.
+// A packet is never created from a sequence that failed persistence.
+bool sequencePersistenceReady =
+    false;
+
+// Active binary-ring records captured before absolute UTC was available.
+size_t unresolvedTimestampCount =
+    0;
+
+uint64_t newestUnresolvedOrdinal =
+    0;
+
+// Durable mapping for unresolved records:
+//   timestamp_ms = anchor_epoch_ms
+//                + (record.ordinal - anchor_ordinal) * 3990 ms
+//
+// The mapping is stored in NVS before any unresolved packet is replayed.
+// It is intentionally kept after the queue drains; recovery ignores a
+// stale anchor when there are no active unresolved records. This preserves
+// deterministic duplicate replay if power fails before the ACK watermark
+// itself becomes durable.
+uint64_t unresolvedAnchorOrdinal =
+    0;
+
+uint64_t unresolvedAnchorEpochMs =
     0;
 
 bool timeReady =
@@ -2129,16 +2223,172 @@ bool syncTime()
 // Sequence
 // =====================================================
 
-uint32_t allocateSequence()
+bool persistSequenceValue(
+    uint32_t value
+)
 {
-    telemetrySequence++;
+    if (
+        TEST_FORCE_SEQUENCE_NVS_FAIL
+    )
+    {
+        Serial.printf(
+            "[TEST][SEQUENCE] Forced NVS failure for candidate %lu.\n",
+            static_cast<unsigned long>(
+                value
+            )
+        );
 
-    preferences.putUInt(
-        "sequence",
+        sequencePersistenceReady =
+            false;
+
+        return false;
+    }
+
+    const size_t written =
+        preferences.putUInt(
+            "sequence",
+            value
+        );
+
+    const bool writeSucceeded =
+        written ==
+        sizeof(uint32_t);
+
+    if (
+        !writeSucceeded
+    )
+    {
+        Serial.printf(
+            "[SEQUENCE] NVS write FAILED for sequence %lu; packet will not be created.\n",
+            static_cast<unsigned long>(
+                value
+            )
+        );
+
+        sequencePersistenceReady =
+            false;
+
+        return false;
+    }
+
+    const uint32_t verified =
+        preferences.getUInt(
+            "sequence",
+            0
+        );
+
+    const bool persistenceVerified =
+        FirmwareLogic::shouldAdvanceSequence(
+            writeSucceeded,
+            true,
+            value,
+            verified
+        );
+
+    if (
+        !persistenceVerified
+    )
+    {
+        Serial.printf(
+            "[SEQUENCE] NVS read-back mismatch: expected=%lu actual=%lu; packet will not be created.\n",
+            static_cast<unsigned long>(
+                value
+            ),
+            static_cast<unsigned long>(
+                verified
+            )
+        );
+
+        sequencePersistenceReady =
+            false;
+
+        return false;
+    }
+
+    sequencePersistenceReady =
+        true;
+
+    return true;
+}
+
+bool ensureCurrentSequenceFloorDurable()
+{
+    uint32_t stored =
+        preferences.getUInt(
+            "sequence",
+            0
+        );
+
+    if (
+        stored >=
+        telemetrySequence
+    )
+    {
+        sequencePersistenceReady =
+            true;
+
+        return true;
+    }
+
+    return persistSequenceValue(
         telemetrySequence
     );
+}
 
-    return telemetrySequence;
+bool allocateSequence(
+    uint32_t& allocatedSequence
+)
+{
+    allocatedSequence =
+        0;
+
+    // Recovery may discover a higher sequence in LittleFS than the value
+    // that survived in NVS. Never allocate another ID until that recovered
+    // floor itself has been made durable.
+    if (
+        !sequencePersistenceReady &&
+        !ensureCurrentSequenceFloorDurable()
+    )
+    {
+        return false;
+    }
+
+    if (
+        telemetrySequence ==
+        UINT32_MAX
+    )
+    {
+        Serial.println(
+            "[SEQUENCE] Sequence space exhausted; refusing unsafe reuse."
+        );
+
+        sequencePersistenceReady =
+            false;
+
+        return false;
+    }
+
+    uint32_t candidate =
+        telemetrySequence + 1U;
+
+    // Durability comes BEFORE use. If this write fails, candidate is not
+    // attached to a packet, not written to the ring and not transmitted.
+    if (
+        !persistSequenceValue(
+            candidate
+        )
+    )
+    {
+        return false;
+    }
+
+    telemetrySequence =
+        candidate;
+
+    allocatedSequence =
+        candidate;
+
+    return true;
 }
 
 // =====================================================
@@ -2152,95 +2402,68 @@ uint32_t allocateSequence()
 // - The device never promotes model/rule output to ground truth.
 // =====================================================
 
-String createTelemetryPayload(
-    uint32_t sequence,
-    const String& timestamp,
-    const VibrationFeatures& vib,
-    const AcousticFeatures& audio
+String createCanonicalTelemetryPayload(
+    const TelemetryPacket& packet
 )
 {
-    String json;
+    if (
+        !packet.timestampResolved ||
+        packet.epochSeconds <
+            1700000000ULL
+    )
+    {
+        return "";
+    }
 
-    json.reserve(
-        768
+    String timestamp =
+        formatTimestampFromEpoch(
+            packet.epochSeconds
+        );
+
+    if (
+        timestamp.length() ==
+        0
+    )
+    {
+        return "";
+    }
+
+    FirmwareLogic::CanonicalTelemetry telemetry;
+
+    telemetry.sequence =
+        packet.sequence;
+
+    telemetry.vibrationRmsRaw =
+        packet.vibrationRmsRaw;
+
+    telemetry.vibrationPeakHz =
+        packet.vibrationPeakHz;
+
+    telemetry.acousticRmsRaw =
+        packet.acousticRmsRaw;
+
+    telemetry.acousticPeakHz =
+        packet.acousticPeakHz;
+
+    const std::string canonicalPayload =
+        FirmwareLogic::buildCanonicalTelemetryPayload(
+            timestamp.c_str(),
+            SITE_ID,
+            ASSET_ID,
+            DEVICE_ID,
+            telemetry
+        );
+
+    if (
+        canonicalPayload.empty()
+    )
+    {
+        return "";
+    }
+
+    return String(
+        canonicalPayload.c_str()
     );
-
-    json += "{";
-
-    json += "\"timestamp\":\"";
-    json += timestamp;
-    json += "\",";
-
-    json += "\"sequence\":";
-    json += String(sequence);
-    json += ",";
-
-    json += "\"siteId\":\"";
-    json += SITE_ID;
-    json += "\",";
-
-    json += "\"assetId\":\"";
-    json += ASSET_ID;
-    json += "\",";
-
-    json += "\"deviceId\":\"";
-    json += DEVICE_ID;
-    json += "\",";
-
-    json += "\"rpm\":null,";
-
-    json += "\"vibrationRmsRaw\":";
-    json += String(
-        vib.totalRms,
-        6
-    );
-    json += ",";
-
-    json += "\"vibrationRmsMmS\":null,";
-
-    json += "\"vibrationPeakHz\":";
-    json += String(
-        vib.peakHz,
-        2
-    );
-    json += ",";
-
-    json += "\"acousticRmsRaw\":";
-    json += String(
-        audio.rmsRaw,
-        2
-    );
-    json += ",";
-
-    json += "\"acousticDb\":null,";
-
-    json += "\"acousticPeakHz\":";
-    json += String(
-        audio.peakHz,
-        2
-    );
-    json += ",";
-
-    // P2:
-    // Ordinary ESP32 real telemetry is unlabeled.
-    // Ground-truth labels must be supplied only by trusted external
-    // experiment/replay/import workflows with provenance.
-    json += "\"scenarioLabel\":null,";
-    json += "\"knownVibrationLabel\":null,";
-    json += "\"knownAcousticLabel\":null,";
-
-    json += "\"source\":\"esp32-s3\",";
-    json += "\"isSynthetic\":false,";
-
-    json +=
-        "\"vibrationUnitNote\":\"ADXL345 acceleration RMS in g\",";
-
-    json +=
-        "\"acousticUnitNote\":\"INMP441 raw PCM RMS, uncalibrated\"";
-
-    json += "}";
-
-    return json;
 }
 
 // =====================================================
@@ -2345,6 +2568,16 @@ uint32_t calculateRecordCrc(
     );
 }
 
+bool recordHasUnresolvedTimestamp(
+    const BinaryTelemetryRecord& record
+)
+{
+    return (
+        record.flags &
+        RING_FLAG_TIME_UNRESOLVED
+    ) != 0;
+}
+
 bool recordIsValid(
     const BinaryTelemetryRecord& record
 )
@@ -2355,7 +2588,41 @@ bool recordIsValid(
         record.schemaVersion !=
             RING_SCHEMA_VERSION ||
         record.ordinal == 0 ||
-        record.sequence == 0 ||
+        record.sequence == 0
+    )
+    {
+        return false;
+    }
+
+    // Current schema recognizes only the cold-boot unresolved-time flag.
+    if (
+        (
+            record.flags &
+            static_cast<uint16_t>(
+                ~RING_FLAG_TIME_UNRESOLVED
+            )
+        ) != 0
+    )
+    {
+        return false;
+    }
+
+    if (
+        recordHasUnresolvedTimestamp(
+            record
+        )
+    )
+    {
+        // A true offline cold boot intentionally has no UTC value yet.
+        if (
+            record.epochSeconds !=
+            0
+        )
+        {
+            return false;
+        }
+    }
+    else if (
         record.epochSeconds <
             1700000000ULL
     )
@@ -2433,9 +2700,6 @@ uint64_t ringOffsetForOrdinal(
 
 bool ensureRingFile()
 {
-    bool recreate =
-        false;
-
     if (
         LittleFS.exists(
             RING_FILE
@@ -2450,6 +2714,10 @@ bool ensureRingFile()
 
         if (!existing)
         {
+            Serial.println(
+                "[RING] Existing ring cannot be opened; preserving filesystem without format."
+            );
+
             return false;
         }
 
@@ -2463,30 +2731,21 @@ bool ensureRingFile()
             ringFileSizeBytes()
         )
         {
-            recreate =
-                true;
+            Serial.printf(
+                "[RING] Existing ring size mismatch: expected=%llu actual=%llu. "
+                "Backlog preserved; automatic recreation is disabled.\n",
+                static_cast<unsigned long long>(
+                    ringFileSizeBytes()
+                ),
+                static_cast<unsigned long long>(
+                    existingSize
+                )
+            );
+
+            return false;
         }
-    }
-    else
-    {
-        recreate =
-            true;
-    }
 
-    if (!recreate)
-    {
         return true;
-    }
-
-    if (
-        LittleFS.exists(
-            RING_FILE
-        )
-    )
-    {
-        LittleFS.remove(
-            RING_FILE
-        );
     }
 
     Serial.printf(
@@ -2550,7 +2809,6 @@ bool ensureRingFile()
         remaining -=
             chunk;
 
-        // Avoid starving system tasks during one-time ~1.2 MB creation.
         delay(0);
     }
 
@@ -2842,9 +3100,11 @@ void noteConsumedOrdinal(
     pendingConsumedCount++;
 
     if (
-        forceCommit ||
-        pendingConsumedCount >=
-            ACK_WATERMARK_BATCH_SIZE
+        FirmwareLogic::shouldCommitWatermark(
+            pendingConsumedCount,
+            ACK_WATERMARK_BATCH_SIZE,
+            forceCommit
+        )
     )
     {
         commitConsumedWatermark();
@@ -2854,6 +3114,209 @@ void noteConsumedOrdinal(
 // =====================================================
 // Binary <-> HTTP Packet
 // =====================================================
+
+bool unresolvedTimeAnchorReady()
+{
+    return (
+        unresolvedAnchorOrdinal >
+            0 &&
+        unresolvedAnchorEpochMs >=
+            1700000000000ULL
+    );
+}
+
+bool establishUnresolvedTimeAnchor()
+{
+    if (
+        unresolvedTimestampCount ==
+        0
+    )
+    {
+        return true;
+    }
+
+    if (
+        unresolvedTimeAnchorReady()
+    )
+    {
+        return true;
+    }
+
+    if (
+        !timeReady
+    )
+    {
+        return false;
+    }
+
+    time_t now =
+        time(nullptr);
+
+    if (
+        now <
+        1700000000
+    )
+    {
+        return false;
+    }
+
+    if (
+        newestUnresolvedOrdinal ==
+        0
+    )
+    {
+        Serial.println(
+            "[TIME] Cannot establish unresolved timestamp anchor: no active unresolved ordinal."
+        );
+
+        return false;
+    }
+
+    uint64_t candidateOrdinal =
+        newestUnresolvedOrdinal;
+
+    uint64_t candidateEpochMs =
+        static_cast<uint64_t>(
+            now
+        ) *
+        1000ULL;
+
+    // Both anchor values must be durable before any unresolved record is
+    // serialized or transmitted. This guarantees that an ACK-loss reboot
+    // reconstructs the identical timestamp and therefore identical JSON.
+    size_t ordinalWritten =
+        preferences.putULong64(
+            "uTimeOrd",
+            candidateOrdinal
+        );
+
+    size_t epochWritten =
+        preferences.putULong64(
+            "uTimeMs",
+            candidateEpochMs
+        );
+
+    if (
+        ordinalWritten !=
+            sizeof(uint64_t) ||
+        epochWritten !=
+            sizeof(uint64_t)
+    )
+    {
+        Serial.println(
+            "[TIME] Failed to persist unresolved timestamp anchor; replay will wait."
+        );
+
+        return false;
+    }
+
+    uint64_t verifiedOrdinal =
+        preferences.getULong64(
+            "uTimeOrd",
+            0
+        );
+
+    uint64_t verifiedEpochMs =
+        preferences.getULong64(
+            "uTimeMs",
+            0
+        );
+
+    if (
+        verifiedOrdinal !=
+            candidateOrdinal ||
+        verifiedEpochMs !=
+            candidateEpochMs
+    )
+    {
+        Serial.println(
+            "[TIME] Unresolved timestamp anchor read-back mismatch; replay will wait."
+        );
+
+        return false;
+    }
+
+    unresolvedAnchorOrdinal =
+        candidateOrdinal;
+
+    unresolvedAnchorEpochMs =
+        candidateEpochMs;
+
+    Serial.printf(
+        "[TIME] Durable cold-boot timestamp anchor: ordinal=%llu epochMs=%llu.\n",
+        static_cast<unsigned long long>(
+            unresolvedAnchorOrdinal
+        ),
+        static_cast<unsigned long long>(
+            unresolvedAnchorEpochMs
+        )
+    );
+
+    return true;
+}
+
+bool resolveUnresolvedRecordEpoch(
+    const BinaryTelemetryRecord& record,
+    uint64_t& resolvedEpochSeconds
+)
+{
+    resolvedEpochSeconds =
+        0;
+
+    if (
+        !recordHasUnresolvedTimestamp(
+            record
+        )
+    )
+    {
+        resolvedEpochSeconds =
+            record.epochSeconds;
+
+        return (
+            resolvedEpochSeconds >=
+            1700000000ULL
+        );
+    }
+
+    if (
+        !unresolvedTimeAnchorReady() ||
+        unresolvedAnchorEpochMs >
+            static_cast<uint64_t>(
+                INT64_MAX
+            )
+    )
+    {
+        return false;
+    }
+
+    const int64_t resolvedEpochMs =
+        FirmwareLogic::resolveTimestampMs(
+            record.ordinal,
+            unresolvedAnchorOrdinal,
+            static_cast<int64_t>(
+                unresolvedAnchorEpochMs
+            ),
+            static_cast<uint32_t>(
+                UNRESOLVED_NOMINAL_PERIOD_MS
+            )
+        );
+
+    if (
+        resolvedEpochMs <
+        1700000000000LL
+    )
+    {
+        return false;
+    }
+
+    resolvedEpochSeconds =
+        static_cast<uint64_t>(
+            resolvedEpochMs /
+            1000LL
+        );
+
+    return true;
+}
 
 BinaryTelemetryRecord packetToRecord(
     const TelemetryPacket& packet,
@@ -2868,8 +3331,24 @@ BinaryTelemetryRecord packetToRecord(
     record.sequence =
         packet.sequence;
 
-    record.epochSeconds =
-        packet.epochSeconds;
+    if (
+        packet.timestampResolved
+    )
+    {
+        record.flags =
+            0;
+
+        record.epochSeconds =
+            packet.epochSeconds;
+    }
+    else
+    {
+        record.flags =
+            RING_FLAG_TIME_UNRESOLVED;
+
+        record.epochSeconds =
+            0;
+    }
 
     record.vibrationRmsRaw =
         packet.vibrationRmsRaw;
@@ -2900,39 +3379,35 @@ bool recordToPacket(
         return false;
     }
 
-    String timestamp =
-        formatTimestampFromEpoch(
-            record.epochSeconds
-        );
-
-    if (
-        timestamp.length() == 0
-    )
-    {
-        return false;
-    }
-
-    VibrationFeatures vib;
-
-    vib.totalRms =
-        record.vibrationRmsRaw;
-
-    vib.peakHz =
-        record.vibrationPeakHz;
-
-    AcousticFeatures audio;
-
-    audio.rmsRaw =
-        record.acousticRmsRaw;
-
-    audio.peakHz =
-        record.acousticPeakHz;
-
     packet.sequence =
         record.sequence;
 
-    packet.epochSeconds =
-        record.epochSeconds;
+    if (
+        !resolveUnresolvedRecordEpoch(
+            record,
+            packet.epochSeconds
+        )
+    )
+    {
+        if (
+            recordHasUnresolvedTimestamp(
+                record
+            )
+        )
+        {
+            Serial.printf(
+                "[TIME] Sequence %lu is safely buffered but still waiting for a durable UTC anchor.\n",
+                static_cast<unsigned long>(
+                    record.sequence
+                )
+            );
+        }
+
+        return false;
+    }
+
+    packet.timestampResolved =
+        true;
 
     packet.vibrationRmsRaw =
         record.vibrationRmsRaw;
@@ -2947,12 +3422,17 @@ bool recordToPacket(
         record.acousticPeakHz;
 
     packet.payload =
-        createTelemetryPayload(
-            packet.sequence,
-            timestamp,
-            vib,
-            audio
+        createCanonicalTelemetryPayload(
+            packet
         );
+
+    if (
+        packet.payload.length() ==
+        0
+    )
+    {
+        return false;
+    }
 
     return true;
 }
@@ -3044,6 +3524,9 @@ bool removeOldestPersistent()
     uint32_t sequence =
         0;
 
+    bool consumedUnresolvedTimestamp =
+        false;
+
     if (
         readRingRecord(
             ordinal,
@@ -3053,6 +3536,11 @@ bool removeOldestPersistent()
     {
         sequence =
             record.sequence;
+
+        consumedUnresolvedTimestamp =
+            recordHasUnresolvedTimestamp(
+                record
+            );
     }
 
     // FAST PATH:
@@ -3061,6 +3549,15 @@ bool removeOldestPersistent()
     // ordinal watermark to NVS.
     ringHeadOrdinal++;
     queueCount--;
+
+    if (
+        consumedUnresolvedTimestamp &&
+        unresolvedTimestampCount >
+            0
+    )
+    {
+        unresolvedTimestampCount--;
+    }
 
     noteConsumedOrdinal(
         ordinal,
@@ -3103,6 +3600,9 @@ bool dropOldestForOverflow()
     uint32_t sequence =
         0;
 
+    bool droppedUnresolvedTimestamp =
+        false;
+
     if (
         readRingRecord(
             ordinal,
@@ -3112,12 +3612,26 @@ bool dropOldestForOverflow()
     {
         sequence =
             oldest.sequence;
+
+        droppedUnresolvedTimestamp =
+            recordHasUnresolvedTimestamp(
+                oldest
+            );
     }
 
     // The next enqueue at full capacity naturally overwrites this oldest
     // physical ring slot. Avoid the old per-drop LittleFS invalidation flush.
     ringHeadOrdinal++;
     queueCount--;
+
+    if (
+        droppedUnresolvedTimestamp &&
+        unresolvedTimestampCount >
+            0
+    )
+    {
+        unresolvedTimestampCount--;
+    }
 
     noteConsumedOrdinal(
         ordinal,
@@ -3187,6 +3701,24 @@ bool enqueuePersistent(
     }
 
     if (
+        recordHasUnresolvedTimestamp(
+            record
+        )
+    )
+    {
+        unresolvedTimestampCount++;
+
+        if (
+            ordinal >
+            newestUnresolvedOrdinal
+        )
+        {
+            newestUnresolvedOrdinal =
+                ordinal;
+        }
+    }
+
+    if (
         queueCount == 0
     )
     {
@@ -3253,6 +3785,18 @@ void restoreQueueFromFlash()
         committedConsumedOrdinal;
 
     pendingConsumedCount =
+        0;
+
+    unresolvedTimestampCount =
+        0;
+
+    newestUnresolvedOrdinal =
+        0;
+
+    unresolvedAnchorOrdinal =
+        0;
+
+    unresolvedAnchorEpochMs =
         0;
 
     if (
@@ -3361,8 +3905,10 @@ void restoreQueueFromFlash()
         // valid bytes can remain in the ring after ACK. The durable watermark
         // is authoritative for whether that ordinal is still queued.
         if (
-            record.ordinal <=
-            committedConsumedOrdinal
+            FirmwareLogic::shouldIgnoreRecoveredOrdinal(
+                record.ordinal,
+                committedConsumedOrdinal
+            )
         )
         {
             ignoredConsumedCount++;
@@ -3370,6 +3916,24 @@ void restoreQueueFromFlash()
         }
 
         activeValidCount++;
+
+        if (
+            recordHasUnresolvedTimestamp(
+                record
+            )
+        )
+        {
+            unresolvedTimestampCount++;
+
+            if (
+                record.ordinal >
+                newestUnresolvedOrdinal
+            )
+            {
+                newestUnresolvedOrdinal =
+                    record.ordinal;
+            }
+        }
 
         if (
             record.ordinal <
@@ -3394,15 +3958,9 @@ void restoreQueueFromFlash()
 
     // Never reuse an ordinal at or below the consumed watermark.
     ringNextOrdinal =
-        maximumOrdinalSeen + 1;
-
-    if (
-        ringNextOrdinal == 0
-    )
-    {
-        ringNextOrdinal =
-            1;
-    }
+        FirmwareLogic::calculateNextRingOrdinal(
+            maximumOrdinalSeen
+        );
 
     if (
         activeValidCount >
@@ -3414,24 +3972,68 @@ void restoreQueueFromFlash()
 
         // Valid records should form one continuous FIFO interval.
         // Any missing/torn slot is skipped lazily by readOldestPersistent().
-        uint64_t span =
-            maximumActiveOrdinal -
-            minimumActiveOrdinal +
-            1;
-
         queueCount =
-            static_cast<size_t>(
-                span >
-                    QUEUE_CAPACITY
-                    ? QUEUE_CAPACITY
-                    : span
+            FirmwareLogic::calculateRecoveredQueueCount(
+                minimumActiveOrdinal,
+                maximumActiveOrdinal,
+                QUEUE_CAPACITY,
+                activeValidCount
             );
     }
 
-    preferences.putUInt(
-        "sequence",
-        telemetrySequence
-    );
+    // The ring may contain a sequence newer than the NVS value (for
+    // example, if a prior write was interrupted). Repair that floor before
+    // any new sequence is ever allocated.
+    if (
+        !ensureCurrentSequenceFloorDurable()
+    )
+    {
+        Serial.println(
+            "[RECOVERY] Sequence floor is NOT durable. New packet creation will remain blocked until NVS persistence succeeds."
+        );
+    }
+
+    if (
+        unresolvedTimestampCount >
+        0
+    )
+    {
+        uint64_t storedAnchorOrdinal =
+            preferences.getULong64(
+                "uTimeOrd",
+                0
+            );
+
+        uint64_t storedAnchorEpochMs =
+            preferences.getULong64(
+                "uTimeMs",
+                0
+            );
+
+        if (
+            storedAnchorOrdinal >
+                0 &&
+            storedAnchorEpochMs >=
+                1700000000000ULL
+        )
+        {
+            unresolvedAnchorOrdinal =
+                storedAnchorOrdinal;
+
+            unresolvedAnchorEpochMs =
+                storedAnchorEpochMs;
+
+            Serial.printf(
+                "[RECOVERY] Restored cold-boot UTC anchor: ordinal=%llu epochMs=%llu.\n",
+                static_cast<unsigned long long>(
+                    unresolvedAnchorOrdinal
+                ),
+                static_cast<unsigned long long>(
+                    unresolvedAnchorEpochMs
+                )
+            );
+        }
+    }
 
     Serial.printf(
         "[RECOVERY] Binary ring restored %u queued slot(s).\n",
@@ -3454,6 +4056,13 @@ void restoreQueueFromFlash()
         ),
         static_cast<unsigned long long>(
             ringNextOrdinal
+        )
+    );
+
+    Serial.printf(
+        "[RECOVERY] Active cold-boot unresolved timestamps: %u.\n",
+        static_cast<unsigned int>(
+            unresolvedTimestampCount
         )
     );
 
@@ -3511,23 +4120,103 @@ bool responseHasErrorCode(
     );
 }
 
+bool validateAckResponse(
+    const TelemetryPacket& packet,
+    int statusCode,
+    const String& response
+)
+{
+    const FirmwareLogic::AckValidationResult validation =
+        FirmwareLogic::validateAckJson(
+            statusCode,
+            response.c_str(),
+            DEVICE_ID,
+            packet.sequence
+        );
+
+    switch (
+        validation
+    )
+    {
+        case FirmwareLogic::AckValidationResult::VALID:
+            return true;
+
+        case FirmwareLogic::AckValidationResult::UNSUPPORTED_STATUS:
+            Serial.printf(
+                "[ACK-VALIDATION] Unsupported success status HTTP %d; telemetry preserved.\n",
+                statusCode
+            );
+            break;
+
+        case FirmwareLogic::AckValidationResult::MALFORMED_RESPONSE:
+            Serial.println(
+                "[ACK-VALIDATION] Missing or malformed ACK fields; telemetry preserved."
+            );
+            break;
+
+        case FirmwareLogic::AckValidationResult::NOT_ACCEPTED:
+            Serial.println(
+                "[ACK-VALIDATION] accepted != true; telemetry preserved."
+            );
+            break;
+
+        case FirmwareLogic::AckValidationResult::DEVICE_MISMATCH:
+            Serial.println(
+                "[ACK-VALIDATION] deviceId mismatch; telemetry preserved."
+            );
+            break;
+
+        case FirmwareLogic::AckValidationResult::SEQUENCE_MISMATCH:
+            Serial.printf(
+                "[ACK-VALIDATION] sequence mismatch for expected Sequence %lu; telemetry preserved.\n",
+                static_cast<unsigned long>(
+                    packet.sequence
+                )
+            );
+            break;
+
+        case FirmwareLogic::AckValidationResult::DUPLICATE_CONTRACT_MISMATCH:
+            Serial.printf(
+                "[ACK-VALIDATION] HTTP %d duplicate contract mismatch; telemetry preserved.\n",
+                statusCode
+            );
+            break;
+    }
+
+    return false;
+}
+
 PostResult classifyHttpOutcome(
+    const TelemetryPacket& packet,
     int statusCode,
     const String& response
 )
 {
     // -------------------------------------------------
-    // Success / idempotent duplicate
-    // API v1.3:
-    // 201 = newly stored
-    // 200 = identical replay, duplicate=true
+    // Validated success / idempotent duplicate
+    //
+    // Never consume a queued packet from HTTP status alone.
+    // Only an ACK body matching DEVICE_ID + packet.sequence is success.
     // -------------------------------------------------
     if (
         statusCode >= 200 &&
         statusCode <= 299
     )
     {
-        return PostResult::SUCCESS;
+        if (
+            validateAckResponse(
+                packet,
+                statusCode,
+                response
+            )
+        )
+        {
+            return PostResult::SUCCESS;
+        }
+
+        // A malformed/mismatched 2xx is a protocol/configuration fault,
+        // not proof that this packet was safely accepted. Keep it queued.
+        return PostResult::CONFIGURATION_ERROR;
     }
 
     // -------------------------------------------------
@@ -4025,6 +4714,7 @@ PostOutcome postPacket(
 
     outcome.result =
         classifyHttpOutcome(
+            packet,
             statusCode,
             outcome.response
         );
@@ -4036,7 +4726,7 @@ PostOutcome postPacket(
 // P1 + P3: Replay
 // =====================================================
 
-void flushQueue()
+void replayQueueBatch()
 {
     if (
         queueIsEmpty() ||
@@ -4049,12 +4739,26 @@ void flushQueue()
 
     Serial.println();
 
-    Serial.println(
-        "[BUFFER] Persistent Replay Started"
+    Serial.printf(
+        "[BUFFER] Persistent Replay Batch Started (max %u record(s))\n",
+        static_cast<unsigned int>(
+            REPLAY_MAX_RECORDS_PER_LOOP
+        )
     );
 
+    size_t consumedThisBatch =
+        0;
+
+    const size_t replayLimit =
+        FirmwareLogic::calculateReplayBatchSize(
+            queueCount,
+            REPLAY_MAX_RECORDS_PER_LOOP
+        );
+
     while (
-        !queueIsEmpty()
+        !queueIsEmpty() &&
+        consumedThisBatch <
+            replayLimit
     )
     {
         TelemetryPacket packet;
@@ -4111,6 +4815,10 @@ void flushQueue()
                 return;
             }
 
+            consumedThisBatch++;
+
+            // Keep a small pacing gap so catch-up does not hammer the
+            // backend, but never drain the whole backlog in one loop.
             delay(100);
             continue;
         }
@@ -4180,16 +4888,38 @@ void flushQueue()
                 return;
             }
 
+            consumedThisBatch++;
+
             Serial.println(
                 "[BUFFER] Continuing with next queued packet."
             );
         }
     }
 
-    commitConsumedWatermark();
+    // Do not force an NVS write at every small replay slice.
+    // removeOldestPersistent() keeps the existing 32-record watermark
+    // batching policy and force-commits automatically when the queue
+    // becomes empty. If power is lost between commits, the backend's
+    // idempotent duplicate handling safely absorbs the small replay window.
+    if (
+        queueIsEmpty()
+    )
+    {
+        Serial.println(
+            "[BUFFER] Persistent Replay Completed."
+        );
 
-    Serial.println(
-        "[BUFFER] Persistent Replay Completed."
+        return;
+    }
+
+    Serial.printf(
+        "[BUFFER] Replay batch finished after %u record(s); %u remain. Returning to sensor acquisition.\n",
+        static_cast<unsigned int>(
+            consumedThisBatch
+        ),
+        static_cast<unsigned int>(
+            queueCount
+        )
     );
 }
 
@@ -4203,80 +4933,83 @@ bool createPacket(
     TelemetryPacket& packet
 )
 {
+    uint32_t allocatedSequence =
+        0;
+
     if (
-        !timeReady
+        !allocateSequence(
+            allocatedSequence
+        )
     )
     {
         return false;
     }
+
+    packet.sequence =
+        allocatedSequence;
+
+    packet.vibrationRmsRaw =
+        FirmwareLogic::canonicalizeMeasurement(
+            vib.totalRms
+        );
+
+    packet.vibrationPeakHz =
+        FirmwareLogic::canonicalizeMeasurement(
+            vib.peakHz
+        );
+
+    packet.acousticRmsRaw =
+        FirmwareLogic::canonicalizeMeasurement(
+            audio.rmsRaw
+        );
+
+    packet.acousticPeakHz =
+        FirmwareLogic::canonicalizeMeasurement(
+            audio.peakHz
+        );
 
     time_t now =
         time(nullptr);
 
     if (
-        now <
-        1700000000
+        timeReady &&
+        now >=
+            1700000000
     )
     {
-        timeReady =
-            false;
+        packet.timestampResolved =
+            true;
 
-        return false;
-    }
-
-    String timestamp =
-        formatTimestampFromEpoch(
+        packet.epochSeconds =
             static_cast<uint64_t>(
                 now
-            )
+            );
+
+        packet.payload =
+            createCanonicalTelemetryPayload(
+                packet
+            );
+
+        return (
+            packet.payload.length() >
+            0
         );
-
-    if (
-        timestamp.length() ==
-        0
-    )
-    {
-        timeReady =
-            false;
-
-        return false;
     }
 
-    packet.sequence =
-        allocateSequence();
+    // True offline cold boot:
+    // no RTC means absolute UTC is physically unknowable right now.
+    // Do NOT invent a timestamp and do NOT stop acquisition. Persist the
+    // sensor values + durable sequence with the unresolved-time ring flag.
+    // Once UTC becomes available, replay derives a deterministic timestamp
+    // from the durable ordinal->UTC anchor.
+    packet.timestampResolved =
+        false;
 
     packet.epochSeconds =
-        static_cast<uint64_t>(
-            now
-        );
-
-    packet.vibrationRmsRaw =
-        static_cast<float>(
-            vib.totalRms
-        );
-
-    packet.vibrationPeakHz =
-        static_cast<float>(
-            vib.peakHz
-        );
-
-    packet.acousticRmsRaw =
-        static_cast<float>(
-            audio.rmsRaw
-        );
-
-    packet.acousticPeakHz =
-        static_cast<float>(
-            audio.peakHz
-        );
+        0;
 
     packet.payload =
-        createTelemetryPayload(
-            packet.sequence,
-            timestamp,
-            vib,
-            audio
-        );
+        "";
 
     return true;
 }
@@ -4288,27 +5021,54 @@ bool createPacket(
 bool initPersistentStorage()
 {
     Serial.println(
-        "[FLASH] Mounting LittleFS..."
+        "[FLASH] Mounting LittleFS without automatic format..."
     );
 
-    if (
-        !LittleFS.begin(
-            false
-        )
+    bool mounted =
+        false;
+
+    for (
+        uint8_t attempt = 1;
+        attempt <=
+            LITTLEFS_MOUNT_ATTEMPTS;
+        attempt++
     )
     {
-        Serial.println(
-            "[FLASH] Mount failed. Trying format..."
-        );
-
         if (
-            !LittleFS.begin(
-                true
+            !TEST_FORCE_LITTLEFS_MOUNT_FAIL &&
+            LittleFS.begin(
+                false
             )
         )
         {
-            return false;
+            mounted =
+                true;
+
+            break;
         }
+
+        Serial.printf(
+            "[FLASH] LittleFS mount attempt %u/%u failed. Backlog is preserved; no format will be performed.\n",
+            static_cast<unsigned int>(
+                attempt
+            ),
+            static_cast<unsigned int>(
+                LITTLEFS_MOUNT_ATTEMPTS
+            )
+        );
+
+        delay(250);
+    }
+
+    if (
+        !mounted
+    )
+    {
+        Serial.println(
+            "[FLASH] Mount failed after retries. Refusing automatic format to protect existing backlog."
+        );
+
+        return false;
     }
 
     if (
@@ -4377,23 +5137,38 @@ void setup()
     );
 
     Serial.println(
-        " Fix : 24H Ring + Fast Replay + P1-P5"
+        " Fix : Durable Sequence + No Auto-Format + Offline Cold Boot"
     );
 
     Serial.println(
         "=============================================================="
     );
 
-    preferences.begin(
-        "telemetry",
-        false
-    );
+    if (
+        !preferences.begin(
+            "telemetry",
+            false
+        )
+    )
+    {
+        Serial.println(
+            "[FATAL] NVS Preferences unavailable. Refusing unsafe sequence operation."
+        );
+
+        while (true)
+        {
+            delay(1000);
+        }
+    }
 
     telemetrySequence =
         preferences.getUInt(
             "sequence",
             0
         );
+
+    sequencePersistenceReady =
+        true;
 
     if (
         !initPersistentStorage()
@@ -4555,7 +5330,7 @@ void setup()
         );
 
         Serial.println(
-            "[TIME] New telemetry will wait until a valid clock is obtained."
+            "[TIME] No UTC yet. Sensor acquisition will continue and unresolved records will be stored locally."
         );
     }
 
@@ -4596,35 +5371,34 @@ void loop()
         syncTime();
     }
 
-    // Replay old data first whenever the backend is reachable.
+    // If cold-boot records were captured before UTC was known, establish
+    // one durable ordinal->UTC mapping before any of those records can be
+    // replayed. Failure is safe: data stays queued and acquisition continues.
+    if (
+        timeReady &&
+        unresolvedTimestampCount >
+            0 &&
+        !unresolvedTimeAnchorReady()
+    )
+    {
+        establishUnresolvedTimeAnchor();
+    }
+
+    // Replay only a bounded slice of old data before each fresh
+    // measurement. This prevents a full 24-hour backlog from starving
+    // synchronized sensor acquisition while preserving FIFO order.
     if (
         WiFi.status() ==
             WL_CONNECTED &&
         !queueIsEmpty()
     )
     {
-        flushQueue();
+        replayQueueBatch();
     }
 
-    // Cold boot without any valid absolute time source:
-    // do not invent timestamps.
-    //
-    // After time has synchronized once, ordinary Wi-Fi loss does not
-    // set timeReady=false; the ESP system clock continues locally.
-    if (
-        !timeReady
-    )
-    {
-        Serial.println(
-            "[TIME] No valid clock. New telemetry acquisition paused."
-        );
-
-        delay(
-            MEASUREMENT_INTERVAL_MS
-        );
-
-        return;
-    }
+    // A missing absolute clock no longer blocks sensing. createPacket()
+    // will mark the fresh record as unresolved and the binary ring will
+    // preserve it until a durable UTC anchor can be established.
 
     // =================================================
     // P5: one common 0.64 s vibration/acoustic window
@@ -4699,13 +5473,55 @@ void loop()
     }
 
     Serial.printf(
-        "[PACKET] Created Sequence %lu\n",
+        "[PACKET] Created Sequence %lu%s\n",
         static_cast<unsigned long>(
             packet.sequence
-        )
+        ),
+        packet.timestampResolved
+            ? ""
+            : " (UTC unresolved)"
     );
 
+    // True cold boot without UTC:
+    // even if the station is associated with Wi-Fi but NTP/backend time is
+    // unavailable, never attempt an HTTP POST with an invented timestamp.
+    // Persist immediately and continue measuring.
+    if (
+        !packet.timestampResolved
+    )
+    {
+        Serial.printf(
+            "[OFFLINE-COLD-BOOT] Storing Sequence %lu locally without UTC; acquisition continues.\n",
+            static_cast<unsigned long>(
+                packet.sequence
+            )
+        );
+
+        if (
+            !enqueuePersistent(
+                packet
+            )
+        )
+        {
+            Serial.println(
+                "[CRITICAL] Cold-boot telemetry persistence failed."
+            );
+        }
+
+        delay(
+            MEASUREMENT_INTERVAL_MS
+        );
+
+        return;
+    }
+
     // Existing backlog always wins FIFO.
+    //
+    // replayQueueBatch() consumed only a bounded number of oldest
+    // records at the start of this loop. If backlog remains, this fresh
+    // measurement is appended to the tail instead of bypassing older
+    // telemetry. Therefore catch-up and acquisition are interleaved
+    // without reordering packets.
     if (
         !queueIsEmpty()
     )

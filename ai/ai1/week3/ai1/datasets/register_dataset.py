@@ -644,10 +644,18 @@ def build_manifest(
         splits = group_split(records, split_ratios, seed, group_key="specimen_id")
         holdout_type = "specimen"
         independent_holdout = True
+        recorded_split_ratios = split_ratios
     else:  # operating_condition_holdout
+        # [리뷰 P1] operating_condition_split은 부하 tier로 배정을 고정하고
+        # split_ratios 인자를 완전히 무시한다(시그니처 호환용). 그런데 예전
+        # 코드는 이 무시된 입력값을 그대로 매니페스트["split"]/체크섬에 기록해서,
+        # 예를 들어 train=1.0/validation=test=0.0을 넘겨도 실제 rows에는
+        # validation/test가 들어가는데 매니페스트는 "전부 train"이라고 거짓말했다.
+        # 실제 적용된(rows 기준) 비율을 아래에서 계산해 기록한다.
         splits = operating_condition_split(records, split_ratios)
         holdout_type = "operating_condition"
         independent_holdout = False
+        recorded_split_ratios = None  # split_counts 계산 후 채운다
 
     rows = []
     for rec, split in zip(records, splits):
@@ -673,11 +681,24 @@ def build_manifest(
         }
         rows.append(row)
 
+    split_counts = {"train": 0, "validation": 0, "test": 0}
+    for split in splits:
+        split_counts[split] += 1
+
+    if recorded_split_ratios is None:
+        # operating_condition_holdout: 실제로 rows에 반영된(요청 비율과 무관한
+        # 고정 tier 배정 결과의) 비율을 계산해 기록한다 — 매니페스트/체크섬이
+        # 무시된 요청값이 아니라 실제 데이터를 정직하게 반영하도록.
+        total = len(records)
+        recorded_split_ratios = {
+            name: split_counts[name] / total for name in ("train", "validation", "test")
+        }
+
     version_checksum = compute_version_checksum(
         source["files"],
         window_size,
         hop_size,
-        split_ratios,
+        recorded_split_ratios,
         seed,
         LABEL_TAXONOMY_VERSION,
         DATASET_LABEL_MAPPING,
@@ -688,10 +709,6 @@ def build_manifest(
         split_strategy=split_strategy,
     )
     source["checksum"] = version_checksum
-
-    split_counts = {"train": 0, "validation": 0, "test": 0}
-    for split in splits:
-        split_counts[split] += 1
 
     label_summary = summarize_dataset_labels(
         rows, DATASET_LABEL_MAPPING, LABEL_TAXONOMY_VERSION
@@ -710,7 +727,7 @@ def build_manifest(
         "labelMapping": DATASET_LABEL_MAPPING,
         "labelPolicyVersion": LABEL_POLICY_VERSION,
         "snapshotSchemaVersion": SNAPSHOT_SCHEMA_VERSION,
-        "split": split_ratios,
+        "split": recorded_split_ratios,
         "splitStrategy": _SPLIT_STRATEGY_TEXT[split_strategy],
         "holdoutType": holdout_type,
         "independentHoldout": independent_holdout,

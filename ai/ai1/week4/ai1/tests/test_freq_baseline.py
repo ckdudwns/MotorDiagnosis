@@ -40,7 +40,9 @@ from train_and_evaluate import (  # noqa: E402
     collect_error_cases,
     run_training_job,
     prepare_lstm_chunks,
-    _evaluate_candidate,
+    _train_and_validate_candidate,
+    _finalize_test_evaluation,
+    _actual_independent_holdout,
     select_best,
     score_from_artifact,
     feature_names_from_manifest,
@@ -222,6 +224,19 @@ def _synthetic_split(n_features=4, seq=None):
     }
 
 
+def _train_validate_and_finalize(name, split_strategy, splits, *, feature_names, epochs, artifact_path=None):
+    """테스트 전용 헬퍼: train/validation 학습 + (예전 _evaluate_candidate처럼)
+    같은 호출 안에서 test holdout까지 즉시 평가한다. 운영 코드(run_training_job)는
+    select_best() 이후 선택된 후보에 대해서만 이렇게 한다 — [리뷰 P1]."""
+    candidate, state = _train_and_validate_candidate(
+        name, split_strategy, splits, feature_names=feature_names, epochs=epochs,
+        artifact_path=artifact_path,
+    )
+    metrics, error_cases = _finalize_test_evaluation(name, state, splits)
+    candidate["metrics"] = metrics
+    return candidate, error_cases
+
+
 class TestArtifactReloadReproducesVerdict(unittest.TestCase):
     def _check(self, name, seq):
         import tempfile
@@ -231,12 +246,13 @@ class TestArtifactReloadReproducesVerdict(unittest.TestCase):
         test_labels = [s["common_label"] == "ANOMALY" for s in splits["test"]]
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, f"{name}.pt")
-            candidate, _ = _evaluate_candidate(
+            candidate, _ = _train_validate_and_finalize(
                 name, "x", splits, feature_names=names, epochs=40, artifact_path=path
             )
             test_matrix = np.stack([s["vector"] for s in splits["test"]])
             reloaded = score_from_artifact(
-                path, test_matrix, input_feature_names=names
+                path, test_matrix, input_feature_names=names,
+                expected_checksum=candidate["artifactChecksum"],
             )
 
         # 재로딩한 임계값·특징 순서가 학습 때와 같아야 한다.
@@ -262,23 +278,26 @@ class TestScoreFromArtifactSchemaValidation(unittest.TestCase):
         splits = _synthetic_split(seq=None)
         names = ["f0", "f1", "f2", "f3"]
         path = os.path.join(tmp, "dense_autoencoder.pt")
-        _evaluate_candidate(
+        candidate, _ = _train_validate_and_finalize(
             "dense_autoencoder", "x", splits, feature_names=names, epochs=10,
             artifact_path=path,
         )
         matrix = np.stack([s["vector"] for s in splits["test"]])
-        return path, names, matrix
+        return path, names, matrix, candidate["artifactChecksum"]
 
     def test_reversed_column_order_is_corrected_by_name(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
-            path, names, matrix = self._artifact(tmp)
-            straight = score_from_artifact(path, matrix, input_feature_names=names)
+            path, names, matrix, checksum = self._artifact(tmp)
+            straight = score_from_artifact(
+                path, matrix, input_feature_names=names, expected_checksum=checksum
+            )
             reversed_names = list(reversed(names))
             reversed_matrix = matrix[:, ::-1]
             corrected = score_from_artifact(
-                path, reversed_matrix, input_feature_names=reversed_names
+                path, reversed_matrix, input_feature_names=reversed_names,
+                expected_checksum=checksum,
             )
         # 이름 기준 재정렬 → 열을 뒤집어 넣어도 같은 판정.
         self.assertEqual(corrected["verdict"], straight["verdict"])
@@ -287,31 +306,86 @@ class TestScoreFromArtifactSchemaValidation(unittest.TestCase):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
-            path, names, matrix = self._artifact(tmp)
+            path, names, matrix, checksum = self._artifact(tmp)
             with self.assertRaises(ValueError):
                 score_from_artifact(
-                    path, matrix, input_feature_names=["f0", "f1", "f2", "OTHER"]
+                    path, matrix, input_feature_names=["f0", "f1", "f2", "OTHER"],
+                    expected_checksum=checksum,
                 )
 
     def test_column_count_mismatch_raises(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
-            path, names, matrix = self._artifact(tmp)
+            path, names, matrix, checksum = self._artifact(tmp)
             with self.assertRaises(ValueError):
                 score_from_artifact(
-                    path, matrix[:, :3], input_feature_names=names[:3]
+                    path, matrix[:, :3], input_feature_names=names[:3],
+                    expected_checksum=checksum,
                 )
 
     def test_nan_input_raises(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
-            path, names, matrix = self._artifact(tmp)
+            path, names, matrix, checksum = self._artifact(tmp)
             bad = matrix.copy()
             bad[0, 0] = np.nan
             with self.assertRaises(ValueError):
-                score_from_artifact(path, bad, input_feature_names=names)
+                score_from_artifact(
+                    path, bad, input_feature_names=names, expected_checksum=checksum
+                )
+
+
+class TestScoreFromArtifactChecksumRequired(unittest.TestCase):
+    """[리뷰 P1] 추론 전 artifact checksum을 반드시 검증한다 — checksum을 확인하지
+    않고 load하면 threshold 등이 변조된 아티팩트도 그대로 추론에 쓰인다."""
+
+    def _artifact(self, tmp):
+        splits = _synthetic_split(seq=None)
+        names = ["f0", "f1", "f2", "f3"]
+        path = os.path.join(tmp, "dense_autoencoder.pt")
+        candidate, _ = _train_validate_and_finalize(
+            "dense_autoencoder", "x", splits, feature_names=names, epochs=10,
+            artifact_path=path,
+        )
+        matrix = np.stack([s["vector"] for s in splits["test"]])
+        return path, names, matrix, candidate["artifactChecksum"]
+
+    def test_expected_checksum_is_required_keyword(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, _checksum = self._artifact(tmp)
+            with self.assertRaises(TypeError):
+                score_from_artifact(path, matrix, input_feature_names=names)
+
+    def test_mismatched_checksum_rejects_inference(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, _checksum = self._artifact(tmp)
+            with self.assertRaises(ValueError):
+                score_from_artifact(
+                    path, matrix, input_feature_names=names,
+                    expected_checksum="sha256:" + "0" * 64,
+                )
+
+    def test_tampered_artifact_is_rejected_even_with_correct_shape(self):
+        """checksum이 기록 당시 값과 다르면(예: threshold 변조) — 파일이 여전히
+        정상적으로 torch.load 가능하더라도 — 추론을 거부해야 한다."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, original_checksum = self._artifact(tmp)
+            payload = torch.load(path, weights_only=False)
+            payload["threshold"] = payload["threshold"] * 1000.0  # 변조
+            torch.save(payload, path)
+            with self.assertRaises(ValueError):
+                score_from_artifact(
+                    path, matrix, input_feature_names=names,
+                    expected_checksum=original_checksum,  # 변조 전 checksum
+                )
 
 
 class TestValidationBasedSelection(unittest.TestCase):
@@ -383,6 +457,129 @@ def _synthetic_frozen_manifest(windows_per_file=10, sample_rate_hz=12000, seed=0
         "rows": rows,
     }
     return freeze_dataset_version(draft)
+
+
+def _frozen_manifest_from_files(files, *, independent_holdout, windows_per_file=6, seed=0):
+    """[테스트 전용] `_synthetic_frozen_manifest`처럼 v1.3 draft를 만들어 동결하지만,
+    파일마다 (source_file, known_label, common_label, split, specimen_id)를 직접
+    지정할 수 있다 — independentHoldout 선언/실제 불일치, validation NORMAL 부재
+    같은 경계 조건을 구성하기 위함."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for source_file, known, common, split, specimen_id in files:
+        base = source_file.replace(".mat", "")
+        offset = 6.0 if common == "ANOMALY" else 0.0
+        for i in range(windows_per_file):
+            row = {
+                "sample_id": f"{base}_{i:04d}",
+                "source_file": source_file,
+                "specimen_id": specimen_id,
+                "known_label": known,
+                "common_label": common,
+                "split": split,
+                "sample_rate_hz": 12000,
+                "rpm": 1797,
+            }
+            for col in _SYNTH_FEATURE_COLS:
+                row[col] = float(rng.normal(scale=0.1) + offset)
+            rows.append(row)
+    draft = {
+        "id": "DS-SYNTH-CUSTOM-001",
+        "name": "synthetic-custom",
+        "status": "draft",
+        "source": {"type": "external", "checksum": "sha256:synth-custom-checksum"},
+        "compatibility": {"signalType": ["vibration"], "samplingRateHz": 12000},
+        "labelTaxonomyVersion": "CWRU-FAULT-V1",
+        "labelMapping": {"NORMAL": "NORMAL", "BEARING_FAULT_INNER": "ANOMALY"},
+        "labelPolicyVersion": "LABEL-POLICY-V2",
+        "snapshotSchemaVersion": "2",
+        "split": {"train": 0.5, "validation": 0.3, "test": 0.2},
+        "splitStrategy": "custom: synthetic",
+        "holdoutType": "specimen" if independent_holdout else "operating_condition",
+        "independentHoldout": independent_holdout,
+        "rows": rows,
+    }
+    return freeze_dataset_version(draft)
+
+
+class TestActualIndependentHoldoutComputation(unittest.TestCase):
+    def test_true_when_every_specimen_has_single_split(self):
+        manifest = {
+            "rows": [
+                {"specimen_id": "A", "split": "train"},
+                {"specimen_id": "A", "split": "train"},
+                {"specimen_id": "B", "split": "validation"},
+            ]
+        }
+        self.assertTrue(_actual_independent_holdout(manifest))
+
+    def test_false_when_a_specimen_spans_splits(self):
+        manifest = {
+            "rows": [
+                {"specimen_id": "A", "split": "train"},
+                {"specimen_id": "A", "split": "validation"},
+            ]
+        }
+        self.assertFalse(_actual_independent_holdout(manifest))
+
+
+class TestIndependentHoldoutClaimVerified(unittest.TestCase):
+    """[리뷰 P1] independentHoldout 메타데이터 선언을 그대로 신뢰하지 않는다 —
+    실제 rows의 specimen_id -> split 관계로 재계산해 선언과 대조한다."""
+
+    def test_declared_true_but_specimen_spans_splits_rejected(self):
+        files = [
+            ("97.mat", "NORMAL", "NORMAL", "train", "SAME-SPECIMEN"),
+            ("98.mat", "NORMAL", "NORMAL", "validation", "SAME-SPECIMEN"),  # train과 같은 specimen!
+            ("99.mat", "BEARING_FAULT_INNER", "ANOMALY", "validation", "SPEC-B"),
+            ("100.mat", "NORMAL", "NORMAL", "test", "SPEC-C"),
+            ("105.mat", "BEARING_FAULT_INNER", "ANOMALY", "test", "SPEC-D"),
+        ]
+        manifest = _frozen_manifest_from_files(files, independent_holdout=True)
+        with self.assertRaises(ValueError):
+            run_training_job(manifest, dense_epochs=2, lstm_epochs=2)
+
+    def test_declared_true_and_actually_independent_reports_true(self):
+        files = [
+            ("97.mat", "NORMAL", "NORMAL", "train", "SPEC-A"),
+            ("98.mat", "NORMAL", "NORMAL", "validation", "SPEC-B"),
+            ("99.mat", "BEARING_FAULT_INNER", "ANOMALY", "validation", "SPEC-C"),
+            ("100.mat", "NORMAL", "NORMAL", "test", "SPEC-D"),
+            ("105.mat", "BEARING_FAULT_INNER", "ANOMALY", "test", "SPEC-E"),
+        ]
+        manifest = _frozen_manifest_from_files(files, independent_holdout=True)
+        report = run_training_job(manifest, dense_epochs=2, lstm_epochs=2)
+        self.assertTrue(report["metrics"]["independentHoldout"])
+
+    def test_actual_independence_computed_not_trusted_from_false_declaration(self):
+        # independentHoldout=False로 선언해도 실제 rows가 독립이면 실제 계산값
+        # (True)을 보고한다 — 선언값을 그대로 베끼지 않는다.
+        files = [
+            ("97.mat", "NORMAL", "NORMAL", "train", "SPEC-A"),
+            ("98.mat", "NORMAL", "NORMAL", "validation", "SPEC-B"),
+            ("99.mat", "BEARING_FAULT_INNER", "ANOMALY", "validation", "SPEC-C"),
+            ("100.mat", "NORMAL", "NORMAL", "test", "SPEC-D"),
+            ("105.mat", "BEARING_FAULT_INNER", "ANOMALY", "test", "SPEC-E"),
+        ]
+        manifest = _frozen_manifest_from_files(files, independent_holdout=False)
+        report = run_training_job(manifest, dense_epochs=2, lstm_epochs=2)
+        self.assertTrue(report["metrics"]["independentHoldout"])
+
+
+class TestValidationRequiresNormalSamples(unittest.TestCase):
+    """[리뷰 P1] validation에 NORMAL 표본이 없으면 mean+3*std가 NaN이 되어
+    임계값이 조용히 NaN으로 저장된다 — 명확한 오류로 막아야 한다."""
+
+    def test_no_normal_in_validation_raises_clear_error(self):
+        files = [
+            ("97.mat", "NORMAL", "NORMAL", "train", "SPEC-A"),
+            ("99.mat", "BEARING_FAULT_INNER", "ANOMALY", "validation", "SPEC-B"),  # validation 전부 ANOMALY
+            ("100.mat", "NORMAL", "NORMAL", "test", "SPEC-C"),
+            ("105.mat", "BEARING_FAULT_INNER", "ANOMALY", "test", "SPEC-D"),
+        ]
+        manifest = _frozen_manifest_from_files(files, independent_holdout=True)
+        with self.assertRaises(ValueError):
+            run_training_job(manifest, dense_epochs=2, lstm_epochs=2)
 
 
 class TestLstmInputMatchesFrozenDataset(unittest.TestCase):
@@ -477,7 +674,7 @@ class TestArtifactUriIsRegistrableFileUri(unittest.TestCase):
         names = [f"f{i}" for i in range(4)]
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "dense_autoencoder.pt")
-            candidate, _ = _evaluate_candidate(
+            candidate, _ = _train_and_validate_candidate(
                 "dense_autoencoder", "x", splits, feature_names=names,
                 epochs=3, artifact_path=path,
             )
@@ -495,7 +692,7 @@ class TestArtifactUriIsRegistrableFileUri(unittest.TestCase):
 
     def test_none_when_no_artifact_saved(self):
         splits = _synthetic_split(seq=None)
-        candidate, _ = _evaluate_candidate(
+        candidate, _ = _train_and_validate_candidate(
             "dense_autoencoder", "x", splits,
             feature_names=[f"f{i}" for i in range(4)], epochs=2,
         )
@@ -540,11 +737,22 @@ class TestRunTrainingJobWithRealCwruData(unittest.TestCase):
         self.assertEqual(len(strategies), 2)
 
     def test_metrics_are_valid_probabilities(self):
+        # [리뷰 P1] test holdout은 선택된 후보에 대해서만 평가한다 — 낙선 후보는
+        # "metrics"(test 지표) 자체가 없다.
+        for key in ("precision", "recall", "f1", "accuracy"):
+            value = self.report["metrics"][key]
+            self.assertGreaterEqual(value, 0.0)
+            self.assertLessEqual(value, 1.0)
+
+        best_name = self.report["metrics"]["bestCandidate"]
         for candidate in self.report["candidates"]:
-            for key in ("precision", "recall", "f1", "accuracy"):
-                value = candidate["metrics"][key]
-                self.assertGreaterEqual(value, 0.0)
-                self.assertLessEqual(value, 1.0)
+            if candidate["name"] == best_name:
+                for key in ("precision", "recall", "f1", "accuracy"):
+                    value = candidate["metrics"][key]
+                    self.assertGreaterEqual(value, 0.0)
+                    self.assertLessEqual(value, 1.0)
+            else:
+                self.assertNotIn("metrics", candidate)
 
     def test_best_candidate_has_some_signal_on_non_independent_holdout(self):
         # 최소한의 신호는 기대하되(운전조건 기준 in-distribution), 완전 분리를
@@ -603,12 +811,14 @@ class TestRunTrainingJobWithRealCwruData(unittest.TestCase):
                 # 보고서에 기록된 checksum이 실제 파일과 일치.
                 self.assertEqual(c["artifactChecksum"], _sha256(path))
 
-    def test_error_cases_present_for_each_candidate(self):
-        self.assertIn("dense_autoencoder", self.report["errorCases"])
-        self.assertIn("lstm_autoencoder", self.report["errorCases"])
-        for cases in self.report["errorCases"].values():
-            self.assertIn("false_positives", cases)
-            self.assertIn("false_negatives", cases)
+    def test_error_cases_present_only_for_selected_candidate(self):
+        """[리뷰 P1] test holdout은 선택된 후보에 대해서만 열린다 — 낙선 후보는
+        test 오류 사례 자체가 존재하지 않는다(계산되지 않았으므로)."""
+        best_name = self.report["metrics"]["bestCandidate"]
+        self.assertEqual(set(self.report["errorCases"].keys()), {best_name})
+        cases = self.report["errorCases"][best_name]
+        self.assertIn("false_positives", cases)
+        self.assertIn("false_negatives", cases)
 
     def test_domain_gap_and_field_calibration_plan_present(self):
         self.assertIn("guaranteeScope", self.report["domainGap"])

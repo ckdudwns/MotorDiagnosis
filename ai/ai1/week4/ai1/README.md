@@ -56,10 +56,19 @@ API 명세서 v1.3에서 추가된 `labelPolicyVersion`(`LABEL-POLICY-V2`)·`sna
   불변 필드가 변조돼도 승인을 거부하고, `verify_frozen_integrity`는 학습 시작 전에
   같은 검증을 한다.
 - 신규 동결은 v1.3 필수 필드(`labelPolicyVersion`/`snapshotSchemaVersion`/`source.checksum`)를
-  요구한다. 이미 동결된 v1은 재동결하지 않고 관용 처리한다(`is_legacy_v1_frozen`).
+  요구한다. 이미 동결된 v1은 재동결하지 않고 관용 처리한다(`is_legacy_v1_frozen`). legacy 판별은
+  `snapshotSchemaVersion` **필드의 존재 여부**로만 한다 — `snapshotDigest`를 나중에 지운다고
+  legacy로 강등되지 않는다(v1.3 동결본은 digest가 없으면 그 자체로 무결성 오류).
+- `verify_reproducibility`는 v1.3 동결본에 대해 `datasetChecksum`(rows/labelMapping/split)뿐
+  아니라 `labelPolicyVersion`/`snapshotSchemaVersion`/원본 `source.checksum`까지 함께 검증한다.
+- `register_model_version`은 필수 문자열(version/artifactUri/datasetId/baselineVersion)의
+  nonblank와 `metrics`가 dict인지 검증한다. `approve_model_version`은 `approved_by`와
+  명시적인 `metric_snapshot`을 모두 필수로 받는다(등록 시점 metrics를 암묵적으로 재사용하지
+  않는다) — 누가, 어떤 지표를 보고 승인했는지 감사 가능해야 한다.
 - `rollback_model_version`은 target이 **실제로 current보다 앞선 승인 버전**인지
   (`approved_history` 계보 또는 `approvedAt` 비교) 검증하고 자기 자신·더 최신 버전으로의
-  롤백을 거부한다.
+  롤백을 거부한다. 계보 검증은 `approved_history` **배열 순서가 아니라 각 항목의 실제
+  `approvedAt`**을 파싱·비교한다 — 배열이 역순으로 전달돼도 forward rollback을 막는다.
 
 **재현성:** 같은 입력·`split_strategy`로 `build_manifest`를 두 번 생성해 체크섬이
 동일함을 확인한다. `split_strategy`가 다르면(specimen_group vs operating_condition_holdout)
@@ -100,10 +109,16 @@ train/validation 구간에서 이미 값 범위가 겹치지 않는다(train/val
 epoch·시드에 따라 값이 흔들리며, 이 수치를 일반화 성능으로 해석하면 안 된다. NORMAL
 독립 베어링 확보 후 `specimen_group`으로 재검증해야 한다.
 
-`run_training_job`은 학습 전 `verify_frozen_integrity`로 동결본 변조를 검사하고, artifact를
-작업별 유일 `job_id` 아래 불변 경로에 저장하며(덮어쓰기 금지) 보고서에 `artifactChecksum`·
-`datasetSnapshotDigest`를 남긴다. 추론(`score_from_artifact`)은 `input_feature_names`를
-필수로 받아 열 순서를 검증·재정렬한다.
+`run_training_job`은 학습 전 `verify_frozen_integrity`로 동결본 변조를 검사하고, 매니페스트의
+`independentHoldout` 선언도 rows의 specimen_id→split 관계로 재계산해 대조한다(선언=True인데
+실제로 같은 specimen이 여러 split에 걸쳐 있으면 거부 — 선언값을 그대로 신뢰하지 않는다).
+두 후보 모두 train/validation만으로 학습·검증하고 artifact를 저장하며(test holdout 미접근),
+**validation f1으로 후보를 선택한 뒤에만** 선택된 후보 하나에 대해 test holdout을 한 번 열어
+최종 지표·오류 사례를 계산한다(리뷰 P1 — 낙선 후보의 test 지표는 아예 계산하지 않는다).
+artifact는 작업별 유일 `job_id` 아래 불변 경로에 저장하며(덮어쓰기 금지) 보고서에
+`artifactChecksum`·`datasetSnapshotDigest`를 남긴다. 추론(`score_from_artifact`)은
+`input_feature_names`와 `expected_checksum`을 모두 필수로 받아, 열 순서를 검증·재정렬하고
+파일을 읽기 전에 SHA-256을 대조해 변조된 아티팩트(예: threshold 변경)를 거부한다.
 
 ```bash
 # 기본(specimen_group)은 CWRU에서 InsufficientAssetGroupsError로 정직하게 실패

@@ -270,7 +270,7 @@ _MODEL_BUILDERS = {
 }
 
 
-def _evaluate_candidate(
+def _train_and_validate_candidate(
     name: str,
     split_strategy: str,
     samples_by_split: dict,
@@ -279,15 +279,31 @@ def _evaluate_candidate(
     epochs: int = 150,
     artifact_path: str = None,
 ) -> tuple:
+    """train+validation만으로 후보를 학습·평가하고 아티팩트를 저장한다.
+
+    [리뷰 P1] test holdout은 여기서 절대 건드리지 않는다 — 예전에는 두 후보
+    모두 여기서 test 지표·오류 사례까지 계산한 뒤에 select_best()를 호출해서,
+    선택에 쓰이지 않는 test 값이라도 후보 비교 단계에 노출됐다(test holdout이
+    더 이상 "본 적 없는" 데이터가 아니게 된다). 최종 test 평가는 select_best()
+    이후 선택된 후보 하나에 대해서만 _finalize_test_evaluation()이 수행한다.
+    아티팩트 저장은 test 데이터를 쓰지 않으므로(가중치+스케일러+임계값은
+    train/validation만으로 정해짐) 두 후보 모두 여기서 저장해도 무방하다.
+    """
     model_builder = _MODEL_BUILDERS[name]
 
     train_normal = [s for s in samples_by_split["train"] if s["common_label"] == "NORMAL"]
     if not train_normal:
         raise ValueError(f"{name}: train split에 NORMAL 샘플이 없습니다.")
+    empty_splits = [
+        split_name
+        for split_name in ("validation", "test")
+        if not samples_by_split.get(split_name)
+    ]
+    if empty_splits:
+        raise ValueError(f"{name}: 필수 split이 비어 있습니다: {empty_splits}")
 
     train_matrix, _ = _matrix_and_labels(train_normal)
     val_matrix, val_labels = _matrix_and_labels(samples_by_split["validation"])
-    test_matrix, test_labels = _matrix_and_labels(samples_by_split["test"])
     input_dim = train_matrix.shape[-1]
 
     scaler = FeatureScaler().fit(train_matrix)
@@ -300,20 +316,19 @@ def _evaluate_candidate(
     val_errors = reconstruction_error(model, val_tensor)
     val_normal_mask = ~np.array(val_labels, dtype=bool)
     val_normal_errors = val_errors[val_normal_mask]
+    # [리뷰 P1] validation에 NORMAL 표본이 없으면 mean/std가 NaN이 되어 임계값이
+    # 조용히 NaN으로 저장되고(모든 판정이 False), 최종 JSON 저장도
+    # allow_nan=False 때문에 실패한다 — 학습을 계속하는 대신 여기서 명확히 막는다.
+    if val_normal_errors.size == 0:
+        raise ValueError(
+            f"{name}: validation split에 NORMAL 표본이 없어 정상범위 임계값"
+            f"(mean + {SIGMA}*std)을 계산할 수 없습니다. 매니페스트 분할을 확인하세요."
+        )
     threshold = float(val_normal_errors.mean() + SIGMA * val_normal_errors.std())
 
     # 후보 선택용: 검증셋 전체에 대한 지표 (테스트셋은 선택에 쓰지 않는다).
     validation_metrics = compute_metrics(
         val_labels, (val_errors > threshold).tolist()
-    )
-
-    test_tensor = torch.tensor(scaler.transform(test_matrix), dtype=torch.float32)
-    test_errors = reconstruction_error(model, test_tensor)
-    y_pred = (test_errors > threshold).tolist()
-
-    metrics = compute_metrics(test_labels, y_pred)  # 선택된 모델의 최종 성능 보고용
-    error_cases = collect_error_cases(
-        samples_by_split["test"], test_labels, y_pred, test_errors, threshold
     )
 
     scaler_mean = scaler.mean_.tolist()
@@ -369,13 +384,31 @@ def _evaluate_candidate(
             "persistedInArtifact": artifact_path is not None,
         },
         "validationMetrics": validation_metrics,
-        "metrics": metrics,
     }
-    return candidate, error_cases
+    state = {"model": model, "scaler": scaler, "threshold": threshold}
+    return candidate, state
+
+
+def _finalize_test_evaluation(name: str, state: dict, samples_by_split: dict) -> tuple:
+    """후보 선택이 끝난 뒤, 선택된 후보 하나에 대해서만 test holdout을 한 번 연다."""
+    test_matrix, test_labels = _matrix_and_labels(samples_by_split["test"])
+    test_tensor = torch.tensor(state["scaler"].transform(test_matrix), dtype=torch.float32)
+    test_errors = reconstruction_error(state["model"], test_tensor)
+    y_pred = (test_errors > state["threshold"]).tolist()
+
+    metrics = compute_metrics(test_labels, y_pred)
+    error_cases = collect_error_cases(
+        samples_by_split["test"], test_labels, y_pred, test_errors, state["threshold"]
+    )
+    return metrics, error_cases
 
 
 def score_from_artifact(
-    artifact_path: str, matrix: np.ndarray, *, input_feature_names: list
+    artifact_path: str,
+    matrix: np.ndarray,
+    *,
+    input_feature_names: list,
+    expected_checksum: str,
 ) -> dict:
     """저장된 아티팩트만으로 재구성 오차·이상 판정을 재현한다.
 
@@ -383,11 +416,26 @@ def score_from_artifact(
     학습 시점 특징 순서와 대조·재정렬한다. 이름 없이 shape만 맞는 입력을 넘기면
     열 순서가 어긋나도 오류 없이 다른 판정이 나오기 때문이다.
 
+    [리뷰 P1] `expected_checksum`(보고서의 artifactChecksum)도 **필수**다 — 파일을
+    읽기 전에 SHA-256을 검증한다. torch.load()는 threshold 등 내용이 변조된
+    아티팩트도 아무 오류 없이 그대로 읽어버리므로, checksum 검증 없이는 변조된
+    임계값·가중치가 그대로 추론에 쓰인다. 선택적 인자로 두면 호출자가 잊고
+    누락하기 쉬우므로 아예 필수로 강제한다.
+
+    - checksum 불일치 → ValueError (load 전에 거부)
     - 특징 집합이 아티팩트와 다르면 → ValueError
     - 순서만 다르면 → 아티팩트 순서로 열 재정렬
     - 열 개수 불일치 / NaN·Inf → ValueError
     """
-    payload = torch.load(artifact_path, weights_only=False)  # 신뢰된 로컬 아티팩트
+    actual_checksum = _sha256_of_file(artifact_path)
+    if actual_checksum != expected_checksum:
+        raise ValueError(
+            "artifact checksum이 일치하지 않습니다 — 변조되었을 수 있어 추론을 "
+            f"거부합니다 (경로={artifact_path!r}, 기대={expected_checksum!r}, "
+            f"실제={actual_checksum!r})."
+        )
+
+    payload = torch.load(artifact_path, weights_only=False)  # checksum 검증된 아티팩트
     artifact_names = list(payload["feature_names"])
 
     input_names = list(input_feature_names)
@@ -478,6 +526,37 @@ def select_best(candidates: list) -> dict:
     return max(candidates, key=lambda c: c["validationMetrics"]["f1"])
 
 
+def _actual_independent_holdout(frozen_manifest: dict) -> bool:
+    """rows의 specimen_id -> split 관계에서 실제 독립성을 계산한다.
+
+    같은 specimen_id가 여러 split에 걸쳐 있으면 독립 holdout이 아니다.
+    """
+    splits_by_specimen: dict = {}
+    for row in frozen_manifest.get("rows") or []:
+        splits_by_specimen.setdefault(row.get("specimen_id"), set()).add(row.get("split"))
+    return all(len(splits) <= 1 for splits in splits_by_specimen.values())
+
+
+def _verify_independent_holdout_claim(frozen_manifest: dict) -> bool:
+    """[리뷰 P1] independentHoldout 메타데이터 선언을 그대로 신뢰하지 않는다.
+
+    같은 specimen이 train/validation/test에 모두 걸쳐 있어도 매니페스트에
+    independentHoldout=True가 박혀 있으면 이전에는 그대로 "독립 평가"로
+    보고됐다. 실제 rows의 specimen_id -> split 관계로 독립성을 재계산하고,
+    선언(True)이 실제(False)와 어긋나면 학습을 거부한다. 반환값(실제 계산된
+    독립성)을 보고서에 쓴다 — 선언값을 그대로 믿지 않는다.
+    """
+    declared = bool(frozen_manifest.get("independentHoldout"))
+    actual = _actual_independent_holdout(frozen_manifest)
+    if declared and not actual:
+        raise ValueError(
+            "independentHoldout=True로 선언됐지만 실제 rows에서 같은 specimen_id가 "
+            "여러 split에 걸쳐 있습니다 (선언과 데이터 불일치) — 독립 평가로 보고할 "
+            "수 없습니다."
+        )
+    return actual
+
+
 def run_training_job(
     frozen_manifest: dict,
     *,
@@ -493,6 +572,9 @@ def run_training_job(
     # status만 보면 freeze 이후 row 값이 바뀌어도 같은 datasetId로 학습이 완료된다 —
     # 특징 준비 전에 전체 snapshot 무결성을 재검증한다.
     verify_frozen_integrity(frozen_manifest)
+    # 선언된 independentHoldout이 실제 rows와 일치하는지 검증하고, 실제 계산값을
+    # 이후 보고서에 쓴다(선언값을 그대로 신뢰하지 않는다).
+    independent_holdout = _verify_independent_holdout_claim(frozen_manifest)
     torch.manual_seed(seed)
 
     # 작업별 유일 job_id. artifact는 이 아래 불변 경로에 저장 — 다음 학습이 이전 모델을
@@ -505,13 +587,13 @@ def run_training_job(
     )
     job_dir = os.path.join(artifact_dir, job_id) if artifact_dir else None
 
-    independent_holdout = bool(frozen_manifest.get("independentHoldout"))
     holdout_type = frozen_manifest.get("holdoutType")
 
     # dense와 lstm 모두 동결 매니페스트 rows의 inline 특징값만 입력으로 쓴다
     # (원본 CWRU 재로드·재계산 없음). 같은 feature_names로 두 경로를 묶는다.
+    # train/validation만으로 두 후보를 학습·평가한다 — test holdout은 아직 열지 않는다.
     feature_names, dense_splits = prepare_dense_splits(frozen_manifest)
-    dense_candidate, dense_errors = _evaluate_candidate(
+    dense_candidate, dense_state = _train_and_validate_candidate(
         "dense_autoencoder",
         DENSE_SPLIT_STRATEGY,
         dense_splits,
@@ -521,7 +603,7 @@ def run_training_job(
     )
 
     lstm_splits = prepare_lstm_chunks(frozen_manifest, feature_names)
-    lstm_candidate, lstm_errors = _evaluate_candidate(
+    lstm_candidate, lstm_state = _train_and_validate_candidate(
         "lstm_autoencoder",
         LSTM_SPLIT_STRATEGY,
         lstm_splits,
@@ -531,7 +613,15 @@ def run_training_job(
     )
 
     candidates = [dense_candidate, lstm_candidate]
-    best = select_best(candidates)
+    best = select_best(candidates)  # 검증 f1만 사용 — 이 시점까지 test holdout 미접근
+
+    # [리뷰 P1] 선택된 후보 하나에 대해서만, 선택이 끝난 뒤 test holdout을 연다.
+    states_by_name = {"dense_autoencoder": dense_state, "lstm_autoencoder": lstm_state}
+    splits_by_name = {"dense_autoencoder": dense_splits, "lstm_autoencoder": lstm_splits}
+    best_metrics, best_error_cases = _finalize_test_evaluation(
+        best["name"], states_by_name[best["name"]], splits_by_name[best["name"]]
+    )
+    best["metrics"] = best_metrics
 
     evaluation_note = (
         "specimen-independent holdout"
@@ -555,7 +645,9 @@ def run_training_job(
             "validation": best["validationMetrics"],
             **best["metrics"],  # 선택된 모델의 test 지표 (독립 검증 아님 — 위 플래그 참고)
         },
-        "errorCases": {"dense_autoencoder": dense_errors, "lstm_autoencoder": lstm_errors},
+        # test holdout은 선택된 후보에 대해서만 평가했으므로, error case도 그
+        # 후보 하나만 담긴다 — 낙선한 후보는 test holdout을 아예 열지 않았다.
+        "errorCases": {best["name"]: best_error_cases},
         "domainGap": build_domain_gap(),
         "fieldCalibrationPlan": build_field_calibration_plan(),
         "createdAt": datetime.now(timezone.utc).isoformat(),
@@ -622,12 +714,18 @@ if __name__ == "__main__":
             "평가이며 specimen 독립 검증이 아닙니다."
         )
     for candidate in report["candidates"]:
-        vm, tm = candidate["validationMetrics"], candidate["metrics"]
-        print(
-            f"  {candidate['name']}: 검증 f1={vm['f1']:.3f} / (비독립) 테스트 f1={tm['f1']:.3f}, "
-            f"precision={tm['precision']:.3f}, recall={tm['recall']:.3f}  "
-            f"artifact={candidate['artifactChecksum']}"
-        )
+        vm = candidate["validationMetrics"]
+        line = f"  {candidate['name']}: 검증 f1={vm['f1']:.3f}"
+        # test holdout은 선택된 후보에 대해서만 평가한다 — 낙선 후보는 검증
+        # 지표까지만 보고한다.
+        tm = candidate.get("metrics")
+        if tm is not None:
+            line += (
+                f" / (비독립) 테스트 f1={tm['f1']:.3f}, precision={tm['precision']:.3f}, "
+                f"recall={tm['recall']:.3f}"
+            )
+        line += f"  artifact={candidate['artifactChecksum']}"
+        print(line)
     print(
         f"  선택 기준: {m['selectionCriterion']} → 최적 후보: {m['bestCandidate']} "
         f"(검증 f1={m['validation']['f1']:.3f}, 비독립 테스트 f1={m['f1']:.3f})"

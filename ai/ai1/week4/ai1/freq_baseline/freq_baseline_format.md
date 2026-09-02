@@ -48,9 +48,11 @@ train/validation/test에 함께 들어간다. 따라서 **`independentHoldout=fa
 | LSTM Autoencoder | 연속 윈도우 시퀀스(길이 5) | 동결 rows를 `sample_id` 윈도우 순번으로 정렬해 시퀀스로 묶음 (한 파일의 모든 시퀀스는 한 split에만) |
 
 `run_training_job`은 학습 시작 전에 `verify_frozen_integrity()`로 동결본이 변조되지
-않았는지(snapshotDigest 재계산·비교) 확인하고, artifact는 작업별 유일 `job_id` 아래
-불변 경로에 저장하며(`<artifact_dir>/<job_id>/<name>.pt`, 덮어쓰기 금지) 보고서에
-`artifactChecksum`을 함께 남긴다.
+않았는지(snapshotDigest 재계산·비교) 확인하고, 매니페스트의 `independentHoldout` 선언도
+rows의 specimen_id→split 관계로 재계산해 대조한다(선언=True인데 실제로 같은 specimen이
+여러 split에 걸쳐 있으면 거부 — 선언값을 그대로 신뢰하지 않는다). artifact는 작업별 유일
+`job_id` 아래 불변 경로에 저장하며(`<artifact_dir>/<job_id>/<name>.pt`, 덮어쓰기 금지)
+보고서에 `artifactChecksum`을 함께 남긴다.
 
 ### 모델 입력 특징 — 27개 중 26개
 
@@ -88,17 +90,21 @@ threshold = mean(validation set의 NORMAL 재구성오차) + 3 * std(같은 것)
 
 ## 후보 선택 vs 최종 평가 (분리)
 
-- **선택**: 두 후보를 **validation split 지표(f1)**로만 비교해 최적 후보를 고른다
-  (`select_best`, `metrics.selectionCriterion == "validation_f1"`). 각 후보의
-  `validationMetrics`에 검증 지표가 담긴다.
-- **최종 평가**: 선택된 후보에 대해서만 **test split**으로 혼동행렬과
-  precision/recall/f1/accuracy를 계산해 `metrics`에 보고한다.
-- 예전에는 test f1으로 후보를 고르고 같은 값을 최종 성능으로 보고해 test 데이터가
-  모델 선정에도 쓰였다(낙관 편향). 이제 선택과 최종 평가의 데이터가 분리된다.
+- **선택**: 두 후보 모두 **train/validation만으로** 학습·평가한다(`select_best`,
+  `metrics.selectionCriterion == "validation_f1"`) — 이 단계에서는 test holdout을
+  전혀 열지 않는다. 각 후보의 `validationMetrics`에 검증 지표가 담긴다.
+- **최종 평가**: `select_best()`로 후보를 고른 **뒤에만**, 선택된 후보 하나에 대해서만
+  **test split**을 한 번 열어 혼동행렬과 precision/recall/f1/accuracy를 계산해
+  `metrics`에 보고한다. 낙선한 후보는 `candidate["metrics"]`/`errorCases` 자체가
+  존재하지 않는다(계산되지 않았으므로).
+- 예전에는 두 후보 모두 test 지표·오류 사례를 계산한 뒤에 select_best()를 호출해서,
+  선택에 쓰이지 않는 값이라도 test holdout이 후보 비교 단계에 노출됐다(리뷰 P1). 이제
+  test holdout은 선택이 끝난 뒤 선택된 후보 하나에 대해서만, 단 한 번 열린다.
 
 test split에서 `predicted = error > threshold` vs `true = (common_label == "ANOMALY")`로
-계산한다. 오류 사례(`errorCases`)는 FP(정상인데 이상으로 오판)와 FN(결함인데 정상으로
-오판) 각각 `sample_id`/`known_label`/재구성오차/threshold를 최대 10건까지 기록한다.
+계산한다. 오류 사례(`errorCases`)는 선택된 후보 하나에 대해서만 FP(정상인데 이상으로
+오판)와 FN(결함인데 정상으로 오판) 각각 `sample_id`/`known_label`/재구성오차/threshold를
+최대 10건까지 기록한다.
 
 ## 모델 아티팩트 (`.pt`) — 정규화 상태 포함, 작업별 불변 경로
 
@@ -112,11 +118,15 @@ test split에서 `predicted = error > threshold` vs `true = (common_label == "AN
 `artifactUri`가 나중 모델을 가리키는 문제를 막는다. 보고서의 각 candidate에는 파일
 sha256(`artifactChecksum`)이, 최상위에는 검증에 쓴 `datasetSnapshotDigest`가 기록된다.
 
-**추론 스키마 검증 (리뷰 P1).** `score_from_artifact(path, matrix, *, input_feature_names)`는
-입력 열 이름을 **필수**로 받아 artifact에 저장된 학습 시점 순서와 대조한다: 특징
-집합이 다르면 거부, 순서만 다르면 이름 기준 재정렬, 열 개수 불일치·NaN/Inf도 거부.
-이름 없이 shape만 맞는 입력을 넘겨 열이 뒤바뀌어도 조용히 다른 판정이 나오던 문제를
-막는다. 재로딩 전후 판정이 학습 때 (비독립) test 지표와 일치함을 테스트로 검증한다.
+**추론 스키마 검증 (리뷰 P1).**
+`score_from_artifact(path, matrix, *, input_feature_names, expected_checksum)`는
+입력 열 이름과 `expected_checksum`(보고서의 `artifactChecksum`)을 모두 **필수**로 받는다.
+`expected_checksum`은 `torch.load()`로 파일을 읽기 **전에** SHA-256을 대조한다 —
+`torch.load()`는 threshold 등 내용이 변조된 아티팩트도 오류 없이 그대로 읽어버리므로,
+checksum 검증 없이는 변조된 임계값·가중치가 그대로 추론에 쓰인다. 이어서 입력 열 이름을
+artifact에 저장된 학습 시점 순서와 대조한다: 특징 집합이 다르면 거부, 순서만 다르면 이름
+기준 재정렬, 열 개수 불일치·NaN/Inf도 거부. 재로딩 전후 판정이 학습 때 (비독립) test
+지표와 일치함을 테스트로 검증한다.
 
 ## 도메인 차이·현장 보정 계획 (`domainGap` / `fieldCalibrationPlan`)
 

@@ -169,6 +169,33 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         different["split"] = {"train": 0.5, "validation": 0.3, "test": 0.2}
         self.assertFalse(verify_reproducibility(frozen, different))
 
+    def test_verify_reproducibility_false_when_source_checksum_differs(self):
+        """[리뷰 P1] rows/labelMapping/split만 같으면 원본(source) checksum이
+        달라도 이전에는 재현 성공으로 오판됐다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        other = _draft_manifest()
+        other["source"]["checksum"] = "sha256:different-source-checksum"
+        self.assertFalse(verify_reproducibility(frozen, other))
+
+    def test_verify_reproducibility_false_when_label_policy_version_differs(self):
+        frozen = freeze_dataset_version(_draft_manifest())
+        other = _draft_manifest()
+        other["labelPolicyVersion"] = "LABEL-POLICY-V9"
+        self.assertFalse(verify_reproducibility(frozen, other))
+
+    def test_verify_reproducibility_false_when_snapshot_schema_version_differs(self):
+        frozen = freeze_dataset_version(_draft_manifest())
+        other = _draft_manifest()
+        other["snapshotSchemaVersion"] = "99"
+        self.assertFalse(verify_reproducibility(frozen, other))
+
+    def test_verify_reproducibility_legacy_ignores_snapshot_identity(self):
+        """legacy(v1) 동결본은 snapshot identity 필드가 없으므로 datasetChecksum만
+        본다 — 관용 처리를 유지한다."""
+        legacy = _legacy_frozen()
+        recomputed = _draft_manifest_legacy()
+        self.assertTrue(verify_reproducibility(legacy, recomputed))
+
     def test_summary_excludes_rows(self):
         frozen = freeze_dataset_version(_draft_manifest())
         summary = dataset_version_summary(frozen)
@@ -283,6 +310,32 @@ class TestSnapshotDigestProtectsApproval(unittest.TestCase):
         approved = approve_dataset_version(frozen, approved_by="mgr", reason="ok")
         self.assertEqual(approved["status"], "approved")
 
+    def test_deleting_snapshot_digest_does_not_bypass_integrity_check(self):
+        """[리뷰 P1] snapshotDigest 필드를 지워서 v1(legacy) 관용 경로로 강등시키는
+        우회를 차단한다. v1.3 동결본(snapshotSchemaVersion 보유)에서 digest만
+        지우고 source.license를 변조해도 승인/무결성 검증이 이를 잡아내야 한다
+        (datasetChecksum은 rows/labelMapping/split만 보므로 license 변조를 못
+        잡는다 — 예전에는 이 경로로 승인이 통과했다)."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        frozen["source"]["license"] = "CHANGED-BY-ATTACKER"
+        del frozen["snapshotDigest"]
+
+        self.assertFalse(is_legacy_v1_frozen(frozen))
+        with self.assertRaises(ValueError):
+            verify_frozen_integrity(frozen)
+        with self.assertRaises(ValueError):
+            approve_dataset_version(frozen, approved_by="mgr", reason="ok")
+
+    def test_deleting_snapshot_digest_without_other_tamper_still_rejected(self):
+        """digest 삭제 자체만으로도(다른 필드 변조 없이) v1.3 동결본은 거부돼야
+        한다 — "무결성 검증값이 없다"는 사실 자체가 거부 사유다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        del frozen["snapshotDigest"]
+        with self.assertRaises(ValueError):
+            verify_frozen_integrity(frozen)
+        with self.assertRaises(ValueError):
+            approve_dataset_version(frozen, approved_by="mgr", reason="ok")
+
 
 class TestFrozenIntegrityVerification(unittest.TestCase):
     """[리뷰 P1] verify_frozen_integrity: 학습·배포처럼 동결본을 입력으로 쓰는 쪽이
@@ -352,11 +405,17 @@ class TestModelVersionLifecycle(unittest.TestCase):
             version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
             baseline_version="b1", metrics={"f1": 0.9},
         )
-        approved = approve_model_version(mv, reason="지표 통과")
+        approved = approve_model_version(
+            mv, approved_by="mgr", reason="지표 통과", metric_snapshot={"f1": 0.9}
+        )
         self.assertEqual(approved["status"], "approved")
+        self.assertEqual(approved["approvedBy"], "mgr")
         self.assertEqual(approved["metricSnapshot"], {"f1": 0.9})
         with self.assertRaises(ValueError):
-            approve_model_version(approved, reason="재승인 시도")
+            approve_model_version(
+                approved, approved_by="mgr", reason="재승인 시도",
+                metric_snapshot={"f1": 0.9},
+            )
 
     def test_metric_snapshot_is_isolated_from_source_metrics(self):
         metrics = {"f1": 0.91, "cm": {"tp": 10, "fp": 1}}
@@ -364,7 +423,9 @@ class TestModelVersionLifecycle(unittest.TestCase):
             version="v1", artifact_uri="a", dataset_id="d", baseline_version="b",
             metrics=metrics,
         )
-        approved = approve_model_version(mv, reason="지표 통과")
+        approved = approve_model_version(
+            mv, approved_by="mgr", reason="지표 통과", metric_snapshot=metrics
+        )
         metrics["f1"] = 0.12
         metrics["cm"]["tp"] = 0
         mv["metrics"]["f1"] = 0.0
@@ -377,9 +438,89 @@ class TestModelVersionLifecycle(unittest.TestCase):
             metrics={"f1": 0.5},
         )
         snap = {"f1": 0.91, "cm": {"tp": 3}}
-        approved = approve_model_version(mv, reason="ok", metric_snapshot=snap)
+        approved = approve_model_version(
+            mv, approved_by="mgr", reason="ok", metric_snapshot=snap
+        )
         snap["cm"]["tp"] = 999
         self.assertEqual(approved["metricSnapshot"]["cm"]["tp"], 3)
+
+
+class TestRegisterModelVersionValidation(unittest.TestCase):
+    """[리뷰 P1] 불완전한 등록 정보가 승인 상태까지 조용히 전이되지 않도록 등록
+    단계에서 필수 메타데이터를 검증한다."""
+
+    _VALID_KWARGS = dict(
+        version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
+        baseline_version="b1", metrics={"f1": 0.9},
+    )
+
+    def test_blank_required_strings_rejected(self):
+        for field in ("version", "artifact_uri", "dataset_id", "baseline_version"):
+            for blank in ("", "   "):
+                kwargs = dict(self._VALID_KWARGS)
+                kwargs[field] = blank
+                with self.assertRaises(ValueError, msg=f"{field}={blank!r}"):
+                    register_model_version(**kwargs)
+
+    def test_none_metrics_rejected(self):
+        kwargs = dict(self._VALID_KWARGS)
+        kwargs["metrics"] = None
+        with self.assertRaises(ValueError):
+            register_model_version(**kwargs)
+
+    def test_non_dict_metrics_rejected(self):
+        kwargs = dict(self._VALID_KWARGS)
+        kwargs["metrics"] = "not-a-dict"
+        with self.assertRaises(ValueError):
+            register_model_version(**kwargs)
+
+
+class TestApproveModelVersionRequiresAuditTrail(unittest.TestCase):
+    """[리뷰 P1] 승인은 승인자와 명시적인 지표 스냅샷 없이는 이뤄질 수 없다."""
+
+    def _registered(self):
+        return register_model_version(
+            version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
+            baseline_version="b1", metrics={"f1": 0.9},
+        )
+
+    def test_missing_approved_by_rejected(self):
+        with self.assertRaises(TypeError):
+            approve_model_version(
+                self._registered(), reason="ok", metric_snapshot={"f1": 0.9}
+            )
+
+    def test_blank_approved_by_rejected(self):
+        with self.assertRaises(ValueError):
+            approve_model_version(
+                self._registered(), approved_by="   ", reason="ok",
+                metric_snapshot={"f1": 0.9},
+            )
+
+    def test_missing_metric_snapshot_rejected(self):
+        with self.assertRaises(TypeError):
+            approve_model_version(self._registered(), approved_by="mgr", reason="ok")
+
+    def test_empty_metric_snapshot_rejected(self):
+        with self.assertRaises(ValueError):
+            approve_model_version(
+                self._registered(), approved_by="mgr", reason="ok", metric_snapshot={}
+            )
+
+    def test_non_dict_metric_snapshot_rejected(self):
+        with self.assertRaises(ValueError):
+            approve_model_version(
+                self._registered(), approved_by="mgr", reason="ok",
+                metric_snapshot="not-a-dict",
+            )
+
+    def test_valid_approval_records_approver_and_snapshot(self):
+        approved = approve_model_version(
+            self._registered(), approved_by="mgr", reason="ok",
+            metric_snapshot={"f1": 0.95},
+        )
+        self.assertEqual(approved["approvedBy"], "mgr")
+        self.assertEqual(approved["metricSnapshot"], {"f1": 0.95})
 
 
 class TestRollbackLineage(unittest.TestCase):
@@ -389,9 +530,11 @@ class TestRollbackLineage(unittest.TestCase):
     def _approved(self, version, when):
         mv = register_model_version(
             version=version, artifact_uri=f"file:///{version}.pt", dataset_id="d",
-            baseline_version="b", metrics={},
+            baseline_version="b", metrics={"f1": 0.9},
         )
-        approved = approve_model_version(mv, reason="ok")
+        approved = approve_model_version(
+            mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}
+        )
         approved["approvedAt"] = when  # 결정적 시각으로 고정
         return approved
 
@@ -454,6 +597,38 @@ class TestRollbackLineage(unittest.TestCase):
                 approved_history=history,
             )
 
+    def test_reversed_history_array_order_does_not_enable_forward_rollback(self):
+        """[리뷰 P1] 계보 순서 판정은 배열 index가 아니라 approvedAt 실값을 써야
+        한다. history를 시간 역순으로 넘겨도(예: 캐시·쿼리 정렬이 뒤집힌 경우)
+        실제로는 더 최신인 버전으로의 forward rollback을 차단해야 한다."""
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        v3 = self._approved("v3", "2026-08-20T00:00:00+00:00")
+        reversed_history = [v3, v2, v1]  # 시간 역순(내림차순)으로 전달
+
+        # v1 -> v3: 배열 index로는 v3가 index 0(더 "앞")이라 예전 구현이 통과시켰다.
+        # 실제 approvedAt 기준으로는 v3가 v1보다 미래이므로 forward rollback -> 거부.
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v1, v3, reason="x", target_environment="prod",
+                approved_history=reversed_history,
+            )
+        # v3 -> v1은 실제로 앞선 버전이므로 배열 순서와 무관하게 여전히 허용.
+        rollback_model_version(
+            v3, v1, reason="ok", target_environment="prod",
+            approved_history=reversed_history,
+        )
+
+    def test_duplicate_versions_in_history_rejected(self):
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        dup_v1 = self._approved("v1", "2026-08-15T00:00:00+00:00")
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v2, v1, reason="x", target_environment="prod",
+                approved_history=[v1, dup_v1],
+            )
+
 
 class TestBaselineVersionLifecycle(unittest.TestCase):
     def test_activate_requires_approved(self):
@@ -503,7 +678,7 @@ class TestReproducibilityWithRealCwruData(unittest.TestCase):
         )
         self.assertTrue(verify_reproducibility(frozen, m2))
 
-    def test_different_split_config_changes_checksum(self):
+    def test_different_window_size_changes_checksum(self):
         from register_dataset import build_manifest
 
         frozen = freeze_dataset_version(
@@ -513,10 +688,32 @@ class TestReproducibilityWithRealCwruData(unittest.TestCase):
         )
         other = build_manifest(
             data_dir=_CWRU_DATA_DIR,
-            split_ratios={"train": 0.5, "validation": 0.3, "test": 0.2},
+            window_size=1024,
+            hop_size=1024,
             split_strategy="operating_condition_holdout",
         )
         self.assertFalse(verify_reproducibility(frozen, other))
+
+    def test_operating_condition_holdout_ignores_requested_split_ratios_in_checksum(self):
+        """[리뷰 P1] operating_condition_split은 요청 split_ratios를 무시하고 부하
+        tier로 배정을 고정한다. 매니페스트/체크섬도 실제 rows를 반영해야 하므로,
+        무의미한(무시되는) split_ratios를 다르게 넘겨도 실제 데이터가 같으면 같은
+        체크섬 — 재현성 판정이 흔들리면 안 된다(이전에는 무시된 입력이 체크섬에
+        그대로 들어가 실제로 같은 데이터가 다른 버전으로 판정됐다)."""
+        from register_dataset import build_manifest
+
+        m1 = build_manifest(
+            data_dir=_CWRU_DATA_DIR, split_strategy="operating_condition_holdout"
+        )
+        m2 = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
+            split_strategy="operating_condition_holdout",
+        )
+        self.assertEqual(m1["split"], m2["split"])
+        self.assertTrue(
+            verify_reproducibility(freeze_dataset_version(m1), m2)
+        )
 
 
 if __name__ == "__main__":

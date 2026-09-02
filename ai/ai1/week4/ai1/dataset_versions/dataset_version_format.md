@@ -81,7 +81,11 @@ draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다
 `source.checksum`이 없으면 거부**한다 — "이미 동결된 v1을 유지"하는 것과 "구형 draft를
 지금 새로 동결"하는 것은 다른 요구사항이다. 이미 커밋된 v1 frozen(이 필드·`snapshotDigest`
 없음)은 재동결하지 않고 `approve`/`verify_reproducibility`/`dataset_version_summary`가
-관용 처리한다. `is_legacy_v1_frozen(frozen)`으로 v1/v2를 구분한다(별도 migration 함수는 없음).
+관용 처리한다. `is_legacy_v1_frozen(frozen)`은 **`snapshotSchemaVersion` 필드의 존재
+여부만으로** v1/v1.3을 구분한다(별도 migration 함수는 없음) — `snapshotDigest`의 존재
+여부로 판별하면 v1.3 동결본에서 digest만 지워서 legacy 관용 경로(느슨한 `datasetChecksum`
+검증)로 강등시킬 수 있어(리뷰 P1) 의도적으로 이 필드는 판별 기준에서 뺐다. v1.3 동결본은
+`snapshotDigest`가 없는 것 자체가 무결성 오류다.
 
 ## `snapshotDigest` — 전체 불변 필드 변조 탐지 (리뷰 P1)
 
@@ -97,7 +101,12 @@ draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다
   둘 중 하나라도 어긋나면 승인을 거부한다.
 - `verify_frozen_integrity(frozen)`는 같은 검증을 학습·배포 시작 전에 하도록 노출한
   함수다 — 하류(`train_and_evaluate.run_training_job`)가 `status=="frozen"`만 보지 않고
-  이걸 호출한다. v1 frozen에는 `datasetChecksum`으로 폴백한다.
+  이걸 호출한다. v1(legacy) frozen에만 `datasetChecksum`으로 폴백하고, v1.3
+  동결본(`snapshotSchemaVersion` 보유)은 `snapshotDigest`가 없으면 그 자체로 거부한다.
+- `verify_reproducibility(frozen, recomputed)`도 v1.3 동결본에는 `datasetChecksum`뿐
+  아니라 `labelPolicyVersion`/`snapshotSchemaVersion`/원본 `source.checksum`까지 함께
+  대조한다 — rows/labelMapping/split만 같고 원본·정책 버전이 다른 데이터셋을 "재현
+  성공"으로 오판하지 않도록.
 
 ## `checksum` vs `digest` 역할 구분
 
@@ -120,19 +129,28 @@ draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다
 }
 ```
 
-상태 머신: `registered --approve_model_version()--> approved`. 승인에는 `reason`과
-`metricSnapshot`(승인 시점 지표를 **깊은 복사** — 나중에 원본 `metrics`나 재계산
-로직이 바뀌어도 승인 당시 근거가 남도록)이 필수다(FUT-006 계약과 동일). 기준선
-`features`도 `register`/`approve`/`activate` 각 단계에서 깊은 복사해, draft 수정이
-승인본·active 기준선으로 새지 않는다.
+`register_model_version()`은 필수 문자열(`version`/`artifact_uri`/`dataset_id`/
+`baseline_version`)이 비어 있으면 거부하고 `metrics`가 dict가 아니어도 거부한다(리뷰
+P1) — 불완전한 레코드가 승인 상태까지 조용히 전이되는 것을 막는다.
+
+상태 머신: `registered --approve_model_version()--> approved`. 승인에는 `approved_by`,
+`reason`, **명시적** `metricSnapshot`(승인 시점에 실제로 검토한 지표 — 승인 후 깊은
+복사로 저장해, 나중에 원본 `metrics`나 재계산 로직이 바뀌어도 승인 당시 근거가 남도록)이
+모두 필수다(FUT-006 계약과 동일, 리뷰 P1). 등록 시점 `metrics`를 암묵적으로 재사용하는
+기본값은 없다 — 누가·어떤 지표로 승인했는지 감사할 수 있어야 한다. 기준선 `features`도
+`register`/`approve`/`activate` 각 단계에서 깊은 복사해, draft 수정이 승인본·active
+기준선으로 새지 않는다.
 
 `rollback_model_version(current, target, *, reason, target_environment, approved_history=None)`은
 target이 **실제로 이전 승인 버전**인지 검증한다 (리뷰 P1):
 
 - `target.status == "approved"` 이고 `current.version != target.version` (자기 롤백 금지)
-- `approved_history`(승인 시각 오름차순 리스트)가 주어지면 target이 그 안에 있고
-  `current`보다 앞 index여야 한다. 없으면 `target.approvedAt < current.approvedAt`를 요구해
-  더 최신/동일 버전으로의 "롤백"을 차단한다.
+- `approved_history`가 주어지면 target/current가 그 안에서 유일한 버전으로 존재해야
+  하고, **배열의 index 순서가 아니라 각 항목의 `approvedAt`을 실제로 파싱해(UTC 정규화)
+  시간순으로 비교**한다 — history가 시간 역순으로 전달돼도 forward rollback을 막는다
+  (예전에는 배열 index로 계보 순서를 판단해 역순 배열을 넘기면 우회됐다). `approved_history`가
+  없으면 `target.approvedAt < current.approvedAt`(마찬가지로 실제 파싱값)를 요구해 더
+  최신/동일 버전으로의 "롤백"을 차단한다.
 - 반환 레코드에 `targetApprovedAt`를 함께 남긴다.
 
 반환값은 별도의 rollback 액션 레코드(FUT-007 "배포와 롤백을 별도 작업으로 기록")다.

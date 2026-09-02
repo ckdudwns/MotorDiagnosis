@@ -981,6 +981,26 @@ class TestSpecimenGroupingForCwru(unittest.TestCase):
             self.assertEqual(len(s), 1, f"{specimen}가 여러 split에: {s}")
         self.assertEqual(set(splits), {"train", "validation", "test"})
 
+    def test_operating_condition_holdout_manifest_split_matches_actual_rows(self):
+        """[리뷰 P1] operating_condition_split은 요청 split_ratios를 완전히 무시하고
+        부하 tier로 배정을 고정한다. 예전 build_manifest는 이 무시된 요청값을 그대로
+        매니페스트["split"]/체크섬에 기록해서, 예를 들어 train=1.0/validation=
+        test=0.0을 넘겨도 실제 rows에는 validation/test가 들어가는데 매니페스트는
+        "전부 train"이라고 거짓말했다. 기록된 split은 실제 splitCounts 비율과
+        일치해야 한다."""
+        manifest = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            split_strategy="operating_condition_holdout",
+            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
+        )
+        total = manifest["rowCount"]
+        for name in ("train", "validation", "test"):
+            expected_ratio = manifest["splitCounts"][name] / total
+            self.assertAlmostEqual(manifest["split"][name], expected_ratio, places=9)
+        # 요청한 대로 "전부 train"이 되지는 않았다 — validation/test가 실제로 존재.
+        self.assertGreater(manifest["splitCounts"]["validation"], 0)
+        self.assertGreater(manifest["splitCounts"]["test"], 0)
+
     def test_operating_condition_holdout_succeeds_but_is_not_independent(self):
         manifest = build_manifest(
             data_dir=_CWRU_DATA_DIR, split_strategy="operating_condition_holdout"
@@ -1037,11 +1057,13 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
             recomputed = sha256_of_file(os.path.join(_CWRU_DATA_DIR, filename))
             self.assertEqual(info["sha256"], recomputed)
 
-    def test_id_and_source_checksum_change_with_split_config(self):
-        # 분할 비율을 바꾸면(체크섬 payload에 포함) 다른 버전 체크섬/ID가 나와야 한다.
+    def test_id_and_source_checksum_change_with_real_config_change(self):
+        # window_size는 operating_condition_holdout에서도 실제로 rows/특징을
+        # 바꾸는 설정이므로(체크섬 payload에 포함) 다른 버전 체크섬/ID가 나와야 한다.
         other = build_manifest(
             data_dir=_CWRU_DATA_DIR,
-            split_ratios={"train": 0.5, "validation": 0.3, "test": 0.2},
+            window_size=1024,
+            hop_size=1024,
             seed=42,
             split_strategy="operating_condition_holdout",
         )
@@ -1049,6 +1071,21 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
         self.assertNotEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])
         self.assertNotEqual(self.manifest["id"], other["id"])
         self.assertIn(self.manifest["source"]["checksum"].split(":", 1)[1][:12], self.manifest["id"])
+
+    def test_id_and_checksum_ignore_requested_split_ratios(self):
+        """[리뷰 P1] operating_condition_split은 요청 split_ratios를 완전히
+        무시한다. 실제 데이터가 같으면(요청 비율만 다르게 줘도) 매니페스트
+        id/checksum이 같아야 한다 — 예전에는 무시된 입력이 체크섬 payload에
+        그대로 들어가 실제로 동일한 데이터가 다른 버전으로 판정됐다."""
+        other = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
+            seed=42,
+            split_strategy="operating_condition_holdout",
+        )
+        self.assertEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])
+        self.assertEqual(self.manifest["id"], other["id"])
+        self.assertEqual(self.manifest["split"], other["split"])
 
     def test_label_mapping_applied_to_every_row(self):
         for row in self.manifest["rows"]:

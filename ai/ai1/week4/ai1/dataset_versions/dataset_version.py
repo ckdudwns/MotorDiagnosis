@@ -68,13 +68,17 @@ def compute_snapshot_digest(manifest: dict) -> str:
 
 
 def is_legacy_v1_frozen(frozen_manifest: dict) -> bool:
-    """snapshotDigest가 없는 구(v1) 동결본인지 판별한다.
+    """v1.3 이전(schema 미표기)의 구(v1) 동결본인지 판별한다.
 
-    v1 frozen은 이미 커밋된 산출물이라 재계산·재동결하지 않는다. approve /
-    verify_reproducibility / summary는 v1을 관용적으로 계속 처리하고, 신규 동결
-    (freeze_dataset_version)만 v1.3 필수 필드를 요구한다.
+    [리뷰 P1] 이전에는 "snapshotDigest 없음"을 legacy 판정 기준으로 썼다 — 그러면
+    v1.3 동결본에서 snapshotDigest **필드만 지워도** legacy로 오인되어, 무결성
+    검사가 datasetChecksum(rows/labelMapping/split)만으로 관대하게 통과했다(즉
+    source.license/checksum, samplingRate, labelPolicyVersion 변조를 못 잡는다).
+    freeze_dataset_version()이 신규 동결에 snapshotSchemaVersion을 항상 필수로
+    요구하므로, 이 필드의 **존재 여부**만으로 legacy를 판별한다 — snapshotDigest를
+    나중에 지워도 legacy로 강등되지 않는다.
     """
-    return "snapshotDigest" not in frozen_manifest
+    return "snapshotSchemaVersion" not in frozen_manifest
 
 
 def freeze_dataset_version(manifest: dict) -> dict:
@@ -142,8 +146,16 @@ def approve_dataset_version(frozen_manifest: dict, *, approved_by: str, reason: 
         )
     # (2) v2: 매니페스트 전체 불변 필드 digest — source.license/checksum, samplingRate,
     #     labelPolicyVersion, splitStrategy 등 freeze 이후 변조까지 잡는다.
-    stored_digest = frozen_manifest.get("snapshotDigest")
-    if stored_digest is not None:
+    # [리뷰 P1] v1.3(snapshotSchemaVersion 보유) 동결본은 snapshotDigest가 반드시
+    # 있어야 한다 — digest가 없다고 legacy로 관용 처리하면 digest 필드만 지워서
+    # 이 검사 전체를 우회할 수 있다.
+    if not is_legacy_v1_frozen(frozen_manifest):
+        stored_digest = frozen_manifest.get("snapshotDigest")
+        if stored_digest is None:
+            raise ValueError(
+                "v1.3 동결본에 snapshotDigest가 없어 승인할 수 없습니다 "
+                "(무결성 검증을 우회할 수 없습니다)."
+            )
         current_digest = compute_snapshot_digest(frozen_manifest)
         if current_digest != stored_digest:
             raise ValueError(
@@ -170,32 +182,59 @@ def verify_frozen_integrity(frozen_manifest: dict) -> None:
         raise ValueError(
             f"frozen/approved 상태가 아닙니다 (status={frozen_manifest.get('status')!r})."
         )
-    stored_digest = frozen_manifest.get("snapshotDigest")
-    if stored_digest is not None:
-        current = compute_snapshot_digest(frozen_manifest)
-        if current != stored_digest:
+    if is_legacy_v1_frozen(frozen_manifest):
+        # v1 관용: snapshotSchemaVersion이 없는 구 동결본은 datasetChecksum으로라도 검증.
+        stored_checksum = frozen_manifest.get("datasetChecksum")
+        if stored_checksum is None:
+            raise ValueError("동결본에 무결성 검증값(snapshotDigest/datasetChecksum)이 없습니다.")
+        current = compute_dataset_checksum(frozen_manifest)
+        if current != stored_checksum:
             raise ValueError(
-                "동결 이후 매니페스트가 변조되었습니다 "
-                f"(snapshotDigest frozen={stored_digest!r}, current={current!r})."
+                "동결 이후 매니페스트 rows/labelMapping/split이 변조되었습니다 "
+                f"(datasetChecksum frozen={stored_checksum!r}, current={current!r})."
             )
         return
-    # v1 관용: digest가 없으면 datasetChecksum으로라도 검증.
-    stored_checksum = frozen_manifest.get("datasetChecksum")
-    if stored_checksum is None:
-        raise ValueError("동결본에 무결성 검증값(snapshotDigest/datasetChecksum)이 없습니다.")
-    current = compute_dataset_checksum(frozen_manifest)
-    if current != stored_checksum:
+    # [리뷰 P1] v1.3 동결본은 snapshotDigest가 반드시 있어야 한다 — 없다고 legacy로
+    # 관용 처리하면 digest 필드만 지워서 source.license 등 불변 필드 변조를
+    # datasetChecksum(rows/labelMapping/split만 봄)로는 잡지 못한 채 통과시킨다.
+    stored_digest = frozen_manifest.get("snapshotDigest")
+    if stored_digest is None:
         raise ValueError(
-            "동결 이후 매니페스트 rows/labelMapping/split이 변조되었습니다 "
-            f"(datasetChecksum frozen={stored_checksum!r}, current={current!r})."
+            "v1.3 동결본에 snapshotDigest가 없습니다 — 무결성 검증을 우회할 수 없습니다."
+        )
+    current = compute_snapshot_digest(frozen_manifest)
+    if current != stored_digest:
+        raise ValueError(
+            "동결 이후 매니페스트가 변조되었습니다 "
+            f"(snapshotDigest frozen={stored_digest!r}, current={current!r})."
         )
 
 
 def verify_reproducibility(frozen_manifest: dict, recomputed_manifest: dict) -> bool:
     """동일 조건(같은 seed)으로 다시 만든 draft 매니페스트가 frozen 시점과 같은
     체크섬을 내는지 검증한다 (DATASET_MODEL_01 수용 기준: "동일 데이터셋 버전을
-    재현할 수 있다")."""
-    return frozen_manifest["datasetChecksum"] == compute_dataset_checksum(recomputed_manifest)
+    재현할 수 있다").
+
+    [리뷰 P1] datasetChecksum은 rows+labelMapping+split만 본다 — source(원본 파일)
+    checksum이나 labelPolicyVersion/snapshotSchemaVersion이 다른 데이터셋도 rows만
+    우연히 같으면 "재현 성공"으로 오판될 수 있다. v1.3(snapshotSchemaVersion 보유)
+    동결본은 이 snapshot identity까지 함께 검증한다.
+    """
+    if frozen_manifest["datasetChecksum"] != compute_dataset_checksum(recomputed_manifest):
+        return False
+    if is_legacy_v1_frozen(frozen_manifest):
+        return True
+
+    for field in ("labelPolicyVersion", "snapshotSchemaVersion"):
+        if frozen_manifest.get(field) != recomputed_manifest.get(field):
+            return False
+    frozen_source_checksum = frozen_manifest.get("snapshotChecksum") or (
+        frozen_manifest.get("source") or {}
+    ).get("checksum")
+    recomputed_source_checksum = (recomputed_manifest.get("source") or {}).get("checksum")
+    if frozen_source_checksum != recomputed_source_checksum:
+        return False
+    return True
 
 
 def dataset_version_summary(manifest: dict) -> dict:

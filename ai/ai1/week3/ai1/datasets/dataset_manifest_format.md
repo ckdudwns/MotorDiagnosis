@@ -39,7 +39,7 @@ export 행의 라벨 상태(`label_status`/`training_eligible`), manifest 라벨
 | `labelCounts` | object | `{verified, weak, unlabeled, unmapped}` — 행의 라벨 상태별 건수 (합 = `rowCount`) |
 | `trainingEligibleCount` | number | `training_eligible=true` 전체 건수 |
 | `trainingEligibleSplitCounts` | object | `{train, validation, test}` — split별 학습 가능 건수 |
-| `split` | object | `{"train":0.7,"validation":0.2,"test":0.1}` (operating_condition_holdout에서는 부하 tier가 실제 배정을 결정) |
+| `split` | object | `{"train":0.7,"validation":0.2,"test":0.1}`. `operating_condition_holdout`에서는 부하 tier가 실제 배정을 결정하고 요청 `split_ratios`는 완전히 무시하므로, 이 필드는 요청값이 아니라 **실제 `splitCounts`에서 역산한 값**이다(리뷰 P1 — 예전에는 무시된 요청 비율을 그대로 기록해 매니페스트가 실제 rows와 어긋났다) |
 | `splitStrategy` | string | 분할 전략 설명 (아래 "분할 전략" 참고) |
 | `holdoutType` | string | `"specimen"` \| `"operating_condition"` |
 | `independentHoldout` | boolean | `specimen` 전략이면 `true`, `operating_condition_holdout`이면 `false` (같은 물리 베어링이 여러 split에) |

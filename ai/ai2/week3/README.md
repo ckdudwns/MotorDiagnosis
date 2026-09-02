@@ -1,0 +1,59 @@
+# AI-2 3주차: 이상 이벤트 생명주기
+
+AI-1이 계산한 기준선·임계값과 AI-2 2주차의 `anomalyScore`를 입력으로 받아, 운영자가
+검토할 **설비 이상 이벤트**를 시작·병합·종료하는 상태 머신이다.
+
+## 범위
+
+- `event_lifecycle.py`
+  - 연속 고점수 조건을 만족한 뒤 이벤트 시작
+  - 연속 회복 조건을 만족한 뒤 이벤트 종료
+  - 짧은 정상 구간 뒤 재발한 이벤트 병합
+  - 센서 고장 신호는 `sensor_fault_suppressed`로 분리하고 설비 이상 이벤트 생성을 억제
+  - 이벤트마다 AI-1 임계값 규칙 버전과 AI-2 모델 버전을 보존
+
+이 모듈은 원시 신호·특징량·점수를 새로 계산하지 않는다. 점수는 AI-1 기준선과 AI-2 2주차
+점수 경로가 제공하며, 백엔드는 `process_point()`의 업데이트를 이벤트 저장소에 반영한다.
+
+## 기본 규칙
+
+- 진입: 점수 75 이상 2회 연속
+- 종료: 점수 50 미만 2회 연속. `endAt`은 회복을 확인한 마지막 표본 시각이며,
+  `lastScore`·`sampleCount`도 같은 시점까지의 범위를 나타낸다.
+- 병합: 종료 후 30초 안에 다시 진입하면 기존 이벤트를 재개
+- 센서 고장: 센서 자체 이상은 설비 고장 이벤트로 생성하지 않는다. 이미 열린 이벤트는
+  `sensor_fault_detected` 사유로 종료해 신뢰할 수 없는 센서 값이 이벤트를 연장하지 못하게 한다.
+  센서 고장은 병합 경계도 끊으므로, 이후 이상은 새 이벤트로 생성한다.
+- 식별자·모델 출처: 이벤트 ID는 UUID 기반으로 인스턴스·프로세스 재시작과 무관하게 고유하다.
+  `modelVersion`은 이벤트를 시작한 모델을 유지하고, `maxScoreModelVersion`은 최대 점수를 낸
+  모델을 기록한다.
+- 경계값: 히스테리시스 0(진입·종료 점수 동일)과 병합 시간 0초(동일 시각에만 병합)를 허용한다.
+- 입력 순서: 자산별 시간은 비감소 순서여야 한다. 과거 시각 point는 `ValueError`로 거부하고,
+  바로 재전송된 동일 point는 무시한다. 수집 어댑터는 `deviceId`·`sequence` 기준 멱등성과
+  시간순 전달을 보장해야 한다.
+- 멱등성·정밀도: `deviceId`·`sequence`가 있는 telemetry는 유한 숫자 점수로 정규화해
+  중복을 판별하며, 같은 키의 다른 payload는 충돌로 거부한다. 최대 점수 비교는 반올림 전
+  값으로 수행하고 외부 이벤트에는 표시용 반올림 값만 제공한다.
+- 내구성: `snapshot()` 결과를 이벤트/outbox와 같은 DB 트랜잭션으로 저장하고,
+  `from_snapshot()`으로 재시작 시 복구한다. `persist_transaction` 콜백이 실패하면 상태와
+  멱등성 체크포인트를 메모리에 반영하지 않아 동일 telemetry를 재시도할 수 있다. 멱등성
+  캐시는 설정값 `idempotency_cache_size`(기본 1024)로 제한한다. 캐시와 watermark는 자산별이
+  아닌 lifecycle 전역의 `(deviceId, sequence)` 계약을 따른다.
+- 동시성: 단일 프로세스에서는 read-copy-persist-commit 구간을 lifecycle lock으로 직렬화한다.
+  저장 콜백에는 다음 revision과 `expectedRevision`이 포함된 checkpoint가 전달된다. 다중
+  프로세스 저장소는 이 값을 CAS 조건으로 사용하고, 충돌 시 최신 snapshot을 복구한 후 재시도한다.
+- 동일 시각: 모든 point에 `(timestamp, deviceId, sequence, receivedAt)` 단일 순서를 적용한다.
+  이 순서를 벗어난 point는 거부한다.
+  규칙 설정이 달라진 snapshot을 복구하면 pending entry와 exit streak를 초기화한다.
+- snapshot: schema version 2는 revision·config·assets·전역 멱등성 이력·watermark를 모두
+  필수로 저장하며, 복구 시 RFC3339 시각·유한 점수·이벤트 상태 불변식을 검증한다. persistence
+  callback 안에서 같은 lifecycle의 `process_point()` 재호출은 실패 처리한다.
+
+실제 값은 AI-1의 설비별 `scoreThreshold`, 지속 조건, 히스테리시스 규칙을 받아
+`EventLifecycleConfig`로 주입한다.
+
+## 검사
+
+```bash
+python -m unittest discover -s ai/ai2/week3/tests -v
+```

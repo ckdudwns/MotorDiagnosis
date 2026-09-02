@@ -10,8 +10,9 @@ from __future__ import annotations
 import copy
 import json
 import math
+import threading
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 from uuid import uuid4
@@ -103,12 +104,7 @@ class _AssetState:
     latest_closed_event: dict[str, Any] | None = None
     last_processed_at: datetime | None = None
     last_point_identity: tuple[object, ...] | None = None
-    processed_telemetry: OrderedDict[tuple[str, int], tuple[object, ...]] = field(
-        default_factory=OrderedDict
-    )
-    sequence_watermarks: OrderedDict[str, tuple[datetime, int]] = field(
-        default_factory=OrderedDict
-    )
+    last_processing_key: tuple[datetime, datetime, str, int] | None = None
 
 
 def _finite_score(point: dict[str, Any]) -> float | None:
@@ -146,6 +142,8 @@ def _point_identity(
     point: dict[str, Any],
     timestamp: datetime,
     fallback_score: float | None,
+    sensor_fault: bool,
+    sensor_fault_reason: str | None,
 ) -> tuple[str, str]:
     """Build the API-contract payload identity without derived score fields."""
     raw_payload = {
@@ -159,6 +157,8 @@ def _point_identity(
         raw_payload["timestamp"] = timestamp.isoformat()
         raw_payload["anomalyScore"] = fallback_score
         raw_payload["anomalyModel"] = str(point.get("anomalyModel") or "unknown")
+        raw_payload["sensorFault"] = sensor_fault
+        raw_payload["sensorFaultReason"] = (sensor_fault_reason or "").strip()
     return timestamp.isoformat(), _canonical_json(raw_payload)
 
 
@@ -225,9 +225,131 @@ def _telemetry_key(payload: dict[str, Any]) -> tuple[str, int] | None:
     return device_id.strip().upper(), sequence
 
 
+def _processing_key(
+    point: dict[str, Any], payload: dict[str, Any], timestamp: datetime
+) -> tuple[datetime, datetime, str, int]:
+    """Return the required deterministic per-asset processing order."""
+    received_at = payload.get("receivedAt", point.get("receivedAt"))
+    try:
+        received_timestamp = _parse_timestamp(received_at)
+    except ValueError:
+        received_timestamp = timestamp
+    device_id = payload.get("deviceId", point.get("deviceId"))
+    normalized_device_id = (
+        device_id.strip().upper() if isinstance(device_id, str) else ""
+    )
+    sequence = payload.get("sequence", point.get("sequence"))
+    normalized_sequence = (
+        sequence if isinstance(sequence, int) and not isinstance(sequence, bool) else -1
+    )
+    return timestamp, received_timestamp, normalized_device_id, normalized_sequence
+
+
 def _event_view(event: dict[str, Any]) -> dict[str, Any]:
     """Return an external event without lifecycle-only precision fields."""
     return {key: value for key, value in event.items() if not key.startswith("_")}
+
+
+def _history_to_snapshot(
+    history: OrderedDict[tuple[str, int], tuple[object, ...]],
+) -> list[dict[str, Any]]:
+    return [
+        {"deviceId": device_id, "sequence": sequence, "identity": list(identity)}
+        for (device_id, sequence), identity in history.items()
+    ]
+
+
+def _history_from_snapshot(
+    stored: object,
+) -> OrderedDict[tuple[str, int], tuple[object, ...]]:
+    if not isinstance(stored, list):
+        raise ValueError("snapshot processedTelemetry is invalid.")
+    history: OrderedDict[tuple[str, int], tuple[object, ...]] = OrderedDict()
+    for item in stored:
+        if not isinstance(item, dict):
+            raise ValueError("snapshot processedTelemetry entry is invalid.")
+        device_id = item.get("deviceId")
+        sequence = item.get("sequence")
+        identity = item.get("identity")
+        if (
+            not isinstance(device_id, str)
+            or isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or not isinstance(identity, list)
+        ):
+            raise ValueError("snapshot processedTelemetry entry is invalid.")
+        history[(device_id, sequence)] = tuple(identity)
+    return history
+
+
+def _watermarks_to_snapshot(
+    watermarks: OrderedDict[str, tuple[datetime, int]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "deviceId": device_id,
+            "timestamp": timestamp.isoformat(),
+            "sequence": sequence,
+        }
+        for device_id, (timestamp, sequence) in watermarks.items()
+    ]
+
+
+def _watermarks_from_snapshot(
+    stored: object,
+) -> OrderedDict[str, tuple[datetime, int]]:
+    if not isinstance(stored, list):
+        raise ValueError("snapshot sequenceWatermarks is invalid.")
+    watermarks: OrderedDict[str, tuple[datetime, int]] = OrderedDict()
+    for item in stored:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("deviceId"), str)
+            or isinstance(item.get("sequence"), bool)
+            or not isinstance(item.get("sequence"), int)
+        ):
+            raise ValueError("snapshot sequenceWatermarks entry is invalid.")
+        watermarks[item["deviceId"]] = (
+            _parse_timestamp(item.get("timestamp")),
+            item["sequence"],
+        )
+    return watermarks
+
+
+def _processing_key_to_snapshot(
+    key: tuple[datetime, datetime, str, int] | None,
+) -> list[object] | None:
+    if key is None:
+        return None
+    return [key[0].isoformat(), key[1].isoformat(), key[2], key[3]]
+
+
+def _processing_key_from_snapshot(
+    stored: object,
+) -> tuple[datetime, datetime, str, int] | None:
+    if stored is None:
+        return None
+    if (
+        not isinstance(stored, list)
+        or len(stored) != 4
+        or not isinstance(stored[2], str)
+        or isinstance(stored[3], bool)
+        or not isinstance(stored[3], int)
+    ):
+        raise ValueError("snapshot lastProcessingKey is invalid.")
+    return (
+        _parse_timestamp(stored[0]),
+        _parse_timestamp(stored[1]),
+        stored[2],
+        stored[3],
+    )
+
+
+def _snapshot_revision(snapshot: dict[str, Any]) -> int:
+    revision = snapshot.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("snapshot revision must be a non-negative integer.")
+    return revision
 
 
 class AnomalyEventLifecycle:
@@ -242,11 +364,25 @@ class AnomalyEventLifecycle:
 
     def __init__(self, config: EventLifecycleConfig | None = None) -> None:
         self.config = config or EventLifecycleConfig()
+        self._lock = threading.RLock()
+        self._revision = 0
         self._states: dict[str, _AssetState] = {}
+        self._processed_telemetry: OrderedDict[tuple[str, int], tuple[object, ...]] = (
+            OrderedDict()
+        )
+        self._sequence_watermarks: OrderedDict[str, tuple[datetime, int]] = (
+            OrderedDict()
+        )
 
     def snapshot(self) -> dict[str, Any]:
         """Return a JSON-serializable checkpoint for durable lifecycle storage."""
-        return self._snapshot_for_states(self._states)
+        with self._lock:
+            return self._snapshot_for_states(
+                self._states,
+                self._processed_telemetry,
+                self._sequence_watermarks,
+                self._revision,
+            )
 
     @classmethod
     def from_snapshot(
@@ -255,13 +391,14 @@ class AnomalyEventLifecycle:
         config: EventLifecycleConfig | None = None,
     ) -> AnomalyEventLifecycle:
         """Restore a lifecycle after restart from :meth:`snapshot` output."""
-        if not isinstance(snapshot, dict) or snapshot.get("schemaVersion") != 1:
-            raise ValueError("snapshot schemaVersion must be 1.")
+        if not isinstance(snapshot, dict) or snapshot.get("schemaVersion") != 2:
+            raise ValueError("snapshot schemaVersion must be 2.")
         snapshot_config = snapshot.get("config")
+        if not isinstance(snapshot_config, dict):
+            raise ValueError("snapshot config is required.")
         if config is None:
-            if not isinstance(snapshot_config, dict):
-                raise ValueError("snapshot config is required.")
             config = EventLifecycleConfig(**snapshot_config)
+        snapshot_rule = EventLifecycleConfig(**snapshot_config)
         lifecycle = cls(config)
         assets = snapshot.get("assets")
         if not isinstance(assets, dict):
@@ -270,13 +407,31 @@ class AnomalyEventLifecycle:
             if not isinstance(asset_id, str) or not isinstance(stored_state, dict):
                 raise ValueError("snapshot asset state is invalid.")
             restored_state = lifecycle._state_from_snapshot(stored_state)
-            lifecycle._trim_history(restored_state)
+            if config != snapshot_rule:
+                lifecycle._reset_entry_candidate(restored_state)
+                restored_state.exit_count = 0
+                restored_state.exit_start_at = None
             lifecycle._states[asset_id] = restored_state
+        lifecycle._revision = _snapshot_revision(snapshot)
+        lifecycle._processed_telemetry = _history_from_snapshot(
+            snapshot.get("processedTelemetry", [])
+        )
+        lifecycle._sequence_watermarks = _watermarks_from_snapshot(
+            snapshot.get("sequenceWatermarks", [])
+        )
+        lifecycle._trim_history()
         return lifecycle
 
-    def _snapshot_for_states(self, states: dict[str, _AssetState]) -> dict[str, Any]:
+    def _snapshot_for_states(
+        self,
+        states: dict[str, _AssetState],
+        processed_telemetry: OrderedDict[tuple[str, int], tuple[object, ...]],
+        sequence_watermarks: OrderedDict[str, tuple[datetime, int]],
+        revision: int,
+    ) -> dict[str, Any]:
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
+            "revision": revision,
             "config": {
                 "score_enter": self.config.score_enter,
                 "score_exit": self.config.score_exit,
@@ -286,6 +441,8 @@ class AnomalyEventLifecycle:
                 "idempotency_cache_size": self.config.idempotency_cache_size,
                 "rule_version": self.config.rule_version,
             },
+            "processedTelemetry": _history_to_snapshot(processed_telemetry),
+            "sequenceWatermarks": _watermarks_to_snapshot(sequence_watermarks),
             "assets": {
                 asset_id: {
                     "candidateCount": state.candidate_count,
@@ -307,28 +464,9 @@ class AnomalyEventLifecycle:
                         if state.last_point_identity is not None
                         else None
                     ),
-                    "processedTelemetry": [
-                        {
-                            "deviceId": device_id,
-                            "sequence": sequence,
-                            "identity": list(identity),
-                        }
-                        for (
-                            device_id,
-                            sequence,
-                        ), identity in state.processed_telemetry.items()
-                    ],
-                    "sequenceWatermarks": [
-                        {
-                            "deviceId": device_id,
-                            "timestamp": timestamp.isoformat(),
-                            "sequence": sequence,
-                        }
-                        for device_id, (
-                            timestamp,
-                            sequence,
-                        ) in state.sequence_watermarks.items()
-                    ],
+                    "lastProcessingKey": _processing_key_to_snapshot(
+                        state.last_processing_key
+                    ),
                 }
                 for asset_id, state in states.items()
             },
@@ -336,37 +474,6 @@ class AnomalyEventLifecycle:
 
     @staticmethod
     def _state_from_snapshot(stored: dict[str, Any]) -> _AssetState:
-        processed = OrderedDict()
-        for item in stored.get("processedTelemetry", []):
-            if not isinstance(item, dict):
-                raise ValueError("snapshot processedTelemetry entry is invalid.")
-            device_id = item.get("deviceId")
-            sequence = item.get("sequence")
-            identity = item.get("identity")
-            if (
-                not isinstance(device_id, str)
-                or isinstance(sequence, bool)
-                or not isinstance(sequence, int)
-                or not isinstance(identity, list)
-            ):
-                raise ValueError("snapshot processedTelemetry entry is invalid.")
-            processed[(device_id, sequence)] = tuple(identity)
-        sequence_watermarks = OrderedDict()
-        stored_sequences = stored.get("sequenceWatermarks", [])
-        if not isinstance(stored_sequences, list):
-            raise ValueError("snapshot sequenceWatermarks is invalid.")
-        for item in stored_sequences:
-            if (
-                not isinstance(item, dict)
-                or not isinstance(item.get("deviceId"), str)
-                or isinstance(item.get("sequence"), bool)
-                or not isinstance(item.get("sequence"), int)
-            ):
-                raise ValueError("snapshot sequenceWatermarks entry is invalid.")
-            sequence_watermarks[item["deviceId"]] = (
-                _parse_timestamp(item.get("timestamp")),
-                item["sequence"],
-            )
         last_processed_at = stored.get("lastProcessedAt")
         return _AssetState(
             candidate_count=int(stored.get("candidateCount", 0)),
@@ -390,36 +497,35 @@ class AnomalyEventLifecycle:
                 if isinstance(stored.get("lastPointIdentity"), list)
                 else None
             ),
-            processed_telemetry=processed,
-            sequence_watermarks=sequence_watermarks,
+            last_processing_key=_processing_key_from_snapshot(
+                stored.get("lastProcessingKey")
+            ),
         )
 
     def _remember_telemetry(
         self,
-        state: _AssetState,
         telemetry_key: tuple[str, int],
         point_identity: tuple[object, ...],
     ) -> None:
-        state.processed_telemetry[telemetry_key] = point_identity
-        state.processed_telemetry.move_to_end(telemetry_key)
-        self._trim_history(state)
+        self._processed_telemetry[telemetry_key] = point_identity
+        self._processed_telemetry.move_to_end(telemetry_key)
+        self._trim_history()
 
     def _remember_sequence_watermark(
         self,
-        state: _AssetState,
         device_id: str,
         timestamp: datetime,
         sequence: int,
     ) -> None:
-        state.sequence_watermarks[device_id] = (timestamp, sequence)
-        state.sequence_watermarks.move_to_end(device_id)
-        self._trim_history(state)
+        self._sequence_watermarks[device_id] = (timestamp, sequence)
+        self._sequence_watermarks.move_to_end(device_id)
+        self._trim_history()
 
-    def _trim_history(self, state: _AssetState) -> None:
-        while len(state.sequence_watermarks) > self.config.idempotency_cache_size:
-            state.sequence_watermarks.popitem(last=False)
-        while len(state.processed_telemetry) > self.config.idempotency_cache_size:
-            state.processed_telemetry.popitem(last=False)
+    def _trim_history(self) -> None:
+        while len(self._sequence_watermarks) > self.config.idempotency_cache_size:
+            self._sequence_watermarks.popitem(last=False)
+        while len(self._processed_telemetry) > self.config.idempotency_cache_size:
+            self._processed_telemetry.popitem(last=False)
 
     def process_point(
         self,
@@ -429,6 +535,7 @@ class AnomalyEventLifecycle:
         sensor_fault_reason: str | None = None,
         telemetry_payload: dict[str, Any] | None = None,
         persist_transaction: PersistTransaction | None = None,
+        expected_revision: int | None = None,
     ) -> list[dict[str, Any]]:
         """Process one score point and return lifecycle updates.
 
@@ -450,71 +557,100 @@ class AnomalyEventLifecycle:
         parsed_timestamp = _parse_timestamp(timestamp)
         score = _finite_score(point)
         asset_id = asset_id.strip().upper()
-        state = copy.deepcopy(self._states.get(asset_id, _AssetState()))
         idempotency_payload = telemetry_payload or point
         point_identity = _point_identity(
-            idempotency_payload, point, parsed_timestamp, score
+            idempotency_payload,
+            point,
+            parsed_timestamp,
+            score,
+            sensor_fault,
+            sensor_fault_reason,
         )
         telemetry_key = _telemetry_key(idempotency_payload)
-        if telemetry_key is not None:
-            previous_identity = state.processed_telemetry.get(telemetry_key)
-            if previous_identity is not None:
-                if previous_identity == point_identity:
-                    return []
+        processing_key = _processing_key(point, idempotency_payload, parsed_timestamp)
+
+        with self._lock:
+            if expected_revision is not None and expected_revision != self._revision:
                 raise ValueError(
-                    "deviceId and sequence were already processed with a different payload."
+                    "expectedRevision does not match the current checkpoint."
                 )
-            previous_sequence = state.sequence_watermarks.get(telemetry_key[0])
+            state = copy.deepcopy(self._states.get(asset_id, _AssetState()))
+            history = copy.deepcopy(self._processed_telemetry)
+            watermarks = copy.deepcopy(self._sequence_watermarks)
+            if telemetry_key is not None:
+                previous_identity = history.get(telemetry_key)
+                if previous_identity is not None:
+                    if previous_identity == point_identity:
+                        return []
+                    raise ValueError(
+                        "deviceId and sequence were already processed with a different payload."
+                    )
+                previous_sequence = watermarks.get(telemetry_key[0])
+                if (
+                    previous_sequence is not None
+                    and previous_sequence[0] == parsed_timestamp
+                    and telemetry_key[1] < previous_sequence[1]
+                ):
+                    raise ValueError(
+                        "sequence must not decrease for the same device and timestamp."
+                    )
             if (
-                previous_sequence is not None
-                and previous_sequence[0] == parsed_timestamp
-                and telemetry_key[1] < previous_sequence[1]
+                state.last_processing_key is not None
+                and processing_key < state.last_processing_key
             ):
                 raise ValueError(
-                    "sequence must not decrease for the same device and timestamp."
+                    "point order must increase by timestamp, receivedAt, deviceId, sequence."
                 )
-        if (
-            state.last_processed_at is not None
-            and parsed_timestamp < state.last_processed_at
-        ):
-            raise ValueError(
-                "timestamp must not be earlier than the last point for assetId."
-            )
-        if (
-            parsed_timestamp == state.last_processed_at
-            and point_identity == state.last_point_identity
-        ):
-            return []
-        if sensor_fault:
-            updates = self._suppress_for_sensor_fault(
-                state,
-                asset_id,
-                str(timestamp),
-                sensor_fault_reason or "sensor_fault_detected",
-            )
-        elif score is None:
-            self._reset_entry_candidate(state)
-            state.exit_count = 0
-            state.exit_start_at = None
-            updates = []
-        elif state.open_event is None:
-            updates = self._process_entry(state, asset_id, str(timestamp), score, point)
-        else:
-            updates = self._process_open_event(state, str(timestamp), score, point)
+            if (
+                processing_key == state.last_processing_key
+                and point_identity == state.last_point_identity
+            ):
+                return []
+            if sensor_fault:
+                updates = self._suppress_for_sensor_fault(
+                    state,
+                    asset_id,
+                    str(timestamp),
+                    sensor_fault_reason or "sensor_fault_detected",
+                )
+            elif score is None:
+                self._reset_entry_candidate(state)
+                state.exit_count = 0
+                state.exit_start_at = None
+                updates = []
+            elif state.open_event is None:
+                updates = self._process_entry(
+                    state, asset_id, str(timestamp), score, point
+                )
+            else:
+                updates = self._process_open_event(state, str(timestamp), score, point)
 
-        state.last_processed_at = parsed_timestamp
-        state.last_point_identity = point_identity
-        if telemetry_key is not None:
-            self._remember_telemetry(state, telemetry_key, point_identity)
-            self._remember_sequence_watermark(
-                state, telemetry_key[0], parsed_timestamp, telemetry_key[1]
+            state.last_processed_at = parsed_timestamp
+            state.last_processing_key = processing_key
+            state.last_point_identity = point_identity
+            if telemetry_key is not None:
+                history[telemetry_key] = point_identity
+                history.move_to_end(telemetry_key)
+                watermarks[telemetry_key[0]] = (parsed_timestamp, telemetry_key[1])
+                watermarks.move_to_end(telemetry_key[0])
+                while len(history) > self.config.idempotency_cache_size:
+                    history.popitem(last=False)
+                while len(watermarks) > self.config.idempotency_cache_size:
+                    watermarks.popitem(last=False)
+            candidate_states = copy.deepcopy(self._states)
+            candidate_states[asset_id] = state
+            next_revision = self._revision + 1
+            checkpoint = self._snapshot_for_states(
+                candidate_states, history, watermarks, next_revision
             )
-        candidate_states = {**self._states, asset_id: state}
-        checkpoint = self._snapshot_for_states(candidate_states)
-        if persist_transaction is not None:
-            persist_transaction(checkpoint, copy.deepcopy(updates))
-        self._states[asset_id] = state
-        return updates
+            checkpoint["expectedRevision"] = self._revision
+            if persist_transaction is not None:
+                persist_transaction(checkpoint, copy.deepcopy(updates))
+            self._states = candidate_states
+            self._processed_telemetry = history
+            self._sequence_watermarks = watermarks
+            self._revision = next_revision
+            return updates
 
     def _process_entry(
         self,

@@ -37,7 +37,14 @@ AI-1이 계산한 기준선·임계값과 AI-2 2주차의 `anomalyScore`를 입�
 - 내구성: `snapshot()` 결과를 이벤트/outbox와 같은 DB 트랜잭션으로 저장하고,
   `from_snapshot()`으로 재시작 시 복구한다. `persist_transaction` 콜백이 실패하면 상태와
   멱등성 체크포인트를 메모리에 반영하지 않아 동일 telemetry를 재시도할 수 있다. 멱등성
-  캐시는 설정값 `idempotency_cache_size`(기본 1024)로 제한한다.
+  캐시는 설정값 `idempotency_cache_size`(기본 1024)로 제한한다. 캐시와 watermark는 자산별이
+  아닌 lifecycle 전역의 `(deviceId, sequence)` 계약을 따른다.
+- 동시성: 단일 프로세스에서는 read-copy-persist-commit 구간을 lifecycle lock으로 직렬화한다.
+  저장 콜백에는 다음 revision과 `expectedRevision`이 포함된 checkpoint가 전달된다. 다중
+  프로세스 저장소는 이 값을 CAS 조건으로 사용하고, 충돌 시 최신 snapshot을 복구한 후 재시도한다.
+- 동일 시각: 자산별 처리 순서는 `(timestamp, receivedAt, deviceId, sequence)` 오름차순이다.
+  이 순서를 벗어난 point는 거부한다. 규칙 설정이 달라진 snapshot을 복구하면 pending entry와
+  exit streak를 초기화한다.
 
 실제 값은 AI-1의 설비별 `scoreThreshold`, 지속 조건, 히스테리시스 규칙을 받아
 `EventLifecycleConfig`로 주입한다.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import unittest
 
 from ai.ai2.week3.event_lifecycle import AnomalyEventLifecycle, EventLifecycleConfig
@@ -348,9 +349,164 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
                 )
             )
 
-        stored = lifecycle.snapshot()["assets"]["SITE-01-MOT-02"]["processedTelemetry"]
+        stored = lifecycle.snapshot()["processedTelemetry"]
         self.assertEqual(len(stored), 2)
         self.assertEqual([row["sequence"] for row in stored], [2, 3])
+
+    def test_same_telemetry_concurrently_creates_one_event(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        record = point(
+            "2026-08-31T00:00:00Z",
+            80,
+            deviceId="DEVICE-01",
+            sequence=1,
+            vibrationRmsRaw=3.0,
+        )
+        barrier = threading.Barrier(2)
+        results: list[list[dict[str, object]]] = []
+
+        def process() -> None:
+            barrier.wait()
+            results.append(lifecycle.process_point(record))
+
+        threads = [threading.Thread(target=process) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(sum(bool(result) for result in results), 1)
+        self.assertEqual(
+            results[[bool(result) for result in results].index(True)][0]["kind"],
+            "asset_event_started",
+        )
+
+    def test_concurrent_assets_keep_both_states_in_the_last_checkpoint(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        barrier = threading.Barrier(2)
+        checkpoints: list[dict[str, object]] = []
+
+        def persist(checkpoint: dict[str, object], _: list[dict[str, object]]) -> None:
+            checkpoints.append(checkpoint)
+
+        def process(asset_id: str, device_id: str) -> None:
+            barrier.wait()
+            lifecycle.process_point(
+                point(
+                    "2026-08-31T00:00:00Z",
+                    80,
+                    assetId=asset_id,
+                    deviceId=device_id,
+                    sequence=1,
+                    vibrationRmsRaw=3.0,
+                ),
+                persist_transaction=persist,
+            )
+
+        threads = [
+            threading.Thread(target=process, args=("SITE-01-MOT-02", "DEVICE-01")),
+            threading.Thread(target=process, args=("SITE-01-MOT-03", "DEVICE-02")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(lifecycle.snapshot()["assets"]), 2)
+        self.assertEqual(len(checkpoints[-1]["assets"]), 2)
+
+    def test_idempotency_key_is_global_across_assets(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        lifecycle.process_point(
+            point(
+                "2026-08-31T00:00:00Z",
+                80,
+                assetId="SITE-01-MOT-02",
+                deviceId="DEVICE-01",
+                sequence=1,
+                vibrationRmsRaw=3.0,
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "already processed"):
+            lifecycle.process_point(
+                point(
+                    "2026-08-31T00:00:00Z",
+                    80,
+                    assetId="SITE-01-MOT-03",
+                    deviceId="DEVICE-01",
+                    sequence=1,
+                    vibrationRmsRaw=3.0,
+                )
+            )
+
+    def test_rejects_out_of_order_devices_at_the_same_timestamp(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        lifecycle.process_point(
+            point(
+                "2026-08-31T00:00:00Z",
+                90,
+                deviceId="DEVICE-B",
+                sequence=1,
+                vibrationRmsRaw=3.0,
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "point order must increase"):
+            lifecycle.process_point(
+                point(
+                    "2026-08-31T00:00:00Z",
+                    10,
+                    deviceId="DEVICE-A",
+                    sequence=1,
+                    vibrationRmsRaw=2.0,
+                )
+            )
+
+    def test_config_change_resets_pending_candidate_after_snapshot_restore(
+        self,
+    ) -> None:
+        original = AnomalyEventLifecycle(
+            EventLifecycleConfig(score_enter=75, score_exit=50, min_consecutive_enter=2)
+        )
+        original.process_point(point("2026-08-31T00:00:00Z", 80))
+        restored = AnomalyEventLifecycle.from_snapshot(
+            original.snapshot(),
+            EventLifecycleConfig(
+                score_enter=90, score_exit=50, min_consecutive_enter=2
+            ),
+        )
+
+        self.assertEqual(restored.process_point(point("2026-08-31T00:00:05Z", 95)), [])
+        started = restored.process_point(point("2026-08-31T00:00:10Z", 95))
+        self.assertEqual(started[0]["kind"], "asset_event_started")
+
+    def test_sensor_fault_is_not_deduplicated_with_a_non_device_point(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        record = point("2026-08-31T00:00:00Z", 80)
+        lifecycle.process_point(record)
+
+        updates = lifecycle.process_point(record, sensor_fault=True)
+
+        self.assertEqual(updates[0]["kind"], "sensor_fault_suppressed")
+        self.assertEqual(updates[1]["kind"], "asset_event_closed")
+
+    def test_expected_revision_provides_compare_and_swap_boundary(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        checkpoints: list[dict[str, object]] = []
+        lifecycle.process_point(
+            point("2026-08-31T00:00:00Z", 80),
+            expected_revision=0,
+            persist_transaction=lambda checkpoint, _: checkpoints.append(checkpoint),
+        )
+
+        self.assertEqual(checkpoints[0]["expectedRevision"], 0)
+        self.assertEqual(checkpoints[0]["revision"], 1)
+
+        with self.assertRaisesRegex(ValueError, "expectedRevision"):
+            lifecycle.process_point(
+                point("2026-08-31T00:00:05Z", 80), expected_revision=0
+            )
 
     def test_rejects_reverse_sequence_at_the_same_timestamp(self) -> None:
         lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))

@@ -927,6 +927,42 @@ class TestExportDatasetSynthetic(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_same_id_different_label_mapping_rejected_not_silently_reused(self):
+        """[리뷰 P1] version_id(=source.checksum)는 export 시점에만 바뀌는 값
+        (labelMapping을 export 직전에 수정)을 반영하지 않는다. 같은 id로 먼저
+        export한 뒤 labelMapping을 바꿔 다시 export하면, 예전 코드는 os.replace()
+        실패를 "동시 export가 이미 같은 내용을 배치했다"는 뜻으로 오해해 새
+        staged 결과(새 unmapped 상태)를 조용히 버리고 기존(오래된 verified 상태)
+        산출물을 그대로 재사용했다 — 두 번째 export가 성공을 반환했지만 CSV에는
+        여전히 예전 라벨 상태가 남는 문제였다."""
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_conflict_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+            with open(result_1["csv_path"], newline="", encoding="utf-8") as f:
+                first_rows = {row["sample_id"]: row for row in csv.DictReader(f)}
+            self.assertEqual(first_rows["105_0000"]["label_status"], "verified")
+
+            # labelMapping을 새 dict로 교체(공유 전역 객체를 직접 변형하지 않음) —
+            # BEARING_FAULT_INNER 매핑을 빼서 105_0000이 unmapped가 되도록 한다.
+            # id/source.checksum은 그대로 두어 첫 export와 동일한 version_id를
+            # 재사용하게 만든다(이게 바로 재현 조건).
+            manifest["labelMapping"] = {"NORMAL": "NORMAL"}
+            self.assertEqual(manifest["id"], self._synthetic_manifest()["id"])
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+
+            # 거부됐으므로 기존(첫 번째) 산출물이 조용히 손상되거나 새 값으로
+            # 바뀌지 않고 그대로 남아 있어야 한다.
+            with open(result_1["csv_path"], newline="", encoding="utf-8") as f:
+                after_rows = {row["sample_id"]: row for row in csv.DictReader(f)}
+            self.assertEqual(after_rows["105_0000"]["label_status"], "verified")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def test_concurrent_exports_of_different_manifests_never_expose_mixed_version(self):
         """서로 다른 두 버전을 동시에 내보내도, CURRENT가 가리키는 버전의
         csv/xlsx/manifest 세 파일은 항상 같은 버전에서 나온 것이어야 한다

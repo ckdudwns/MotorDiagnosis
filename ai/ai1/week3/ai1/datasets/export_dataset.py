@@ -17,6 +17,7 @@ import csv
 import json
 import time
 import shutil
+import hashlib
 import tempfile
 import argparse
 
@@ -50,6 +51,25 @@ def _replace_with_retry(src: str, dst: str, attempts: int = 10, delay: float = 0
             if attempt == attempts - 1:
                 raise
             time.sleep(delay)
+
+
+class VersionContentConflictError(RuntimeError):
+    """같은 version_id(=dataset id)로 서로 다른 내용의 산출물을 내보내려 할 때 발생한다.
+
+    [리뷰 P1] version_id는 `build_manifest()`의 `source.checksum`(원본 파일·전처리·
+    특징 산출물 기준)으로 결정되고, export 시점에만 바뀌는 값(예: `export_dataset()`
+    호출 직전에 `manifest["labelMapping"]`을 수정)은 반영하지 않는다. 그래서 같은
+    id로 실제로 다른 라벨 상태를 담은 CSV를 두 번 내보내려 하면 "이미 있는
+    version_dir는 방금 만든 staged 산출물과 내용이 같다"는 가정이 깨진다.
+    """
+
+
+def _sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _manifest_without_rows(manifest: dict, artifact_refs: dict, label_summary: dict) -> dict:
@@ -216,14 +236,30 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
         try:
             _replace_with_retry(staging_dir, version_dir)
         except OSError:
-            # version_id는 원본·전처리·산출물 내용으로 결정되는 불변
-            # 체크섬을 담고 있다(compute_version_checksum). 그래서
-            # version_dir가 이미 존재한다면 동시에 실행된 다른 export가
-            # 정확히 같은 내용을 이미 배치를 마쳤다는 뜻이며, 이 시도는
-            # 버리고 기존 버전을 그대로 재사용한다(같은 입력은 항상 같은
-            # 산출물이어야 하는 불변 버전 원칙).
             if not os.path.isdir(version_dir):
                 raise
+            # [리뷰 P1] version_id(=source.checksum)는 원본 파일·전처리·특징
+            # 산출물로 결정되지만, export 시점에만 바뀌는 값(예: 호출 직전
+            # manifest["labelMapping"] 수정)은 반영하지 않는다 — 그래서
+            # "version_dir가 이미 있다 == 동시 export가 정확히 같은 내용을
+            # 이미 배치했다"는 예전 가정이 항상 참은 아니다. CSV(rows + 라벨
+            # 파생 컬럼을 그대로 담고, 타임스탬프 등 휘발성 메타데이터가 없어
+            # 결정적이다 — XLSX는 openpyxl이 저장 시각을 파일에 넣어 내용이
+            # 같아도 바이트가 달라지므로 비교에 쓰지 않는다)를 기존 산출물과
+            # 대조해 실제로 동일한 내용인지 확인한다.
+            existing_csv_path = os.path.join(version_dir, "dataset_rows.csv")
+            if not os.path.exists(existing_csv_path) or (
+                _sha256_of_file(csv_path) != _sha256_of_file(existing_csv_path)
+            ):
+                raise VersionContentConflictError(
+                    f"version_id {version_id!r}가 이미 존재하지만 내보내려는 rows/라벨 "
+                    "내용이 기존 산출물과 다릅니다. 이 id는 source.checksum만 반영하며 "
+                    "export 시점에만 바뀐 값(예: labelMapping 변경)은 반영하지 않습니다 "
+                    "— 기존 버전을 조용히 재사용하면 방금 내보내려던 내용이 사라집니다. "
+                    "매니페스트를 다시 생성하거나 원인을 확인하세요."
+                ) from None
+            # CSV 내용이 완전히 같다 -> 동시에 실행된 다른 export가 이미 같은
+            # 내용을 배치했다는 뜻이므로, 이 시도는 버리고 기존 버전을 재사용한다.
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 

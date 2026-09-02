@@ -64,6 +64,18 @@ id>/`에 모두 만들고 검증한 뒤 그 디렉터리 자체를 단일 rename
 `compute_version_checksum()`이 만드는 불변 체크섬을 담고 있으므로, 같은 입력으로 다시
 내보내면 같은 version_dir을 재사용한다(idempotent).
 
+**"이미 있는 version_dir == 같은 내용"을 가정하지 않는다 (리뷰 P1).** `version_id`는
+`source.checksum`(원본 파일·전처리·특징 산출물 기준)만 반영하고, `export_dataset()` 호출
+직전에 `manifest["labelMapping"]`을 바꾸는 것처럼 **export 시점에만** 달라지는 값은
+반영하지 않는다. 그래서 같은 id로 실제로 다른 라벨 상태를 담은 CSV를 두 번 내보내려 하면,
+"디렉터리가 이미 있으면 동시 export가 이미 같은 내용을 배치한 것" 가정이 깨진다. 이제
+`os.replace()`가 기존 `version_dir` 때문에 실패하면, 방금 만든 CSV(rows + 라벨 파생 컬럼을
+그대로 담고, 타임스탬프 등 휘발성 메타데이터가 없어 결정적이다 — XLSX는 openpyxl이 저장
+시각을 파일에 넣어 내용이 같아도 바이트가 달라지므로 비교에 쓰지 않는다)를 기존 산출물과
+sha256으로 대조한다. 완전히 같으면(동시 export race) 기존 버전을 그대로 재사용하고, 다르면
+`VersionContentConflictError`로 거부한다 — 조용히 새 내용을 버리고 예전 산출물을 성공으로
+반환하지 않는다.
+
 ## 라벨 매핑 (`labelMapping`)
 
 | CWRU 원본 라벨 (`known_label`) | 공통 학습 라벨 (`common_label`) |

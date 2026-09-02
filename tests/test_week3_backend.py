@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 import threading
 import unittest
 from collections import Counter
@@ -2066,15 +2067,25 @@ class Week3HttpContractTest(unittest.TestCase):
         return body["session"]["token"]
 
     def test_health_timestamp_is_rfc3339_utc_string(self) -> None:
+        requested_at = datetime.now(timezone.utc)
         status, health = self.request("/api/health")
+        responded_at = datetime.now(timezone.utc)
 
         self.assertEqual(status, 200)
         timestamp = health["timestamp"]
         self.assertIsInstance(timestamp, str)
-        self.assertTrue(timestamp.endswith("Z"))
+        self.assertIsNotNone(
+            re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+                r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z",
+                timestamp,
+            )
+        )
         parsed = datetime.fromisoformat(timestamp.removesuffix("Z") + "+00:00")
         self.assertIsNotNone(parsed.tzinfo)
         self.assertEqual(parsed.utcoffset(), timedelta(0))
+        self.assertGreaterEqual(parsed, requested_at - timedelta(seconds=1))
+        self.assertLessEqual(parsed, responded_at)
 
     def test_invalid_utf8_and_oversized_json_integer_return_400(self) -> None:
         invalid_bodies = (

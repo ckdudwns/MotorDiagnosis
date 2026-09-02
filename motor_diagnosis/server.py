@@ -66,6 +66,7 @@ from .data import (
     logout,
     network_profile,
     network_profiles_for_sites,
+    now_iso,
     parse_rfc3339,
     quarantine_mqtt_message,
     quarantine_unregistered_device,
@@ -193,7 +194,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "Bind Edge AI backend",
-                    "timestamp": time.time(),
+                    "timestamp": now_iso(),
                 }
             )
             return

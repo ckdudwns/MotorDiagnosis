@@ -2065,6 +2065,17 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertEqual(status, 200)
         return body["session"]["token"]
 
+    def test_health_timestamp_is_rfc3339_utc_string(self) -> None:
+        status, health = self.request("/api/health")
+
+        self.assertEqual(status, 200)
+        timestamp = health["timestamp"]
+        self.assertIsInstance(timestamp, str)
+        self.assertTrue(timestamp.endswith("Z"))
+        parsed = datetime.fromisoformat(timestamp.removesuffix("Z") + "+00:00")
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertEqual(parsed.utcoffset(), timedelta(0))
+
     def test_invalid_utf8_and_oversized_json_integer_return_400(self) -> None:
         invalid_bodies = (
             b'{"name":"\xff"}',

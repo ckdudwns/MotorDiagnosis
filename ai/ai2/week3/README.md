@@ -34,6 +34,10 @@ AI-1이 계산한 기준선·임계값과 AI-2 2주차의 `anomalyScore`를 입�
 - 멱등성·정밀도: `deviceId`·`sequence`가 있는 telemetry는 유한 숫자 점수로 정규화해
   중복을 판별하며, 같은 키의 다른 payload는 충돌로 거부한다. 최대 점수 비교는 반올림 전
   값으로 수행하고 외부 이벤트에는 표시용 반올림 값만 제공한다.
+- 내구성: `snapshot()` 결과를 이벤트/outbox와 같은 DB 트랜잭션으로 저장하고,
+  `from_snapshot()`으로 재시작 시 복구한다. `persist_transaction` 콜백이 실패하면 상태와
+  멱등성 체크포인트를 메모리에 반영하지 않아 동일 telemetry를 재시도할 수 있다. 멱등성
+  캐시는 설정값 `idempotency_cache_size`(기본 1024)로 제한한다.
 
 실제 값은 AI-1의 설비별 `scoreThreshold`, 지속 조건, 히스테리시스 규칙을 받아
 `EventLifecycleConfig`로 주입한다.

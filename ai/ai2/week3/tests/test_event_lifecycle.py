@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from ai.ai2.week3.event_lifecycle import AnomalyEventLifecycle, EventLifecycleConfig
@@ -108,9 +109,7 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
             "event"
         ]
         lifecycle.process_point(point("2026-08-31T00:00:05Z", 40))
-        lifecycle.process_point(
-            point("2026-08-31T00:00:10Z", 100), sensor_fault=True
-        )
+        lifecycle.process_point(point("2026-08-31T00:00:10Z", 100), sensor_fault=True)
 
         restarted = lifecycle.process_point(point("2026-08-31T00:00:20Z", 90))
 
@@ -124,9 +123,7 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
         original = lifecycle.process_point(point("2026-08-31T00:00:00Z", 80))[0][
             "event"
         ]
-        lifecycle.process_point(
-            point("2026-08-31T00:00:05Z", 100), sensor_fault=True
-        )
+        lifecycle.process_point(point("2026-08-31T00:00:05Z", 100), sensor_fault=True)
 
         restarted = lifecycle.process_point(point("2026-08-31T00:00:20Z", 90))
 
@@ -215,15 +212,11 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
         self.lifecycle.process_point(point("2026-08-31T00:00:00Z", 80))
         overflow_score = 10**400
         self.assertEqual(
-            self.lifecycle.process_point(
-                point("2026-08-31T00:00:05Z", overflow_score)
-            ),
+            self.lifecycle.process_point(point("2026-08-31T00:00:05Z", overflow_score)),
             [],
         )
         self.assertEqual(
-            self.lifecycle.process_point(
-                point("2026-08-31T00:00:05Z", overflow_score)
-            ),
+            self.lifecycle.process_point(point("2026-08-31T00:00:05Z", overflow_score)),
             [],
         )
         self.assertEqual(
@@ -234,10 +227,18 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
 
     def test_normalizes_numeric_duplicate_telemetry_and_rejects_conflict(self) -> None:
         first = point(
-            "2026-08-31T00:00:00Z", 80, deviceId="DEVICE-01", sequence=1
+            "2026-08-31T00:00:00Z",
+            80,
+            deviceId="DEVICE-01",
+            sequence=1,
+            vibrationRmsRaw=3,
         )
         retransmission = point(
-            "2026-08-31T00:00:00Z", 80.0, deviceId="DEVICE-01", sequence=1
+            "2026-08-31T00:00:00Z",
+            80.0,
+            deviceId="DEVICE-01",
+            sequence=1,
+            vibrationRmsRaw=3.0,
         )
         self.assertEqual(self.lifecycle.process_point(first), [])
         self.assertEqual(self.lifecycle.process_point(retransmission), [])
@@ -248,6 +249,7 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
                     81,
                     deviceId="DEVICE-01",
                     sequence=1,
+                    vibrationRmsRaw=4.0,
                 )
             )
 
@@ -255,6 +257,138 @@ class AnomalyEventLifecycleTest(unittest.TestCase):
             point("2026-08-31T00:00:05Z", 80, deviceId="DEVICE-01", sequence=2)
         )
         self.assertEqual(started[0]["kind"], "asset_event_started")
+
+    def test_matches_api_payload_normalization_for_idempotency(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        first_point = point("2026-08-31T00:00:00Z", 80)
+        first_payload = {
+            "timestamp": "2026-08-31T00:00:00Z",
+            "sequence": 1,
+            "siteId": "site-01",
+            "assetId": "site-01-mot-02",
+            "deviceId": "device-01",
+            "vibrationRmsRaw": 3,
+            "vibrationRmsMmS": None,
+            "acousticDb": None,
+            "source": "  prototype  ",
+        }
+        retried_payload = {
+            **first_payload,
+            "timestamp": "2026-08-31T00:00:00+00:00",
+            "siteId": "SITE-01",
+            "assetId": "SITE-01-MOT-02",
+            "deviceId": "DEVICE-01",
+            "vibrationRmsRaw": 3.0,
+            "source": "prototype",
+        }
+
+        lifecycle.process_point(first_point, telemetry_payload=first_payload)
+        self.assertEqual(
+            lifecycle.process_point(first_point, telemetry_payload=retried_payload), []
+        )
+
+    def test_persistence_failure_does_not_commit_idempotency_checkpoint(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        record = point(
+            "2026-08-31T00:00:00Z",
+            80,
+            deviceId="DEVICE-01",
+            sequence=1,
+            vibrationRmsRaw=3.0,
+        )
+
+        def persist_failure(_: dict[str, object], __: list[dict[str, object]]) -> None:
+            raise RuntimeError("database unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            lifecycle.process_point(record, persist_transaction=persist_failure)
+
+        restarted = lifecycle.process_point(record)
+        self.assertEqual(restarted[0]["kind"], "asset_event_started")
+
+    def test_snapshot_restores_open_event_and_idempotency_history(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        first = point(
+            "2026-08-31T00:00:00Z",
+            80,
+            deviceId="DEVICE-01",
+            sequence=1,
+            vibrationRmsRaw=3.0,
+        )
+        started = lifecycle.process_point(first)[0]["event"]
+
+        snapshot = lifecycle.snapshot()
+        json.dumps(snapshot, allow_nan=False)
+        restored = AnomalyEventLifecycle.from_snapshot(snapshot)
+        self.assertEqual(restored.process_point(first), [])
+        updated = restored.process_point(
+            point(
+                "2026-08-31T00:00:05Z",
+                90,
+                deviceId="DEVICE-01",
+                sequence=2,
+                vibrationRmsRaw=4.0,
+            )
+        )[0]["event"]
+
+        self.assertEqual(updated["id"], started["id"])
+
+    def test_idempotency_cache_is_bounded(self) -> None:
+        lifecycle = AnomalyEventLifecycle(
+            EventLifecycleConfig(min_consecutive_enter=1, idempotency_cache_size=2)
+        )
+        for sequence in range(1, 4):
+            lifecycle.process_point(
+                point(
+                    f"2026-08-31T00:00:0{sequence}Z",
+                    80,
+                    deviceId="DEVICE-01",
+                    sequence=sequence,
+                    vibrationRmsRaw=float(sequence),
+                )
+            )
+
+        stored = lifecycle.snapshot()["assets"]["SITE-01-MOT-02"]["processedTelemetry"]
+        self.assertEqual(len(stored), 2)
+        self.assertEqual([row["sequence"] for row in stored], [2, 3])
+
+    def test_rejects_reverse_sequence_at_the_same_timestamp(self) -> None:
+        lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))
+        lifecycle.process_point(
+            point(
+                "2026-08-31T00:00:00Z",
+                90,
+                deviceId="DEVICE-01",
+                sequence=2,
+                vibrationRmsRaw=3.0,
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "sequence must not decrease"):
+            lifecycle.process_point(
+                point(
+                    "2026-08-31T00:00:00Z",
+                    10,
+                    deviceId="DEVICE-01",
+                    sequence=1,
+                    vibrationRmsRaw=2.0,
+                )
+            )
+
+    def test_zero_score_keeps_its_max_score_model_version(self) -> None:
+        lifecycle = AnomalyEventLifecycle(
+            EventLifecycleConfig(
+                score_enter=0,
+                score_exit=0,
+                min_consecutive_enter=1,
+            )
+        )
+        started = lifecycle.process_point(
+            point("2026-08-31T00:00:00Z", 0, anomalyModel="model-v0")
+        )[0]["event"]
+
+        self.assertEqual(started["maxScore"], 0)
+        self.assertEqual(started["maxScoreModelVersion"], "model-v0")
 
     def test_tracks_max_score_model_before_rounding_the_external_value(self) -> None:
         lifecycle = AnomalyEventLifecycle(EventLifecycleConfig(min_consecutive_enter=1))

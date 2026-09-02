@@ -28,10 +28,11 @@
  *   CRC-protected fixed-record binary ring sized for at least 24 h at
  *   the current cadence. When full, the oldest record is dropped while
  *   acquisition continues.
- * - The production ring stores 25,000 x 48-byte records (~1.20 MB),
- *   which exceeds the 24-hour target at the current acquisition cadence.
- * - Overflow policy is oldest-drop: acquisition continues and the newest
- *   retention window is preserved.
+ * - The physical ring stores 25,000 x 48-byte slots (~1.20 MB).
+ *   One slot is kept spare, so 24,999 records are logically active; this
+ *   still exceeds the 24-hour retention target.
+ * - Full-ring append is write-first: the new record is verified in the
+ *   spare slot before the oldest record is logically consumed.
  *
  * Unit policy:
  * - vibrationRmsRaw = ADXL345 acceleration RMS [g]
@@ -44,6 +45,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <arduinoFFT.h>
@@ -53,6 +55,8 @@
 #include <sys/time.h>
 #include <math.h>
 #include <stddef.h>
+#include <algorithm>
+#include <cstring>
 
 #include "firmware_logic.h"
 
@@ -67,7 +71,7 @@
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.2-beta.11.7";
+    "v1.2-beta.11.8.3";
 
 // =====================================================
 // Test Config
@@ -91,6 +95,17 @@ constexpr bool TEST_FORCE_SEQUENCE_NVS_FAIL =
 constexpr bool TEST_FORCE_LITTLEFS_MOUNT_FAIL =
     false;
 
+// Runtime fault-injection hooks for regression testing. Leave false in
+// production. These never classify an I/O failure as acknowledged data.
+constexpr bool TEST_FORCE_RING_READ_IO_FAIL =
+    false;
+
+constexpr bool TEST_FORCE_RING_WRITE_FAIL =
+    false;
+
+constexpr bool TEST_FORCE_ISOLATION_WRITE_FAIL =
+    false;
+
 // =====================================================
 // Wi-Fi / Backend Secrets
 // =====================================================
@@ -109,6 +124,20 @@ const char* HEALTH_URL =
 
 const char* INGEST_TOKEN =
     INGEST_TOKEN_VALUE;
+
+#ifndef BACKEND_CA_CERT_VALUE
+#define BACKEND_CA_CERT_VALUE ""
+#endif
+
+#ifndef ALLOW_INSECURE_HTTP_FOR_LOCAL_DEV_VALUE
+#define ALLOW_INSECURE_HTTP_FOR_LOCAL_DEV_VALUE false
+#endif
+
+const char* BACKEND_CA_CERT =
+    BACKEND_CA_CERT_VALUE;
+
+constexpr bool ALLOW_INSECURE_HTTP_FOR_LOCAL_DEV =
+    ALLOW_INSECURE_HTTP_FOR_LOCAL_DEV_VALUE;
 
 // =====================================================
 // Device
@@ -222,32 +251,48 @@ static_assert(
 // Offline Buffer - 24H Binary Ring
 // =====================================================
 //
-// Current offline cycle is approximately:
-//   3.0 s measurement interval + ~0.99 s acquisition ~= 3.99 s
+// The physical LittleFS ring remains exactly 25,000 x 48-byte slots
+// (1.20 MB), so existing files do not require a destructive resize.
 //
-// 25,000 fixed 48-byte records occupy about 1.20 MB and provide
-// roughly 27.7 h at the measured 3.99 s cadence. Even at a 3.64 s
-// lower-bound cycle (3.0 s delay + 0.64 s common signal window),
-// capacity is about 25.3 h.
-//
-// IMPORTANT:
-// - The HTTP/API payload remains JSON and API-v1.3 compatible.
-// - First-send and replay JSON use one canonical serializer fed only by
-//   fields preserved in the binary ring, so ACK loss cannot change the
-//   payload merely because RAM sensor values had higher precision.
-// - Only the local offline storage representation is binary.
-// - On overflow the OLDEST buffered record is discarded so acquisition
-//   continues and the newest ~24 h window is retained.
+// One slot is intentionally kept spare. Therefore at most 24,999 records
+// are logically active. When the queue is full, the new record is written
+// and read-back verified into the spare slot BEFORE the oldest record is
+// consumed. A failed write therefore cannot destroy both the old and new
+// telemetry. The retention loss is only one ~4 s record and still exceeds
+// the 24-hour target.
 //
 
-constexpr size_t QUEUE_CAPACITY =
+constexpr size_t RING_SLOT_COUNT =
     25000;
+
+constexpr size_t QUEUE_CAPACITY =
+    RING_SLOT_COUNT - 1;
+
+static_assert(
+    QUEUE_CAPACITY + 1 == RING_SLOT_COUNT,
+    "One physical ring slot must remain spare."
+);
 
 constexpr char RING_FILE[] =
     "/telemetry_ring.bin";
 
 constexpr char REJECTED_DIR[] =
     "/telemetry_rejected";
+
+constexpr size_t MAX_REJECTED_ARCHIVE_FILES =
+    128;
+
+// Archive maintenance is deliberately bounded. A legacy archive can contain
+// hundreds of .json/.meta files; deleting one file and rescanning the entire
+// directory repeatedly can stall replay and fresh sensor acquisition.
+constexpr size_t MAX_ISOLATION_EVICTIONS_PER_PASS =
+    8;
+
+constexpr size_t MAX_STALE_TEMP_REMOVALS_PER_PASS =
+    4;
+
+constexpr size_t MAX_ISOLATION_BACKEND_RESPONSE_CHARS =
+    1024;
 
 constexpr uint32_t RING_MAGIC =
     0x4D445231UL; // "MDR1"
@@ -257,51 +302,41 @@ constexpr uint16_t RING_SCHEMA_VERSION =
 
 // Cold-boot timestamp handling:
 //
-// A device with no RTC cannot know absolute UTC during a true offline
-// cold boot. We still acquire and persist the measurement immediately.
-// Such records carry this flag and epochSeconds=0 until network time is
-// available.
+// No RTC means absolute UTC before the first network time sync is unknown.
+// Such records are persisted immediately, but epochSeconds is repurposed
+// while RING_FLAG_TIME_UNRESOLVED is set:
 //
-// At the first successful time sync, one durable NVS anchor maps ring
-// ordinal -> UTC. Every unresolved record is then serialized from that
-// same persisted anchor. This makes replay deterministic across reboots
-// and avoids changing the JSON body for an already-used sequence.
+//   high 32 bits = durable boot session ID
+//   low  32 bits = millis() at capture
 //
-// The measured offline production cadence is approximately 3.99 s.
+// Once UTC becomes available in THE SAME boot session, a single NVS blob
+// maps sessionId + millis() -> UTC. Actual observed monotonic deltas are
+// used; no fixed 3.99 s timestamp is invented. Records from an older boot
+// session cannot be timestamped reliably after power loss, so they are
+// preserved in the bounded isolation archive instead of being transmitted
+// with fabricated UTC.
 constexpr uint16_t RING_FLAG_TIME_UNRESOLVED =
     0x0001U;
 
-constexpr uint64_t UNRESOLVED_NOMINAL_PERIOD_MS =
-    3990ULL;
+constexpr uint32_t TIME_ANCHOR_MAGIC =
+    0x4D445441UL; // "MDTA"
+
+constexpr uint16_t TIME_ANCHOR_VERSION =
+    1;
+
+constexpr size_t TIME_ANCHOR_SLOT_COUNT =
+    32;
 
 constexpr uint8_t LITTLEFS_MOUNT_ATTEMPTS =
     3;
 
-// Fast replay:
-// Successful ACKs no longer rewrite + flush the 1.2 MB LittleFS ring
-// for every single packet. Instead, consumed ordinals are tracked by a
-// durable NVS watermark in batches.
-//
-// If power is lost before the next watermark commit, at most the uncommitted
-// batch can replay once more. The backend already handles duplicate sequence
-// IDs idempotently (HTTP 200 duplicate:true), so this is safe at-least-once
-// delivery behavior.
+// Fast replay watermark. ACK loss before a batch commit may cause only a
+// bounded duplicate replay; the backend's sequence contract handles this
+// idempotently.
 constexpr size_t ACK_WATERMARK_BATCH_SIZE =
     32;
 
-// Backlog replay is deliberately bounded per loop iteration.
-//
-// Previous behavior drained the entire persistent queue before taking
-// another sensor measurement. A 24-hour backlog could therefore block
-// fresh acquisition for hours.
-//
-// With this limit, each loop:
-//   1. replays at most four oldest records,
-//   2. returns to synchronized sensor acquisition,
-//   3. appends the fresh packet to the tail if backlog still exists.
-//
-// FIFO order is preserved, while new measurements continue throughout
-// catch-up.
+// Replay at most four old records per loop, then return to fresh sensing.
 constexpr size_t REPLAY_MAX_RECORDS_PER_LOOP =
     4;
 
@@ -413,15 +448,13 @@ struct TelemetryPacket
 {
     uint32_t sequence = 0;
 
-    // Resolved packet:
-    //   timestampResolved=true, epochSeconds=absolute UTC.
-    //
-    // Offline cold-boot packet:
-    //   timestampResolved=false, epochSeconds=0 until replay resolves
-    //   it from the durable ordinal->UTC NVS anchor.
     uint64_t epochSeconds = 0;
-
     bool timestampResolved = false;
+
+    // Used only while timestampResolved=false. These values are persisted
+    // in the existing 64-bit epochSeconds field of BinaryTelemetryRecord.
+    uint32_t offlineSessionId = 0;
+    uint32_t captureMonotonicMs = 0;
 
     float vibrationRmsRaw = 0.0f;
     float vibrationPeakHz = 0.0f;
@@ -430,6 +463,9 @@ struct TelemetryPacket
 
     String payload;
 };
+
+using TimeAnchorBlob =
+    FirmwareLogic::DurableTimeAnchorBlob;
 
 struct __attribute__((packed)) BinaryTelemetryRecord
 {
@@ -545,23 +581,22 @@ bool sequencePersistenceReady =
 size_t unresolvedTimestampCount =
     0;
 
-uint64_t newestUnresolvedOrdinal =
+// Every boot receives a durable monotonically increasing session ID before
+// sensing starts. Unresolved records are only resolved against an anchor
+// carrying this exact session ID.
+uint32_t bootSessionId =
     0;
 
-// Durable mapping for unresolved records:
-//   timestamp_ms = anchor_epoch_ms
-//                + (record.ordinal - anchor_ordinal) * 3990 ms
-//
-// The mapping is stored in NVS before any unresolved packet is replayed.
-// It is intentionally kept after the queue drains; recovery ignores a
-// stale anchor when there are no active unresolved records. This preserves
-// deterministic duplicate replay if power fails before the ACK watermark
-// itself becomes durable.
-uint64_t unresolvedAnchorOrdinal =
-    0;
+bool bootSessionReady =
+    false;
 
-uint64_t unresolvedAnchorEpochMs =
-    0;
+TimeAnchorBlob timeAnchors[
+    TIME_ANCHOR_SLOT_COUNT
+];
+
+bool timeAnchorValid[
+    TIME_ANCHOR_SLOT_COUNT
+] = {};
 
 bool timeReady =
     false;
@@ -1940,8 +1975,71 @@ String formatTimestampFromEpoch(
 }
 
 // =====================================================
-// Backend Time Fallback
+// Backend Transport + Time Fallback
 // =====================================================
+
+bool beginBackendHttp(
+    HTTPClient& http,
+    WiFiClientSecure& secureClient,
+    const char* url
+)
+{
+    if (
+        !FirmwareLogic::isBackendTransportAllowed(
+            url,
+            ALLOW_INSECURE_HTTP_FOR_LOCAL_DEV
+        )
+    )
+    {
+        Serial.printf(
+            "[SECURITY] Refusing backend URL without HTTPS: %s\n",
+            url != nullptr ? url : "(null)"
+        );
+
+        return false;
+    }
+
+    const String target =
+        String(url);
+
+    if (
+        target.startsWith(
+            "https://"
+        )
+    )
+    {
+        if (
+            BACKEND_CA_CERT == nullptr ||
+            BACKEND_CA_CERT[0] == '\0'
+        )
+        {
+            Serial.println(
+                "[SECURITY] HTTPS requires BACKEND_CA_CERT_VALUE; refusing insecure TLS."
+            );
+
+            return false;
+        }
+
+        secureClient.setCACert(
+            BACKEND_CA_CERT
+        );
+
+        return http.begin(
+            secureClient,
+            target
+        );
+    }
+
+    // Development escape hatch only. The committed example/default is false.
+    // Production must terminate TLS with a CA-validated certificate.
+    Serial.println(
+        "[SECURITY][DEV-ONLY] Plain HTTP explicitly enabled; Bearer token/ACK integrity are NOT protected."
+    );
+
+    return http.begin(
+        target
+    );
+}
 
 bool syncTimeFromBackend()
 {
@@ -1958,6 +2056,7 @@ bool syncTimeFromBackend()
     }
 
     HTTPClient http;
+    WiFiClientSecure secureClient;
 
     http.setConnectTimeout(
         3000
@@ -1968,19 +2067,21 @@ bool syncTimeFromBackend()
     );
 
     if (
-        !http.begin(
+        !beginBackendHttp(
+            http,
+            secureClient,
             HEALTH_URL
         )
     )
     {
         Serial.println(
-            "[TIME] Backend health connection failed."
+            "[TIME] Backend health connection failed or transport policy rejected it."
         );
 
         return false;
     }
 
-    int statusCode =
+    const int statusCode =
         http.GET();
 
     if (
@@ -1994,107 +2095,48 @@ bool syncTimeFromBackend()
         );
 
         http.end();
-
         return false;
     }
 
-    String response =
+    const String response =
         http.getString();
 
     http.end();
 
-    const String key =
-        "\"timestamp\":";
-
-    int keyPosition =
-        response.indexOf(
-            key
-        );
+    int64_t serverEpochMs =
+        0;
 
     if (
-        keyPosition <
-        0
+        !FirmwareLogic::parseHealthTimestampJson(
+            response.c_str(),
+            serverEpochMs
+        ) ||
+        serverEpochMs <
+            1700000000000LL
     )
     {
         Serial.println(
-            "[TIME] Backend timestamp not found."
+            "[TIME] /api/health timestamp is not the API-v1.3 RFC3339 contract."
         );
 
         return false;
     }
-
-    int valueStart =
-        keyPosition +
-        key.length();
-
-    while (
-        valueStart <
-            response.length() &&
-        (
-            response[valueStart] == ' ' ||
-            response[valueStart] == '\t'
-        )
-    )
-    {
-        valueStart++;
-    }
-
-    int valueEnd =
-        valueStart;
-
-    while (
-        valueEnd <
-            response.length() &&
-        (
-            (
-                response[valueEnd] >= '0' &&
-                response[valueEnd] <= '9'
-            ) ||
-            response[valueEnd] == '.'
-        )
-    )
-    {
-        valueEnd++;
-    }
-
-    double serverTimestamp =
-        response.substring(
-            valueStart,
-            valueEnd
-        ).toDouble();
-
-    if (
-        serverTimestamp <
-        1700000000.0
-    )
-    {
-        Serial.println(
-            "[TIME] Invalid backend timestamp."
-        );
-
-        return false;
-    }
-
-    time_t seconds =
-        static_cast<time_t>(
-            serverTimestamp
-        );
-
-    double fraction =
-        serverTimestamp -
-        static_cast<double>(
-            seconds
-        );
 
     struct timeval tv;
 
     tv.tv_sec =
-        seconds;
+        static_cast<time_t>(
+            serverEpochMs /
+            1000LL
+        );
 
     tv.tv_usec =
         static_cast<suseconds_t>(
-            fraction *
-            1000000.0
+            (
+                serverEpochMs %
+                1000LL
+            ) *
+            1000LL
         );
 
     settimeofday(
@@ -2106,7 +2148,7 @@ bool syncTimeFromBackend()
         true;
 
     Serial.printf(
-        "[OK] Backend time synchronized: %s\n",
+        "[OK] Backend RFC3339 time synchronized: %s\n",
         getTimestamp().c_str()
     );
 
@@ -2467,41 +2509,53 @@ String createCanonicalTelemetryPayload(
 }
 
 // =====================================================
-// Rejected Storage Paths
+// Bounded Isolation Archive Paths
 // =====================================================
 
 String rejectedPacketFilePath(
     uint32_t sequence
 )
 {
+    const uint32_t slot =
+        sequence %
+        static_cast<uint32_t>(
+            MAX_REJECTED_ARCHIVE_FILES
+        );
+
     char path[64];
 
     snprintf(
         path,
         sizeof(path),
-        "%s/%010lu.json",
+        "%s/slot_%03lu.json",
         REJECTED_DIR,
         static_cast<unsigned long>(
-            sequence
+            slot
         )
     );
 
     return String(path);
 }
 
-String rejectedMetaFilePath(
+String rejectedTempFilePath(
     uint32_t sequence
 )
 {
+    const uint32_t slot =
+        sequence %
+        static_cast<uint32_t>(
+            MAX_REJECTED_ARCHIVE_FILES
+        );
+
     char path[64];
 
     snprintf(
         path,
         sizeof(path),
-        "%s/%010lu.meta",
+        "%s/slot_%03lu.tmp",
         REJECTED_DIR,
         static_cast<unsigned long>(
-            sequence
+            slot
         )
     );
 
@@ -2613,10 +2667,15 @@ bool recordIsValid(
         )
     )
     {
-        // A true offline cold boot intentionally has no UTC value yet.
+        uint32_t sessionId = 0;
+        uint32_t captureMonotonicMs = 0;
+
         if (
-            record.epochSeconds !=
-            0
+            !FirmwareLogic::unpackOfflineCaptureMetadata(
+                record.epochSeconds,
+                sessionId,
+                captureMonotonicMs
+            )
         )
         {
             return false;
@@ -2664,7 +2723,7 @@ uint64_t ringFileSizeBytes()
 {
     return (
         static_cast<uint64_t>(
-            QUEUE_CAPACITY
+            RING_SLOT_COUNT
         ) *
         sizeof(
             BinaryTelemetryRecord
@@ -2678,7 +2737,7 @@ uint32_t ringSlotFromOrdinal(
 {
     return static_cast<uint32_t>(
         (ordinal - 1ULL) %
-        QUEUE_CAPACITY
+        RING_SLOT_COUNT
     );
 }
 
@@ -2822,16 +2881,27 @@ bool ensureRingFile()
     return true;
 }
 
-bool readRingRecord(
+FirmwareLogic::RingReadClass readRingRecord(
     uint64_t ordinal,
     BinaryTelemetryRecord& record
 )
 {
     if (
+        TEST_FORCE_RING_READ_IO_FAIL
+    )
+    {
+        Serial.println(
+            "[TEST][RING] Forced transient read I/O failure."
+        );
+
+        return FirmwareLogic::RingReadClass::IO_ERROR;
+    }
+
+    if (
         ordinal == 0
     )
     {
-        return false;
+        return FirmwareLogic::RingReadClass::CORRUPT;
     }
 
     File file =
@@ -2842,7 +2912,7 @@ bool readRingRecord(
 
     if (!file)
     {
-        return false;
+        return FirmwareLogic::RingReadClass::IO_ERROR;
     }
 
     if (
@@ -2854,10 +2924,10 @@ bool readRingRecord(
     )
     {
         file.close();
-        return false;
+        return FirmwareLogic::RingReadClass::IO_ERROR;
     }
 
-    size_t bytes =
+    const size_t bytes =
         file.read(
             reinterpret_cast<uint8_t*>(
                 &record
@@ -2872,22 +2942,38 @@ bool readRingRecord(
         sizeof(record)
     )
     {
-        return false;
+        return FirmwareLogic::RingReadClass::IO_ERROR;
     }
 
-    return (
-        record.ordinal ==
-            ordinal &&
-        recordIsValid(
+    if (
+        record.ordinal !=
+            ordinal ||
+        !recordIsValid(
             record
         )
-    );
+    )
+    {
+        return FirmwareLogic::RingReadClass::CORRUPT;
+    }
+
+    return FirmwareLogic::RingReadClass::VALID;
 }
 
 bool writeRingRecord(
     BinaryTelemetryRecord record
 )
 {
+    if (
+        TEST_FORCE_RING_WRITE_FAIL
+    )
+    {
+        Serial.println(
+            "[TEST][RING] Forced write/read-back failure."
+        );
+
+        return false;
+    }
+
     record.magic =
         RING_MAGIC;
 
@@ -2949,7 +3035,8 @@ bool writeRingRecord(
         readRingRecord(
             record.ordinal,
             verify
-        ) &&
+        ) ==
+            FirmwareLogic::RingReadClass::VALID &&
         verify.sequence ==
             record.sequence
     );
@@ -3112,211 +3199,327 @@ void noteConsumedOrdinal(
 }
 
 // =====================================================
+// Boot Session + Durable Time Anchors
+// =====================================================
+
+String timeAnchorKey(
+    size_t slot
+)
+{
+    char key[8];
+
+    snprintf(
+        key,
+        sizeof(key),
+        "ta%02u",
+        static_cast<unsigned int>(
+            slot
+        )
+    );
+
+    return String(key);
+}
+
+void loadTimeAnchorHistory()
+{
+    for (
+        size_t slot = 0;
+        slot < TIME_ANCHOR_SLOT_COUNT;
+        slot++
+    )
+    {
+        timeAnchorValid[slot] =
+            false;
+
+        TimeAnchorBlob candidate;
+
+        const String key =
+            timeAnchorKey(slot);
+
+        if (
+            !preferences.isKey(
+                key.c_str()
+            )
+        )
+        {
+            continue;
+        }
+
+        const size_t bytes =
+            preferences.getBytes(
+                key.c_str(),
+                &candidate,
+                sizeof(candidate)
+            );
+
+        if (
+            bytes != sizeof(candidate) ||
+            !FirmwareLogic::isDurableTimeAnchorValid(
+                candidate,
+                TIME_ANCHOR_MAGIC,
+                TIME_ANCHOR_VERSION,
+                1700000000000LL
+            )
+        )
+        {
+            continue;
+        }
+
+        timeAnchors[slot] =
+            candidate;
+
+        timeAnchorValid[slot] =
+            true;
+    }
+}
+
+bool findTimeAnchor(
+    uint32_t sessionId,
+    FirmwareLogic::TimeAnchor& anchor
+)
+{
+    if (
+        sessionId == 0
+    )
+    {
+        return false;
+    }
+
+    for (
+        size_t slot = 0;
+        slot < TIME_ANCHOR_SLOT_COUNT;
+        slot++
+    )
+    {
+        if (
+            !timeAnchorValid[slot] ||
+            timeAnchors[slot].sessionId !=
+                sessionId
+        )
+        {
+            continue;
+        }
+
+        anchor.sessionId =
+            timeAnchors[slot].sessionId;
+
+        anchor.monotonicMs =
+            timeAnchors[slot].monotonicMs;
+
+        anchor.epochMs =
+            timeAnchors[slot].epochMs;
+
+        return true;
+    }
+
+    return false;
+}
+
+bool initializeBootSession()
+{
+    const uint32_t stored =
+        preferences.getUInt(
+            "bootSession",
+            0
+        );
+
+    if (
+        stored == UINT32_MAX
+    )
+    {
+        Serial.println(
+            "[TIME] Boot-session ID space exhausted; refusing unsafe reuse."
+        );
+
+        return false;
+    }
+
+    const uint32_t candidate =
+        stored + 1U;
+
+    const size_t written =
+        preferences.putUInt(
+            "bootSession",
+            candidate
+        );
+
+    const uint32_t verified =
+        preferences.getUInt(
+            "bootSession",
+            0
+        );
+
+    if (
+        written != sizeof(uint32_t) ||
+        verified != candidate
+    )
+    {
+        Serial.println(
+            "[TIME] Failed to durably allocate boot-session ID."
+        );
+
+        return false;
+    }
+
+    bootSessionId =
+        candidate;
+
+    bootSessionReady =
+        true;
+
+    Serial.printf(
+        "[TIME] Boot session ID: %lu\n",
+        static_cast<unsigned long>(
+            bootSessionId
+        )
+    );
+
+    return true;
+}
+
+bool persistCurrentSessionTimeAnchor()
+{
+    if (
+        !timeReady ||
+        !bootSessionReady
+    )
+    {
+        return false;
+    }
+
+    FirmwareLogic::TimeAnchor existing;
+
+    if (
+        findTimeAnchor(
+            bootSessionId,
+            existing
+        )
+    )
+    {
+        return true;
+    }
+
+    struct timeval tv;
+
+    if (
+        gettimeofday(
+            &tv,
+            nullptr
+        ) != 0 ||
+        tv.tv_sec < 1700000000
+    )
+    {
+        return false;
+    }
+
+    TimeAnchorBlob candidate;
+
+    candidate.magic =
+        TIME_ANCHOR_MAGIC;
+
+    candidate.version =
+        TIME_ANCHOR_VERSION;
+
+    candidate.sessionId =
+        bootSessionId;
+
+    candidate.monotonicMs =
+        millis();
+
+    candidate.epochMs =
+        static_cast<int64_t>(
+            tv.tv_sec
+        ) * 1000LL +
+        static_cast<int64_t>(
+            tv.tv_usec /
+            1000
+        );
+
+    FirmwareLogic::finalizeDurableTimeAnchor(
+        candidate
+    );
+
+    const size_t slot =
+        static_cast<size_t>(
+            candidate.sessionId %
+            TIME_ANCHOR_SLOT_COUNT
+        );
+
+    const String key =
+        timeAnchorKey(slot);
+
+    const size_t written =
+        preferences.putBytes(
+            key.c_str(),
+            &candidate,
+            sizeof(candidate)
+        );
+
+    TimeAnchorBlob verified;
+
+    const size_t readBack =
+        preferences.getBytes(
+            key.c_str(),
+            &verified,
+            sizeof(verified)
+        );
+
+    if (
+        written != sizeof(candidate) ||
+        readBack != sizeof(verified) ||
+        !FirmwareLogic::isDurableTimeAnchorValid(
+            verified,
+            TIME_ANCHOR_MAGIC,
+            TIME_ANCHOR_VERSION,
+            1700000000000LL
+        ) ||
+        memcmp(
+            &candidate,
+            &verified,
+            sizeof(candidate)
+        ) != 0
+    )
+    {
+        Serial.println(
+            "[TIME] Durable session timestamp anchor write/read-back failed."
+        );
+
+        return false;
+    }
+
+    timeAnchors[slot] =
+        candidate;
+
+    timeAnchorValid[slot] =
+        true;
+
+    Serial.printf(
+        "[TIME] Durable timestamp anchor: session=%lu monotonicMs=%lu epochMs=%lld\n",
+        static_cast<unsigned long>(
+            candidate.sessionId
+        ),
+        static_cast<unsigned long>(
+            candidate.monotonicMs
+        ),
+        static_cast<long long>(
+            candidate.epochMs
+        )
+    );
+
+    return true;
+}
+
+// =====================================================
 // Binary <-> HTTP Packet
 // =====================================================
 
-bool unresolvedTimeAnchorReady()
+enum class RecordToPacketResult
 {
-    return (
-        unresolvedAnchorOrdinal >
-            0 &&
-        unresolvedAnchorEpochMs >=
-            1700000000000ULL
-    );
-}
-
-bool establishUnresolvedTimeAnchor()
-{
-    if (
-        unresolvedTimestampCount ==
-        0
-    )
-    {
-        return true;
-    }
-
-    if (
-        unresolvedTimeAnchorReady()
-    )
-    {
-        return true;
-    }
-
-    if (
-        !timeReady
-    )
-    {
-        return false;
-    }
-
-    time_t now =
-        time(nullptr);
-
-    if (
-        now <
-        1700000000
-    )
-    {
-        return false;
-    }
-
-    if (
-        newestUnresolvedOrdinal ==
-        0
-    )
-    {
-        Serial.println(
-            "[TIME] Cannot establish unresolved timestamp anchor: no active unresolved ordinal."
-        );
-
-        return false;
-    }
-
-    uint64_t candidateOrdinal =
-        newestUnresolvedOrdinal;
-
-    uint64_t candidateEpochMs =
-        static_cast<uint64_t>(
-            now
-        ) *
-        1000ULL;
-
-    // Both anchor values must be durable before any unresolved record is
-    // serialized or transmitted. This guarantees that an ACK-loss reboot
-    // reconstructs the identical timestamp and therefore identical JSON.
-    size_t ordinalWritten =
-        preferences.putULong64(
-            "uTimeOrd",
-            candidateOrdinal
-        );
-
-    size_t epochWritten =
-        preferences.putULong64(
-            "uTimeMs",
-            candidateEpochMs
-        );
-
-    if (
-        ordinalWritten !=
-            sizeof(uint64_t) ||
-        epochWritten !=
-            sizeof(uint64_t)
-    )
-    {
-        Serial.println(
-            "[TIME] Failed to persist unresolved timestamp anchor; replay will wait."
-        );
-
-        return false;
-    }
-
-    uint64_t verifiedOrdinal =
-        preferences.getULong64(
-            "uTimeOrd",
-            0
-        );
-
-    uint64_t verifiedEpochMs =
-        preferences.getULong64(
-            "uTimeMs",
-            0
-        );
-
-    if (
-        verifiedOrdinal !=
-            candidateOrdinal ||
-        verifiedEpochMs !=
-            candidateEpochMs
-    )
-    {
-        Serial.println(
-            "[TIME] Unresolved timestamp anchor read-back mismatch; replay will wait."
-        );
-
-        return false;
-    }
-
-    unresolvedAnchorOrdinal =
-        candidateOrdinal;
-
-    unresolvedAnchorEpochMs =
-        candidateEpochMs;
-
-    Serial.printf(
-        "[TIME] Durable cold-boot timestamp anchor: ordinal=%llu epochMs=%llu.\n",
-        static_cast<unsigned long long>(
-            unresolvedAnchorOrdinal
-        ),
-        static_cast<unsigned long long>(
-            unresolvedAnchorEpochMs
-        )
-    );
-
-    return true;
-}
-
-bool resolveUnresolvedRecordEpoch(
-    const BinaryTelemetryRecord& record,
-    uint64_t& resolvedEpochSeconds
-)
-{
-    resolvedEpochSeconds =
-        0;
-
-    if (
-        !recordHasUnresolvedTimestamp(
-            record
-        )
-    )
-    {
-        resolvedEpochSeconds =
-            record.epochSeconds;
-
-        return (
-            resolvedEpochSeconds >=
-            1700000000ULL
-        );
-    }
-
-    if (
-        !unresolvedTimeAnchorReady() ||
-        unresolvedAnchorEpochMs >
-            static_cast<uint64_t>(
-                INT64_MAX
-            )
-    )
-    {
-        return false;
-    }
-
-    const int64_t resolvedEpochMs =
-        FirmwareLogic::resolveTimestampMs(
-            record.ordinal,
-            unresolvedAnchorOrdinal,
-            static_cast<int64_t>(
-                unresolvedAnchorEpochMs
-            ),
-            static_cast<uint32_t>(
-                UNRESOLVED_NOMINAL_PERIOD_MS
-            )
-        );
-
-    if (
-        resolvedEpochMs <
-        1700000000000LL
-    )
-    {
-        return false;
-    }
-
-    resolvedEpochSeconds =
-        static_cast<uint64_t>(
-            resolvedEpochMs /
-            1000LL
-        );
-
-    return true;
-}
+    READY,
+    WAITING_FOR_TIME_ANCHOR,
+    PREVIOUS_SESSION_TIME_UNRESOLVABLE,
+    INVALID_RECORD
+};
 
 BinaryTelemetryRecord packetToRecord(
     const TelemetryPacket& packet,
@@ -3347,7 +3550,10 @@ BinaryTelemetryRecord packetToRecord(
             RING_FLAG_TIME_UNRESOLVED;
 
         record.epochSeconds =
-            0;
+            FirmwareLogic::packOfflineCaptureMetadata(
+                packet.offlineSessionId,
+                packet.captureMonotonicMs
+            );
     }
 
     record.vibrationRmsRaw =
@@ -3365,7 +3571,7 @@ BinaryTelemetryRecord packetToRecord(
     return record;
 }
 
-bool recordToPacket(
+RecordToPacketResult recordToPacket(
     const BinaryTelemetryRecord& record,
     TelemetryPacket& packet
 )
@@ -3376,38 +3582,11 @@ bool recordToPacket(
         )
     )
     {
-        return false;
+        return RecordToPacketResult::INVALID_RECORD;
     }
 
     packet.sequence =
         record.sequence;
-
-    if (
-        !resolveUnresolvedRecordEpoch(
-            record,
-            packet.epochSeconds
-        )
-    )
-    {
-        if (
-            recordHasUnresolvedTimestamp(
-                record
-            )
-        )
-        {
-            Serial.printf(
-                "[TIME] Sequence %lu is safely buffered but still waiting for a durable UTC anchor.\n",
-                static_cast<unsigned long>(
-                    record.sequence
-                )
-            );
-        }
-
-        return false;
-    }
-
-    packet.timestampResolved =
-        true;
 
     packet.vibrationRmsRaw =
         record.vibrationRmsRaw;
@@ -3421,6 +3600,104 @@ bool recordToPacket(
     packet.acousticPeakHz =
         record.acousticPeakHz;
 
+    if (
+        !recordHasUnresolvedTimestamp(
+            record
+        )
+    )
+    {
+        packet.epochSeconds =
+            record.epochSeconds;
+
+        packet.timestampResolved =
+            packet.epochSeconds >=
+            1700000000ULL;
+
+        if (
+            !packet.timestampResolved
+        )
+        {
+            return RecordToPacketResult::INVALID_RECORD;
+        }
+    }
+    else
+    {
+        uint32_t recordSessionId =
+            0;
+
+        uint32_t captureMonotonicMs =
+            0;
+
+        if (
+            !FirmwareLogic::unpackOfflineCaptureMetadata(
+                record.epochSeconds,
+                recordSessionId,
+                captureMonotonicMs
+            )
+        )
+        {
+            return RecordToPacketResult::INVALID_RECORD;
+        }
+
+        FirmwareLogic::TimeAnchor anchor;
+
+        if (
+            !findTimeAnchor(
+                recordSessionId,
+                anchor
+            )
+        )
+        {
+            if (
+                recordSessionId ==
+                    bootSessionId
+            )
+            {
+                return RecordToPacketResult::WAITING_FOR_TIME_ANCHOR;
+            }
+
+            return RecordToPacketResult::PREVIOUS_SESSION_TIME_UNRESOLVABLE;
+        }
+
+        int64_t resolvedEpochMs =
+            0;
+
+        const FirmwareLogic::OfflineTimestampResult resolved =
+            FirmwareLogic::resolveOfflineTimestampMs(
+                recordSessionId,
+                captureMonotonicMs,
+                &anchor,
+                resolvedEpochMs
+            );
+
+        if (
+            resolved ==
+            FirmwareLogic::OfflineTimestampResult::SESSION_MISMATCH
+        )
+        {
+            return RecordToPacketResult::PREVIOUS_SESSION_TIME_UNRESOLVABLE;
+        }
+
+        if (
+            resolved !=
+            FirmwareLogic::OfflineTimestampResult::RESOLVED ||
+            resolvedEpochMs <
+                1700000000000LL
+        )
+        {
+            return RecordToPacketResult::WAITING_FOR_TIME_ANCHOR;
+        }
+
+        packet.epochSeconds =
+            static_cast<uint64_t>(
+                resolvedEpochMs /
+                1000LL
+            );
+
+        packet.timestampResolved =
+            true;
+    }
+
     packet.payload =
         createCanonicalTelemetryPayload(
             packet
@@ -3431,15 +3708,24 @@ bool recordToPacket(
         0
     )
     {
-        return false;
+        return RecordToPacketResult::INVALID_RECORD;
     }
 
-    return true;
+    return RecordToPacketResult::READY;
 }
 
 // =====================================================
 // Ring Queue
 // =====================================================
+
+enum class QueueReadResult
+{
+    READY,
+    EMPTY,
+    IO_ERROR,
+    WAITING_FOR_TIME_ANCHOR,
+    PREVIOUS_SESSION_TIME_UNRESOLVABLE
+};
 
 bool queueIsEmpty()
 {
@@ -3457,103 +3743,31 @@ bool queueIsFull()
     );
 }
 
-bool readOldestPersistent(
-    TelemetryPacket& packet,
-    uint64_t& ordinal
+bool consumeHeadOrdinal(
+    uint64_t ordinal,
+    bool unresolvedTimestamp,
+    uint32_t sequence,
+    bool forceCommit
 )
 {
-    while (
-        !queueIsEmpty()
-    )
-    {
-        ordinal =
-            ringHeadOrdinal;
-
-        BinaryTelemetryRecord record;
-
-        if (
-            readRingRecord(
-                ordinal,
-                record
-            )
-        )
-        {
-            return recordToPacket(
-                record,
-                packet
-            );
-        }
-
-        Serial.printf(
-            "[RECOVERY] Invalid/corrupt ring ordinal %llu discarded.\n",
-            static_cast<unsigned long long>(
-                ordinal
-            )
-        );
-
-        // Do NOT perform the old 1.2 MB LittleFS flush here.
-        // Persist the skipped position with the watermark instead.
-        ringHeadOrdinal++;
-        queueCount--;
-
-        // Corruption is rare, so commit immediately to avoid repeatedly
-        // rediscovering the same bad ordinal after reboot.
-        noteConsumedOrdinal(
-            ordinal,
-            true
-        );
-    }
-
-    return false;
-}
-
-bool removeOldestPersistent()
-{
     if (
-        queueIsEmpty()
+        queueIsEmpty() ||
+        ordinal != ringHeadOrdinal
     )
     {
         return false;
     }
 
-    uint64_t ordinal =
-        ringHeadOrdinal;
+    ringHeadOrdinal =
+        FirmwareLogic::calculateNextRingOrdinal(
+            ringHeadOrdinal
+        );
 
-    BinaryTelemetryRecord record;
-
-    uint32_t sequence =
-        0;
-
-    bool consumedUnresolvedTimestamp =
-        false;
-
-    if (
-        readRingRecord(
-            ordinal,
-            record
-        )
-    )
-    {
-        sequence =
-            record.sequence;
-
-        consumedUnresolvedTimestamp =
-            recordHasUnresolvedTimestamp(
-                record
-            );
-    }
-
-    // FAST PATH:
-    // Do not zero/flush the 1.2 MB ring file per ACK.
-    // Advance RAM FIFO state immediately and batch-persist a consumed
-    // ordinal watermark to NVS.
-    ringHeadOrdinal++;
     queueCount--;
 
     if (
-        consumedUnresolvedTimestamp &&
-        unresolvedTimestampCount >
-            0
+        unresolvedTimestamp &&
+        unresolvedTimestampCount > 0
     )
     {
         unresolvedTimestampCount--;
@@ -3561,12 +3775,12 @@ bool removeOldestPersistent()
 
     noteConsumedOrdinal(
         ordinal,
-        queueIsEmpty()
+        forceCommit ||
+            queueIsEmpty()
     );
 
     if (
-        sequence >
-        0
+        sequence > 0
     )
     {
         Serial.printf(
@@ -3583,94 +3797,180 @@ bool removeOldestPersistent()
     return true;
 }
 
-bool dropOldestForOverflow()
+QueueReadResult readOldestPersistent(
+    TelemetryPacket& packet,
+    uint64_t& ordinal,
+    BinaryTelemetryRecord& rawRecord
+)
 {
-    if (
-        queueIsEmpty()
+    while (
+        !queueIsEmpty()
     )
     {
-        return true;
-    }
+        ordinal =
+            ringHeadOrdinal;
 
-    uint64_t ordinal =
-        ringHeadOrdinal;
-
-    BinaryTelemetryRecord oldest;
-
-    uint32_t sequence =
-        0;
-
-    bool droppedUnresolvedTimestamp =
-        false;
-
-    if (
-        readRingRecord(
-            ordinal,
-            oldest
-        )
-    )
-    {
-        sequence =
-            oldest.sequence;
-
-        droppedUnresolvedTimestamp =
-            recordHasUnresolvedTimestamp(
-                oldest
+        const FirmwareLogic::RingReadClass readClass =
+            readRingRecord(
+                ordinal,
+                rawRecord
             );
-    }
 
-    // The next enqueue at full capacity naturally overwrites this oldest
-    // physical ring slot. Avoid the old per-drop LittleFS invalidation flush.
-    ringHeadOrdinal++;
-    queueCount--;
-
-    if (
-        droppedUnresolvedTimestamp &&
-        unresolvedTimestampCount >
-            0
-    )
-    {
-        unresolvedTimestampCount--;
-    }
-
-    noteConsumedOrdinal(
-        ordinal,
-        true
-    );
-
-    droppedOldestCount++;
-
-    preferences.putULong64(
-        "ringDropped",
-        droppedOldestCount
-    );
-
-    Serial.printf(
-        "[BUFFER] Capacity reached. Dropped oldest Sequence %lu. Total dropped: %llu\n",
-        static_cast<unsigned long>(
-            sequence
-        ),
-        static_cast<unsigned long long>(
-            droppedOldestCount
+        if (
+            readClass ==
+            FirmwareLogic::RingReadClass::IO_ERROR
         )
-    );
+        {
+            Serial.printf(
+                "[RING] Temporary/read I/O failure at ordinal %llu; queue preserved and replay paused.\n",
+                static_cast<unsigned long long>(
+                    ordinal
+                )
+            );
 
-    return true;
+            return QueueReadResult::IO_ERROR;
+        }
+
+        if (
+            readClass ==
+            FirmwareLogic::RingReadClass::CORRUPT
+        )
+        {
+            Serial.printf(
+                "[RECOVERY] CRC/schema-corrupt ring ordinal %llu is unrecoverable and will be skipped.\n",
+                static_cast<unsigned long long>(
+                    ordinal
+                )
+            );
+
+            if (
+                !FirmwareLogic::shouldConsumeAfterReadFailure(
+                    readClass
+                ) ||
+                !consumeHeadOrdinal(
+                    ordinal,
+                    false,
+                    0,
+                    true
+                )
+            )
+            {
+                return QueueReadResult::IO_ERROR;
+            }
+
+            continue;
+        }
+
+        const RecordToPacketResult conversion =
+            recordToPacket(
+                rawRecord,
+                packet
+            );
+
+        if (
+            conversion ==
+            RecordToPacketResult::READY
+        )
+        {
+            return QueueReadResult::READY;
+        }
+
+        if (
+            conversion ==
+            RecordToPacketResult::WAITING_FOR_TIME_ANCHOR
+        )
+        {
+            return QueueReadResult::WAITING_FOR_TIME_ANCHOR;
+        }
+
+        if (
+            conversion ==
+            RecordToPacketResult::PREVIOUS_SESSION_TIME_UNRESOLVABLE
+        )
+        {
+            return QueueReadResult::PREVIOUS_SESSION_TIME_UNRESOLVABLE;
+        }
+
+        // The file read succeeded but the record cannot satisfy the schema.
+        // Treat this as durable corruption, not a transient I/O event.
+        if (
+            !consumeHeadOrdinal(
+                ordinal,
+                recordHasUnresolvedTimestamp(
+                    rawRecord
+                ),
+                rawRecord.sequence,
+                true
+            )
+        )
+        {
+            return QueueReadResult::IO_ERROR;
+        }
+    }
+
+    return QueueReadResult::EMPTY;
 }
 
 bool enqueuePersistent(
     const TelemetryPacket& packet
 )
 {
+    bool queueWasFull =
+        queueIsFull();
+
+    BinaryTelemetryRecord oldestRecord;
+    bool oldestRecordValid =
+        false;
+
     if (
-        queueIsFull()
+        queueWasFull
     )
     {
+        const FirmwareLogic::RingReadClass oldestRead =
+            readRingRecord(
+                ringHeadOrdinal,
+                oldestRecord
+            );
+
         if (
-            !dropOldestForOverflow()
+            oldestRead ==
+            FirmwareLogic::RingReadClass::IO_ERROR
         )
         {
+            Serial.println(
+                "[BUFFER] Full ring oldest-read I/O failure; refusing append so existing telemetry remains intact."
+            );
+
             return false;
+        }
+
+        if (
+            oldestRead ==
+            FirmwareLogic::RingReadClass::CORRUPT
+        )
+        {
+            const uint64_t corruptOrdinal =
+                ringHeadOrdinal;
+
+            if (
+                !consumeHeadOrdinal(
+                    corruptOrdinal,
+                    false,
+                    0,
+                    true
+                )
+            )
+            {
+                return false;
+            }
+
+            queueWasFull =
+                false;
+        }
+        else
+        {
+            oldestRecordValid =
+                true;
         }
     }
 
@@ -3691,13 +3991,69 @@ bool enqueuePersistent(
             ordinal
         );
 
-    if (
-        !writeRingRecord(
+    // The logical queue leaves one physical slot spare. Even when full,
+    // this write cannot overwrite the current oldest active slot.
+    const bool writeVerified =
+        writeRingRecord(
             record
+        );
+
+    if (
+        !writeVerified
+    )
+    {
+        Serial.println(
+            "[BUFFER] New record write/read-back failed; oldest record was NOT consumed."
+        );
+
+        return false;
+    }
+
+    if (
+        FirmwareLogic::shouldDropOldestAfterVerifiedWrite(
+            queueWasFull,
+            writeVerified
         )
     )
     {
-        return false;
+        if (
+            !oldestRecordValid ||
+            !consumeHeadOrdinal(
+                ringHeadOrdinal,
+                recordHasUnresolvedTimestamp(
+                    oldestRecord
+                ),
+                oldestRecord.sequence,
+                true
+            )
+        )
+        {
+            // The new record is durable in the spare slot. Recovery will see
+            // at most RING_SLOT_COUNT valid ordinals and retain the newest
+            // QUEUE_CAPACITY window after reboot.
+            Serial.println(
+                "[BUFFER] New record is durable but oldest logical consume failed; reboot recovery will reconcile the spare-slot transaction."
+            );
+
+            return false;
+        }
+
+        droppedOldestCount++;
+
+        const size_t dropWritten =
+            preferences.putULong64(
+                "ringDropped",
+                droppedOldestCount
+            );
+
+        if (
+            dropWritten != sizeof(uint64_t)
+        )
+        {
+            Serial.println(
+                "[BUFFER] Drop counter persistence failed; telemetry ordering remains safe."
+            );
+        }
     }
 
     if (
@@ -3707,15 +4063,6 @@ bool enqueuePersistent(
     )
     {
         unresolvedTimestampCount++;
-
-        if (
-            ordinal >
-            newestUnresolvedOrdinal
-        )
-        {
-            newestUnresolvedOrdinal =
-                ordinal;
-        }
     }
 
     if (
@@ -3727,25 +4074,23 @@ bool enqueuePersistent(
     }
 
     ringNextOrdinal =
-        ordinal + 1;
+        FirmwareLogic::calculateNextRingOrdinal(
+            ordinal
+        );
 
     queueCount++;
 
     Serial.printf(
-        "[BUFFER] Queue : %u / %u | approx %.1f h retained | dropped=%llu\n",
+        "[BUFFER] Queue : %u / %u | physical slots=%u | dropped=%llu\n",
         static_cast<unsigned int>(
             queueCount
         ),
         static_cast<unsigned int>(
             QUEUE_CAPACITY
         ),
-        (
-            static_cast<double>(
-                queueCount
-            ) *
-            3.99
-        ) /
-            3600.0,
+        static_cast<unsigned int>(
+            RING_SLOT_COUNT
+        ),
         static_cast<unsigned long long>(
             droppedOldestCount
         )
@@ -3758,16 +4103,11 @@ bool enqueuePersistent(
 // Ring Recovery
 // =====================================================
 
-void restoreQueueFromFlash()
+bool restoreQueueFromFlash()
 {
-    queueCount =
-        0;
-
-    ringHeadOrdinal =
-        0;
-
-    ringNextOrdinal =
-        1;
+    queueCount = 0;
+    ringHeadOrdinal = 0;
+    ringNextOrdinal = 1;
 
     droppedOldestCount =
         preferences.getULong64(
@@ -3790,15 +4130,6 @@ void restoreQueueFromFlash()
     unresolvedTimestampCount =
         0;
 
-    newestUnresolvedOrdinal =
-        0;
-
-    unresolvedAnchorOrdinal =
-        0;
-
-    unresolvedAnchorEpochMs =
-        0;
-
     if (
         !ensureRingFile()
     )
@@ -3807,7 +4138,7 @@ void restoreQueueFromFlash()
             "[RING] Ring file initialization failed."
         );
 
-        return;
+        return false;
     }
 
     File file =
@@ -3818,7 +4149,11 @@ void restoreQueueFromFlash()
 
     if (!file)
     {
-        return;
+        Serial.println(
+            "[RECOVERY] Ring open I/O failure; refusing to mutate queue state."
+        );
+
+        return false;
     }
 
     uint64_t minimumActiveOrdinal =
@@ -3827,8 +4162,6 @@ void restoreQueueFromFlash()
     uint64_t maximumActiveOrdinal =
         0;
 
-    // Must include stale-but-valid consumed slots so a reboot never reuses
-    // an ordinal lower than the durable watermark.
     uint64_t maximumOrdinalSeen =
         committedConsumedOrdinal;
 
@@ -3843,13 +4176,13 @@ void restoreQueueFromFlash()
 
     for (
         size_t slot = 0;
-        slot < QUEUE_CAPACITY;
+        slot < RING_SLOT_COUNT;
         slot++
     )
     {
         BinaryTelemetryRecord record;
 
-        size_t bytes =
+        const size_t bytes =
             file.read(
                 reinterpret_cast<uint8_t*>(
                     &record
@@ -3858,14 +4191,24 @@ void restoreQueueFromFlash()
             );
 
         if (
-            bytes !=
-            sizeof(record)
+            bytes != sizeof(record)
         )
         {
-            break;
+            file.close();
+
+            Serial.printf(
+                "[RECOVERY] LittleFS read I/O failure at physical slot %u; recovery aborted without advancing watermark.\n",
+                static_cast<unsigned int>(
+                    slot
+                )
+            );
+
+            queueCount = 0;
+            ringHeadOrdinal = 0;
+            ringNextOrdinal = 1;
+            return false;
         }
 
-        // Empty / legacy-invalidated slot.
         if (
             record.magic == 0
         )
@@ -3884,8 +4227,7 @@ void restoreQueueFromFlash()
         }
 
         if (
-            record.ordinal >
-            maximumOrdinalSeen
+            record.ordinal > maximumOrdinalSeen
         )
         {
             maximumOrdinalSeen =
@@ -3893,17 +4235,13 @@ void restoreQueueFromFlash()
         }
 
         if (
-            record.sequence >
-            telemetrySequence
+            record.sequence > telemetrySequence
         )
         {
             telemetrySequence =
                 record.sequence;
         }
 
-        // New fast-replay rule:
-        // valid bytes can remain in the ring after ACK. The durable watermark
-        // is authoritative for whether that ordinal is still queued.
         if (
             FirmwareLogic::shouldIgnoreRecoveredOrdinal(
                 record.ordinal,
@@ -3924,54 +4262,39 @@ void restoreQueueFromFlash()
         )
         {
             unresolvedTimestampCount++;
-
-            if (
-                record.ordinal >
-                newestUnresolvedOrdinal
-            )
-            {
-                newestUnresolvedOrdinal =
-                    record.ordinal;
-            }
         }
 
-        if (
-            record.ordinal <
-            minimumActiveOrdinal
-        )
-        {
-            minimumActiveOrdinal =
-                record.ordinal;
-        }
+        minimumActiveOrdinal =
+            std::min(
+                minimumActiveOrdinal,
+                record.ordinal
+            );
 
-        if (
-            record.ordinal >
-            maximumActiveOrdinal
-        )
-        {
-            maximumActiveOrdinal =
-                record.ordinal;
-        }
+        maximumActiveOrdinal =
+            std::max(
+                maximumActiveOrdinal,
+                record.ordinal
+            );
     }
 
     file.close();
 
-    // Never reuse an ordinal at or below the consumed watermark.
     ringNextOrdinal =
         FirmwareLogic::calculateNextRingOrdinal(
             maximumOrdinalSeen
         );
 
     if (
-        activeValidCount >
-        0
+        activeValidCount > 0
     )
     {
         ringHeadOrdinal =
-            minimumActiveOrdinal;
+            FirmwareLogic::calculateRecoveryHeadOrdinal(
+                minimumActiveOrdinal,
+                maximumActiveOrdinal,
+                QUEUE_CAPACITY
+            );
 
-        // Valid records should form one continuous FIFO interval.
-        // Any missing/torn slot is skipped lazily by readOldestPersistent().
         queueCount =
             FirmwareLogic::calculateRecoveredQueueCount(
                 minimumActiveOrdinal,
@@ -3979,64 +4302,37 @@ void restoreQueueFromFlash()
                 QUEUE_CAPACITY,
                 activeValidCount
             );
+
+        // A power cut may occur after a full-ring spare-slot write succeeds
+        // but before the oldest-drop watermark is committed. In that state
+        // all 25,000 physical slots are valid. The new record is already
+        // durable, so recovery intentionally retains the newest 24,999 and
+        // commits the now-safe oldest-drop boundary.
+        if (
+            ringHeadOrdinal > minimumActiveOrdinal
+        )
+        {
+            pendingConsumedOrdinal =
+                ringHeadOrdinal - 1ULL;
+
+            pendingConsumedCount =
+                ACK_WATERMARK_BATCH_SIZE;
+
+            commitConsumedWatermark();
+        }
     }
 
-    // The ring may contain a sequence newer than the NVS value (for
-    // example, if a prior write was interrupted). Repair that floor before
-    // any new sequence is ever allocated.
     if (
         !ensureCurrentSequenceFloorDurable()
     )
     {
         Serial.println(
-            "[RECOVERY] Sequence floor is NOT durable. New packet creation will remain blocked until NVS persistence succeeds."
+            "[RECOVERY] Sequence floor is NOT durable. New packet creation remains blocked."
         );
     }
 
-    if (
-        unresolvedTimestampCount >
-        0
-    )
-    {
-        uint64_t storedAnchorOrdinal =
-            preferences.getULong64(
-                "uTimeOrd",
-                0
-            );
-
-        uint64_t storedAnchorEpochMs =
-            preferences.getULong64(
-                "uTimeMs",
-                0
-            );
-
-        if (
-            storedAnchorOrdinal >
-                0 &&
-            storedAnchorEpochMs >=
-                1700000000000ULL
-        )
-        {
-            unresolvedAnchorOrdinal =
-                storedAnchorOrdinal;
-
-            unresolvedAnchorEpochMs =
-                storedAnchorEpochMs;
-
-            Serial.printf(
-                "[RECOVERY] Restored cold-boot UTC anchor: ordinal=%llu epochMs=%llu.\n",
-                static_cast<unsigned long long>(
-                    unresolvedAnchorOrdinal
-                ),
-                static_cast<unsigned long long>(
-                    unresolvedAnchorEpochMs
-                )
-            );
-        }
-    }
-
     Serial.printf(
-        "[RECOVERY] Binary ring restored %u queued slot(s).\n",
+        "[RECOVERY] Binary ring restored %u queued record(s).\n",
         static_cast<unsigned int>(
             queueCount
         )
@@ -4060,23 +4356,26 @@ void restoreQueueFromFlash()
     );
 
     Serial.printf(
-        "[RECOVERY] Active cold-boot unresolved timestamps: %u.\n",
+        "[RECOVERY] Active unresolved timestamps: %u.\n",
         static_cast<unsigned int>(
             unresolvedTimestampCount
         )
     );
 
     Serial.printf(
-        "[RECOVERY] CRC-invalid/torn slots observed: %u.\n",
+        "[RECOVERY] CRC/schema-invalid slots observed: %u.\n",
         static_cast<unsigned int>(
             corruptCount
         )
     );
 
     Serial.printf(
-        "[RECOVERY] Ring capacity: %u records, %llu bytes (~25+ h minimum target).\n",
+        "[RECOVERY] Logical capacity: %u | physical slots: %u | bytes: %llu.\n",
         static_cast<unsigned int>(
             QUEUE_CAPACITY
+        ),
+        static_cast<unsigned int>(
+            RING_SLOT_COUNT
         ),
         static_cast<unsigned long long>(
             ringFileSizeBytes()
@@ -4089,6 +4388,8 @@ void restoreQueueFromFlash()
             droppedOldestCount
         )
     );
+
+    return true;
 }
 
 // =====================================================
@@ -4320,8 +4621,24 @@ PostResult classifyHttpOutcome(
 
 
 // =====================================================
-// LittleFS Quiet Existence Helper
+// Bounded Atomic Isolation Archive
 // =====================================================
+
+String baseNameOfPath(
+    const String& path
+)
+{
+    const int slash =
+        path.lastIndexOf('/');
+
+    return (
+        slash >= 0
+            ? path.substring(
+                  slash + 1
+              )
+            : path
+    );
+}
 
 bool fileExistsQuiet(
     const String& absolutePath
@@ -4346,7 +4663,7 @@ bool fileExistsQuiet(
             path;
     }
 
-    int slash =
+    const int slash =
         path.lastIndexOf('/');
 
     if (
@@ -4360,22 +4677,25 @@ bool fileExistsQuiet(
         return false;
     }
 
-    String directoryPath =
+    const String directoryPath =
         slash == 0
-            ? "/"
+            ? String("/")
             : path.substring(
                   0,
                   slash
               );
 
-    String expectedName =
+    const String expectedName =
         path.substring(
             slash + 1
         );
 
+    // Do not probe the target path with LittleFS.open(). ESP32 VFS logs an
+    // error whenever the file does not exist. Enumerating the parent
+    // directory keeps a normal archive miss genuinely quiet.
     File directory =
         LittleFS.open(
-            directoryPath
+            directoryPath.c_str()
         );
 
     if (
@@ -4400,23 +4720,10 @@ bool fileExistsQuiet(
             !entry.isDirectory()
         )
         {
-            String entryName =
-                String(
-                    entry.name()
+            const String entryName =
+                baseNameOfPath(
+                    String(entry.name())
                 );
-
-            int entrySlash =
-                entryName.lastIndexOf('/');
-
-            if (
-                entrySlash >= 0
-            )
-            {
-                entryName =
-                    entryName.substring(
-                        entrySlash + 1
-                    );
-            }
 
             if (
                 entryName ==
@@ -4430,73 +4737,581 @@ bool fileExistsQuiet(
         }
 
         entry.close();
+        entry =
+            directory.openNextFile();
+    }
 
+    directory.close();
+    return false;
+}
+
+void considerOldestArchiveCandidate(
+    const String& name,
+    String* candidates,
+    size_t capacity,
+    size_t& count
+)
+{
+    if (
+        candidates == nullptr ||
+        capacity == 0
+    )
+    {
+        return;
+    }
+
+    if (
+        count < capacity
+    )
+    {
+        candidates[count++] =
+            name;
+        return;
+    }
+
+    size_t newestCandidateIndex =
+        0;
+
+    for (
+        size_t i = 1;
+        i < count;
+        i++
+    )
+    {
+        if (
+            candidates[i].compareTo(
+                candidates[newestCandidateIndex]
+            ) > 0
+        )
+        {
+            newestCandidateIndex =
+                i;
+        }
+    }
+
+    if (
+        name.compareTo(
+            candidates[newestCandidateIndex]
+        ) < 0
+    )
+    {
+        candidates[newestCandidateIndex] =
+            name;
+    }
+}
+
+void sortArchiveCandidatesAscending(
+    String* candidates,
+    size_t count
+)
+{
+    if (
+        candidates == nullptr
+    )
+    {
+        return;
+    }
+
+    for (
+        size_t i = 0;
+        i < count;
+        i++
+    )
+    {
+        for (
+            size_t j = i + 1;
+            j < count;
+            j++
+        )
+        {
+            if (
+                candidates[j].compareTo(
+                    candidates[i]
+                ) < 0
+            )
+            {
+                const String temporary =
+                    candidates[i];
+
+                candidates[i] =
+                    candidates[j];
+
+                candidates[j] =
+                    temporary;
+            }
+        }
+    }
+}
+
+bool ensureIsolationArchiveCapacity()
+{
+    File directory =
+        LittleFS.open(
+            REJECTED_DIR
+        );
+
+    if (
+        !directory ||
+        !directory.isDirectory()
+    )
+    {
+        if (directory)
+        {
+            directory.close();
+        }
+
+        return false;
+    }
+
+    size_t entryCount =
+        0;
+
+    String oldestCandidates[
+        MAX_ISOLATION_EVICTIONS_PER_PASS
+    ];
+
+    size_t oldestCandidateCount =
+        0;
+
+    String staleTempNames[
+        MAX_STALE_TEMP_REMOVALS_PER_PASS
+    ];
+
+    size_t staleTempCount =
+        0;
+
+    // Scan exactly once. Removing files during traversal can invalidate
+    // directory iteration on an embedded filesystem, so removals happen
+    // only after the directory handle is closed.
+    File entry =
+        directory.openNextFile();
+
+    while (entry)
+    {
+        if (
+            !entry.isDirectory()
+        )
+        {
+            const String name =
+                baseNameOfPath(
+                    String(entry.name())
+                );
+
+            if (
+                name.endsWith(
+                    ".tmp"
+                )
+            )
+            {
+                if (
+                    staleTempCount <
+                    MAX_STALE_TEMP_REMOVALS_PER_PASS
+                )
+                {
+                    staleTempNames[
+                        staleTempCount++
+                    ] =
+                        name;
+                }
+            }
+            else
+            {
+                entryCount++;
+
+                considerOldestArchiveCandidate(
+                    name,
+                    oldestCandidates,
+                    MAX_ISOLATION_EVICTIONS_PER_PASS,
+                    oldestCandidateCount
+                );
+            }
+        }
+
+        entry.close();
         entry =
             directory.openNextFile();
     }
 
     directory.close();
 
-    return false;
-}
+    for (
+        size_t i = 0;
+        i < staleTempCount;
+        i++
+    )
+    {
+        const String stalePath =
+            String(REJECTED_DIR) +
+            "/" +
+            staleTempNames[i];
 
-bool writeRejectedMeta(
-    uint32_t sequence,
-    const PostOutcome& outcome
-)
-{
-    File metaFile =
-        LittleFS.open(
-            rejectedMetaFilePath(
-                sequence
-            ),
-            FILE_WRITE
+        if (
+            LittleFS.remove(
+                stalePath.c_str()
+            )
+        )
+        {
+            Serial.printf(
+                "[ISOLATION] Removed stale temp file %s.\n",
+                staleTempNames[i].c_str()
+            );
+        }
+    }
+
+    const size_t evictionCount =
+        FirmwareLogic::calculateArchiveEvictionCount(
+            entryCount,
+            MAX_REJECTED_ARCHIVE_FILES,
+            MAX_ISOLATION_EVICTIONS_PER_PASS
         );
 
-    if (!metaFile)
+    if (
+        evictionCount == 0
+    )
+    {
+        return true;
+    }
+
+    if (
+        oldestCandidateCount <
+        evictionCount
+    )
     {
         return false;
     }
 
-    metaFile.print(
-        "sequence="
+    sortArchiveCandidatesAscending(
+        oldestCandidates,
+        oldestCandidateCount
     );
 
-    metaFile.println(
-        sequence
-    );
+    for (
+        size_t i = 0;
+        i < evictionCount;
+        i++
+    )
+    {
+        const String oldestPath =
+            String(REJECTED_DIR) +
+            "/" +
+            oldestCandidates[i];
 
-    metaFile.print(
-        "httpStatus="
-    );
+        if (
+            !LittleFS.remove(
+                oldestPath.c_str()
+            )
+        )
+        {
+            Serial.printf(
+                "[ISOLATION] Archive cleanup could not remove %s; isolation write deferred.\n",
+                oldestPath.c_str()
+            );
 
-    metaFile.println(
-        outcome.statusCode
-    );
+            return false;
+        }
 
-    metaFile.print(
-        "response="
-    );
+        Serial.printf(
+            "[ISOLATION] Archive cap=%u; evicted oldest diagnostic file %s.\n",
+            static_cast<unsigned int>(
+                MAX_REJECTED_ARCHIVE_FILES
+            ),
+            oldestCandidates[i].c_str()
+        );
+    }
 
-    metaFile.println(
-        outcome.response
-    );
+    const size_t remainingEntryCount =
+        entryCount -
+        evictionCount;
 
-    metaFile.print(
-        "recordedAt="
-    );
+    if (
+        remainingEntryCount >=
+        MAX_REJECTED_ARCHIVE_FILES
+    )
+    {
+        // A large legacy archive is cleaned incrementally. Returning false
+        // is safe: the unresolved/rejected packet remains durable and a
+        // later loop performs the next bounded cleanup pass.
+        Serial.printf(
+            "[ISOLATION] Cleanup pass bounded at %u eviction(s); %u committed file(s) remain. "
+            "Isolation write deferred so sensor acquisition can continue.\n",
+            static_cast<unsigned int>(
+                evictionCount
+            ),
+            static_cast<unsigned int>(
+                remainingEntryCount
+            )
+        );
 
-    String timestamp =
+        return false;
+    }
+
+    return true;
+}
+
+void printJsonEscaped(
+    File& file,
+    const String& value
+)
+{
+    for (
+        size_t i = 0;
+        i < value.length();
+        i++
+    )
+    {
+        const char c =
+            value[i];
+
+        switch (c)
+        {
+            case '"':
+                file.print("\\\"");
+                break;
+
+            case '\\':
+                file.print("\\\\");
+                break;
+
+            case '\n':
+                file.print("\\n");
+                break;
+
+            case '\r':
+                file.print("\\r");
+                break;
+
+            case '\t':
+                file.print("\\t");
+                break;
+
+            default:
+                if (
+                    static_cast<uint8_t>(c) < 0x20
+                )
+                {
+                    file.print('?');
+                }
+                else
+                {
+                    file.print(c);
+                }
+                break;
+        }
+    }
+}
+
+bool writeIsolationEnvelopeAtomic(
+    uint32_t sequence,
+    const char* reason,
+    const String* canonicalPayload,
+    const PostOutcome* outcome,
+    const BinaryTelemetryRecord* unresolvedRecord
+)
+{
+    if (
+        TEST_FORCE_ISOLATION_WRITE_FAIL
+    )
+    {
+        Serial.println(
+            "[TEST][ISOLATION] Forced archive write failure."
+        );
+
+        return false;
+    }
+
+    const String finalPath =
+        rejectedPacketFilePath(
+            sequence
+        );
+
+    const String tempPath =
+        rejectedTempFilePath(
+            sequence
+        );
+
+    // Avoid noisy VFS errors when the fixed-slot temp file does not
+    // exist yet. This is expected on the first use of a slot.
+    if (
+        LittleFS.exists(
+            tempPath.c_str()
+        )
+    )
+    {
+        LittleFS.remove(
+            tempPath.c_str()
+        );
+    }
+
+    File file =
+        LittleFS.open(
+            tempPath.c_str(),
+            FILE_WRITE
+        );
+
+    if (!file)
+    {
+        return false;
+    }
+
+    file.print("{\n  \"sequence\": ");
+    file.print(sequence);
+    file.print(",\n  \"reason\": \"");
+    printJsonEscaped(
+        file,
+        String(reason != nullptr ? reason : "unknown")
+    );
+    file.print("\",");
+
+    file.print("\n  \"recordedAt\": \"");
+    const String timestamp =
         getTimestamp();
-
-    metaFile.println(
+    printJsonEscaped(
+        file,
         timestamp.length() > 0
             ? timestamp
-            : "time-unavailable"
+            : String("time-unavailable")
     );
+    file.print("\"");
 
-    metaFile.flush();
-    metaFile.close();
+    if (
+        outcome != nullptr
+    )
+    {
+        file.print(",\n  \"httpStatus\": ");
+        file.print(outcome->statusCode);
+        file.print(",\n  \"backendResponse\": \"");
+
+        const String boundedResponse =
+            outcome->response.substring(
+                0,
+                MAX_ISOLATION_BACKEND_RESPONSE_CHARS
+            );
+
+        printJsonEscaped(
+            file,
+            boundedResponse
+        );
+        file.print("\"");
+    }
+
+    if (
+        canonicalPayload != nullptr &&
+        canonicalPayload->length() > 0
+    )
+    {
+        file.print(",\n  \"telemetry\": ");
+        file.print(
+            *canonicalPayload
+        );
+    }
+
+    if (
+        unresolvedRecord != nullptr
+    )
+    {
+        uint32_t sessionId = 0;
+        uint32_t captureMonotonicMs = 0;
+
+        FirmwareLogic::unpackOfflineCaptureMetadata(
+            unresolvedRecord->epochSeconds,
+            sessionId,
+            captureMonotonicMs
+        );
+
+        file.print(",\n  \"unresolvedCapture\": {");
+        file.print("\n    \"sessionId\": ");
+        file.print(sessionId);
+        file.print(",\n    \"captureMonotonicMs\": ");
+        file.print(captureMonotonicMs);
+        file.print(",\n    \"vibrationRmsRaw\": ");
+        file.print(unresolvedRecord->vibrationRmsRaw, 6);
+        file.print(",\n    \"vibrationPeakHz\": ");
+        file.print(unresolvedRecord->vibrationPeakHz, 2);
+        file.print(",\n    \"acousticRmsRaw\": ");
+        file.print(unresolvedRecord->acousticRmsRaw, 2);
+        file.print(",\n    \"acousticPeakHz\": ");
+        file.print(unresolvedRecord->acousticPeakHz, 2);
+        file.print("\n  }");
+    }
+
+    file.print("\n}\n");
+    file.flush();
+
+    const bool writeError =
+        file.getWriteError() != 0;
+
+    file.close();
+
+    if (writeError)
+    {
+        LittleFS.remove(
+            tempPath.c_str()
+        );
+        return false;
+    }
+
+    File verify =
+        LittleFS.open(
+            tempPath.c_str(),
+            FILE_READ
+        );
+
+    if (
+        !verify ||
+        verify.size() == 0
+    )
+    {
+        if (verify)
+        {
+            verify.close();
+        }
+
+        LittleFS.remove(
+            tempPath.c_str()
+        );
+        return false;
+    }
+
+    verify.close();
+
+    // Fixed-slot archive: the new temp file is fully written and verified
+    // before replacing the previous diagnostic occupying this slot. The
+    // source telemetry stays queued until rename succeeds.
+    // The fixed slot may be unused on its first write. Only remove an
+    // existing destination so LittleFS does not emit a false error log.
+    if (
+        LittleFS.exists(
+            finalPath.c_str()
+        )
+    )
+    {
+        LittleFS.remove(
+            finalPath.c_str()
+        );
+    }
+
+    if (
+        !LittleFS.rename(
+            tempPath.c_str(),
+            finalPath.c_str()
+        )
+    )
+    {
+        LittleFS.remove(
+            tempPath.c_str()
+        );
+        return false;
+    }
+
+    Serial.printf(
+        "[ISOLATION] Stored Sequence %lu in bounded slot %lu/%u.\n",
+        static_cast<unsigned long>(sequence),
+        static_cast<unsigned long>(
+            sequence %
+            static_cast<uint32_t>(MAX_REJECTED_ARCHIVE_FILES)
+        ),
+        static_cast<unsigned int>(MAX_REJECTED_ARCHIVE_FILES)
+    );
 
     return true;
 }
@@ -4506,67 +5321,40 @@ bool saveImmediateRejectedPacket(
     const PostOutcome& outcome
 )
 {
-    String path =
-        rejectedPacketFilePath(
-            packet.sequence
-        );
-
-    if (
-        fileExistsQuiet(
-            path
-        )
-    )
-    {
-        path +=
-            "." +
-            String(
-                millis()
-            ) +
-            ".rejected";
-    }
-
-    File file =
-        LittleFS.open(
-            path,
-            FILE_WRITE
-        );
-
-    if (!file)
-    {
-        return false;
-    }
-
-    size_t written =
-        file.print(
-            packet.payload
-        );
-
-    file.flush();
-    file.close();
-
-    if (
-        written !=
-        packet.payload.length()
-    )
-    {
-        return false;
-    }
-
-    bool metaOk =
-        writeRejectedMeta(
+    const bool saved =
+        writeIsolationEnvelopeAtomic(
             packet.sequence,
-            outcome
+            "PERMANENT_PACKET_REJECT",
+            &packet.payload,
+            &outcome,
+            nullptr
         );
 
-    Serial.printf(
-        "[REJECT] Preserved Sequence %lu (HTTP %d)\n",
-        static_cast<unsigned long>(
-            packet.sequence
-        ),
-        outcome.statusCode
-    );
+    if (saved)
+    {
+        Serial.printf(
+            "[REJECT] Isolated Sequence %lu (HTTP %d).\n",
+            static_cast<unsigned long>(
+                packet.sequence
+            ),
+            outcome.statusCode
+        );
+    }
 
-    return metaOk;
+    return saved;
+}
+
+bool saveUnresolvedRecordToIsolation(
+    const BinaryTelemetryRecord& record
+)
+{
+    return writeIsolationEnvelopeAtomic(
+        record.sequence,
+        "UTC_UNRESOLVABLE_AFTER_REBOOT",
+        nullptr,
+        nullptr,
+        &record
+    );
 }
 
 bool moveQueuedPacketToRejected(
@@ -4574,8 +5362,6 @@ bool moveQueuedPacketToRejected(
     const PostOutcome& outcome
 )
 {
-    // Binary-ring packets are reconstructed into the exact API JSON payload
-    // before preservation in the rejected archive.
     return saveImmediateRejectedPacket(
         packet,
         outcome
@@ -4610,6 +5396,7 @@ PostOutcome postPacket(
     }
 
     HTTPClient http;
+    WiFiClientSecure secureClient;
 
     http.setConnectTimeout(
         3000
@@ -4620,19 +5407,21 @@ PostOutcome postPacket(
     );
 
     if (
-        !http.begin(
+        !beginBackendHttp(
+            http,
+            secureClient,
             INGEST_URL
         )
     )
     {
         outcome.result =
-            PostResult::RETRYABLE;
+            PostResult::CONFIGURATION_ERROR;
 
         outcome.statusCode =
             -1;
 
         outcome.response =
-            "http-begin-failed";
+            "backend-transport-policy-rejected";
 
         return outcome;
     }
@@ -4649,7 +5438,6 @@ PostOutcome postPacket(
     );
 
     Serial.println();
-
     Serial.println(
         "========== POST =========="
     );
@@ -4671,7 +5459,7 @@ PostOutcome postPacket(
         )
     );
 
-    int statusCode =
+    const int statusCode =
         http.POST(
             packet.payload
         );
@@ -4680,8 +5468,7 @@ PostOutcome postPacket(
         statusCode;
 
     if (
-        statusCode >
-        0
+        statusCode > 0
     )
     {
         outcome.response =
@@ -4701,8 +5488,7 @@ PostOutcome postPacket(
     );
 
     if (
-        outcome.response.length() >
-        0
+        outcome.response.length() > 0
     )
     {
         Serial.println(
@@ -4762,22 +5548,98 @@ void replayQueueBatch()
     )
     {
         TelemetryPacket packet;
+        BinaryTelemetryRecord rawRecord;
 
         uint64_t ordinal =
             0;
 
-        if (
-            !readOldestPersistent(
+        const QueueReadResult readResult =
+            readOldestPersistent(
                 packet,
-                ordinal
-            )
+                ordinal,
+                rawRecord
+            );
+
+        if (
+            readResult ==
+            QueueReadResult::EMPTY
         )
         {
             commitConsumedWatermark();
             return;
         }
 
-        uint32_t sequence =
+        if (
+            readResult ==
+            QueueReadResult::IO_ERROR
+        )
+        {
+            // IMPORTANT: no ACK, no corruption proof, no watermark advance.
+            Serial.println(
+                "[BUFFER] Replay paused on LittleFS I/O error; oldest record remains queued."
+            );
+
+            commitConsumedWatermark();
+            return;
+        }
+
+        if (
+            readResult ==
+            QueueReadResult::WAITING_FOR_TIME_ANCHOR
+        )
+        {
+            Serial.println(
+                "[BUFFER] Replay waiting for a durable timestamp anchor for this boot session."
+            );
+
+            commitConsumedWatermark();
+            return;
+        }
+
+        if (
+            readResult ==
+            QueueReadResult::PREVIOUS_SESSION_TIME_UNRESOLVABLE
+        )
+        {
+            Serial.printf(
+                "[TIME] Sequence %lu belongs to a boot session with no durable UTC anchor; preserving raw capture without inventing UTC.\n",
+                static_cast<unsigned long>(
+                    rawRecord.sequence
+                )
+            );
+
+            if (
+                !saveUnresolvedRecordToIsolation(
+                    rawRecord
+                )
+            )
+            {
+                Serial.println(
+                    "[TIME] Isolation write failed; unresolved record remains in ring."
+                );
+
+                commitConsumedWatermark();
+                return;
+            }
+
+            if (
+                !consumeHeadOrdinal(
+                    ordinal,
+                    true,
+                    rawRecord.sequence,
+                    false
+                )
+            )
+            {
+                commitConsumedWatermark();
+                return;
+            }
+
+            consumedThisBatch++;
+            continue;
+        }
+
+        const uint32_t sequence =
             packet.sequence;
 
         Serial.printf(
@@ -4790,7 +5652,7 @@ void replayQueueBatch()
             )
         );
 
-        PostOutcome outcome =
+        const PostOutcome outcome =
             postPacket(
                 packet
             );
@@ -4808,7 +5670,14 @@ void replayQueueBatch()
             );
 
             if (
-                !removeOldestPersistent()
+                !consumeHeadOrdinal(
+                    ordinal,
+                    recordHasUnresolvedTimestamp(
+                        rawRecord
+                    ),
+                    sequence,
+                    false
+                )
             )
             {
                 commitConsumedWatermark();
@@ -4816,9 +5685,6 @@ void replayQueueBatch()
             }
 
             consumedThisBatch++;
-
-            // Keep a small pacing gap so catch-up does not hammer the
-            // backend, but never drain the whole backlog in one loop.
             delay(100);
             continue;
         }
@@ -4876,12 +5742,25 @@ void replayQueueBatch()
                 )
             )
             {
+                // Archive failure must never convert a permanent backend
+                // reject into telemetry loss. Keep the ring head untouched.
+                Serial.println(
+                    "[BUFFER] Rejected archive write failed; ring record remains queued."
+                );
+
                 commitConsumedWatermark();
                 return;
             }
 
             if (
-                !removeOldestPersistent()
+                !consumeHeadOrdinal(
+                    ordinal,
+                    recordHasUnresolvedTimestamp(
+                        rawRecord
+                    ),
+                    sequence,
+                    false
+                )
             )
             {
                 commitConsumedWatermark();
@@ -4889,18 +5768,9 @@ void replayQueueBatch()
             }
 
             consumedThisBatch++;
-
-            Serial.println(
-                "[BUFFER] Continuing with next queued packet."
-            );
         }
     }
 
-    // Do not force an NVS write at every small replay slice.
-    // removeOldestPersistent() keeps the existing 32-record watermark
-    // batching policy and force-commits automatically when the queue
-    // becomes empty. If power is lost between commits, the backend's
-    // idempotent duplicate handling safely absorbs the small replay window.
     if (
         queueIsEmpty()
     )
@@ -4996,17 +5866,30 @@ bool createPacket(
         );
     }
 
-    // True offline cold boot:
-    // no RTC means absolute UTC is physically unknowable right now.
-    // Do NOT invent a timestamp and do NOT stop acquisition. Persist the
-    // sensor values + durable sequence with the unresolved-time ring flag.
-    // Once UTC becomes available, replay derives a deterministic timestamp
-    // from the durable ordinal->UTC anchor.
+    // True offline cold boot: absolute UTC is unknowable without an RTC.
+    // Persist the exact boot session + capture millis() instead of inventing
+    // a nominal 3.99 s cadence. If this same session later receives UTC,
+    // the durable session anchor reconstructs the timestamp from the actual
+    // monotonic delta. If power is lost first, the record is retained for
+    // isolation rather than assigned a fabricated time.
+    if (
+        !bootSessionReady
+    )
+    {
+        return false;
+    }
+
     packet.timestampResolved =
         false;
 
     packet.epochSeconds =
         0;
+
+    packet.offlineSessionId =
+        bootSessionId;
+
+    packet.captureMonotonicMs =
+        millis();
 
     packet.payload =
         "";
@@ -5137,7 +6020,7 @@ void setup()
     );
 
     Serial.println(
-        " Fix : Durable Sequence + No Auto-Format + Offline Cold Boot"
+        " Fix : I/O-safe ring + session timestamps + strict ACK + TLS"
     );
 
     Serial.println(
@@ -5170,6 +6053,22 @@ void setup()
     sequencePersistenceReady =
         true;
 
+    loadTimeAnchorHistory();
+
+    if (
+        !initializeBootSession()
+    )
+    {
+        Serial.println(
+            "[FATAL] Durable boot-session allocation failed."
+        );
+
+        while (true)
+        {
+            delay(1000);
+        }
+    }
+
     if (
         !initPersistentStorage()
     )
@@ -5184,7 +6083,19 @@ void setup()
         }
     }
 
-    restoreQueueFromFlash();
+    if (
+        !restoreQueueFromFlash()
+    )
+    {
+        Serial.println(
+            "[FATAL] Ring recovery encountered an I/O failure; refusing to overwrite existing backlog."
+        );
+
+        while (true)
+        {
+            delay(1000);
+        }
+    }
 
     pinMode(
         ADXL_CS,
@@ -5321,7 +6232,12 @@ void setup()
         WL_CONNECTED
     )
     {
-        syncTime();
+        if (
+            syncTime()
+        )
+        {
+            persistCurrentSessionTimeAnchor();
+        }
     }
     else
     {
@@ -5368,20 +6284,22 @@ void loop()
         !timeReady
     )
     {
-        syncTime();
+        if (
+            syncTime()
+        )
+        {
+            persistCurrentSessionTimeAnchor();
+        }
     }
 
-    // If cold-boot records were captured before UTC was known, establish
-    // one durable ordinal->UTC mapping before any of those records can be
-    // replayed. Failure is safe: data stays queued and acquisition continues.
+    // If time was already valid (for example after NTP sync in setup) but
+    // the anchor write previously failed, retry it. Old-session records only
+    // use an exact matching session anchor from the durable history.
     if (
-        timeReady &&
-        unresolvedTimestampCount >
-            0 &&
-        !unresolvedTimeAnchorReady()
+        timeReady
     )
     {
-        establishUnresolvedTimeAnchor();
+        persistCurrentSessionTimeAnchor();
     }
 
     // Replay only a bounded slice of old data before each fresh
@@ -5613,16 +6531,32 @@ void loop()
             outcome.statusCode
         );
 
-        if (
-            !saveImmediateRejectedPacket(
+        const bool archived =
+            saveImmediateRejectedPacket(
                 packet,
                 outcome
+            );
+
+        if (
+            FirmwareLogic::shouldFallbackRejectedPacketToQueue(
+                archived
             )
         )
         {
             Serial.println(
-                "[CRITICAL] Rejected telemetry preservation failed."
+                "[REJECT] Isolation archive failed; preserving packet in the persistent ring instead of losing it."
             );
+
+            if (
+                !enqueuePersistent(
+                    packet
+                )
+            )
+            {
+                Serial.println(
+                    "[CRITICAL] Rejected packet could not be archived OR queued."
+                );
+            }
         }
 
         delay(

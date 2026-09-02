@@ -35,7 +35,9 @@ jobs:
           from pathlib import Path
           import re
 
-          main = Path("firmware/esp32_edge_node/src/main.cpp").read_text(encoding="utf-8")
+          root = Path("firmware/esp32_edge_node")
+          main = (root / "src/main.cpp").read_text(encoding="utf-8")
+          example = (root / "include/secrets.example.h").read_text(encoding="utf-8")
 
           if re.search(r"LittleFS\.begin\s*\(\s*true\s*\)", main):
               raise SystemExit("Automatic LittleFS format-on-fail must remain disabled.")
@@ -45,6 +47,21 @@ jobs:
 
           if '#include "secrets.example.h"' not in main:
               raise SystemExit("secrets.example.h fallback is missing.")
+
+          if "setInsecure(" in main:
+              raise SystemExit("TLS certificate validation must never be disabled with setInsecure().")
+
+          if "UNRESOLVED_NOMINAL_PERIOD_MS" in main:
+              raise SystemExit("Offline UTC must not be fabricated from a fixed nominal cadence.")
+
+          if '#define ALLOW_INSECURE_HTTP_FOR_LOCAL_DEV_VALUE false' not in example:
+              raise SystemExit("The clean-checkout transport policy must deny plaintext HTTP by default.")
+
+          if 'INGEST_URL_VALUE "https://' not in example or 'HEALTH_URL_VALUE "https://' not in example:
+              raise SystemExit("Example backend URLs must default to HTTPS.")
+
+          if "TEST_FORCE_RING_READ_IO_FAIL" not in main:
+              raise SystemExit("Runtime I/O fault-injection hook is missing.")
 
           print("Fail-safe source policy checks passed.")
           PY

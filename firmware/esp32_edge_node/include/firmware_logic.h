@@ -18,6 +18,22 @@ enum class AckValidationResult
     DUPLICATE_CONTRACT_MISMATCH
 };
 
+enum class RingReadClass
+{
+    VALID,
+    CORRUPT,
+    IO_ERROR
+};
+
+enum class OfflineTimestampResult
+{
+    RESOLVED,
+    WAITING_FOR_ANCHOR,
+    SESSION_MISMATCH,
+    INVALID_METADATA,
+    OUT_OF_RANGE
+};
+
 struct CanonicalTelemetry
 {
     std::uint32_t sequence = 0;
@@ -27,11 +43,46 @@ struct CanonicalTelemetry
     float acousticPeakHz = 0.0f;
 };
 
+struct TimeAnchor
+{
+    std::uint32_t sessionId = 0;
+    std::uint32_t monotonicMs = 0;
+    std::int64_t epochMs = 0;
+};
+
+#pragma pack(push, 1)
+struct DurableTimeAnchorBlob
+{
+    std::uint32_t magic = 0;
+    std::uint16_t version = 0;
+    std::uint16_t reserved = 0;
+    std::uint32_t sessionId = 0;
+    std::uint32_t monotonicMs = 0;
+    std::int64_t epochMs = 0;
+    std::uint32_t crc32 = 0;
+};
+#pragma pack(pop)
+
+static_assert(
+    sizeof(DurableTimeAnchorBlob) == 28,
+    "DurableTimeAnchorBlob must remain 28 bytes."
+);
+
 AckValidationResult validateAckJson(
     int statusCode,
     const char* responseJson,
     const char* expectedDeviceId,
     std::uint32_t expectedSequence
+);
+
+bool parseHealthTimestampJson(
+    const char* responseJson,
+    std::int64_t& epochMs
+);
+
+bool parseRfc3339ToEpochMs(
+    const char* value,
+    std::int64_t& epochMs
 );
 
 float canonicalizeMeasurement(
@@ -58,11 +109,41 @@ bool shouldAdvanceSequence(
     std::uint32_t readbackSequence
 );
 
-std::int64_t resolveTimestampMs(
-    std::uint64_t recordOrdinal,
-    std::uint64_t anchorOrdinal,
-    std::int64_t anchorEpochMs,
-    std::uint32_t acquisitionIntervalMs
+bool shouldConsumeAfterReadFailure(
+    RingReadClass readClass
+);
+
+std::uint64_t packOfflineCaptureMetadata(
+    std::uint32_t sessionId,
+    std::uint32_t captureMonotonicMs
+);
+
+bool unpackOfflineCaptureMetadata(
+    std::uint64_t packed,
+    std::uint32_t& sessionId,
+    std::uint32_t& captureMonotonicMs
+);
+
+OfflineTimestampResult resolveOfflineTimestampMs(
+    std::uint32_t recordSessionId,
+    std::uint32_t captureMonotonicMs,
+    const TimeAnchor* anchor,
+    std::int64_t& epochMs
+);
+
+std::uint32_t calculateDurableTimeAnchorCrc(
+    const DurableTimeAnchorBlob& blob
+);
+
+void finalizeDurableTimeAnchor(
+    DurableTimeAnchorBlob& blob
+);
+
+bool isDurableTimeAnchorValid(
+    const DurableTimeAnchorBlob& blob,
+    std::uint32_t expectedMagic,
+    std::uint16_t expectedVersion,
+    std::int64_t minimumEpochMs
 );
 
 bool shouldIgnoreRecoveredOrdinal(
@@ -77,6 +158,12 @@ std::size_t calculateRecoveredQueueCount(
     std::size_t activeValidCount
 );
 
+std::uint64_t calculateRecoveryHeadOrdinal(
+    std::uint64_t minimumActiveOrdinal,
+    std::uint64_t maximumActiveOrdinal,
+    std::size_t capacity
+);
+
 std::uint64_t calculateNextRingOrdinal(
     std::uint64_t maximumOrdinalSeen
 );
@@ -85,6 +172,35 @@ bool shouldCommitWatermark(
     std::size_t pendingConsumedCount,
     std::size_t batchSize,
     bool forceCommit
+);
+
+std::size_t calculateLogicalQueueCapacity(
+    std::size_t physicalRingSlots
+);
+
+bool shouldDropOldestAfterVerifiedWrite(
+    bool queueWasFull,
+    bool newRecordWriteVerified
+);
+
+bool shouldEvictArchiveEntry(
+    std::size_t currentEntryCount,
+    std::size_t maximumEntryCount
+);
+
+std::size_t calculateArchiveEvictionCount(
+    std::size_t currentEntryCount,
+    std::size_t maximumEntryCount,
+    std::size_t maximumEvictionsPerPass
+);
+
+bool shouldFallbackRejectedPacketToQueue(
+    bool archiveWriteSucceeded
+);
+
+bool isBackendTransportAllowed(
+    const char* url,
+    bool allowInsecureHttpForLocalDev
 );
 
 } // namespace FirmwareLogic

@@ -619,6 +619,52 @@ class TestValidateArtifactPayloadSchema(unittest.TestCase):
         with self.assertRaises(ValueError):
             _validate_artifact_payload(payload)
 
+    def test_negative_threshold_rejected(self):
+        """[리뷰 P2] threshold는 유한값 여부만 확인하면 음수도 통과한다 —
+        reconstruction_error는 항상 0 이상이므로 threshold<0은 무의미하다."""
+        payload = _valid_dense_payload()
+        payload["threshold"] = -1.0
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_zero_threshold_accepted(self):
+        payload = _valid_dense_payload()
+        payload["threshold"] = 0.0
+        _validate_artifact_payload(payload)  # no raise — 0은 허용 경계값
+
+    def test_zero_sigma_rejected(self):
+        """[리뷰 P2] sigma(정상범위 배수)는 0보다 커야 의미가 있다."""
+        payload = _valid_dense_payload()
+        payload["sigma"] = 0.0
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_negative_sigma_rejected(self):
+        payload = _valid_dense_payload()
+        payload["sigma"] = -3.0
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_blank_feature_name_rejected(self):
+        """[리뷰 P2] feature_names가 리스트이고 중복이 없는지만 확인하면
+        공백 문자열("")도 "고유한 이름"으로 통과한다."""
+        payload = _valid_dense_payload()
+        payload["feature_names"] = ["f0", "", "f2", "f3"]
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_whitespace_only_feature_name_rejected(self):
+        payload = _valid_dense_payload()
+        payload["feature_names"] = ["f0", "   ", "f2", "f3"]
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_non_string_feature_name_rejected(self):
+        payload = _valid_dense_payload()
+        payload["feature_names"] = ["f0", "f1", "f2", 3]
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
     def test_dense_payload_with_seq_len_rejected(self):
         payload = _valid_dense_payload()
         payload["seq_len"] = 5

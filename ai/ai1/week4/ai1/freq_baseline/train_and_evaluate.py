@@ -421,6 +421,10 @@ def _validate_artifact_payload(payload: dict) -> None:
     feature_names = payload.get("feature_names")
     if not isinstance(feature_names, list) or not feature_names:
         raise ValueError(f"feature_names는 비어있지 않은 리스트여야 합니다: {feature_names!r}")
+    # [리뷰 P2] 리스트이고 중복이 없는지만 확인하면 공백 문자열("")도 "고유한
+    # 이름"으로 통과한다 — 각 원소가 실제로 비어있지 않은 문자열인지도 검증한다.
+    if any(not isinstance(n, str) or not n.strip() for n in feature_names):
+        raise ValueError(f"feature_names에 비어있지 않은 문자열이 아닌 항목이 있습니다: {feature_names!r}")
     if len(feature_names) != len(set(feature_names)):
         raise ValueError(f"artifact feature_names에 중복이 있습니다: {feature_names}")
 
@@ -449,6 +453,15 @@ def _validate_artifact_payload(payload: dict) -> None:
         value = payload.get(label)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError(f"{label}은 유한한 실수여야 합니다: {value!r}")
+    # [리뷰 P2] 유한값 여부만 확인하면 threshold<0이나 sigma<=0도 통과한다.
+    # reconstruction_error는 항상 0 이상이므로 threshold도 0 이상이어야 하고,
+    # sigma(정상범위 배수)는 0보다 커야 의미가 있다.
+    threshold = payload["threshold"]
+    if threshold < 0:
+        raise ValueError(f"threshold는 0 이상이어야 합니다: {threshold!r}")
+    sigma = payload["sigma"]
+    if sigma <= 0:
+        raise ValueError(f"sigma는 0보다 커야 합니다: {sigma!r}")
 
     seq_len = payload.get("seq_len")
     if model_type == "lstm_autoencoder":

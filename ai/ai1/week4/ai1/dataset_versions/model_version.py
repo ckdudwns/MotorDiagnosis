@@ -50,6 +50,8 @@ _REQUIRED_MODEL_VERSION_FIELDS = (
 )
 
 # registrationDigest 계산에서 뺀다 — 등록 이후 상태 전이마다 달라지는 키.
+# approvalDigest도 등록 시점에는 존재하지 않는 값이므로 함께 뺀다(그래야 승인된
+# 레코드에서 registrationDigest를 재계산해도 등록 시점과 같은 값이 나온다).
 _VOLATILE_MODEL_VERSION_KEYS = frozenset(
     {
         "status",
@@ -59,6 +61,7 @@ _VOLATILE_MODEL_VERSION_KEYS = frozenset(
         "approvalReason",
         "metricSnapshot",
         "registrationDigest",
+        "approvalDigest",
     }
 )
 
@@ -76,6 +79,45 @@ def compute_registration_digest(model_version: dict) -> str:
     stable = {k: v for k, v in model_version.items() if k not in _VOLATILE_MODEL_VERSION_KEYS}
     payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_approval_digest(approved_model_version: dict) -> str:
+    """승인 레코드의 **모든 내용**(등록 불변 필드 + registrationDigest + 승인자·
+    사유·시각·metricSnapshot)에 대한 canonical sha256(`status` 자체와 이 필드는
+    제외).
+
+    [리뷰 P1, 4차] `rollback_model_version()`이 `approved_history`의 각 항목을
+    "`status == 'approved'`"라는 자기 선언 필드만으로 신뢰하면, 호출자가 임의의
+    `status`/`approvedAt`을 채운 레코드를 직접 만들어 넘겨도(실제로
+    `approve_model_version()`을 거치지 않아도) 승인 계보로 인정됐다. 이 digest는
+    `approve_model_version()`이 승인 시점에만 계산해 남기므로, `registrationDigest`와
+    함께 대조하면 "실제로 register→approve 흐름을 거친 레코드인지"를 검증할 수 있다.
+    """
+    stable = {
+        k: v for k, v in approved_model_version.items() if k not in ("status", "approvalDigest")
+    }
+    payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_finite_metric_values(value, *, path: str = "metric_snapshot") -> None:
+    """`metric_snapshot`(중첩 dict/list 허용) 안의 모든 수치 leaf가 유한한지 검증한다.
+
+    [리뷰 P2] `f1=NaN` 같은 값이 그대로 승인 레코드에 저장되면 이후 JSON
+    직렬화(`allow_nan=False` 기준)가 실패하거나, NaN이 조용히 "통과"로 오판되는
+    비교 로직과 결합해 잘못된 승인 근거가 남을 수 있다.
+    """
+    if isinstance(value, dict):
+        for key, sub_value in value.items():
+            _validate_finite_metric_values(sub_value, path=f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, sub_value in enumerate(value):
+            _validate_finite_metric_values(sub_value, path=f"{path}[{index}]")
+    elif isinstance(value, bool):
+        return
+    elif isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise ValueError(f"{path}는 유한한 값이어야 합니다: {value!r}")
 
 
 def register_model_version(
@@ -133,7 +175,7 @@ def approve_model_version(
     approved_by: str,
     reason: str,
     metric_snapshot: dict,
-    registry: list[dict] | None = None,
+    registry: list[dict],
 ) -> dict:
     """status가 registered인 모델 버전만 승인할 수 있다 (FUT-006).
 
@@ -143,14 +185,24 @@ def approve_model_version(
     감사할 수 없었다. 호출자가 승인 시점에 검토한 지표를 매번 명시적으로 제출해야
     한다.
 
-    [리뷰 P1, 3차] 승인을 canonical 등록 레코드에 결속한다. `registry`(호출자가
+    [리뷰 P2] `metric_snapshot` 내부 수치(중첩 포함)가 모두 유한한지도 검증한다 —
+    `f1=NaN` 같은 값이 그대로 승인 레코드에 남으면 이후 JSON 직렬화가 실패하거나
+    잘못된 근거가 감사 기록으로 남는다.
+
+    [리뷰 P1, 3차·4차] 승인을 canonical 등록 레코드에 결속한다. `registry`(호출자가
     유지하는 canonical 등록 이력, `rollback_model_version`의 `approved_history`와
-    같은 패턴)가 주어지면 `version`으로 그 안에서 정확히 한 건의 `registered`
-    레코드를 조회해 그 레코드를 승인 대상으로 삼는다 — 전달된 `model_version`이
-    등록 레코드와 다른 내용(빈 필드, 변경된 artifactUri 등)이면 거부한다.
-    `registry`가 없으면 최소한 `model_version` 자신의 `registrationDigest`가
-    현재 내용과 일치하는지(등록 이후 변조되지 않았는지) 검증한다 — 이 digest가
-    없는(register_model_version()을 거치지 않은) 레코드는 무조건 거부한다.
+    같은 패턴)는 **필수** 인자다 — `model_version` 자신이 들고 있는
+    `registrationDigest`만으로 승인하는 경로는 없다. `compute_registration_digest()`는
+    공개 함수라서, 호출자가 임의로 만든 `{"status": "registered", ...}` 객체에 그
+    함수로 직접 계산한 digest를 채워 넣으면(또는 등록된 `artifactUri`/`artifactChecksum`을
+    바꾼 뒤 digest를 다시 계산하면) 자기 자신의 digest와 항상 일치해 "자기 서명"이
+    되어버린다 — canonical 등록 레코드가 아니라 그 레코드를 흉내 낸 값을 신뢰하는
+    셈이다. 이제 `version`으로 `registry`에서 정확히 한 건의 `registered` 레코드를
+    조회해 그 레코드를 승인 대상으로 삼고, 전달된 `model_version`이 그 레코드와 내용이
+    다르면 거부한다. 승인 결과에는 `approvalDigest`(등록 불변 필드 + 승인자·사유·
+    시각·metricSnapshot 전체의 canonical sha256)를 함께 남겨, 이후
+    `rollback_model_version()`이 "실제로 이 함수를 거친 레코드인지"를 검증할 수
+    있게 한다.
     """
     if model_version.get("status") != "registered":
         raise ValueError(
@@ -164,57 +216,50 @@ def approve_model_version(
         raise ValueError(
             f"metric_snapshot은 비어있지 않은 dict로 명시적으로 제출해야 합니다: {metric_snapshot!r}"
         )
+    _validate_finite_metric_values(metric_snapshot)
 
-    if registry is not None:
-        version_key = model_version.get("version")
-        matches = [item for item in registry if item.get("version") == version_key]
-        if len(matches) != 1:
-            raise ValueError(
-                f"버전 {version_key!r}이 canonical 등록 레코드(registry)에 정확히 한 건으로 "
-                f"존재하지 않습니다 ({len(matches)}건 발견). 계보가 주어지면 호출자가 전달한 "
-                "model_version 객체 자체의 값으로 대체하지 않습니다."
-            )
-        registry_entry = matches[0]
-        if registry_entry.get("status") != "registered":
-            raise ValueError(
-                f"등록 레코드 {version_key!r}가 registered 상태가 아닙니다 "
-                f"(status={registry_entry.get('status')!r})."
-            )
-        registry_digest = registry_entry.get("registrationDigest")
-        if registry_digest is None or compute_registration_digest(registry_entry) != registry_digest:
-            raise ValueError(
-                f"등록 레코드 {version_key!r}의 registrationDigest가 내용과 일치하지 않습니다 "
-                "(등록 이후 registry 자체가 변조된 것으로 보입니다)."
-            )
-        if compute_registration_digest(model_version) != registry_digest:
-            raise ValueError(
-                f"전달된 model_version이 canonical 등록 레코드({version_key!r})와 내용이 "
-                "다릅니다 — registry에 등록된 값을 승인 대상으로 씁니다."
-            )
-        base = registry_entry
-    else:
-        stored_digest = model_version.get("registrationDigest")
-        if stored_digest is None:
-            raise ValueError(
-                "registrationDigest가 없어 승인할 수 없습니다 — register_model_version()이 "
-                "만든 레코드를 그대로 전달했는지 확인하세요(무결성 검증을 우회할 수 없습니다)."
-            )
-        if compute_registration_digest(model_version) != stored_digest:
-            raise ValueError(
-                "등록 이후 model_version 내용이 변경되어 승인할 수 없습니다 "
-                f"(registrationDigest registered={stored_digest!r}, "
-                f"current={compute_registration_digest(model_version)!r})."
-            )
-        base = model_version
+    if not registry:
+        raise ValueError(
+            "registry(canonical 등록 이력)가 필수입니다 — 호출자가 전달한 model_version "
+            "객체 자체의 registrationDigest만으로는 승인할 수 없습니다(그 digest는 "
+            "호출자가 임의로 재계산해 자기 자신과 일치시킬 수 있는 공개 함수의 결과라 "
+            "'등록 증명'이 되지 못합니다)."
+        )
+    version_key = model_version.get("version")
+    matches = [item for item in registry if item.get("version") == version_key]
+    if len(matches) != 1:
+        raise ValueError(
+            f"버전 {version_key!r}이 canonical 등록 레코드(registry)에 정확히 한 건으로 "
+            f"존재하지 않습니다 ({len(matches)}건 발견). 계보가 주어지면 호출자가 전달한 "
+            "model_version 객체 자체의 값으로 대체하지 않습니다."
+        )
+    registry_entry = matches[0]
+    if registry_entry.get("status") != "registered":
+        raise ValueError(
+            f"등록 레코드 {version_key!r}가 registered 상태가 아닙니다 "
+            f"(status={registry_entry.get('status')!r})."
+        )
+    registry_digest = registry_entry.get("registrationDigest")
+    if registry_digest is None or compute_registration_digest(registry_entry) != registry_digest:
+        raise ValueError(
+            f"등록 레코드 {version_key!r}의 registrationDigest가 내용과 일치하지 않습니다 "
+            "(등록 이후 registry 자체가 변조된 것으로 보입니다)."
+        )
+    if compute_registration_digest(model_version) != registry_digest:
+        raise ValueError(
+            f"전달된 model_version이 canonical 등록 레코드({version_key!r})와 내용이 "
+            "다릅니다 — registry에 등록된 값을 승인 대상으로 씁니다."
+        )
 
     # 얕은 dict()는 중첩 metrics(혼동행렬 등)를 원본과 공유한다 — 승인 후 원본
     # metric_snapshot을 수정하면 승인 당시 근거까지 바뀐다. 깊은 복사한다.
-    approved = copy.deepcopy(base)
+    approved = copy.deepcopy(registry_entry)
     approved["status"] = "approved"
     approved["approvedBy"] = approved_by
     approved["approvalReason"] = reason
     approved["metricSnapshot"] = copy.deepcopy(metric_snapshot)
     approved["approvedAt"] = _now_iso()
+    approved["approvalDigest"] = compute_approval_digest(approved)
     return approved
 
 
@@ -312,6 +357,25 @@ def rollback_model_version(
                 f"{label} {subject.get('version')!r}의 계보 레코드가 승인(approved) "
                 f"상태가 아닙니다 (status={entry.get('status')!r})."
             )
+        # [리뷰 P1, 4차] `status == "approved"` 필드값만으로는 approved_history
+        # 자체를 호출자가 임의로(실제 register/approve를 거치지 않고) 만들어
+        # 넘겨도 롤백이 만들어졌다. registrationDigest(등록 불변 필드)와
+        # approvalDigest(등록 불변 필드 + 승인자·사유·시각·metricSnapshot,
+        # `approve_model_version()`만 계산해 남긴다)를 모두 재계산해 대조함으로써
+        # "실제로 register→approve 흐름을 거친 레코드"만 계보로 인정한다.
+        registration_digest = entry.get("registrationDigest")
+        if registration_digest is None or compute_registration_digest(entry) != registration_digest:
+            raise ValueError(
+                f"{label} {subject.get('version')!r}의 registrationDigest가 없거나 "
+                "내용과 일치하지 않습니다 — canonical 등록 레코드가 아닌 것으로 보입니다."
+            )
+        approval_digest = entry.get("approvalDigest")
+        if approval_digest is None or compute_approval_digest(entry) != approval_digest:
+            raise ValueError(
+                f"{label} {subject.get('version')!r}의 approvalDigest가 없거나 내용과 "
+                "일치하지 않습니다 — approve_model_version()을 실제로 거친 레코드가 "
+                "아닌 것으로 보입니다."
+            )
         return entry
 
     target_entry = _canonical_entry("target", target)
@@ -351,6 +415,8 @@ def rollback_model_version(
 _REQUIRED_BASELINE_ID_FIELDS = ("id", "datasetId", "siteId", "assetId")
 
 # registrationDigest 계산에서 뺀다 — 등록 이후 상태 전이마다 달라지는 키.
+# approvalDigest도 등록 시점에는 존재하지 않으므로 함께 뺀다(승인된/활성화된
+# 레코드에서 재계산해도 등록 시점과 같은 registrationDigest가 나오도록).
 _VOLATILE_BASELINE_KEYS = frozenset(
     {
         "status",
@@ -360,6 +426,7 @@ _VOLATILE_BASELINE_KEYS = frozenset(
         "approvalReason",
         "activatedAt",
         "registrationDigest",
+        "approvalDigest",
     }
 )
 
@@ -393,6 +460,12 @@ def _validate_baseline_features(features) -> None:
                 f"features[{name!r}].normal_range는 [lo, hi] 형태의 유한값 쌍이어야 합니다: "
                 f"{normal_range!r}"
             )
+        # [리뷰 P2] 유한값 쌍인지만 확인하면 [1.0, -1.0]처럼 하한이 상한보다 큰
+        # 뒤집힌 범위도 통과한다 — 하한이 상한 이하인지 명시적으로 검증한다.
+        if normal_range[0] > normal_range[1]:
+            raise ValueError(
+                f"features[{name!r}].normal_range의 하한이 상한보다 큽니다: {normal_range!r}"
+            )
 
 
 def _validate_baseline_identity_fields(baseline_version: dict) -> None:
@@ -414,6 +487,28 @@ def compute_baseline_registration_digest(baseline_version: dict) -> str:
     """등록 레코드의 불변 필드(id/datasetId/siteId/assetId/timeSegment/features)에
     대한 canonical sha256 — `approve`/`activate`가 등록 이후 변조를 탐지하는 데 쓴다."""
     stable = {k: v for k, v in baseline_version.items() if k not in _VOLATILE_BASELINE_KEYS}
+    payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_baseline_approval_digest(baseline_version: dict) -> str:
+    """승인 레코드의 **모든 내용**(등록 불변 필드 + registrationDigest + 승인자·
+    사유·시각)에 대한 canonical sha256(`status`/`activatedAt`/이 필드 자체는 제외).
+
+    [리뷰 P1, 4차] `register_baseline_version()`의 `registrationDigest`는
+    `status`를 포함하지 않는다(등록 시점엔 아직 정해지지 않은 미래 상태이므로).
+    그래서 등록 결과(`status="draft"`)의 `status` 필드만 `"approved"`로 직접
+    바꾸면, `approve_baseline_version()`을 한 번도 호출하지 않아도
+    `registrationDigest`는 여전히 일치해 `activate_baseline_version()`이 그대로
+    승인을 통과시켰다. 이 digest는 `approve_baseline_version()`이 승인 시점에만
+    계산해 남기므로, `activate`가 이 값까지 대조하면 "실제로 승인 함수를 거친
+    레코드인지"를 검증할 수 있다.
+    """
+    stable = {
+        k: v
+        for k, v in baseline_version.items()
+        if k not in ("status", "activatedAt", "approvalDigest")
+    }
     payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -498,6 +593,7 @@ def approve_baseline_version(baseline_version: dict, *, approved_by: str, reason
     approved["approvedBy"] = approved_by
     approved["approvalReason"] = reason
     approved["approvedAt"] = _now_iso()
+    approved["approvalDigest"] = compute_baseline_approval_digest(approved)
     return approved
 
 
@@ -508,7 +604,15 @@ def activate_baseline_version(baseline_version: dict) -> dict:
     [리뷰 P1] `status == "approved"`만으로는 ID·features 없는 임의 객체도
     active로 전이될 수 있었다. 식별 필드·features를 다시 검증하고,
     `registrationDigest`가 등록 시점 내용과 여전히 일치하는지(승인~활성화 사이
-    변조되지 않았는지)도 대조한다."""
+    변조되지 않았는지)도 대조한다.
+
+    [리뷰 P1, 4차] `registrationDigest`만으로는 충분하지 않다 — 이 값은 `status`를
+    포함하지 않으므로, `register_baseline_version()` 결과의 `status`만
+    `"approved"`로 직접 바꾸면(`approve_baseline_version()`을 한 번도 호출하지
+    않아도) `registrationDigest`가 여전히 일치해 그대로 배포가 통과했다.
+    `approvalDigest`(`approve_baseline_version()`만 계산해 남기는 값)까지 함께
+    대조해, 실제로 승인 함수를 거친 레코드만 배포를 허용한다.
+    """
     if baseline_version.get("status") != "approved":
         raise ValueError(
             f"승인된(approved) 기준선만 배포할 수 있습니다 "
@@ -526,6 +630,18 @@ def activate_baseline_version(baseline_version: dict) -> dict:
             "승인 이후 기준선 내용이 변경되어 배포할 수 없습니다 "
             f"(registrationDigest registered={stored_digest!r}, "
             f"current={compute_baseline_registration_digest(baseline_version)!r})."
+        )
+    approval_digest = baseline_version.get("approvalDigest")
+    if approval_digest is None:
+        raise ValueError(
+            "approvalDigest가 없어 배포할 수 없습니다 — status만 바꾸지 않고 "
+            "approve_baseline_version()을 실제로 거쳤는지 확인하세요."
+        )
+    if compute_baseline_approval_digest(baseline_version) != approval_digest:
+        raise ValueError(
+            "승인 이후 기준선 내용이 변경되어 배포할 수 없습니다 "
+            f"(approvalDigest approved={approval_digest!r}, "
+            f"current={compute_baseline_approval_digest(baseline_version)!r})."
         )
 
     active = copy.deepcopy(baseline_version)

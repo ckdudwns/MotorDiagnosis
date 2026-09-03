@@ -376,8 +376,21 @@ def verify_reproducibility(
     문자열만 다른 값으로 교체) 잡아내지 못한다. `checksumInputs`가 양쪽에 모두
     있으면 `compute_source_checksum()`으로 각자의 canonical checksum을 필드값을
     신뢰하지 않고 독립적으로 재계산해 대조한다.
+
+    [리뷰 P1, 4차] `frozen_manifest` 자체가 동결 이후 변조되지 않았는지 가장
+    먼저 검증한다(`verify_frozen_integrity`) — 그렇지 않으면 변조된 frozen과
+    우연히(혹은 의도적으로) 일치하는 recomputed를 "재현 성공"으로 오판할 수
+    있다. 그리고 비-legacy 경로에서는 `checksumInputs`가 **양쪽 모두 있어야만**
+    canonical 재계산 비교를 한다 — 예전에는 한쪽(특히 recomputed_manifest)에서
+    `checksumInputs`를 지우면 예전의 필드값 비교(`source.checksum` 문자열 대조)로
+    조용히 폴백했는데, 그 폴백은 recomputed_manifest 자신의 `source.checksum`이
+    실제로 재계산됐다는 보장이 없어(예: `samplingRateHz`/`splitStrategy`만 바꾸고
+    `source.checksum` 필드는 예전 값 그대로 둔 채 `checksumInputs`만 지우면) 우회할
+    수 있었다. 이제 하나라도 없으면 재현 실패로 처리한다.
     """
     _require_bool_trusted_legacy(trusted_legacy)
+    verify_frozen_integrity(frozen_manifest, trusted_legacy=trusted_legacy)
+
     if frozen_manifest["datasetChecksum"] != compute_dataset_checksum(recomputed_manifest):
         return False
     if trusted_legacy is True:
@@ -387,23 +400,19 @@ def verify_reproducibility(
         if frozen_manifest.get(field) != recomputed_manifest.get(field):
             return False
 
-    if frozen_manifest.get("checksumInputs") and recomputed_manifest.get("checksumInputs"):
-        frozen_recomputed_checksum = compute_source_checksum(frozen_manifest)
-        recomputed_recomputed_checksum = compute_source_checksum(recomputed_manifest)
-        if frozen_recomputed_checksum != recomputed_recomputed_checksum:
-            return False
-        frozen_declared_checksum = frozen_manifest.get("snapshotChecksum") or (
-            frozen_manifest.get("source") or {}
-        ).get("checksum")
-        if frozen_recomputed_checksum != frozen_declared_checksum:
-            return False
-        return True
+    frozen_checksum_inputs = frozen_manifest.get("checksumInputs")
+    recomputed_checksum_inputs = recomputed_manifest.get("checksumInputs")
+    if not frozen_checksum_inputs or not recomputed_checksum_inputs:
+        return False
 
-    frozen_source_checksum = frozen_manifest.get("snapshotChecksum") or (
+    frozen_recomputed_checksum = compute_source_checksum(frozen_manifest)
+    recomputed_recomputed_checksum = compute_source_checksum(recomputed_manifest)
+    if frozen_recomputed_checksum != recomputed_recomputed_checksum:
+        return False
+    frozen_declared_checksum = frozen_manifest.get("snapshotChecksum") or (
         frozen_manifest.get("source") or {}
     ).get("checksum")
-    recomputed_source_checksum = (recomputed_manifest.get("source") or {}).get("checksum")
-    if frozen_source_checksum != recomputed_source_checksum:
+    if frozen_recomputed_checksum != frozen_declared_checksum:
         return False
     return True
 

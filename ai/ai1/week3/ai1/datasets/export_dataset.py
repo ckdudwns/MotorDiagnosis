@@ -13,6 +13,7 @@ export_dataset()의 docstring 참고). week1 `build_ai1_handoff_dataset.py`처�
 """
 
 import os
+import re
 import csv
 import json
 import time
@@ -64,12 +65,90 @@ class VersionContentConflictError(RuntimeError):
     """
 
 
+class IncompleteVersionDirectoryError(RuntimeError):
+    """기존 `version_dir`가 있지만 JSON manifest/XLSX가 없거나 손상돼 그 안의
+    내용을 신뢰 가능하게 확인할 수 없을 때 발생한다.
+
+    [리뷰 P1, 4차] 기존 산출물이 불완전하면(수동 삭제, 이전 실행 중단 등) CSV만
+    같다고 해서 안전하게 재사용하거나 자동으로 덮어쓸 수 없다 — `source.license`처럼
+    CSV에는 나타나지 않는 필드가 실제로는 달라졌을 수 있고, 이를 확인할 신뢰 가능한
+    registry나 snapshot digest가 이 함수 안에는 없다. 자동 복구(치유) 대신 명시적으로
+    실패해 운영자가 디렉터리를 직접 확인하게 한다.
+    """
+
+
 def _sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# [리뷰 P1, 4차] version_id(=manifest["id"]나 CURRENT 파일 내용)를 검증 없이
+# os.path.join에 쓰면 "../escaped-version"이나 절대경로 같은 값이 versions_dir
+# 밖에 디렉터리를 만들 수 있다(경로 이탈). 실제 id 형식(예: "DS-CWRU-VIBRATION-
+# 20260824-abcdef123456")을 포함하는 안전한 문자(영숫자/./_/-)로만 구성된 단일
+# 경로 세그먼트만 허용한다.
+_SAFE_VERSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+
+
+def _resolve_version_dir(versions_dir: str, version_id: str) -> str:
+    """`versions_dir` 안의 `version_id` 경로를 안전하게 계산한다.
+
+    [리뷰 P1, 4차] `version_id`가 안전한 문자만으로 구성된 단일 경로 세그먼트인지
+    정규식으로 먼저 걸러내고(`..`, `/`, `\\`, 절대경로 등을 모두 차단), 그래도
+    `os.path.realpath()` 기준으로 최종 경로가 실제로 `versions_dir` 내부인지
+    한 번 더 확인한다(defense in depth) — 정규식 하나로만 막으면 플랫폼별 경로
+    구분자 처리 차이를 놓칠 수 있다.
+    """
+    if not isinstance(version_id, str) or not _SAFE_VERSION_ID_RE.match(version_id):
+        raise ValueError(f"안전하지 않은 version_id입니다: {version_id!r}")
+    if version_id in (".", ".."):
+        raise ValueError(f"안전하지 않은 version_id입니다: {version_id!r}")
+
+    candidate = os.path.join(versions_dir, version_id)
+    versions_dir_real = os.path.realpath(versions_dir)
+    candidate_real = os.path.realpath(candidate)
+    try:
+        common = os.path.commonpath([versions_dir_real, candidate_real])
+    except ValueError:
+        common = None
+    if common != versions_dir_real:
+        raise ValueError(
+            f"version_id가 대상 디렉터리 밖을 가리킵니다: {version_id!r} "
+            f"(resolved={candidate_real!r})"
+        )
+    return candidate
+
+
+def _xlsx_content_matches(staged_path: str, existing_path: str) -> bool:
+    """두 XLSX가 시트 이름뿐 아니라 실제 셀 값까지 동일한지 비교한다.
+
+    [리뷰 P1, 4차] openpyxl은 저장 시각을 파일에 넣어 내용이 같아도 바이트가
+    다르므로 바이트 비교를 쓸 수 없다. 예전에는 두 시트("manifest"/"rows")의
+    존재 여부만 확인해서, 기존 XLSX의 셀 값이 변조돼도(예: manifest 시트의 특정
+    필드) "재사용 가능"으로 오판했다. 시트별 전체 셀 값을 직접 비교한다.
+    """
+    if not os.path.exists(existing_path):
+        return False
+    try:
+        staged_wb = load_workbook(staged_path)
+        existing_wb = load_workbook(existing_path)
+    except Exception:
+        return False
+    if staged_wb.sheetnames != existing_wb.sheetnames:
+        return False
+    for name in staged_wb.sheetnames:
+        staged_rows = [
+            [cell.value for cell in row] for row in staged_wb[name].iter_rows()
+        ]
+        existing_rows = [
+            [cell.value for cell in row] for row in existing_wb[name].iter_rows()
+        ]
+        if staged_rows != existing_rows:
+            return False
+    return True
 
 
 # [리뷰 P1] 동시 export 재사용 판정 시, createdAt처럼 "내용은 같지만 다시 만들면
@@ -165,7 +244,7 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
     label_summary = summarize_dataset_labels(rows, label_mapping, taxonomy_version)
 
     version_id = manifest["id"]
-    version_dir = os.path.join(versions_dir, version_id)
+    version_dir = _resolve_version_dir(versions_dir, version_id)
 
     staging_dir = tempfile.mkdtemp(prefix=".export-staging-", dir=versions_dir)
     try:
@@ -274,32 +353,49 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
         except OSError:
             if not os.path.isdir(version_dir):
                 raise
+            # [리뷰 P1, 4차] 기존 디렉터리가 불완전하면(JSON manifest·XLSX가
+            # 없거나 손상됨) 그 안에 무엇이 들어있었는지 신뢰 가능하게 확인할
+            # 방법이 이 함수 안에는 없다 — CSV만 같다고(license처럼 CSV에 안
+            # 나타나는 필드가 실제로는 다를 수 있으므로) 자동으로 지우고
+            # 덮어쓰지 않는다. 예전에는 여기서 `shutil.rmtree(version_dir)` 후
+            # `_replace_with_retry()`로 "치유"했는데, 그 두 연산 사이에 rename이
+            # 실패하면 CURRENT는 이 version_id를 계속 가리키는데 정작
+            # version_dir 자체가 사라지는 상태가 될 수 있었다(비원자적 복구).
+            # 신뢰 가능한 registry/snapshot digest 없이는 자동 복구 대신
+            # 명시적으로 실패하는 편이 더 안전하다(리뷰어 권고).
+            if not _version_dir_is_complete(version_dir):
+                raise IncompleteVersionDirectoryError(
+                    f"version_id {version_id!r}의 기존 산출물 디렉터리({version_dir})가 "
+                    "불완전합니다(JSON manifest 또는 XLSX가 없거나 손상됨) — 이전 "
+                    "내용을 신뢰 가능하게 확인할 수 없어 자동으로 덮어쓰지 않습니다. "
+                    "디렉터리를 직접 확인해 정리한 뒤 다시 시도하세요."
+                ) from None
+
+            # 기존 디렉터리가 완전하다 — CSV/JSON/XLSX 세 산출물 모두 대조해야만
+            # "동시 export가 이미 같은 내용을 배치했다"고 안전하게 판단할 수 있다.
             # [리뷰 P1] version_id(=source.checksum)는 원본 파일·전처리·특징
             # 산출물로 결정되지만, export 시점에만 바뀌는 값(예: 호출 직전
             # manifest["source"]["license"]나 현재 rows에서 쓰이지 않는
             # labelMapping 항목만 수정)은 반영하지 않는다 — 그래서 "version_dir가
             # 이미 있다 == 동시 export가 정확히 같은 내용을 이미 배치했다"는 예전
-            # 가정이 항상 참은 아니다. CSV(rows + 라벨 파생 컬럼을 그대로 담고,
-            # 타임스탬프 등 휘발성 메타데이터가 없어 결정적이다 — XLSX는 openpyxl이
-            # 저장 시각을 파일에 넣어 내용이 같아도 바이트가 달라지므로 비교에 쓰지
-            # 않는다) **와** canonical JSON manifest(createdAt만 제외하고 비교 —
-            # source.license처럼 CSV에는 안 나타나지만 JSON에는 나타나는 필드
-            # 변경을 잡는다) 둘 다 기존 산출물과 대조해 실제로 동일한 내용인지
-            # 확인한다.
+            # 가정이 항상 참은 아니다.
             existing_csv_path = os.path.join(version_dir, "dataset_rows.csv")
             existing_manifest_path = os.path.join(version_dir, "dataset_manifest.json")
+            existing_xlsx_path = os.path.join(version_dir, "dataset_export.xlsx")
             csv_matches = os.path.exists(existing_csv_path) and (
                 _sha256_of_file(csv_path) == _sha256_of_file(existing_csv_path)
             )
-            manifest_conflict = False
-            if csv_matches and os.path.exists(existing_manifest_path):
+            manifest_matches = False
+            if os.path.exists(existing_manifest_path):
                 try:
-                    manifest_conflict = _canonical_manifest_json(
+                    manifest_matches = _canonical_manifest_json(
                         manifest_path
-                    ) != _canonical_manifest_json(existing_manifest_path)
+                    ) == _canonical_manifest_json(existing_manifest_path)
                 except (OSError, ValueError):
-                    manifest_conflict = True  # 기존 JSON이 손상됨 -> 신뢰할 수 없음(치유 대상)
-            if not csv_matches or manifest_conflict:
+                    manifest_matches = False
+            xlsx_matches = _xlsx_content_matches(xlsx_path, existing_xlsx_path)
+
+            if not (csv_matches and manifest_matches and xlsx_matches):
                 raise VersionContentConflictError(
                     f"version_id {version_id!r}가 이미 존재하지만 내보내려는 rows/라벨/"
                     "메타데이터 내용이 기존 산출물과 다릅니다. 이 id는 source.checksum만 "
@@ -308,16 +404,9 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
                     "내보내려던 내용이 사라집니다. 매니페스트를 다시 생성하거나 원인을 "
                     "확인하세요."
                 ) from None
-            if not _version_dir_is_complete(version_dir):
-                # 기존 디렉터리는 CSV/JSON 내용은 같지만 JSON/XLSX가 없거나
-                # 손상되어 불완전하다(예: 수동 삭제, 이전 실행 중단). 그대로
-                # 재사용하면 CURRENT가 계속 불완전한 디렉터리를 가리킨다 — 방금
-                # 만든 완전한 staged 산출물로 교체(치유)한다.
-                shutil.rmtree(version_dir, ignore_errors=True)
-                _replace_with_retry(staging_dir, version_dir)
-            # else: 기존 디렉터리가 이미 완전하고 내용도 같다 -> 동시에 실행된
-            # 다른 export가 이미 같은 내용을 배치했다는 뜻이므로, 이번 staged
-            # 시도는 버리고 기존 버전을 재사용한다.
+            # 세 산출물 모두 완전하고 내용까지 같다 -> 동시에 실행된 다른 export가
+            # 이미 같은 내용을 배치했다는 뜻이므로, 이번 staged 시도는 버리고
+            # 기존 버전을 그대로 재사용한다(디렉터리를 건드리지 않음).
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
@@ -358,7 +447,9 @@ def resolve_current_version_dir(output_dir: str) -> str:
     current_pointer = os.path.join(output_dir, "CURRENT")
     with open(current_pointer, encoding="utf-8") as f:
         version_id = f.read().strip()
-    return os.path.join(output_dir, "versions", version_id)
+    # [리뷰 P1, 4차] CURRENT 파일 내용도 신뢰하지 않는다 — export_dataset()이
+    # 쓴 값이라 해도, 파일이 외부에서 조작됐을 가능성을 배제할 수 없다.
+    return _resolve_version_dir(os.path.join(output_dir, "versions"), version_id)
 
 
 if __name__ == "__main__":

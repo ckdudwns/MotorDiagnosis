@@ -43,7 +43,9 @@ from model_version import (  # noqa: E402
     approve_baseline_version,
     activate_baseline_version,
     compute_registration_digest,
+    compute_approval_digest,
     compute_baseline_registration_digest,
+    compute_baseline_approval_digest,
 )
 
 
@@ -377,6 +379,41 @@ class TestFreezeRecomputesFullCanonicalIdentity(unittest.TestCase):
         forged["source"]["checksum"] = frozen["source"]["checksum"]  # 필드만 위조해 맞춤
         self.assertFalse(verify_reproducibility(frozen, forged))
 
+    def test_verify_reproducibility_rejects_when_recomputed_checksum_inputs_deleted_and_content_changed(self):
+        """[리뷰 P1, 4차] recomputed_manifest에서 checksumInputs를 통째로 지우고
+        samplingRateHz/splitStrategy를 바꿔도, 예전에는 (양쪽 중 하나라도
+        checksumInputs가 없으면) 필드값 비교로 폴백해 "재현 성공"으로 오판했다.
+        비-legacy 경로에서는 양쪽 모두 checksumInputs가 있어야 한다 — 하나라도
+        없으면 무조건 실패로 처리한다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        recomputed = _draft_manifest()
+        # source.checksum 필드는 예전 값 그대로 둔 채(재계산 안 함) 실제 내용만 바꾼다.
+        recomputed["compatibility"]["samplingRateHz"] = 48000
+        recomputed["splitStrategy"] = "operating_condition_holdout: TAMPERED"
+        del recomputed["checksumInputs"]
+        self.assertFalse(verify_reproducibility(frozen, recomputed))
+
+    def test_verify_reproducibility_rejects_when_frozen_checksum_inputs_deleted(self):
+        """checksumInputs가 없는 쪽이 frozen이면, frozen 자체의 무결성 검증
+        (snapshotDigest — checksumInputs를 지운 것 자체가 매니페스트 내용 변경)에서
+        먼저 걸린다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        del frozen["checksumInputs"]
+        recomputed = _draft_manifest()
+        with self.assertRaises(ValueError):
+            verify_reproducibility(frozen, recomputed)
+
+    def test_verify_reproducibility_raises_when_frozen_manifest_itself_tampered(self):
+        """[리뷰 P1, 4차] verify_reproducibility는 recomputed와 비교하기 전에
+        frozen_manifest 자체의 무결성(snapshotDigest)부터 검증해야 한다 —
+        그렇지 않으면 변조된 frozen과 우연히 일치하는 recomputed를 "재현
+        성공"으로 오판할 수 있다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        frozen["source"]["license"] = "TAMPERED-AFTER-FREEZE"  # snapshotDigest와 불일치
+        recomputed = _draft_manifest()
+        with self.assertRaises(ValueError):
+            verify_reproducibility(frozen, recomputed)
+
 
 class TestV13FrozenFields(unittest.TestCase):
     def test_freeze_carries_policy_schema_and_snapshot_checksum(self):
@@ -613,15 +650,17 @@ class TestModelVersionLifecycle(unittest.TestCase):
             baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
         )
         approved = approve_model_version(
-            mv, approved_by="mgr", reason="지표 통과", metric_snapshot={"f1": 0.9}
+            mv, approved_by="mgr", reason="지표 통과", metric_snapshot={"f1": 0.9},
+            registry=[mv],
         )
         self.assertEqual(approved["status"], "approved")
         self.assertEqual(approved["approvedBy"], "mgr")
         self.assertEqual(approved["metricSnapshot"], {"f1": 0.9})
+        self.assertIn("approvalDigest", approved)
         with self.assertRaises(ValueError):
             approve_model_version(
                 approved, approved_by="mgr", reason="재승인 시도",
-                metric_snapshot={"f1": 0.9},
+                metric_snapshot={"f1": 0.9}, registry=[mv],
             )
 
     def test_metric_snapshot_is_isolated_from_source_metrics(self):
@@ -631,7 +670,8 @@ class TestModelVersionLifecycle(unittest.TestCase):
             metrics=metrics, artifact_checksum="sha256:aaa",
         )
         approved = approve_model_version(
-            mv, approved_by="mgr", reason="지표 통과", metric_snapshot=metrics
+            mv, approved_by="mgr", reason="지표 통과", metric_snapshot=metrics,
+            registry=[mv],
         )
         metrics["f1"] = 0.12
         metrics["cm"]["tp"] = 0
@@ -646,7 +686,7 @@ class TestModelVersionLifecycle(unittest.TestCase):
         )
         snap = {"f1": 0.91, "cm": {"tp": 3}}
         approved = approve_model_version(
-            mv, approved_by="mgr", reason="ok", metric_snapshot=snap
+            mv, approved_by="mgr", reason="ok", metric_snapshot=snap, registry=[mv],
         )
         snap["cm"]["tp"] = 999
         self.assertEqual(approved["metricSnapshot"]["cm"]["tp"], 3)
@@ -698,61 +738,128 @@ class TestApproveModelVersionRequiresAuditTrail(unittest.TestCase):
         )
 
     def test_missing_approved_by_rejected(self):
+        mv = self._registered()
         with self.assertRaises(TypeError):
             approve_model_version(
-                self._registered(), reason="ok", metric_snapshot={"f1": 0.9}
+                mv, reason="ok", metric_snapshot={"f1": 0.9}, registry=[mv]
             )
 
     def test_blank_approved_by_rejected(self):
+        mv = self._registered()
         with self.assertRaises(ValueError):
             approve_model_version(
-                self._registered(), approved_by="   ", reason="ok",
-                metric_snapshot={"f1": 0.9},
+                mv, approved_by="   ", reason="ok",
+                metric_snapshot={"f1": 0.9}, registry=[mv],
             )
 
     def test_missing_metric_snapshot_rejected(self):
+        mv = self._registered()
         with self.assertRaises(TypeError):
-            approve_model_version(self._registered(), approved_by="mgr", reason="ok")
+            approve_model_version(mv, approved_by="mgr", reason="ok", registry=[mv])
 
     def test_empty_metric_snapshot_rejected(self):
+        mv = self._registered()
         with self.assertRaises(ValueError):
             approve_model_version(
-                self._registered(), approved_by="mgr", reason="ok", metric_snapshot={}
+                mv, approved_by="mgr", reason="ok", metric_snapshot={}, registry=[mv]
             )
 
     def test_non_dict_metric_snapshot_rejected(self):
+        mv = self._registered()
         with self.assertRaises(ValueError):
             approve_model_version(
-                self._registered(), approved_by="mgr", reason="ok",
-                metric_snapshot="not-a-dict",
+                mv, approved_by="mgr", reason="ok",
+                metric_snapshot="not-a-dict", registry=[mv],
             )
 
+    def test_non_finite_metric_snapshot_value_rejected(self):
+        """[리뷰 P2] metric_snapshot 내부(중첩 포함) 수치가 NaN/Inf면 거부한다 —
+        JSON 직렬화 실패나 잘못된 승인 근거로 남는 것을 막는다."""
+        mv = self._registered()
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValueError, msg=f"f1={bad!r}"):
+                approve_model_version(
+                    mv, approved_by="mgr", reason="ok",
+                    metric_snapshot={"f1": bad}, registry=[mv],
+                )
+            with self.assertRaises(ValueError, msg=f"nested f1={bad!r}"):
+                approve_model_version(
+                    mv, approved_by="mgr", reason="ok",
+                    metric_snapshot={"cm": {"f1": bad}}, registry=[mv],
+                )
+
     def test_valid_approval_records_approver_and_snapshot(self):
+        mv = self._registered()
         approved = approve_model_version(
-            self._registered(), approved_by="mgr", reason="ok",
-            metric_snapshot={"f1": 0.95},
+            mv, approved_by="mgr", reason="ok",
+            metric_snapshot={"f1": 0.95}, registry=[mv],
         )
         self.assertEqual(approved["approvedBy"], "mgr")
         self.assertEqual(approved["metricSnapshot"], {"f1": 0.95})
 
 
 class TestApproveModelVersionBoundToCanonicalRegistration(unittest.TestCase):
-    """[리뷰 P1, 3차] 승인을 canonical 등록 레코드에 결속한다 — status만
-    "registered"인 임의 객체나, 등록 이후 변조된 model_version은 거부돼야 한다."""
+    """[리뷰 P1, 3차·4차] 승인을 canonical 등록 레코드에 결속한다 — status만
+    "registered"인 임의 객체나, 등록 이후 변조된 model_version, registry 없이
+    호출자 자신의 registrationDigest만 신뢰하는 경로는 모두 거부돼야 한다."""
 
-    def test_hand_crafted_object_without_registration_digest_rejected(self):
-        """version/artifact/dataset/baseline 정보가 없는(또는 임의로 채운) 객체도
-        status만 registered로 맞추면 예전에는 승인됐다 — registrationDigest가
-        없는 레코드는 무조건 거부해야 한다."""
-        forged = {"status": "registered", "version": "", "artifactUri": ""}
-        with self.assertRaises(ValueError):
+    def test_missing_registry_raises_type_error(self):
+        """[리뷰 P1, 4차] registry는 이제 필수 인자다 — 생략하면(호출자가 전달한
+        model_version 자신의 registrationDigest만으로 승인되는 경로가 아예
+        없다) TypeError."""
+        mv = register_model_version(
+            version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
+            baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
+        )
+        with self.assertRaises(TypeError):
+            approve_model_version(
+                mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}
+            )
+
+    def test_self_computed_registration_digest_no_longer_sufficient(self):
+        """[리뷰 P1, 4차] `compute_registration_digest`는 공개 함수라서, 호출자가
+        임의로 만든 레코드에 그 함수로 직접 계산한 digest를 채워 넣으면 "자기
+        서명"이 되어 registry 없이는(예전 코드에서) 승인됐다. 이제 registry가
+        없으면 호출 자체가 TypeError이므로, self-signed 레코드도 이 경로로는
+        승인될 수 없다."""
+        forged = {
+            "version": "v-forged", "artifactUri": "file:///forged.pt",
+            "artifactChecksum": "sha256:forged", "datasetId": "d",
+            "baselineVersion": "b", "metrics": {"f1": 0.99},
+            "status": "registered", "createdAt": "2026-01-01T00:00:00+00:00",
+        }
+        forged["registrationDigest"] = compute_registration_digest(forged)
+        with self.assertRaises(TypeError):
             approve_model_version(
                 forged, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}
             )
+        # registry에 자기 자신만 넣어도(실제 canonical 저장소가 아니라 호출자가
+        # 즉석에서 지어낸 registry) 여전히 최소한 registrationDigest 자기 일관성은
+        # 요구되므로 이 경우는 통과한다 — 이 함수 하나만으로 "등록 증명"을 완전히
+        # 대체할 수는 없지만(서명 체계가 없는 이 코드베이스의 근본 한계), 최소한
+        # 여기서는 registry를 실제로 조회하도록 강제한다.
+        approve_model_version(
+            forged, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9},
+            registry=[forged],
+        )
+
+    def test_hand_crafted_object_not_found_in_registry_rejected(self):
+        """version/artifact/dataset/baseline 정보가 없는(또는 임의로 채운) 객체는
+        canonical registry에서 그 version을 찾지 못하면 거부돼야 한다."""
+        mv = register_model_version(
+            version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
+            baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
+        )
+        forged = {"status": "registered", "version": "", "artifactUri": ""}
+        with self.assertRaises(ValueError):
+            approve_model_version(
+                forged, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9},
+                registry=[mv],
+            )
 
     def test_tampered_version_after_registration_rejected(self):
-        """정상 등록 결과의 version/artifactUri를 등록 이후에 바꾸면(registry 없이
-        전달돼도) registrationDigest 불일치로 거부돼야 한다."""
+        """정상 등록 결과의 version/artifactUri를 등록 이후에 바꾸면 registry
+        자체의 registrationDigest 자기 일관성 검사에서 거부돼야 한다."""
         mv = register_model_version(
             version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
             baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
@@ -760,7 +867,8 @@ class TestApproveModelVersionBoundToCanonicalRegistration(unittest.TestCase):
         mv["version"] = "v1-tampered"
         with self.assertRaises(ValueError):
             approve_model_version(
-                mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}
+                mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9},
+                registry=[mv],
             )
 
     def test_tampered_artifact_checksum_after_registration_rejected(self):
@@ -771,7 +879,8 @@ class TestApproveModelVersionBoundToCanonicalRegistration(unittest.TestCase):
         mv["artifactChecksum"] = "sha256:swapped-artifact"
         with self.assertRaises(ValueError):
             approve_model_version(
-                mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}
+                mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9},
+                registry=[mv],
             )
 
     def test_registry_lookup_approves_canonical_entry(self):
@@ -826,9 +935,14 @@ class TestRollbackLineage(unittest.TestCase):
             baseline_version="b", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
         )
         approved = approve_model_version(
-            mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}
+            mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}, registry=[mv]
         )
         approved["approvedAt"] = when  # 결정적 시각으로 고정
+        # approvedAt을 덮어쓰면 approve_model_version()이 실제로 계산한
+        # approvalDigest와 어긋난다 — "이 버전이 실제로 `when`에 승인됐다"는
+        # 시나리오를 표현하려면 그 시각을 반영해 다시 계산해야 한다(테스트
+        # 픽스처 전용 — 실제 코드 경로에서는 approvedAt을 직접 덮어쓰지 않는다).
+        approved["approvalDigest"] = compute_approval_digest(approved)
         return approved
 
     def test_rollback_to_earlier_approved_version_ok(self):
@@ -1008,6 +1122,54 @@ class TestRollbackLineage(unittest.TestCase):
                 approved_history=[v1, tampered_v2_entry],
             )
 
+    def test_entirely_fabricated_history_without_real_approval_rejected(self):
+        """[리뷰 P1, 4차] 실제 register/approve를 한 번도 거치지 않고, 임의의
+        `status`/`approvedAt`만으로 만든 old/new 레코드 두 개를 approved_history로
+        전달해도 rollback 액션이 만들어지면 안 된다 — `status == "approved"`
+        필드값만으로는 계보를 증명하지 못한다. registrationDigest/approvalDigest가
+        없으면 거부해야 한다."""
+        fabricated_old = {
+            "version": "fab-old", "status": "approved",
+            "approvedAt": "2026-01-01T00:00:00+00:00",
+        }
+        fabricated_new = {
+            "version": "fab-new", "status": "approved",
+            "approvedAt": "2026-02-01T00:00:00+00:00",
+        }
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                fabricated_new, fabricated_old, reason="x",
+                target_environment="production",
+                approved_history=[fabricated_old, fabricated_new],
+            )
+
+    def test_history_entry_with_tampered_registration_content_rejected(self):
+        """계보 항목의 registrationDigest는 있지만(등록은 실제로 했지만) 등록
+        이후 내용을 바꾼 경우 — 자기 일관성이 깨져 거부돼야 한다."""
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        tampered_v1 = dict(v1)
+        tampered_v1["artifactUri"] = "file:///tampered.pt"  # registrationDigest는 그대로 방치
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v2, tampered_v1, reason="x", target_environment="production",
+                approved_history=[tampered_v1, v2],
+            )
+
+    def test_history_entry_with_tampered_approval_content_rejected(self):
+        """approvalDigest 계산 이후 approvalReason 등 승인 관련 필드만 바꾸면
+        registrationDigest는 그대로 일치해도 approvalDigest 불일치로 거부돼야
+        한다."""
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        tampered_v1 = dict(v1)
+        tampered_v1["approvalReason"] = "TAMPERED"  # approvalDigest는 그대로 방치
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v2, tampered_v1, reason="x", target_environment="production",
+                approved_history=[tampered_v1, v2],
+            )
+
 
 class TestBaselineVersionLifecycle(unittest.TestCase):
     _FEATURES = {"rms_mean": {"mean": 0.05, "std": 0.01, "normal_range": [0.03, 0.07]}}
@@ -1124,6 +1286,37 @@ class TestBaselineVersionValidation(unittest.TestCase):
         approved["features"]["rms_mean"]["std"] = 999.0  # 승인 이후 변조
         with self.assertRaises(ValueError):
             activate_baseline_version(approved)
+
+    def test_status_flip_without_calling_approve_rejected_by_activate(self):
+        """[리뷰 P1, 4차] register_baseline_version() 결과의 status만
+        "approved"로 직접 바꾸면(approve_baseline_version()을 한 번도 호출하지
+        않아도) registrationDigest는 등록 시점 content(id/datasetId/siteId/
+        assetId/timeSegment/features)만 보므로 그대로 일치해 activate가
+        통과했었다. approvalDigest가 없으면 activate가 거부해야 한다."""
+        bv = register_baseline_version(**self._VALID_KWARGS)
+        bv["status"] = "approved"  # approve_baseline_version()을 거치지 않고 직접 변경
+        self.assertEqual(
+            bv["registrationDigest"], compute_baseline_registration_digest(bv)
+        )  # registrationDigest는 여전히 유효함(변조 아님) — 그래도 거부돼야 한다.
+        with self.assertRaises(ValueError):
+            activate_baseline_version(bv)
+
+    def test_approval_digest_matches_recompute(self):
+        bv = register_baseline_version(**self._VALID_KWARGS)
+        approved = approve_baseline_version(bv, approved_by="mgr", reason="ok")
+        self.assertEqual(
+            approved["approvalDigest"], compute_baseline_approval_digest(approved)
+        )
+
+    def test_normal_range_lower_bound_above_upper_bound_rejected(self):
+        """[리뷰 P2] normal_range의 두 값이 유한한지만 확인하고 lo<=hi는
+        검증하지 않으면 [1.0, -1.0]처럼 뒤집힌 범위도 등록된다."""
+        kwargs = dict(self._VALID_KWARGS)
+        kwargs["features"] = {
+            "rms_mean": {"mean": 0.05, "std": 0.01, "normal_range": [1.0, -1.0]}
+        }
+        with self.assertRaises(ValueError):
+            register_baseline_version(**kwargs)
 
 
 @unittest.skipUnless(

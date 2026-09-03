@@ -626,6 +626,62 @@ class TestOperatingConditionSplit(unittest.TestCase):
             operating_condition_split([{"specimen_id": "x", "label": "NORMAL"}])
 
 
+class TestOperatingConditionHoldoutSeedIndependenceSynthetic(unittest.TestCase):
+    """[리뷰 P2] "미사용 seed가 operating_condition_holdout의 checksum/id에
+    영향을 주지 않는다"는 회귀 테스트가 `TestRegisterAndExportRealCwruData`
+    (CWRU 실데이터가 없으면 클래스 전체가 skip)에만 있어 일반 CI에서는 이
+    회귀를 잡을 수 없었다. `load_cwru_dataset`/`build_source_block`을 모킹해
+    실데이터 없이도 항상 실행되는 합성 버전을 추가한다."""
+
+    def _synthetic_records(self):
+        rng = np.random.default_rng(0)
+        records = []
+        specs = (
+            ("CWRU-NORMAL-BASELINE", "NORMAL"),
+            ("CWRU-IR-0007", "BEARING_FAULT_INNER"),
+        )
+        for specimen_id, label in specs:
+            for load_hp in (0, 1, 2, 3):
+                for i in range(3):
+                    records.append(
+                        {
+                            "sample_id": f"{specimen_id}_{load_hp}_{i:04d}",
+                            "source_label": f"{specimen_id}-{load_hp}hp.mat",
+                            "specimen_id": specimen_id,
+                            "label": label,
+                            "load_hp": load_hp,
+                            "sample_rate": 12000,
+                            "rpm": 1797,
+                            "signal": rng.normal(scale=0.1, size=2048),
+                        }
+                    )
+        return records
+
+    def _synthetic_source(self):
+        return {
+            "type": "external",
+            "uri": "https://example.invalid/cwru",
+            "license": "synthetic-test",
+            "files": {"synthetic.mat": {"sha256": "sha256:" + "a" * 64, "label": "NORMAL"}},
+        }
+
+    def test_operating_condition_holdout_checksum_id_unaffected_by_unused_seed(self):
+        with mock.patch(
+            "register_dataset.load_cwru_dataset", return_value=self._synthetic_records()
+        ), mock.patch(
+            "register_dataset.build_source_block", return_value=self._synthetic_source()
+        ):
+            m1 = build_manifest(
+                data_dir="unused", split_strategy="operating_condition_holdout", seed=1
+            )
+            m2 = build_manifest(
+                data_dir="unused", split_strategy="operating_condition_holdout", seed=999
+            )
+        self.assertEqual(m1["split"], m2["split"])
+        self.assertEqual(m1["source"]["checksum"], m2["source"]["checksum"])
+        self.assertEqual(m1["id"], m2["id"])
+
+
 class TestDatasetExportLabelFields(unittest.TestCase):
     """API 명세서 v1.3 DatasetExportRow: CWRU known_label은 신뢰된 외부 라벨이므로
     매핑 성공 행은 verified/training_eligible, 매핑 실패는 unmapped, 라벨 없음은
@@ -1011,29 +1067,94 @@ class TestExportDatasetSynthetic(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def test_missing_manifest_json_is_healed_on_reexport_of_identical_content(self):
-        """[리뷰 P1] 기존 JSON manifest가 삭제된(또는 이전 실행이 XLSX 저장
-        직후 중단된) 채로 남아 있으면, 예전 코드는 CSV만 같으면 그 불완전한
-        디렉터리를 그대로 재사용해 CURRENT가 계속 manifest.json 없는 디렉터리를
-        가리켰다. 완전한 산출물로 치유(교체)해야 한다."""
-        from export_dataset import resolve_current_version_dir
+    def test_tampered_xlsx_cell_value_is_rejected_not_silently_reused(self):
+        """[리뷰 P1, 4차] 기존 XLSX의 셀 값을 변경한 뒤 동일한 manifest를 다시
+        export하면, 시트 이름만 확인하던 예전 검사는 성공을 반환하고 변조된 값도
+        그대로 남겼다. 시트별 셀 값까지 비교해 거부해야 한다."""
+        from openpyxl import load_workbook
+        from export_dataset import VersionContentConflictError
 
         manifest = self._synthetic_manifest()
-        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_heal_")
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_xlsx_tamper_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+
+            wb = load_workbook(result_1["xlsx_path"])
+            manifest_sheet = wb["manifest"]
+            for row in manifest_sheet.iter_rows():
+                if row[0].value == "source.license":
+                    row[1].value = "TAMPERED-LICENSE"
+                    break
+            else:
+                self.fail("manifest 시트에서 source.license 행을 찾지 못했습니다.")
+            wb.save(result_1["xlsx_path"])
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+
+            # 거부됐으므로 변조된 셀 값이 그대로 남아 있어야 한다(추가 손상 없음).
+            wb_after = load_workbook(result_1["xlsx_path"])
+            values = {row[0].value: row[1].value for row in wb_after["manifest"].iter_rows()}
+            self.assertEqual(values["source.license"], "TAMPERED-LICENSE")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_missing_manifest_json_raises_incomplete_error_without_auto_recovery(self):
+        """[리뷰 P1, 4차] 기존 JSON manifest가 삭제된(또는 이전 실행이 XLSX 저장
+        직후 중단된) 채로 남아 있으면, 그 디렉터리가 원래 무엇을 담고 있었는지
+        신뢰 가능하게 확인할 방법이 없다 — CSV만 같다고(license처럼 CSV에
+        안 나타나는 필드가 실제로는 다를 수 있으므로) 자동으로 덮어써서
+        "치유"하면 안 된다. 명시적인 IncompleteVersionDirectoryError로 멈추고,
+        기존에 남아있던 CSV/XLSX도 건드리지 않아야 한다."""
+        from export_dataset import IncompleteVersionDirectoryError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_incomplete_")
         try:
             result_1 = export_dataset(manifest, tmp_dir)
             os.remove(result_1["manifest_path"])  # 손상/삭제 재현
             self.assertFalse(os.path.exists(result_1["manifest_path"]))
+            with open(result_1["csv_path"], "rb") as f:
+                csv_before = f.read()
+            with open(result_1["xlsx_path"], "rb") as f:
+                xlsx_before = f.read()
 
-            # 같은(동일한) manifest를 다시 export — 내용은 바뀌지 않았다.
-            result_2 = export_dataset(manifest, tmp_dir)
+            with self.assertRaises(IncompleteVersionDirectoryError):
+                export_dataset(manifest, tmp_dir)
 
-            self.assertTrue(os.path.exists(result_2["manifest_path"]))
-            with open(result_2["manifest_path"], encoding="utf-8") as f:
-                json.load(f)  # 파싱 가능한 완전한 JSON
-            self.assertEqual(
-                result_2["version_dir"], resolve_current_version_dir(tmp_dir)
-            )
+            # 자동 복구를 시도하지 않았으므로 남아있던 CSV/XLSX는 그대로여야 한다
+            # (지워지거나 새로 교체되지 않음).
+            self.assertFalse(os.path.exists(result_1["manifest_path"]))
+            with open(result_1["csv_path"], "rb") as f:
+                self.assertEqual(f.read(), csv_before)
+            with open(result_1["xlsx_path"], "rb") as f:
+                self.assertEqual(f.read(), xlsx_before)
+
+            # staging 디렉터리도 정리돼 남아있지 않아야 한다.
+            versions_dir = os.path.join(tmp_dir, "versions")
+            leftovers = [
+                name
+                for name in os.listdir(versions_dir)
+                if name.startswith(".export-staging-")
+            ]
+            self.assertEqual(leftovers, [])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_corrupted_xlsx_raises_incomplete_error_without_auto_recovery(self):
+        """XLSX가 손상돼 열리지 않는 경우도 같은 방식으로 명시적으로 실패해야
+        한다."""
+        from export_dataset import IncompleteVersionDirectoryError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_corrupt_xlsx_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+            with open(result_1["xlsx_path"], "wb") as f:
+                f.write(b"not a real xlsx file")
+
+            with self.assertRaises(IncompleteVersionDirectoryError):
+                export_dataset(manifest, tmp_dir)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1095,6 +1216,113 @@ class TestExportDatasetSynthetic(unittest.TestCase):
                     self.assertEqual(exported_rows[0]["rms_mean"], "0.11")
                 else:
                     self.assertEqual(exported_rows[0]["rms_mean"], "0.22")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+class TestVersionIdPathTraversal(unittest.TestCase):
+    """[리뷰 P1, 4차] manifest["id"](또는 CURRENT 파일 내용)을 검증 없이
+    파일 경로에 쓰면 "../escaped-version"이나 절대경로 같은 값이 versions_dir
+    밖에 디렉터리를 만들 수 있다."""
+
+    def _manifest_with_id(self, version_id: str) -> dict:
+        rows = [
+            {
+                "sample_id": "97_0000", "source_file": "97.mat",
+                "known_label": "NORMAL", "common_label": "NORMAL",
+                "split": "train", "sample_rate_hz": 12000, "rpm": 1797,
+                "rms_mean": 0.05,
+            }
+        ]
+        return {
+            "id": version_id,
+            "name": "cwru-bearing-vibration-v1",
+            "source": {
+                "type": "external", "uri": "https://example.invalid/cwru",
+                "license": "test", "checksum": "sha256:deadbeef",
+                "files": {"97.mat": {"sha256": "sha256:aaa", "label": "NORMAL"}},
+            },
+            "compatibility": {
+                "signalType": ["vibration"], "samplingRateHz": 12000,
+                "units": {"vibration": "g"},
+                "operatingConditions": {"rpmRange": [1797, 1797], "load": "test"},
+            },
+            "labelTaxonomyVersion": "CWRU-FAULT-V1",
+            "labelMapping": DATASET_LABEL_MAPPING,
+            "labelPolicyVersion": LABEL_POLICY_VERSION,
+            "snapshotSchemaVersion": SNAPSHOT_SCHEMA_VERSION,
+            "split": {"train": 1.0, "validation": 0.0, "test": 0.0},
+            "splitStrategy": "test",
+            "status": "draft",
+            "reason": "synthetic test",
+            "createdAt": "1970-01-01T00:00:00+00:00",
+            "rowCount": len(rows),
+            "splitCounts": {"train": 1, "validation": 0, "test": 0},
+            **summarize_dataset_labels(rows, DATASET_LABEL_MAPPING, "CWRU-FAULT-V1"),
+            "rows": rows,
+        }
+
+    def test_relative_path_escape_in_id_rejected(self):
+        manifest = self._manifest_with_id("../escaped-version")
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal_")
+        try:
+            with self.assertRaises(ValueError):
+                export_dataset(manifest, tmp_dir)
+            # versions_dir 밖(tmp_dir의 부모 등)에 디렉터리가 실제로 생기지
+            # 않았는지 확인한다.
+            escaped_dir = os.path.normpath(os.path.join(tmp_dir, "..", "escaped-version"))
+            self.assertFalse(os.path.exists(escaped_dir))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_nested_relative_path_in_id_rejected(self):
+        manifest = self._manifest_with_id("sub/dir")
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal2_")
+        try:
+            with self.assertRaises(ValueError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_absolute_path_in_id_rejected(self):
+        manifest = self._manifest_with_id(os.path.join(tempfile.gettempdir(), "evil"))
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal3_")
+        try:
+            with self.assertRaises(ValueError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_dot_dot_alone_rejected(self):
+        manifest = self._manifest_with_id("..")
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal4_")
+        try:
+            with self.assertRaises(ValueError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_safe_id_still_exports_normally(self):
+        manifest = self._manifest_with_id("DS-CWRU-VIBRATION-19700101-deadbeefcafe")
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal_ok_")
+        try:
+            result = export_dataset(manifest, tmp_dir)
+            self.assertTrue(os.path.exists(result["csv_path"]))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_current_pointer_with_traversal_content_rejected_on_resolve(self):
+        """CURRENT 파일 내용도 신뢰하지 않는다 — export_dataset()이 쓴 값이
+        아니라 외부에서 조작됐을 수 있다."""
+        from export_dataset import resolve_current_version_dir
+
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal_current_")
+        try:
+            os.makedirs(os.path.join(tmp_dir, "versions"), exist_ok=True)
+            with open(os.path.join(tmp_dir, "CURRENT"), "w", encoding="utf-8") as f:
+                f.write("../escaped-version")
+            with self.assertRaises(ValueError):
+                resolve_current_version_dir(tmp_dir)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 

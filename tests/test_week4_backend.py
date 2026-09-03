@@ -636,6 +636,34 @@ class Week4HttpTest(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         self.assertTrue(event["isSynthetic"])
+        self.assertEqual(event["scenarioLabel"], "combined_anomaly")
+        self.assertEqual(event["source"], "ai2-week4-combined-signal-demo")
+        samples = [
+            record
+            for record in data.TELEMETRY_RECORDS
+            if record["source"] == event["source"]
+        ]
+        self.assertEqual(len(samples), event["telemetrySampleCount"])
+        self.assertEqual(len(samples), event["durationSec"] + 2)
+        self.assertEqual(samples[-1]["timestamp"], event["occurredAt"])
+        self.assertTrue(all(record["isSynthetic"] for record in samples))
+        self.assertTrue(
+            all(
+                record["vibrationRmsMmS"] is None
+                and record["acousticDb"] is None
+                and "anomalyScore" not in record
+                for record in samples
+            )
+        )
+        self.assertEqual(samples[0]["scenarioLabel"], "normal")
+        self.assertTrue(
+            all(record["scenarioLabel"] == "combined_anomaly" for record in samples[1:])
+        )
+        self.assertGreater(
+            samples[-1]["vibrationRmsRaw"], samples[0]["vibrationRmsRaw"]
+        )
+        self.assertGreater(samples[-1]["acousticRmsRaw"], samples[0]["acousticRmsRaw"])
+        self.assertLess(samples[-1]["rpm"], samples[0]["rpm"])
         deadline = time.monotonic() + 3
         while True:
             status, alerts = self.request(
@@ -757,6 +785,12 @@ class Week4HttpTest(unittest.TestCase):
             )
         self.assertEqual((status, body["error"]["code"]), (403, "SITE_FORBIDDEN"))
         self.assertEqual(len(data.EVENTS), before)
+
+    def test_demo_data_function_is_also_blocked_in_production(self):
+        with patch.dict("os.environ", {"APP_ENV": "production"}):
+            with self.assertRaises(data.ApiError) as error:
+                data.inject_anomaly({"siteId": "SITE-01"})
+        self.assertEqual(error.exception.code, "DEMO_DISABLED")
 
     def test_model_registration_http_contract_and_authorization(self):
         status, dataset = self.request(

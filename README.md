@@ -9,6 +9,8 @@
 - [AI-1 2주차: EDGE_FEATURE_01 — 특징량 계산·정상 기준선·품질 검증](./ai/ai1/week2/README.md)
 - [AI-2 1주차: 분석/실시간 경로 분리·리플레이](./ai/ai2/week1/README.md)
 - [AI-2 2주차: 이상 점수 초안·관제 시각화](./ai/ai2/week2/README.md)
+- [AI-2 3주차: 이벤트 생명주기](./ai/ai2/week3/README.md)
+- [AI-2 4주차: 합성 이상 시연·모델 결과 표시](./ai/ai2/week4/README.md)
 
 AI-1의 공개 데이터 기반 합성 인계 파일을 AI-2가 분석 경로와 실시간 리플레이 경로로
 분리한다. 이 데이터는 실제 한 설비에서 동시에 측정한 데이터가 아니므로, 모델 성능이나
@@ -86,7 +88,8 @@ HTTP 수집·격리를 반복하지 않고 ACK한다. SQLite와 MQTT가 하나�
 - `POST /api/alerts/send`, `GET /api/alerts` 및 대시보드 웹 알림 표시
 - `POST /api/telemetry/bulk`: 장치별 순서 재전송·중복 제거·부분 실패 결과
 - 데이터셋에 연결된 모델/기준선 버전 등록·조회, 사이트 권한 및 감사 기록
-- 데모 주입 기본 비활성화 (`DEMO_ENABLED=true`로 허용, `APP_ENV=production`에서는 차단)
+- 데모 주입 기본 비활성화 (`DEMO_ENABLED=true`로 허용, `APP_ENV=production`에서는 차단),
+  합성 진동·음향·RPM raw telemetry와 이벤트/알림 시연
 
 [4주차 백엔드 API·시연·설정 인계](docs/week4-backend.md)를 참고한다.
 모델 학습·승인·배포는 수행하지 않는다. 기존 메모리 데이터 저장소와 실제 장치

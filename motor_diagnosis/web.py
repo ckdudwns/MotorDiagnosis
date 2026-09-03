@@ -92,6 +92,10 @@ def render_page() -> str:
           <h2>Web Notifications</h2>
           <div id="notifications" role="status" aria-live="polite">No notifications.</div>
         </article>
+        <article class="panel">
+          <h2>AI Baseline Result</h2>
+          <div id="modelResult" role="status" aria-live="polite">Loading model metadata.</div>
+        </article>
         <article class="panel detail">
           <h2>Event Review</h2>
           <div id="eventDetail">Select an event.</div>
@@ -163,16 +167,18 @@ def render_page() -> str:
       const assetId = $("assetSelect").value;
       const periodHours = Number($("periodSelect").value);
       const from = new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString();
-      const [telem, summaries, eventPage, alertPage] = await Promise.all([
+      const [telem, summaries, eventPage, alertPage, modelPage] = await Promise.all([
         api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
         api("/api/dashboard/sites-summary"),
         api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
         api(`/api/alerts?siteId=${site.id}&channel=web&status=sent&size=10`),
+        api(`/api/model-versions?siteId=${site.id}&assetId=${assetId}&status=draft&size=1`),
       ]);
       if (requestGeneration !== renderGeneration) return;
       siteSummaries = summaries;
       events = eventPage.items;
       renderNotifications(alertPage.items);
+      renderModelResult(modelPage.items);
       if (!events.some(event => event.id === selectedEventId)) clearEventSelection();
       $("siteCount").textContent = siteSummaries.length;
       $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
@@ -193,6 +199,36 @@ def render_page() -> str:
         item.textContent = `${row.isTest ? "[TEST] " : ""}${row.event.isSynthetic ? "[SYNTHETIC] " : ""}${row.event.title} · ${new Date(row.deliveredAt).toLocaleString()}`;
         panel.appendChild(item);
       });
+    }
+
+    function renderModelResult(rows) {
+      const panel = $("modelResult");
+      panel.replaceChildren();
+      const model = rows[0];
+      if (!model) {
+        panel.textContent = "No model metadata is registered for this asset. AI-1 reconstruction error is not mapped to anomalyScore in this MVP.";
+        return;
+      }
+      const title = document.createElement("b");
+      title.textContent = `${model.version} · ${model.deploymentStatus || "not_deployed"}`;
+      panel.appendChild(title);
+      appendModelField(panel, "Evaluation scope", "Reported metrics are not deployment or field-generalization evidence.");
+      appendModelField(panel, "Artifact", model.artifactVerified ? "verified" : "reference only; not verified");
+      appendModelField(panel, "Metrics", model.metrics || {});
+      appendModelField(panel, "Known error cases", model.errorCases || []);
+      appendModelField(panel, "Domain gap", model.domainGap);
+      appendModelField(panel, "Field calibration", model.fieldCalibrationPlan);
+      appendModelField(panel, "Limitations", model.limitations);
+    }
+
+    function appendModelField(panel, label, value) {
+      if (value === null || value === undefined || value === "" || (Array.isArray(value) && !value.length)) return;
+      const row = document.createElement("p");
+      const name = document.createElement("b");
+      name.textContent = `${label}: `;
+      const text = Array.isArray(value) ? value.join("; ") : typeof value === "object" ? JSON.stringify(value) : String(value);
+      row.append(name, text);
+      panel.appendChild(row);
     }
 
     function setOptions(select, rows, valueOf, labelOf) {

@@ -41,4 +41,20 @@ assert.equal(panel.children.length, 0);
 assert.equal(panel.textContent, 'No notifications.');
 assert.match(source, /id="injectBtn" hidden/);
 assert.match(source, /hidden = !boot.demoEnabled/);
+vm.runInContext('renderModelResult([])', context);
+const modelPanel = elements.get('modelResult');
+assert.match(modelPanel.textContent, /not mapped to anomalyScore/);
+context.models = [{
+  version: '<model-v1>', deploymentStatus: 'not_deployed', artifactVerified: false,
+  metrics: {f1: 1}, errorCases: ['<img src=x onerror=alert(1)>'],
+  domainGap: 'different sensor', fieldCalibrationPlan: 'collect normal data',
+  limitations: 'demo only',
+}];
+vm.runInContext('renderModelResult(models)', context);
+assert.equal(modelPanel.children[0].textContent, '<model-v1> · not_deployed');
+assert.match(modelPanel.children[1].textContent, /not deployment/);
+assert.match(modelPanel.children[3].children[0].textContent, /Metrics/);
+assert.match(modelPanel.children[4].textContent, /<img src=x/);
+assert.equal(modelPanel.children[4].children.length, 1);
+assert.match(source, /api\(`\/api\/model-versions\?siteId=/);
 console.log('Week 4 dashboard: notification rendering, XSS-safe text, empty state and demo gating passed.');

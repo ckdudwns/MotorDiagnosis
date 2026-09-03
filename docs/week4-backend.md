@@ -11,7 +11,7 @@ W4.2 (`기능정의서!A6:R10`, `역할배정!A11:I15`) 및 API 명세 v1.2
 | ALERT_SEND_01 | 웹 알림, SMTP/Webhook 어댑터, Stub, 채널별 독립 작업자, SQLite 발송·재시도 이력 | 실제 수신 서버/메일 계정 설정 및 외부 종단 간 시험 |
 | DATASET_MODEL_01 | 기존 동결 데이터셋에 기준선·모델·지표·보고서 연결, 불변 등록, 사이트 권한, 감사 기록 | 실제 모델 산출물 검증, 승인·배포·롤백 |
 | EDGE_BUFFER_01 | 100건 이하 일괄 수신, 장치별 sequence 정렬, 단건 계약 재사용, 중복·충돌·부분 실패 결과 | IoT 장치의 24시간 실제 저장·용량 초과·전원 장애 시험 |
-| SIM_ANOMALY_01 | 데모 API 기본 비활성, 운영 강제 차단, 권한 검사, 합성 표시, 주입 이벤트→웹 알림 연결 | AI-2의 진동·음향·RPM 이상 신호 생성과 모델 시각화 |
+| SIM_ANOMALY_01 | 데모 API 기본 비활성, 운영 강제 차단, 권한 검사, 합성 표시, 주입 이벤트→웹 알림 연결 | 실제 센서 파형 및 운영 환경 시연 |
 | AI_FREQ_MODEL_01 | 지표·오류 사례·도메인 차이·현장 보정 계획을 모델 버전에 기록/조회 | AI-1의 FFT/RMS/피크/대역 에너지 추출과 학습·평가 |
 
 API 명세의 FUT 모델/기준선 API 중 **등록·조회만** 시연용으로 선행 구현했다.
@@ -185,8 +185,15 @@ HTTP 본문 한도는 기존 64KiB다.
 
 `DEMO_ENABLED=true`일 때만 주입 가능하며 `APP_ENV=production`이면 강제로 차단한다.
 설정하지 않으면 버튼도 숨기고 API는 `403 DEMO_DISABLED`를 반환한다.
-주입 API는 기존 데모 이벤트를 생성하는 것으로, 실제 센서 파형을 생성하는 API가 아니다.
-이벤트에는 isSynthetic/source와 주입 시각을 기록하며 같은 스냅샷이 알림에 연결된다.
+주입 API는 선택 설비의 활성 장치에 정상 1건과 지속된 combined anomaly summary telemetry를
+함께 생성한다. 진동·음향·RPM raw 값과 피크 주파수는 데모용 합성값이며 실제 파형, 보정된
+mm/s·dB, AI-1 모델 추론값이 아니다. `vibrationRmsMmS`와 `acousticDb`는 raw-only 계약에
+따라 null이다. 모든 행과 이벤트에는 `isSynthetic/source`를 기록하며 같은 종료 시각의
+스냅샷이 알림에 연결된다.
+
+대시보드는 등록된 model-version 메타데이터만 표시한다. AI-1 reconstruction error를 운영
+`anomalyScore`(0–100)로 변환하는 규칙은 이 MVP에 없으므로, 모델 아티팩트를 실행하거나
+점수를 임의 생성하지 않는다.
 
 검증 명령:
 

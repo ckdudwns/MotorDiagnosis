@@ -105,6 +105,33 @@ draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다
 시점에 draft가 신고한 값과 현재 rows에서 다시 계산한 값을 대조해 build 이후 rows가 바뀐
 draft의 동결을 거부한다.
 
+### `checksumInputs` / `compute_source_checksum()` — freeze 시점 canonical 재계산 (리뷰 P1, 3차)
+
+`featureOutputFingerprint` 대조만으로는 rows를 바꾸고 fingerprint를 새 rows에 맞게
+**함께** 재계산해 신고하거나(현재 rows와의 대조는 통과), fingerprint에는 들어가지
+않지만 `source.checksum` 계산에는 들어가는 필드(`labelMapping` 등)만 바꾸는 공격을
+잡지 못한다 — `id`/`source.checksum`이 예전 rows/설정 기준 값 그대로 방치돼도
+동결·승인이 통과했다.
+
+`build_manifest()`는 이제 `compute_version_checksum()` payload 중 rows/labelMapping/
+split만으로는 재현 불가능한 나머지 입력(`window_size`, `hop_size`, `seed`,
+`feature_pipeline_version`, `feature_config`, `split_strategy` 키)을 draft의
+`checksumInputs` 필드로 그대로 노출한다. `dataset_version.compute_source_checksum(manifest)`는
+week3 모듈을 import하지 않고(`compute_rows_fingerprint`와 같은 이유) 이 필드들과
+`source.files`/`split`/`labelTaxonomyVersion`/`labelMapping`/`featureOutputFingerprint`/
+`labelPolicyVersion`/`snapshotSchemaVersion`만으로 `compute_version_checksum()`과
+동일한 payload를 독립 재구성해 sha256을 재계산한다.
+
+- `freeze_dataset_version()`은 신규 필수 필드에 `checksumInputs`를 추가하고,
+  fingerprint 대조 이후 이 재계산 값을 `manifest["source"]["checksum"]`과 대조하며,
+  `id`가 재계산 checksum의 hex suffix(12자)로 끝나는지도 검증한다 — 어느 한쪽만
+  뒤처져도 동결을 거부한다.
+- `verify_reproducibility(frozen, recomputed, *, trusted_legacy=False)`도
+  `checksumInputs`가 양쪽에 있으면 `source.checksum` **필드값**을 서로 비교하지
+  않고, 각자 내용으로 `compute_source_checksum()`을 독립 재계산해 대조한다 —
+  `recomputed_manifest["source"]["checksum"]` 필드 자체가(재계산 없이) 다른 값으로
+  위조돼도 잡아낸다.
+
 ## `snapshotDigest` — 전체 불변 필드 변조 탐지 (리뷰 P1)
 
 `datasetChecksum`은 `rows`/`labelMapping`/`split`만 보므로, freeze 이후 `source.license`,
@@ -121,6 +148,9 @@ draft의 동결을 거부한다.
   시작 전에 하도록 노출한 함수다 — 하류(`train_and_evaluate.run_training_job`)가
   `status=="frozen"`만 보지 않고 이걸 호출한다. `trusted_legacy=True`일 때만
   `datasetChecksum`으로 폴백하고, 기본값에서는 `snapshotDigest`가 없으면 그 자체로 거부한다.
+  `approve_dataset_version`/`verify_frozen_integrity`/`verify_reproducibility` 모두
+  `trusted_legacy`가 실제 `bool`이 아니면(예: 문자열 `"false"` — 파이썬에서 truthy)
+  `TypeError`로 즉시 거부한다(리뷰 P1, 3차) — `is True`로만 완화 경로를 켠다.
 - `verify_reproducibility(frozen, recomputed, *, trusted_legacy=False)`도 기본값에서는
   `datasetChecksum`뿐 아니라 `labelPolicyVersion`/`snapshotSchemaVersion`/원본
   `source.checksum`까지 함께 대조한다 — rows/labelMapping/split만 같고 원본·정책 버전이
@@ -148,8 +178,13 @@ draft의 동결을 거부한다.
 ```
 
 `register_model_version()`은 필수 문자열(`version`/`artifact_uri`/`dataset_id`/
-`baseline_version`)이 비어 있으면 거부하고 `metrics`가 dict가 아니어도 거부한다(리뷰
-P1) — 불완전한 레코드가 승인 상태까지 조용히 전이되는 것을 막는다.
+`baseline_version`/`artifact_checksum`)이 비어 있으면 거부하고 `metrics`가 dict가
+아니어도 거부한다(리뷰 P1) — 불완전한 레코드가 승인 상태까지 조용히 전이되는 것을
+막는다. `artifact_checksum`(학습 시 저장한 아티팩트의 sha256)도 필수로 받아
+`artifactChecksum`으로 등록 레코드에 보존한다(리뷰 P1, 3차). 등록 시 불변 필드
+전체(`version`/`artifactUri`/`artifactChecksum`/`datasetId`/`baselineVersion`/
+`metrics`, `status`/시각류 제외)에 대한 canonical sha256을 `registrationDigest`로
+함께 저장한다.
 
 상태 머신: `registered --approve_model_version()--> approved`. 승인에는 `approved_by`,
 `reason`, **명시적** `metricSnapshot`(승인 시점에 실제로 검토한 지표 — 승인 후 깊은
@@ -159,21 +194,37 @@ P1) — 불완전한 레코드가 승인 상태까지 조용히 전이되는 것
 `register`/`approve`/`activate` 각 단계에서 깊은 복사해, draft 수정이 승인본·active
 기준선으로 새지 않는다.
 
-`rollback_model_version(current, target, *, reason, target_environment, approved_history=None)`은
+`approve_model_version(model_version, *, approved_by, reason, metric_snapshot, registry=None)`은
+승인을 canonical 등록 레코드에 결속한다(리뷰 P1, 3차) — 예전에는 `status`만
+`"registered"`이면 `version`/`artifactUri`/`datasetId`/`baselineVersion`이 없는 임의
+객체도, 정상 등록 결과를 등록 이후에 변조한 객체도 그대로 승인됐다.
+
+- `registry`(호출자가 유지하는 canonical 등록 이력, `rollback_model_version`의
+  `approved_history`와 같은 패턴)가 주어지면 `version`으로 그 안에서 정확히 한 건의
+  `registered` 레코드를 조회해 그 레코드를 승인 대상으로 삼는다 — 전달된
+  `model_version`이 그 레코드와 내용이 다르면(예: `artifactUri`를 바꿔 전달) 거부한다.
+- `registry`가 없으면 `model_version` 자신의 `registrationDigest`가 현재 내용과
+  일치하는지 재계산·대조한다 — 이 필드가 없는(`register_model_version()`을 거치지
+  않은) 레코드는 무조건 거부한다.
+
+`rollback_model_version(current, target, *, reason, target_environment, approved_history)`은
 target이 **실제로 이전 승인 버전**인지 검증한다 (리뷰 P1):
 
 - `target.status == "approved"` 이고 `current.version != target.version` (자기 롤백 금지)
-- `approved_history`가 주어지면 target/current가 그 안에서 **정확히 한 건의 승인
-  (`status == "approved"`) canonical 레코드**로 존재해야 한다(리뷰 P1, 2차) — 계보에
-  없으면 호출자가 넘긴 current/target 객체 자체의 값으로 대체하지 않고 무조건 거부한다
-  (예전에는 current가 계보에 없으면 current 객체 자체의 `approvedAt`으로 대체해서,
-  실제로는 `registered` 상태인 current에 `approvedAt`만 위조해 넣고 history에는 target만
-  넣는 방식으로 계보 검증 전체를 우회할 수 있었다). 그다음 각 항목의 `approvedAt`을
+- `approved_history`는 **필수** 인자다(리뷰 P1, 3차) — 예전에는 이 인자를 생략하면
+  `current`/`target` 객체 자체의 `approvedAt` 필드를 그대로 신뢰하는 폴백 경로가 있어서,
+  `registered` 상태인 `current`에 임의의 `approvedAt`만 넣어도(실제 승인 이력 없이)
+  과거 `target`으로의 롤백 액션이 만들어졌다. 이제 호출자가 신뢰 가능한 승인 이력(또는
+  canonical registry)을 항상 제공해야 하고, `current`/`target`은 반드시 그 계보 안에서
+  조회한 값만 쓴다.
+- target/current가 계보 안에서 **정확히 한 건의 승인(`status == "approved"`) canonical
+  레코드**로 존재해야 한다(리뷰 P1, 2차) — 계보에 없으면 호출자가 넘긴 current/target
+  객체 자체의 값으로 대체하지 않고 무조건 거부한다. 그다음 각 항목의 `approvedAt`을
   실제로 파싱해(UTC 정규화) **배열의 index 순서가 아니라 시간순으로 비교**한다 — history가
   시간 역순으로 전달돼도 forward rollback을 막는다(이전에는 배열 index로 계보 순서를
-  판단해 역순 배열을 넘기면 우회됐다). `approved_history`가 없으면 `target.approvedAt <
-  current.approvedAt`(마찬가지로 실제 파싱값)를 요구해 더
-  최신/동일 버전으로의 "롤백"을 차단한다.
+  판단해 역순 배열을 넘기면 우회됐다).
+- `target_environment`도 비어있지 않은 허용 환경 값(`production`/`staging`/
+  `development`)이어야 한다(리뷰 P1, 3차) — 임의 문자열을 그대로 기록하지 않는다.
 - 반환 레코드에 `targetApprovedAt`를 함께 남긴다.
 
 반환값은 별도의 rollback 액션 레코드(FUT-007 "배포와 롤백을 별도 작업으로 기록")다.
@@ -195,8 +246,24 @@ week2 `baseline.json`과 같은 구조(`mean`/`std`/`normal_range`)를 `features
 }
 ```
 
+`register_baseline_version()`은 `baseline_id`/`dataset_id`/`site_id`/`asset_id`가
+비어 있거나 `features`가 `{name: {"mean", "std", "normal_range"}}` 구조·유한값(`std`는
+양수)을 만족하지 않으면 거부한다(리뷰 P1) — 등록 시점에 검증된 내용만
+`registrationDigest`(불변 필드 canonical sha256)로 봉인해 이후 approve/activate가
+변조·누락을 탐지한다.
+
+`approve_baseline_version(baseline_version, *, approved_by, reason)`은 `reason`뿐 아니라
+`approved_by`도 비어있지 않은지 검증한다(리뷰 P1 — 예전에는 `approved_by` 검증이
+누락돼 공백 승인자가 승인 레코드에 그대로 남을 수 있었다). 승인 대상 객체 자체의
+식별 필드·features 구조도 재검증하고, `registrationDigest`가 등록 시점 내용과
+일치하는지 대조해 `register_baseline_version()`을 거치지 않은(또는 등록 이후 변조된)
+객체의 승인을 거부한다.
+
 `activate_baseline_version()`은 `status == "approved"`가 아니면 예외를 던진다 —
-"검증 데이터셋에 연결하고 승인 전 배포 금지"(FUT-011 수용 기준)를 코드 레벨에서 강제한다.
+"검증 데이터셋에 연결하고 승인 전 배포 금지"(FUT-011 수용 기준)를 코드 레벨에서
+강제한다. `status`만 맞춘 임의 객체(ID·features 없음)가 그대로 active로 전이되지
+않도록(리뷰 P1) 식별 필드·features를 다시 검증하고, `registrationDigest`가 승인~
+활성화 사이 변조되지 않았는지도 대조한다.
 
 ## 대상 확정 후 보완
 

@@ -9,6 +9,8 @@ freq_baseline_format.md 참고.
 """
 
 import hashlib
+import io
+import math
 import os
 import sys
 import uuid
@@ -403,6 +405,59 @@ def _finalize_test_evaluation(name: str, state: dict, samples_by_split: dict) ->
     return metrics, error_cases
 
 
+def _validate_artifact_payload(payload: dict) -> None:
+    """torch.load 직후, 추론에 쓰기 전에 아티팩트 내용의 구조·유한값을 검증한다.
+
+    [리뷰 P1, 2차] scaler 평균·표준편차와 threshold를 구조·크기·유한값 검증 없이
+    그대로 썼다 — std가 0이거나 NaN이면 정규화 결과가 Inf/NaN이 되고, threshold가
+    NaN이면 어떤 재구성 오차와 비교해도 False가 되어 큰 오차도 "정상"으로
+    판정된다. artifact feature_names에 중복이 있으면 입력 열을 이름으로
+    재정렬할 때도 잘못 복제될 수 있다.
+    """
+    model_type = payload.get("model_type")
+    if model_type not in _MODEL_BUILDERS:
+        raise ValueError(f"알 수 없는 model_type입니다: {model_type!r}")
+
+    feature_names = payload.get("feature_names")
+    if not isinstance(feature_names, list) or not feature_names:
+        raise ValueError(f"feature_names는 비어있지 않은 리스트여야 합니다: {feature_names!r}")
+    if len(feature_names) != len(set(feature_names)):
+        raise ValueError(f"artifact feature_names에 중복이 있습니다: {feature_names}")
+
+    input_dim = payload.get("input_dim")
+    if not isinstance(input_dim, int) or isinstance(input_dim, bool) or input_dim <= 0:
+        raise ValueError(f"input_dim은 양의 정수여야 합니다: {input_dim!r}")
+    if input_dim != len(feature_names):
+        raise ValueError(
+            f"input_dim({input_dim})이 feature_names 길이({len(feature_names)})와 다릅니다."
+        )
+
+    for label in ("scaler_mean", "scaler_std"):
+        values = payload.get(label)
+        if not isinstance(values, list) or len(values) != input_dim:
+            raise ValueError(f"{label}은 길이 {input_dim}인 리스트여야 합니다: {values!r}")
+        if any(
+            isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+            for v in values
+        ):
+            raise ValueError(f"{label}에 유한하지 않은 값이 있습니다: {values!r}")
+    scaler_std = payload["scaler_std"]
+    if any(v <= 0 for v in scaler_std):
+        raise ValueError(f"scaler_std는 모두 0보다 커야 합니다: {scaler_std!r}")
+
+    for label in ("threshold", "sigma"):
+        value = payload.get(label)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{label}은 유한한 실수여야 합니다: {value!r}")
+
+    seq_len = payload.get("seq_len")
+    if model_type == "lstm_autoencoder":
+        if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len <= 0:
+            raise ValueError(f"lstm_autoencoder는 양의 정수 seq_len이 필요합니다: {seq_len!r}")
+    elif seq_len is not None:
+        raise ValueError(f"{model_type!r}에는 seq_len이 없어야 합니다(None): {seq_len!r}")
+
+
 def score_from_artifact(
     artifact_path: str,
     matrix: np.ndarray,
@@ -429,14 +484,30 @@ def score_from_artifact(
     보정한 입력 단위(개별 벡터 vs 길이 `seq_len` 시퀀스)와 다르면 재구성 오차
     자체가 의미 없어진다.
 
-    - checksum 불일치 → ValueError (load 전에 거부)
+    [리뷰 P1, 3차] checksum을 계산한 바이트와 실제로 역직렬화하는 바이트가
+    같아야 한다 — 예전에는 `_sha256_of_file(artifact_path)`로 검사한 뒤
+    `torch.load(artifact_path, ...)`로 파일 경로를 다시 열었다. 이 두 파일 읽기
+    사이에 경로의 파일이 교체되면(TOCTOU) checksum 검증이 확인한 바이트와 실제로
+    로드되는 바이트가 달라질 수 있다. 파일을 한 번만 읽어 그 바이트로 checksum을
+    계산하고, 같은 바이트를 `io.BytesIO`로 역직렬화한다. `weights_only=True`(+
+    `map_location="cpu"`)로 로드해 pickle 역직렬화가 텐서/기본 타입 이외의 임의
+    객체를 실행하지 못하게 제한한다. `expected_checksum`은 호출자가 canonical
+    모델 등록 레코드(`register_model_version()`의 `artifactChecksum`)에서 가져와야
+    한다 — 호출자가 스스로 계산한 값을 넘기면 이 함수의 checksum 검증은
+    동어반복이 된다.
+
+    - checksum 불일치 → ValueError (역직렬화 전에 거부)
     - 특징 집합이 아티팩트와 다르면 → ValueError
     - 순서만 다르면 → 아티팩트 순서로 열 재정렬
     - 열 개수 불일치 / NaN·Inf → ValueError
     - dense_autoencoder인데 입력 ndim != 2, 또는 lstm_autoencoder인데
       ndim != 3이거나 시퀀스 길이(shape[-2])가 저장된 seq_len과 다르면 → ValueError
+    - 아티팩트 스키마(특징명 중복, scaler shape/finite/std>0, threshold/sigma
+      finite, model_type/seq_len) 오류 → ValueError (`_validate_artifact_payload`)
     """
-    actual_checksum = _sha256_of_file(artifact_path)
+    with open(artifact_path, "rb") as f:
+        artifact_bytes = f.read()
+    actual_checksum = f"sha256:{hashlib.sha256(artifact_bytes).hexdigest()}"
     if actual_checksum != expected_checksum:
         raise ValueError(
             "artifact checksum이 일치하지 않습니다 — 변조되었을 수 있어 추론을 "
@@ -444,7 +515,9 @@ def score_from_artifact(
             f"실제={actual_checksum!r})."
         )
 
-    payload = torch.load(artifact_path, weights_only=False)  # checksum 검증된 아티팩트
+    # checksum을 검증한 바로 그 바이트를 역직렬화한다(파일을 다시 열지 않음).
+    payload = torch.load(io.BytesIO(artifact_bytes), weights_only=True, map_location="cpu")
+    _validate_artifact_payload(payload)
     artifact_names = list(payload["feature_names"])
 
     input_names = list(input_feature_names)

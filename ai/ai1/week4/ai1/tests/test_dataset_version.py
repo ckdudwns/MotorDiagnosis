@@ -31,6 +31,7 @@ from dataset_version import (  # noqa: E402
     compute_dataset_checksum,
     compute_snapshot_digest,
     compute_rows_fingerprint,
+    compute_source_checksum,
     dataset_version_summary,
     is_legacy_v1_frozen,
 )
@@ -41,7 +42,29 @@ from model_version import (  # noqa: E402
     register_baseline_version,
     approve_baseline_version,
     activate_baseline_version,
+    compute_registration_digest,
+    compute_baseline_registration_digest,
 )
+
+
+def _checksum_inputs() -> dict:
+    """register_dataset.build_manifest()가 채우는 checksumInputs를 흉내낸다 —
+    compute_source_checksum()이 source.checksum/id를 재계산하는 데 쓰는 나머지
+    입력(rows/labelMapping만으로는 재현 불가능한 것들)."""
+    return {
+        "windowSize": 2048,
+        "hopSize": 2048,
+        "seed": 42,
+        "featurePipelineVersion": "test.pipeline.v1",
+        "featureConfig": {
+            "sampleRate": 12000,
+            "frameLength": 2048,
+            "hopLength": 512,
+            "nMfcc": 13,
+            "bandEdges": [0, 500, 1000, 2000, 4000, 8000],
+        },
+        "splitStrategyKey": "operating_condition_holdout",
+    }
 
 
 def _draft_manifest() -> dict:
@@ -50,15 +73,16 @@ def _draft_manifest() -> dict:
         {"sample_id": "A", "common_label": "NORMAL"},
         {"sample_id": "B", "common_label": "ANOMALY"},
     ]
-    return {
-        "id": "DS-TEST-001",
+    manifest = {
+        "id": "DS-TEST-001-000000000000",
         "name": "test-dataset",
         "status": "draft",
         "source": {
             "type": "external",
             "uri": "https://example.invalid/cwru",
             "license": "test-license",
-            "checksum": "sha256:cwru-version-checksum",
+            "files": {"97.mat": {"sha256": "sha256:aaa", "label": "NORMAL"}},
+            "checksum": None,  # 아래에서 실제 재계산 가능한 값으로 채운다.
         },
         "compatibility": {"signalType": ["vibration"], "samplingRateHz": 12000},
         "labelTaxonomyVersion": "CWRU-FAULT-V1",
@@ -68,12 +92,19 @@ def _draft_manifest() -> dict:
         # rows에서 다시 계산 가능한 fingerprint. build_manifest()가 실제로 채우는
         # 값을 흉내낸다 — freeze_dataset_version()이 이 값을 rows와 대조한다.
         "featureOutputFingerprint": compute_rows_fingerprint(rows),
+        "checksumInputs": _checksum_inputs(),
         "split": {"train": 0.7, "validation": 0.2, "test": 0.1},
         "splitStrategy": "operating_condition_holdout: ...",
         "holdoutType": "operating_condition",
         "independentHoldout": False,
         "rows": rows,
     }
+    # build_manifest()처럼 source.checksum과 id suffix를 canonical 재계산 값으로
+    # 맞춘다 — freeze_dataset_version()이 이를 draft 필드만으로 재검증한다.
+    manifest["source"]["checksum"] = compute_source_checksum(manifest)
+    checksum_suffix = manifest["source"]["checksum"].split(":", 1)[1][:12]
+    manifest["id"] = f"DS-TEST-001-{checksum_suffix}"
+    return manifest
 
 
 def _draft_manifest_legacy() -> dict:
@@ -176,10 +207,14 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
 
     def test_verify_reproducibility_false_when_source_checksum_differs(self):
         """[리뷰 P1] rows/labelMapping/split만 같으면 원본(source) checksum이
-        달라도 이전에는 재현 성공으로 오판됐다."""
+        달라도 이전에는 재현 성공으로 오판됐다. [리뷰 P1, 3차] source.checksum
+        필드 그 자체가 아니라 그 값을 결정하는 실제 내용(원본 파일 sha256)이
+        달라야 한다 — checksumInputs가 있으면 recomputed_manifest의 필드값은
+        신뢰하지 않고 내용으로 재계산하기 때문이다."""
         frozen = freeze_dataset_version(_draft_manifest())
         other = _draft_manifest()
-        other["source"]["checksum"] = "sha256:different-source-checksum"
+        other["source"]["files"]["97.mat"]["sha256"] = "sha256:different-file-hash"
+        other["source"]["checksum"] = compute_source_checksum(other)  # 내용에 맞춰 재계산
         self.assertFalse(verify_reproducibility(frozen, other))
 
     def test_verify_reproducibility_false_when_label_policy_version_differs(self):
@@ -238,7 +273,12 @@ class TestFreezeRequiresV13Fields(unittest.TestCase):
             freeze_dataset_version(_draft_manifest_legacy())
 
     def test_each_required_field_missing_rejects(self):
-        for drop in ("labelPolicyVersion", "snapshotSchemaVersion", "featureOutputFingerprint"):
+        for drop in (
+            "labelPolicyVersion",
+            "snapshotSchemaVersion",
+            "featureOutputFingerprint",
+            "checksumInputs",
+        ):
             draft = _draft_manifest()
             del draft[drop]
             with self.assertRaises(ValueError, msg=drop):
@@ -280,12 +320,71 @@ class TestFreezeRejectsStaleFeatureOutputFingerprint(unittest.TestCase):
         freeze_dataset_version(_draft_manifest())  # no raise
 
 
+class TestFreezeRecomputesFullCanonicalIdentity(unittest.TestCase):
+    """[리뷰 P1, 3차] rows 변경 후 fingerprint만 재계산하거나(현재 rows와의 대조는
+    통과), fingerprint에는 안 들어가지만 checksum 계산에는 들어가는 필드
+    (labelMapping 등)만 바꿔도, 예전 source.checksum/id를 그대로 승계해 동결·
+    승인될 수 있었다. freeze는 draft가 가진 필드만으로 source.checksum과 id
+    suffix를 독립적으로 재계산해 대조해야 한다."""
+
+    def test_rows_changed_and_fingerprint_recomputed_to_match_still_rejected(self):
+        """공격자가 rows를 바꾸고 featureOutputFingerprint도 새 rows에 맞게
+        재계산해 신고하면(freeze의 fingerprint-vs-rows 대조는 통과) — 하지만
+        id/source.checksum은 예전 rows 기준 값 그대로 방치했다면 여전히 거부돼야
+        한다."""
+        from dataset_version import compute_rows_fingerprint as _fp
+
+        draft = _draft_manifest()
+        draft["rows"][0]["common_label"] = "TAMPERED"
+        draft["featureOutputFingerprint"] = _fp(draft["rows"])  # 새 rows와는 일치
+        # id/source.checksum은 원래 rows 기준 값 그대로(재계산 안 함).
+        with self.assertRaises(ValueError):
+            freeze_dataset_version(draft)
+
+    def test_unused_label_mapping_change_with_stale_checksum_rejected(self):
+        """featureOutputFingerprint는 rows만으로 결정되므로 labelMapping을 바꿔도
+        변하지 않는다 — 하지만 source.checksum 계산에는 labelMapping이 들어가므로,
+        labelMapping만 바꾸고 id/checksum을 그대로 두면 checksum이 실제로는
+        더 이상 이 draft 내용을 반영하지 않는다."""
+        draft = _draft_manifest()
+        draft["labelMapping"] = dict(draft["labelMapping"], FAULT="OTHER")
+        with self.assertRaises(ValueError):
+            freeze_dataset_version(draft)
+
+    def test_checksum_inputs_change_with_stale_declared_checksum_rejected(self):
+        """window_size 등 checksumInputs만 바꾸고 source.checksum/id를 그대로 두면
+        거부돼야 한다 — rows/fingerprint가 그대로여도 checksum이 반영해야 할
+        입력이 달라졌다."""
+        draft = _draft_manifest()
+        draft["checksumInputs"]["windowSize"] = 4096
+        with self.assertRaises(ValueError):
+            freeze_dataset_version(draft)
+
+    def test_id_suffix_mismatched_with_source_checksum_rejected(self):
+        draft = _draft_manifest()
+        draft["id"] = "DS-TEST-001-000000000000"  # source.checksum과 무관한 suffix
+        with self.assertRaises(ValueError):
+            freeze_dataset_version(draft)
+
+    def test_verify_reproducibility_rejects_manifest_whose_checksum_field_is_forged_to_match(self):
+        """recomputed_manifest의 실제 내용(checksumInputs)은 frozen과 다른데,
+        source.checksum 필드만 frozen과 같은 값으로 위조하면 — 필드값만 비교하던
+        예전 방식은 "재현 성공"으로 오판했다. checksumInputs가 있으면 필드값을
+        믿지 않고 각자 내용으로 독립 재계산해 대조해야 한다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        forged = _draft_manifest()
+        forged["checksumInputs"]["windowSize"] = 4096  # 실제 내용이 다름
+        forged["source"]["checksum"] = frozen["source"]["checksum"]  # 필드만 위조해 맞춤
+        self.assertFalse(verify_reproducibility(frozen, forged))
+
+
 class TestV13FrozenFields(unittest.TestCase):
     def test_freeze_carries_policy_schema_and_snapshot_checksum(self):
-        frozen = freeze_dataset_version(_draft_manifest())
+        draft = _draft_manifest()
+        frozen = freeze_dataset_version(draft)
         self.assertEqual(frozen["labelPolicyVersion"], "LABEL-POLICY-V2")
         self.assertEqual(frozen["snapshotSchemaVersion"], "2")
-        self.assertEqual(frozen["snapshotChecksum"], "sha256:cwru-version-checksum")
+        self.assertEqual(frozen["snapshotChecksum"], draft["source"]["checksum"])
 
     def test_datasetChecksum_calc_unchanged_reproducibility_holds(self):
         frozen = freeze_dataset_version(_draft_manifest())
@@ -293,12 +392,13 @@ class TestV13FrozenFields(unittest.TestCase):
         self.assertTrue(verify_reproducibility(frozen, _draft_manifest()))
 
     def test_approve_carries_new_fields(self):
+        draft = _draft_manifest()
         approved = approve_dataset_version(
-            freeze_dataset_version(_draft_manifest()),
+            freeze_dataset_version(draft),
             approved_by="mgr", reason="검증 완료",
         )
         self.assertEqual(approved["labelPolicyVersion"], "LABEL-POLICY-V2")
-        self.assertEqual(approved["snapshotChecksum"], "sha256:cwru-version-checksum")
+        self.assertEqual(approved["snapshotChecksum"], draft["source"]["checksum"])
         self.assertEqual(approved["snapshotDigest"], compute_snapshot_digest(approved))
 
 
@@ -468,18 +568,49 @@ class TestLegacyV1FrozenTolerance(unittest.TestCase):
         self.assertNotIn("rows", summary)
 
 
+class TestTrustedLegacyRequiresActualBool(unittest.TestCase):
+    """[리뷰 P1] trusted_legacy는 실제 bool만 허용한다 — 문자열 "false"는
+    파이썬에서 truthy라서, 예전에는 legacy 완화 경로가 잘못 켜져 snapshotDigest
+    없는 변조 레코드의 검증·승인·재현성 확인이 통과했다."""
+
+    def test_approve_rejects_string_false(self):
+        legacy = _legacy_frozen()
+        with self.assertRaises(TypeError):
+            approve_dataset_version(
+                legacy, approved_by="mgr", reason="x", trusted_legacy="false"
+            )
+
+    def test_verify_frozen_integrity_rejects_string_false(self):
+        legacy = _legacy_frozen()
+        with self.assertRaises(TypeError):
+            verify_frozen_integrity(legacy, trusted_legacy="false")
+
+    def test_verify_reproducibility_rejects_string_false(self):
+        legacy = _legacy_frozen()
+        recomputed = _draft_manifest_legacy()
+        with self.assertRaises(TypeError):
+            verify_reproducibility(legacy, recomputed, trusted_legacy="false")
+
+    def test_approve_rejects_int_one_as_truthy_stand_in(self):
+        legacy = _legacy_frozen()
+        with self.assertRaises(TypeError):
+            approve_dataset_version(legacy, approved_by="mgr", reason="x", trusted_legacy=1)
+
+
 class TestModelVersionLifecycle(unittest.TestCase):
     def test_register_starts_as_registered(self):
         mv = register_model_version(
             version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
-            baseline_version="b1", metrics={"f1": 0.9},
+            baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
         )
         self.assertEqual(mv["status"], "registered")
+        self.assertEqual(mv["artifactChecksum"], "sha256:aaa")
+        self.assertIn("registrationDigest", mv)
 
     def test_approve_requires_registered(self):
         mv = register_model_version(
             version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
-            baseline_version="b1", metrics={"f1": 0.9},
+            baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
         )
         approved = approve_model_version(
             mv, approved_by="mgr", reason="지표 통과", metric_snapshot={"f1": 0.9}
@@ -497,7 +628,7 @@ class TestModelVersionLifecycle(unittest.TestCase):
         metrics = {"f1": 0.91, "cm": {"tp": 10, "fp": 1}}
         mv = register_model_version(
             version="v1", artifact_uri="a", dataset_id="d", baseline_version="b",
-            metrics=metrics,
+            metrics=metrics, artifact_checksum="sha256:aaa",
         )
         approved = approve_model_version(
             mv, approved_by="mgr", reason="지표 통과", metric_snapshot=metrics
@@ -511,7 +642,7 @@ class TestModelVersionLifecycle(unittest.TestCase):
     def test_explicit_metric_snapshot_is_deep_copied(self):
         mv = register_model_version(
             version="v1", artifact_uri="a", dataset_id="d", baseline_version="b",
-            metrics={"f1": 0.5},
+            metrics={"f1": 0.5}, artifact_checksum="sha256:aaa",
         )
         snap = {"f1": 0.91, "cm": {"tp": 3}}
         approved = approve_model_version(
@@ -527,11 +658,13 @@ class TestRegisterModelVersionValidation(unittest.TestCase):
 
     _VALID_KWARGS = dict(
         version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
-        baseline_version="b1", metrics={"f1": 0.9},
+        baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
     )
 
     def test_blank_required_strings_rejected(self):
-        for field in ("version", "artifact_uri", "dataset_id", "baseline_version"):
+        for field in (
+            "version", "artifact_uri", "dataset_id", "baseline_version", "artifact_checksum",
+        ):
             for blank in ("", "   "):
                 kwargs = dict(self._VALID_KWARGS)
                 kwargs[field] = blank
@@ -550,6 +683,10 @@ class TestRegisterModelVersionValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             register_model_version(**kwargs)
 
+    def test_registration_digest_matches_recompute(self):
+        mv = register_model_version(**self._VALID_KWARGS)
+        self.assertEqual(mv["registrationDigest"], compute_registration_digest(mv))
+
 
 class TestApproveModelVersionRequiresAuditTrail(unittest.TestCase):
     """[리뷰 P1] 승인은 승인자와 명시적인 지표 스냅샷 없이는 이뤄질 수 없다."""
@@ -557,7 +694,7 @@ class TestApproveModelVersionRequiresAuditTrail(unittest.TestCase):
     def _registered(self):
         return register_model_version(
             version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
-            baseline_version="b1", metrics={"f1": 0.9},
+            baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
         )
 
     def test_missing_approved_by_rejected(self):
@@ -599,6 +736,86 @@ class TestApproveModelVersionRequiresAuditTrail(unittest.TestCase):
         self.assertEqual(approved["metricSnapshot"], {"f1": 0.95})
 
 
+class TestApproveModelVersionBoundToCanonicalRegistration(unittest.TestCase):
+    """[리뷰 P1, 3차] 승인을 canonical 등록 레코드에 결속한다 — status만
+    "registered"인 임의 객체나, 등록 이후 변조된 model_version은 거부돼야 한다."""
+
+    def test_hand_crafted_object_without_registration_digest_rejected(self):
+        """version/artifact/dataset/baseline 정보가 없는(또는 임의로 채운) 객체도
+        status만 registered로 맞추면 예전에는 승인됐다 — registrationDigest가
+        없는 레코드는 무조건 거부해야 한다."""
+        forged = {"status": "registered", "version": "", "artifactUri": ""}
+        with self.assertRaises(ValueError):
+            approve_model_version(
+                forged, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}
+            )
+
+    def test_tampered_version_after_registration_rejected(self):
+        """정상 등록 결과의 version/artifactUri를 등록 이후에 바꾸면(registry 없이
+        전달돼도) registrationDigest 불일치로 거부돼야 한다."""
+        mv = register_model_version(
+            version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
+            baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
+        )
+        mv["version"] = "v1-tampered"
+        with self.assertRaises(ValueError):
+            approve_model_version(
+                mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}
+            )
+
+    def test_tampered_artifact_checksum_after_registration_rejected(self):
+        mv = register_model_version(
+            version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
+            baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
+        )
+        mv["artifactChecksum"] = "sha256:swapped-artifact"
+        with self.assertRaises(ValueError):
+            approve_model_version(
+                mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}
+            )
+
+    def test_registry_lookup_approves_canonical_entry(self):
+        mv = register_model_version(
+            version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
+            baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
+        )
+        registry = [mv]
+        approved = approve_model_version(
+            mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9},
+            registry=registry,
+        )
+        self.assertEqual(approved["artifactUri"], "file:///v1.pt")
+
+    def test_registry_rejects_caller_value_that_diverges_from_canonical_entry(self):
+        """registry가 주어지면 호출자가 넘긴 model_version이 canonical 등록본과
+        내용이 달라도(예: artifactUri를 바꿔 전달) registry의 값을 대체로 쓰지
+        않고 거부한다 — 계보 없이는 계보 밖 값을 신뢰하지 않는 rollback과 같은
+        패턴."""
+        mv = register_model_version(
+            version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
+            baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
+        )
+        registry = [mv]
+        forged_copy = copy.deepcopy(mv)
+        forged_copy["artifactUri"] = "file:///swapped.pt"
+        with self.assertRaises(ValueError):
+            approve_model_version(
+                forged_copy, approved_by="mgr", reason="ok",
+                metric_snapshot={"f1": 0.9}, registry=registry,
+            )
+
+    def test_registry_rejects_version_not_present_exactly_once(self):
+        mv = register_model_version(
+            version="v1", artifact_uri="file:///v1.pt", dataset_id="DS-1",
+            baseline_version="b1", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
+        )
+        with self.assertRaises(ValueError):
+            approve_model_version(
+                mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9},
+                registry=[],  # v1이 registry에 없음
+            )
+
+
 class TestRollbackLineage(unittest.TestCase):
     """[리뷰 P1] 롤백 대상은 실제로 current보다 앞선 승인 버전이어야 한다.
     자기 자신·더 최신 버전으로의 '롤백'을 차단한다."""
@@ -606,7 +823,7 @@ class TestRollbackLineage(unittest.TestCase):
     def _approved(self, version, when):
         mv = register_model_version(
             version=version, artifact_uri=f"file:///{version}.pt", dataset_id="d",
-            baseline_version="b", metrics={"f1": 0.9},
+            baseline_version="b", metrics={"f1": 0.9}, artifact_checksum="sha256:aaa",
         )
         approved = approve_model_version(
             mv, approved_by="mgr", reason="ok", metric_snapshot={"f1": 0.9}
@@ -618,7 +835,8 @@ class TestRollbackLineage(unittest.TestCase):
         v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
         v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
         action = rollback_model_version(
-            v2, v1, reason="v2 회귀", target_environment="prod"
+            v2, v1, reason="v2 회귀", target_environment="production",
+            approved_history=[v1, v2],
         )
         self.assertEqual(action["fromVersion"], "v2")
         self.assertEqual(action["toVersion"], "v1")
@@ -627,29 +845,83 @@ class TestRollbackLineage(unittest.TestCase):
     def test_self_rollback_rejected(self):
         v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
         with self.assertRaises(ValueError):
-            rollback_model_version(v1, v1, reason="x", target_environment="prod")
+            rollback_model_version(
+                v1, v1, reason="x", target_environment="production",
+                approved_history=[v1],
+            )
 
     def test_forward_rollback_rejected(self):
         v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
         v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
         with self.assertRaises(ValueError):
-            rollback_model_version(v1, v2, reason="x", target_environment="prod")
+            rollback_model_version(
+                v1, v2, reason="x", target_environment="production",
+                approved_history=[v1, v2],
+            )
 
     def test_non_approved_target_rejected(self):
         v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
         v1_reg = register_model_version(
             version="v1", artifact_uri="a1", dataset_id="d", baseline_version="b",
-            metrics={},
+            metrics={}, artifact_checksum="sha256:bbb",
         )
         with self.assertRaises(ValueError):  # target(v1)이 approved가 아님
-            rollback_model_version(v2, v1_reg, reason="x", target_environment="prod")
+            rollback_model_version(
+                v2, v1_reg, reason="x", target_environment="production",
+                approved_history=[v2, v1_reg],
+            )
 
-    def test_rollback_without_approvedAt_and_no_history_rejected(self):
+    def test_missing_approved_history_raises_type_error(self):
+        """[리뷰 P1, 3차] approved_history는 필수 인자다 — 생략하면(예전처럼
+        current/target 객체 자체의 approvedAt을 신뢰하는 폴백 경로로 빠지지 않고)
+        호출 자체가 실패해야 한다."""
         v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
         v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
-        del v2["approvedAt"]  # current에 승인 시각이 없으면 계보 검증 불가
+        with self.assertRaises(TypeError):
+            rollback_model_version(v2, v1, reason="x", target_environment="production")
+
+    def test_forged_approvedAt_without_being_in_history_rejected(self):
+        """approved_history를 명시적으로 전달하더라도, registered 상태인 current에
+        임의의 approvedAt만 심어 놓고 그 current가 계보에 없으면 여전히 거부돼야
+        한다 — 계보 밖 객체 자체의 값을 신뢰하지 않는다."""
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2_unapproved = register_model_version(
+            version="v2", artifact_uri="file:///v2.pt", dataset_id="d",
+            baseline_version="b", metrics={"f1": 0.9}, artifact_checksum="sha256:ccc",
+        )
+        v2_unapproved["approvedAt"] = "2026-08-10T00:00:00+00:00"  # 위조된 승인 시각
         with self.assertRaises(ValueError):
-            rollback_model_version(v2, v1, reason="x", target_environment="prod")
+            rollback_model_version(
+                v2_unapproved, v1, reason="x", target_environment="production",
+                approved_history=[v1],  # v2는 계보에 없음
+            )
+
+    def test_empty_approved_history_rejected(self):
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v2, v1, reason="x", target_environment="production", approved_history=[]
+            )
+
+    def test_blank_target_environment_rejected(self):
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v2, v1, reason="x", target_environment="", approved_history=[v1, v2]
+            )
+
+    def test_unrecognized_target_environment_rejected(self):
+        """[리뷰 P1, 3차] target_environment는 허용된 환경 값이어야 한다 — 임의
+        문자열을 그대로 기록하지 않는다."""
+        v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
+        v2 = self._approved("v2", "2026-08-10T00:00:00+00:00")
+        with self.assertRaises(ValueError):
+            rollback_model_version(
+                v2, v1, reason="x", target_environment="not-a-real-env",
+                approved_history=[v1, v2],
+            )
 
     def test_approved_history_lineage_enforced(self):
         v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
@@ -658,18 +930,18 @@ class TestRollbackLineage(unittest.TestCase):
         history = [v1, v2, v3]
         # v3 -> v1 (계보상 앞) OK
         rollback_model_version(
-            v3, v1, reason="ok", target_environment="prod", approved_history=history
+            v3, v1, reason="ok", target_environment="production", approved_history=history
         )
         # v1 -> v3 (계보상 뒤) 거부
         with self.assertRaises(ValueError):
             rollback_model_version(
-                v1, v3, reason="x", target_environment="prod", approved_history=history
+                v1, v3, reason="x", target_environment="production", approved_history=history
             )
         # 계보에 없는 target 거부
         stray = self._approved("vX", "2026-07-01T00:00:00+00:00")
         with self.assertRaises(ValueError):
             rollback_model_version(
-                v3, stray, reason="x", target_environment="prod",
+                v3, stray, reason="x", target_environment="production",
                 approved_history=history,
             )
 
@@ -686,12 +958,12 @@ class TestRollbackLineage(unittest.TestCase):
         # 실제 approvedAt 기준으로는 v3가 v1보다 미래이므로 forward rollback -> 거부.
         with self.assertRaises(ValueError):
             rollback_model_version(
-                v1, v3, reason="x", target_environment="prod",
+                v1, v3, reason="x", target_environment="production",
                 approved_history=reversed_history,
             )
         # v3 -> v1은 실제로 앞선 버전이므로 배열 순서와 무관하게 여전히 허용.
         rollback_model_version(
-            v3, v1, reason="ok", target_environment="prod",
+            v3, v1, reason="ok", target_environment="production",
             approved_history=reversed_history,
         )
 
@@ -701,7 +973,7 @@ class TestRollbackLineage(unittest.TestCase):
         dup_v1 = self._approved("v1", "2026-08-15T00:00:00+00:00")
         with self.assertRaises(ValueError):
             rollback_model_version(
-                v2, v1, reason="x", target_environment="prod",
+                v2, v1, reason="x", target_environment="production",
                 approved_history=[v1, dup_v1],
             )
 
@@ -713,13 +985,13 @@ class TestRollbackLineage(unittest.TestCase):
         v1 = self._approved("v1", "2026-08-01T00:00:00+00:00")
         v2_unapproved = register_model_version(
             version="v2", artifact_uri="file:///v2.pt", dataset_id="d",
-            baseline_version="b", metrics={"f1": 0.9},
+            baseline_version="b", metrics={"f1": 0.9}, artifact_checksum="sha256:ddd",
         )
         self.assertEqual(v2_unapproved["status"], "registered")
         v2_unapproved["approvedAt"] = "2026-08-10T00:00:00+00:00"  # 위조된 승인 시각
         with self.assertRaises(ValueError):
             rollback_model_version(
-                v2_unapproved, v1, reason="x", target_environment="prod",
+                v2_unapproved, v1, reason="x", target_environment="production",
                 approved_history=[v1],  # v2는 계보에 없음
             )
 
@@ -732,16 +1004,18 @@ class TestRollbackLineage(unittest.TestCase):
         tampered_v2_entry["status"] = "registered"
         with self.assertRaises(ValueError):
             rollback_model_version(
-                v2, v1, reason="x", target_environment="prod",
+                v2, v1, reason="x", target_environment="production",
                 approved_history=[v1, tampered_v2_entry],
             )
 
 
 class TestBaselineVersionLifecycle(unittest.TestCase):
+    _FEATURES = {"rms_mean": {"mean": 0.05, "std": 0.01, "normal_range": [0.03, 0.07]}}
+
     def test_activate_requires_approved(self):
         bv = register_baseline_version(
             baseline_id="BL-1", dataset_id="DS-1", site_id="SITE-01",
-            asset_id="SITE-01-MOT-02", features={},
+            asset_id="SITE-01-MOT-02", features=self._FEATURES,
         )
         with self.assertRaises(ValueError):
             activate_baseline_version(bv)
@@ -762,6 +1036,94 @@ class TestBaselineVersionLifecycle(unittest.TestCase):
         bv["features"]["rms_mean"]["std"] = 99.0
         self.assertEqual(approved["features"]["rms_mean"]["mean"], 0.05)
         self.assertEqual(active["features"]["rms_mean"]["std"], 0.01)
+
+    def test_registration_digest_matches_recompute(self):
+        bv = register_baseline_version(
+            baseline_id="BL-1", dataset_id="DS-1", site_id="SITE-01",
+            asset_id="SITE-01-MOT-02", features=self._FEATURES,
+        )
+        self.assertEqual(
+            bv["registrationDigest"], compute_baseline_registration_digest(bv)
+        )
+
+
+class TestBaselineVersionValidation(unittest.TestCase):
+    """[리뷰 P1] 빈 baseline/dataset/site/asset ID, 구조가 잘못된 features, 공백
+    승인자가 draft에서 approved/active까지 조용히 전이되지 않도록 검증한다."""
+
+    _VALID_KWARGS = dict(
+        baseline_id="BL-1", dataset_id="DS-1", site_id="SITE-01",
+        asset_id="SITE-01-MOT-02",
+        features={"rms_mean": {"mean": 0.05, "std": 0.01, "normal_range": [0.03, 0.07]}},
+    )
+
+    def test_blank_id_fields_rejected(self):
+        for field in ("baseline_id", "dataset_id", "site_id", "asset_id"):
+            for blank in ("", "   "):
+                kwargs = dict(self._VALID_KWARGS)
+                kwargs[field] = blank
+                with self.assertRaises(ValueError, msg=f"{field}={blank!r}"):
+                    register_baseline_version(**kwargs)
+
+    def test_non_dict_features_rejected(self):
+        kwargs = dict(self._VALID_KWARGS)
+        kwargs["features"] = "not-a-dict"
+        with self.assertRaises(ValueError):
+            register_baseline_version(**kwargs)
+
+    def test_empty_features_rejected(self):
+        kwargs = dict(self._VALID_KWARGS)
+        kwargs["features"] = {}
+        with self.assertRaises(ValueError):
+            register_baseline_version(**kwargs)
+
+    def test_non_positive_std_rejected(self):
+        for bad_std in (0, -0.01, float("nan")):
+            kwargs = dict(self._VALID_KWARGS)
+            kwargs["features"] = {
+                "rms_mean": {"mean": 0.05, "std": bad_std, "normal_range": [0.03, 0.07]}
+            }
+            with self.assertRaises(ValueError, msg=f"std={bad_std!r}"):
+                register_baseline_version(**kwargs)
+
+    def test_non_finite_mean_rejected(self):
+        kwargs = dict(self._VALID_KWARGS)
+        kwargs["features"] = {
+            "rms_mean": {"mean": float("inf"), "std": 0.01, "normal_range": [0.03, 0.07]}
+        }
+        with self.assertRaises(ValueError):
+            register_baseline_version(**kwargs)
+
+    def test_malformed_normal_range_rejected(self):
+        kwargs = dict(self._VALID_KWARGS)
+        kwargs["features"] = {
+            "rms_mean": {"mean": 0.05, "std": 0.01, "normal_range": [0.03]}
+        }
+        with self.assertRaises(ValueError):
+            register_baseline_version(**kwargs)
+
+    def test_blank_approved_by_rejected(self):
+        bv = register_baseline_version(**self._VALID_KWARGS)
+        with self.assertRaises(ValueError):
+            approve_baseline_version(bv, approved_by="   ", reason="ok")
+
+    def test_hand_crafted_approved_object_without_registration_digest_rejected(self):
+        """status만 "approved"로 맞춘 임의 객체는(ID·features 없이도) 예전에는
+        activate까지 통과했다 — registrationDigest가 없으면 activate가 거부해야
+        한다."""
+        forged = {
+            "status": "approved", "id": "", "datasetId": "", "siteId": "",
+            "assetId": "", "features": {},
+        }
+        with self.assertRaises(ValueError):
+            activate_baseline_version(forged)
+
+    def test_tampered_features_after_approval_rejected_by_activate(self):
+        bv = register_baseline_version(**self._VALID_KWARGS)
+        approved = approve_baseline_version(bv, approved_by="mgr", reason="ok")
+        approved["features"]["rms_mean"]["std"] = 999.0  # 승인 이후 변조
+        with self.assertRaises(ValueError):
+            activate_baseline_version(approved)
 
 
 @unittest.skipUnless(

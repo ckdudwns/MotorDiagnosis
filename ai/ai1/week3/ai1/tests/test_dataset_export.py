@@ -963,6 +963,80 @@ class TestExportDatasetSynthetic(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_same_id_metadata_only_change_not_affecting_rows_is_rejected(self):
+        """[리뷰 P1] source.license나 현재 rows에서 사용되지 않는 labelMapping
+        항목만 바뀌면 CSV는 바이트까지 동일하다 — 예전 코드는 CSV만 비교해서
+        이런 경우를 "동일 내용"으로 오판해 기존 JSON manifest(오래된 license
+        텍스트)를 그대로 두고 재사용을 허용했다. CSV뿐 아니라 canonical JSON
+        manifest도 함께 비교해야 한다."""
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_license_conflict_")
+        try:
+            export_dataset(manifest, tmp_dir)
+
+            # license만 변경 — 두 행의 known_label 모두 labelMapping에 그대로
+            # 있으므로 CSV(label_status 등)는 바이트까지 동일하게 재생성된다.
+            manifest["source"] = dict(manifest["source"], license="CHANGED-LICENSE")
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_unused_label_mapping_entry_change_is_rejected_not_silently_reused(self):
+        """CSV에 나타나지 않는(현재 rows의 어떤 known_label과도 매치되지 않는)
+        labelMapping 항목만 추가/변경해도 JSON manifest의 labelMapping 필드는
+        달라진다 — CSV만 비교하면 이 변경을 못 잡고 예전 JSON을 그대로 재사용한다."""
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_unused_mapping_")
+        try:
+            export_dataset(manifest, tmp_dir)
+
+            # 현재 rows의 known_label(NORMAL/BEARING_FAULT_INNER)과 무관한 기존
+            # 항목(BEARING_FAULT_OUTER)의 값만 바꾼다 — CSV의 label_status 파생
+            # 컬럼에는 영향이 없다.
+            self.assertNotIn(
+                "BEARING_FAULT_OUTER", {r["known_label"] for r in manifest["rows"]}
+            )
+            manifest["labelMapping"] = dict(
+                manifest["labelMapping"], BEARING_FAULT_OUTER="OTHER"
+            )
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_missing_manifest_json_is_healed_on_reexport_of_identical_content(self):
+        """[리뷰 P1] 기존 JSON manifest가 삭제된(또는 이전 실행이 XLSX 저장
+        직후 중단된) 채로 남아 있으면, 예전 코드는 CSV만 같으면 그 불완전한
+        디렉터리를 그대로 재사용해 CURRENT가 계속 manifest.json 없는 디렉터리를
+        가리켰다. 완전한 산출물로 치유(교체)해야 한다."""
+        from export_dataset import resolve_current_version_dir
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_heal_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+            os.remove(result_1["manifest_path"])  # 손상/삭제 재현
+            self.assertFalse(os.path.exists(result_1["manifest_path"]))
+
+            # 같은(동일한) manifest를 다시 export — 내용은 바뀌지 않았다.
+            result_2 = export_dataset(manifest, tmp_dir)
+
+            self.assertTrue(os.path.exists(result_2["manifest_path"]))
+            with open(result_2["manifest_path"], encoding="utf-8") as f:
+                json.load(f)  # 파싱 가능한 완전한 JSON
+            self.assertEqual(
+                result_2["version_dir"], resolve_current_version_dir(tmp_dir)
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def test_concurrent_exports_of_different_manifests_never_expose_mixed_version(self):
         """서로 다른 두 버전을 동시에 내보내도, CURRENT가 가리키는 버전의
         csv/xlsx/manifest 세 파일은 항상 같은 버전에서 나온 것이어야 한다

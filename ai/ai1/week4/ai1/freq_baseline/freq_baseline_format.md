@@ -121,16 +121,32 @@ sha256(`artifactChecksum`)이, 최상위에는 검증에 쓴 `datasetSnapshotDig
 **추론 스키마 검증 (리뷰 P1).**
 `score_from_artifact(path, matrix, *, input_feature_names, expected_checksum)`는
 입력 열 이름과 `expected_checksum`(보고서의 `artifactChecksum`)을 모두 **필수**로 받는다.
-`expected_checksum`은 `torch.load()`로 파일을 읽기 **전에** SHA-256을 대조한다 —
-`torch.load()`는 threshold 등 내용이 변조된 아티팩트도 오류 없이 그대로 읽어버리므로,
-checksum 검증 없이는 변조된 임계값·가중치가 그대로 추론에 쓰인다. 이어서 입력 열 이름을
-artifact에 저장된 학습 시점 순서와 대조한다: 특징 집합이 다르면 거부, 순서만 다르면 이름
-기준 재정렬, 열 개수 불일치·NaN/Inf도 거부. 모델별 입력 **rank(차원 수)**도 검증한다
-(리뷰 P1, 2차) — `dense_autoencoder`는 `ndim == 2`, `lstm_autoencoder`는 `ndim == 3`
-**및** 시퀀스 길이(`shape[-2]`)가 아티팩트에 저장된 `seq_len`과 같아야 한다. 이전에는
-마지막(특징) 축만 봐서 Dense에 1차원/3차원 입력을, LSTM에 다른 길이의 시퀀스를 넣어도
-조용히 판정이 나왔다. 재로딩 전후 판정이 학습 때 (비독립) test 지표와 일치함을 테스트로
-검증한다.
+`expected_checksum`은 역직렬화하기 **전에** SHA-256을 대조한다 — 역직렬화는 threshold
+등 내용이 변조된 아티팩트도 오류 없이 그대로 읽어버리므로, checksum 검증 없이는 변조된
+임계값·가중치가 그대로 추론에 쓰인다. 이어서 입력 열 이름을 artifact에 저장된 학습 시점
+순서와 대조한다: 특징 집합이 다르면 거부, 순서만 다르면 이름 기준 재정렬, 열 개수 불일치·
+NaN/Inf도 거부. 모델별 입력 **rank(차원 수)**도 검증한다(리뷰 P1, 2차) —
+`dense_autoencoder`는 `ndim == 2`, `lstm_autoencoder`는 `ndim == 3` **및** 시퀀스
+길이(`shape[-2]`)가 아티팩트에 저장된 `seq_len`과 같아야 한다. 이전에는 마지막(특징)
+축만 봐서 Dense에 1차원/3차원 입력을, LSTM에 다른 길이의 시퀀스를 넣어도 조용히
+판정이 나왔다. 재로딩 전후 판정이 학습 때 (비독립) test 지표와 일치함을 테스트로 검증한다.
+
+**checksum-검증-후-로드 TOCTOU 방지 (리뷰 P1, 3차·보안).** 예전에는
+`_sha256_of_file(artifact_path)`로 checksum을 검사한 뒤 `torch.load(artifact_path, ...)`로
+같은 경로를 다시 열어, 이 두 파일 읽기 사이에 파일이 교체되면(TOCTOU) checksum 검증이
+확인한 바이트와 실제로 로드되는 바이트가 달라질 수 있었다. 이제 파일을 한 번만 읽어 그
+바이트로 checksum을 계산하고, 같은 바이트를 `io.BytesIO`로 `weights_only=True`(+
+`map_location="cpu"`)로 역직렬화한다 — pickle이 텐서/기본 타입 이외의 임의 객체를
+실행하지 못하도록 제한한다.
+
+**아티팩트 스키마 검증 (리뷰 P1, 3차).** `_validate_artifact_payload()`가 역직렬화 직후,
+추론에 쓰기 전에 구조·유한값을 검증한다: `model_type`이 알려진 모델인지, `feature_names`가
+비어있지 않고 중복이 없는지, `input_dim`이 `feature_names` 길이와 일치하는지,
+`scaler_mean`/`scaler_std`가 `input_dim` 길이의 유한값 리스트이고 `scaler_std`는 모두
+0보다 큰지, `threshold`/`sigma`가 유한한 실수인지, `lstm_autoencoder`는 양의 정수
+`seq_len`을 갖고 `dense_autoencoder`는 `seq_len`이 없는지. `scaler_std`가 0/NaN이면
+정규화 결과가 Inf/NaN이 되고, `threshold`가 NaN이면 어떤 재구성 오차와 비교해도 False가
+되어 큰 오차도 "정상"으로 판정되던 문제를 막는다.
 
 ## 도메인 차이·현장 보정 계획 (`domainGap` / `fieldCalibrationPlan`)
 

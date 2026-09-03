@@ -43,12 +43,17 @@ from train_and_evaluate import (  # noqa: E402
     _train_and_validate_candidate,
     _finalize_test_evaluation,
     _actual_independent_holdout,
+    _validate_artifact_payload,
     select_best,
     score_from_artifact,
     feature_names_from_manifest,
     _sha256_of_file as _sha256,
 )
-from dataset_version import freeze_dataset_version, compute_rows_fingerprint  # noqa: E402
+from dataset_version import (  # noqa: E402
+    freeze_dataset_version,
+    compute_rows_fingerprint,
+    compute_source_checksum,
+)
 
 
 class TestComputeMetrics(unittest.TestCase):
@@ -483,6 +488,223 @@ class TestScoreFromArtifactRankValidation(unittest.TestCase):
             self.assertEqual(len(result["verdict"]), matrix.shape[0])
 
 
+class TestScoreFromArtifactReadsBytesOnce(unittest.TestCase):
+    """[리뷰 P1, 3차·보안] checksum을 계산한 바이트와 실제로 역직렬화하는 바이트가
+    같아야 한다 — 예전에는 `_sha256_of_file(path)`로 검사한 뒤 `torch.load(path, ...)`
+    로 파일 경로를 다시 열어, 두 파일 읽기 사이(TOCTOU)에 파일이 교체될 수 있었다."""
+
+    def _artifact(self, tmp):
+        splits = _synthetic_split(seq=None)
+        names = ["f0", "f1", "f2", "f3"]
+        path = os.path.join(tmp, "dense_autoencoder.pt")
+        candidate, _ = _train_validate_and_finalize(
+            "dense_autoencoder", "x", splits, feature_names=names, epochs=10,
+            artifact_path=path,
+        )
+        matrix = np.stack([s["vector"] for s in splits["test"]])
+        return path, names, matrix, candidate["artifactChecksum"]
+
+    def test_torch_load_receives_bytes_not_a_reopened_path(self):
+        """`torch.load`가 파일 경로 문자열이 아니라 이미 읽은 바이트(BytesIO)로
+        호출되는지 확인한다 — 경로 문자열로 다시 열면 checksum 검사와 역직렬화
+        사이에 파일이 교체될 여지가 남는다."""
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._artifact(tmp)
+            import train_and_evaluate as _tae
+
+            real_torch_load = _tae.torch.load
+            calls = []
+
+            def _spy_load(source, **kwargs):
+                calls.append(source)
+                return real_torch_load(source, **kwargs)
+
+            with mock.patch.object(_tae.torch, "load", side_effect=_spy_load):
+                score_from_artifact(
+                    path, matrix, input_feature_names=names, expected_checksum=checksum
+                )
+            self.assertEqual(len(calls), 1)
+            self.assertNotIsInstance(calls[0], str)
+            self.assertNotIsInstance(calls[0], os.PathLike)
+
+    def test_result_unaffected_by_reading_via_bytesio(self):
+        """읽기 경로가 바뀌어도(경로 재오픈 -> 바이트 1회 읽기) 판정 결과 자체는
+        예전과 동일해야 한다(회귀 없음)."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._artifact(tmp)
+            result = score_from_artifact(
+                path, matrix, input_feature_names=names, expected_checksum=checksum
+            )
+            self.assertEqual(len(result["verdict"]), matrix.shape[0])
+            self.assertTrue(all(isinstance(v, bool) for v in result["verdict"]))
+
+
+def _valid_dense_payload():
+    return {
+        "model_type": "dense_autoencoder",
+        "state_dict": {},
+        "input_dim": 4,
+        "seq_len": None,
+        "feature_names": ["f0", "f1", "f2", "f3"],
+        "scaler_mean": [0.0, 0.0, 0.0, 0.0],
+        "scaler_std": [1.0, 1.0, 1.0, 1.0],
+        "threshold": 1.0,
+        "sigma": 3.0,
+    }
+
+
+class TestValidateArtifactPayloadSchema(unittest.TestCase):
+    """[리뷰 P1, 2차] 아티팩트 스키마 오류를 추론 전에 거부한다 — scaler std가
+    0/NaN이거나 threshold가 NaN이면 판정 자체가 무의미해진다."""
+
+    def test_valid_payload_passes(self):
+        _validate_artifact_payload(_valid_dense_payload())  # no raise
+
+    def test_unknown_model_type_rejected(self):
+        payload = _valid_dense_payload()
+        payload["model_type"] = "not_a_real_model"
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_duplicate_feature_names_rejected(self):
+        payload = _valid_dense_payload()
+        payload["feature_names"] = ["f0", "f0", "f2", "f3"]
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_input_dim_mismatch_with_feature_names_rejected(self):
+        payload = _valid_dense_payload()
+        payload["input_dim"] = 5
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_zero_scaler_std_rejected(self):
+        payload = _valid_dense_payload()
+        payload["scaler_std"] = [1.0, 0.0, 1.0, 1.0]
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_negative_scaler_std_rejected(self):
+        payload = _valid_dense_payload()
+        payload["scaler_std"] = [1.0, -0.5, 1.0, 1.0]
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_nan_scaler_std_rejected(self):
+        payload = _valid_dense_payload()
+        payload["scaler_std"] = [1.0, float("nan"), 1.0, 1.0]
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_scaler_mean_wrong_length_rejected(self):
+        payload = _valid_dense_payload()
+        payload["scaler_mean"] = [0.0, 0.0]
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_nan_threshold_rejected(self):
+        payload = _valid_dense_payload()
+        payload["threshold"] = float("nan")
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_inf_sigma_rejected(self):
+        payload = _valid_dense_payload()
+        payload["sigma"] = float("inf")
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_dense_payload_with_seq_len_rejected(self):
+        payload = _valid_dense_payload()
+        payload["seq_len"] = 5
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_lstm_payload_missing_seq_len_rejected(self):
+        payload = _valid_dense_payload()
+        payload["model_type"] = "lstm_autoencoder"
+        payload["seq_len"] = None
+        with self.assertRaises(ValueError):
+            _validate_artifact_payload(payload)
+
+    def test_lstm_payload_with_valid_seq_len_passes(self):
+        payload = _valid_dense_payload()
+        payload["model_type"] = "lstm_autoencoder"
+        payload["seq_len"] = 5
+        _validate_artifact_payload(payload)  # no raise
+
+
+class TestScoreFromArtifactRejectsMalformedSchema(unittest.TestCase):
+    """`_validate_artifact_payload`가 실제 아티팩트 파일을 통해 저장·재로딩되는
+    경로(`score_from_artifact`)에서도 적용되는지 확인한다. checksum은 변조된
+    바이트 자체로 다시 계산해 전달한다 — checksum 불일치가 아니라 스키마
+    검증이 거부 사유임을 확인하기 위함이다."""
+
+    def _tampered_artifact(self, tmp, mutate):
+        splits = _synthetic_split(seq=None)
+        names = ["f0", "f1", "f2", "f3"]
+        path = os.path.join(tmp, "dense_autoencoder.pt")
+        _train_validate_and_finalize(
+            "dense_autoencoder", "x", splits, feature_names=names, epochs=10,
+            artifact_path=path,
+        )
+        payload = torch.load(path, weights_only=False)
+        mutate(payload)
+        torch.save(payload, path)
+        with open(path, "rb") as f:
+            tampered_bytes = f.read()
+        import hashlib
+
+        checksum = f"sha256:{hashlib.sha256(tampered_bytes).hexdigest()}"
+        matrix = np.stack([s["vector"] for s in splits["test"]])
+        return path, names, matrix, checksum
+
+    def test_zero_scaler_std_in_saved_artifact_rejected(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._tampered_artifact(
+                tmp, lambda p: p.__setitem__("scaler_std", [0.0] * len(p["scaler_std"]))
+            )
+            with self.assertRaises(ValueError):
+                score_from_artifact(
+                    path, matrix, input_feature_names=names, expected_checksum=checksum
+                )
+
+    def test_nan_threshold_in_saved_artifact_rejected(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._tampered_artifact(
+                tmp, lambda p: p.__setitem__("threshold", float("nan"))
+            )
+            with self.assertRaises(ValueError):
+                score_from_artifact(
+                    path, matrix, input_feature_names=names, expected_checksum=checksum
+                )
+
+    def test_duplicate_feature_names_in_saved_artifact_rejected(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, checksum = self._tampered_artifact(
+                tmp,
+                lambda p: p.__setitem__(
+                    "feature_names",
+                    [p["feature_names"][0], p["feature_names"][0]] + p["feature_names"][2:],
+                ),
+            )
+            with self.assertRaises(ValueError):
+                score_from_artifact(
+                    path, matrix, input_feature_names=names, expected_checksum=checksum
+                )
+
+
 class TestValidationBasedSelection(unittest.TestCase):
     def test_select_best_uses_validation_not_test(self):
         cand_a = {"name": "a", "validationMetrics": {"f1": 0.9}, "metrics": {"f1": 0.2}}
@@ -499,6 +721,35 @@ _SYNTH_FEATURE_COLS = (
     "spectral_centroid_mean",
     "vibration_peak_hz",
 )
+
+
+def _synthetic_checksum_inputs() -> dict:
+    """register_dataset.build_manifest()가 채우는 checksumInputs를 흉내낸다 —
+    dataset_version.freeze_dataset_version()이 source.checksum/id를 재계산하는
+    데 쓴다."""
+    return {
+        "windowSize": 2048,
+        "hopSize": 2048,
+        "seed": 0,
+        "featurePipelineVersion": "test.pipeline.v1",
+        "featureConfig": {
+            "sampleRate": 12000,
+            "frameLength": 2048,
+            "hopLength": 512,
+            "nMfcc": 13,
+            "bandEdges": [0, 500, 1000, 2000, 4000, 8000],
+        },
+        "splitStrategyKey": "operating_condition_holdout",
+    }
+
+
+def _finalize_synthetic_draft(draft: dict, id_prefix: str) -> dict:
+    """draft의 source.checksum과 id suffix를 canonical 재계산 값으로 채운다 —
+    build_manifest()가 실제로 하는 일을 흉내낸다."""
+    draft["source"]["checksum"] = compute_source_checksum(draft)
+    suffix = draft["source"]["checksum"].split(":", 1)[1][:12]
+    draft["id"] = f"{id_prefix}-{suffix}"
+    return draft
 
 
 def _synthetic_frozen_manifest(windows_per_file=10, sample_rate_hz=12000, seed=0):
@@ -539,19 +790,25 @@ def _synthetic_frozen_manifest(windows_per_file=10, sample_rate_hz=12000, seed=0
         "id": "DS-SYNTH-FROZEN-001",
         "name": "synthetic",
         "status": "draft",
-        "source": {"type": "external", "checksum": "sha256:synth-version-checksum"},
+        "source": {
+            "type": "external",
+            "files": {"97.mat": {"sha256": "sha256:synth97", "label": "NORMAL"}},
+            "checksum": None,  # _finalize_synthetic_draft가 채운다.
+        },
         "compatibility": {"signalType": ["vibration"], "samplingRateHz": sample_rate_hz},
         "labelTaxonomyVersion": "CWRU-FAULT-V1",
         "labelMapping": {"NORMAL": "NORMAL", "BEARING_FAULT_INNER": "ANOMALY"},
         "labelPolicyVersion": "LABEL-POLICY-V2",
         "snapshotSchemaVersion": "2",
         "featureOutputFingerprint": compute_rows_fingerprint(rows),
+        "checksumInputs": _synthetic_checksum_inputs(),
         "split": {"train": 0.5, "validation": 0.3, "test": 0.2},
         "splitStrategy": "operating_condition_holdout: synthetic",
         "holdoutType": "operating_condition",
         "independentHoldout": False,
         "rows": rows,
     }
+    _finalize_synthetic_draft(draft, "DS-SYNTH-FROZEN-001")
     return freeze_dataset_version(draft)
 
 
@@ -583,19 +840,25 @@ def _frozen_manifest_from_files(files, *, independent_holdout, windows_per_file=
         "id": "DS-SYNTH-CUSTOM-001",
         "name": "synthetic-custom",
         "status": "draft",
-        "source": {"type": "external", "checksum": "sha256:synth-custom-checksum"},
+        "source": {
+            "type": "external",
+            "files": {"97.mat": {"sha256": "sha256:synth97", "label": "NORMAL"}},
+            "checksum": None,  # _finalize_synthetic_draft가 채운다.
+        },
         "compatibility": {"signalType": ["vibration"], "samplingRateHz": 12000},
         "labelTaxonomyVersion": "CWRU-FAULT-V1",
         "labelMapping": {"NORMAL": "NORMAL", "BEARING_FAULT_INNER": "ANOMALY"},
         "labelPolicyVersion": "LABEL-POLICY-V2",
         "snapshotSchemaVersion": "2",
         "featureOutputFingerprint": compute_rows_fingerprint(rows),
+        "checksumInputs": _synthetic_checksum_inputs(),
         "split": {"train": 0.5, "validation": 0.3, "test": 0.2},
         "splitStrategy": "custom: synthetic",
         "holdoutType": "specimen" if independent_holdout else "operating_condition",
         "independentHoldout": independent_holdout,
         "rows": rows,
     }
+    _finalize_synthetic_draft(draft, "DS-SYNTH-CUSTOM-001")
     return freeze_dataset_version(draft)
 
 
@@ -755,7 +1018,7 @@ class TestLstmInputMatchesFrozenDataset(unittest.TestCase):
         )
         lstm = next(c for c in report["candidates"] if c["name"] == "lstm_autoencoder")
         self.assertEqual(lstm["testSampleCount"], 4)  # test 파일 2개 * 파일당 2 시퀀스
-        self.assertEqual(report["datasetId"], "DS-SYNTH-FROZEN-001")
+        self.assertTrue(report["datasetId"].startswith("DS-SYNTH-FROZEN-001-"))
 
 
 class TestArtifactUriIsRegistrableFileUri(unittest.TestCase):

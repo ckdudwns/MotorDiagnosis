@@ -67,16 +67,38 @@ API 명세서 v1.3에서 추가된 `labelPolicyVersion`(`LABEL-POLICY-V2`)·`sna
   때만 legacy 완화 검증을 적용한다(기본값 False = 항상 v1.3 엄격 검증).
 - `verify_reproducibility`는 기본값에서 `datasetChecksum`(rows/labelMapping/split)뿐 아니라
   `labelPolicyVersion`/`snapshotSchemaVersion`/원본 `source.checksum`까지 함께 검증한다.
-- `register_model_version`은 필수 문자열(version/artifactUri/datasetId/baselineVersion)의
-  nonblank와 `metrics`가 dict인지 검증한다. `approve_model_version`은 `approved_by`와
-  명시적인 `metric_snapshot`을 모두 필수로 받는다(등록 시점 metrics를 암묵적으로 재사용하지
-  않는다) — 누가, 어떤 지표를 보고 승인했는지 감사 가능해야 한다.
+- **freeze는 `source.checksum`/id도 canonical 재계산으로 재검증한다(리뷰 P1, 3차).**
+  `featureOutputFingerprint`만 rows와 대조하면, rows를 바꾸고 fingerprint를 함께 재계산해
+  신고하거나(현재 rows와의 대조는 통과) fingerprint에는 안 들어가지만 checksum에는 들어가는
+  필드(`labelMapping` 등)만 바꿔도 예전 `id`/`source.checksum`이 그대로 승계됐다. draft는
+  이제 `checksumInputs`(window/hop/seed/파이프라인 버전/특징 설정/split 전략 키)를 노출하고,
+  `compute_source_checksum()`이 이 필드 + draft 자신의 나머지 필드만으로 `source.checksum`을
+  독립 재계산해 대조한다(week3 모듈은 import하지 않음). `verify_reproducibility`도 같은
+  방식으로 recomputed_manifest의 `source.checksum` 필드값을 신뢰하지 않고 재계산해 대조한다.
+- **`trusted_legacy`는 실제 `bool`만 허용한다(리뷰 P1, 3차).** 문자열 `"false"`는 파이썬에서
+  truthy라서, 타입 검증 없이는 legacy 완화 경로가 잘못 켜질 수 있었다 — 이제 `bool`이 아니면
+  `TypeError`, `is True`일 때만 완화 경로를 켠다.
+- `register_model_version`은 필수 문자열(version/artifactUri/datasetId/baselineVersion/
+  artifactChecksum)의 nonblank와 `metrics`가 dict인지 검증하고, 불변 필드 전체의
+  `registrationDigest`를 함께 저장한다. `approve_model_version`은 `approved_by`와 명시적인
+  `metric_snapshot`을 모두 필수로 받고(등록 시점 metrics를 암묵적으로 재사용하지 않는다),
+  승인을 canonical 등록 레코드에 결속한다(리뷰 P1, 3차) — `registry`가 주어지면 `version`으로
+  그 안에서 정확히 한 건의 등록 레코드를 조회해 승인 대상으로 삼고, 없으면 `model_version`
+  자신의 `registrationDigest`가 현재 내용과 일치하는지 검증한다(없으면 무조건 거부) — 누가,
+  어떤 지표를 보고 승인했는지 감사 가능해야 한다.
 - `rollback_model_version`은 target이 **실제로 current보다 앞선 승인 버전**인지 검증한다.
-  `approved_history`가 주어지면 target/current 모두 그 안에서 정확히 한 건의 **승인
-  (`status=="approved"`)** canonical 레코드로 존재해야 하며(계보 누락 시 호출자 객체 자체의
-  값으로 대체하지 않는다 — 그러면 registered 상태에 `approvedAt`만 위조해 계보 검증을
-  우회할 수 있다, 리뷰 P1 2차), **배열 순서가 아니라 각 항목의 실제 `approvedAt`**을
-  UTC로 파싱해 시간순으로 비교한다 — 배열이 역순으로 전달돼도 forward rollback을 막는다.
+  `approved_history`는 이제 **필수** 인자다(리뷰 P1, 3차 — 생략하면 current/target 객체 자체의
+  `approvedAt`을 신뢰하는 폴백 경로가 있어, registered 상태에 `approvedAt`만 위조해도 롤백이
+  만들어졌다). target/current 모두 계보 안에서 정확히 한 건의 **승인(`status=="approved"`)**
+  canonical 레코드로 존재해야 하며(계보 누락 시 호출자 객체 자체의 값으로 대체하지 않는다,
+  리뷰 P1 2차), **배열 순서가 아니라 각 항목의 실제 `approvedAt`**을 UTC로 파싱해 시간순으로
+  비교한다 — 배열이 역순으로 전달돼도 forward rollback을 막는다. `target_environment`도
+  허용된 환경 값(`production`/`staging`/`development`)이어야 한다.
+- `register_baseline_version`은 필수 ID(baseline/dataset/site/asset)와 `features` 구조·
+  유한값(std>0)을 검증하고 `registrationDigest`를 저장한다. `approve_baseline_version`은
+  `approved_by`(이전에는 검증되지 않았다)와 `reason`을 모두 필수로 받고, `activate_baseline_version`과
+  함께 식별 필드·`registrationDigest`를 재검증해 `status`만 맞춘 임의 객체가 ID 없는
+  active 기준선이 되는 것을 막는다(리뷰 P1, 3차).
 
 **재현성:** 같은 입력·`split_strategy`로 `build_manifest`를 두 번 생성해 체크섬이
 동일함을 확인한다. `split_strategy`가 다르면(specimen_group vs operating_condition_holdout)

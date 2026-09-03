@@ -72,6 +72,42 @@ def _sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
+# [리뷰 P1] 동시 export 재사용 판정 시, createdAt처럼 "내용은 같지만 다시 만들면
+# 값이 달라지는" 필드는 JSON manifest 비교에서 뺀다 — 그렇지 않으면 진짜로 같은
+# 내용을 다시 export했을 뿐인데도 매번 충돌로 오판된다.
+_MANIFEST_JSON_VOLATILE_KEYS = frozenset({"createdAt"})
+
+
+def _canonical_manifest_json(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return {k: v for k, v in data.items() if k not in _MANIFEST_JSON_VOLATILE_KEYS}
+
+
+def _version_dir_is_complete(version_dir: str) -> bool:
+    """`version_dir`가 CURRENT가 가리켜도 안전할 만큼 온전한지 확인한다.
+
+    [리뷰 P1] 동시 export 충돌 처리에서 CSV 내용만 같으면 기존 디렉터리를 그대로
+    재사용했는데, JSON manifest가 (수동 삭제나 이전 실행 중단 등으로) 없거나
+    손상된 채 남아 있어도 CURRENT가 계속 그 불완전한 디렉터리를 가리켰다. CSV/
+    JSON/XLSX 세 파일이 모두 존재하고, JSON은 파싱 가능하며, XLSX는 manifest/rows
+    시트를 모두 갖췄을 때만 "완전하다"고 본다.
+    """
+    csv_path = os.path.join(version_dir, "dataset_rows.csv")
+    manifest_path = os.path.join(version_dir, "dataset_manifest.json")
+    xlsx_path = os.path.join(version_dir, "dataset_export.xlsx")
+    for path in (csv_path, manifest_path, xlsx_path):
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return False
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            json.load(f)
+        wb = load_workbook(xlsx_path)
+        return "manifest" in wb.sheetnames and "rows" in wb.sheetnames
+    except Exception:
+        return False
+
+
 def _manifest_without_rows(manifest: dict, artifact_refs: dict, label_summary: dict) -> dict:
     """GET /api/datasets/{id} 응답 형태 (rows 제외, artifactRefs 포함).
 
@@ -240,26 +276,48 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
                 raise
             # [리뷰 P1] version_id(=source.checksum)는 원본 파일·전처리·특징
             # 산출물로 결정되지만, export 시점에만 바뀌는 값(예: 호출 직전
-            # manifest["labelMapping"] 수정)은 반영하지 않는다 — 그래서
-            # "version_dir가 이미 있다 == 동시 export가 정확히 같은 내용을
-            # 이미 배치했다"는 예전 가정이 항상 참은 아니다. CSV(rows + 라벨
-            # 파생 컬럼을 그대로 담고, 타임스탬프 등 휘발성 메타데이터가 없어
-            # 결정적이다 — XLSX는 openpyxl이 저장 시각을 파일에 넣어 내용이
-            # 같아도 바이트가 달라지므로 비교에 쓰지 않는다)를 기존 산출물과
-            # 대조해 실제로 동일한 내용인지 확인한다.
+            # manifest["source"]["license"]나 현재 rows에서 쓰이지 않는
+            # labelMapping 항목만 수정)은 반영하지 않는다 — 그래서 "version_dir가
+            # 이미 있다 == 동시 export가 정확히 같은 내용을 이미 배치했다"는 예전
+            # 가정이 항상 참은 아니다. CSV(rows + 라벨 파생 컬럼을 그대로 담고,
+            # 타임스탬프 등 휘발성 메타데이터가 없어 결정적이다 — XLSX는 openpyxl이
+            # 저장 시각을 파일에 넣어 내용이 같아도 바이트가 달라지므로 비교에 쓰지
+            # 않는다) **와** canonical JSON manifest(createdAt만 제외하고 비교 —
+            # source.license처럼 CSV에는 안 나타나지만 JSON에는 나타나는 필드
+            # 변경을 잡는다) 둘 다 기존 산출물과 대조해 실제로 동일한 내용인지
+            # 확인한다.
             existing_csv_path = os.path.join(version_dir, "dataset_rows.csv")
-            if not os.path.exists(existing_csv_path) or (
-                _sha256_of_file(csv_path) != _sha256_of_file(existing_csv_path)
-            ):
+            existing_manifest_path = os.path.join(version_dir, "dataset_manifest.json")
+            csv_matches = os.path.exists(existing_csv_path) and (
+                _sha256_of_file(csv_path) == _sha256_of_file(existing_csv_path)
+            )
+            manifest_conflict = False
+            if csv_matches and os.path.exists(existing_manifest_path):
+                try:
+                    manifest_conflict = _canonical_manifest_json(
+                        manifest_path
+                    ) != _canonical_manifest_json(existing_manifest_path)
+                except (OSError, ValueError):
+                    manifest_conflict = True  # 기존 JSON이 손상됨 -> 신뢰할 수 없음(치유 대상)
+            if not csv_matches or manifest_conflict:
                 raise VersionContentConflictError(
-                    f"version_id {version_id!r}가 이미 존재하지만 내보내려는 rows/라벨 "
-                    "내용이 기존 산출물과 다릅니다. 이 id는 source.checksum만 반영하며 "
-                    "export 시점에만 바뀐 값(예: labelMapping 변경)은 반영하지 않습니다 "
-                    "— 기존 버전을 조용히 재사용하면 방금 내보내려던 내용이 사라집니다. "
-                    "매니페스트를 다시 생성하거나 원인을 확인하세요."
+                    f"version_id {version_id!r}가 이미 존재하지만 내보내려는 rows/라벨/"
+                    "메타데이터 내용이 기존 산출물과 다릅니다. 이 id는 source.checksum만 "
+                    "반영하며 export 시점에만 바뀐 값(예: license, 미사용 labelMapping "
+                    "항목 변경)은 반영하지 않습니다 — 기존 버전을 조용히 재사용하면 방금 "
+                    "내보내려던 내용이 사라집니다. 매니페스트를 다시 생성하거나 원인을 "
+                    "확인하세요."
                 ) from None
-            # CSV 내용이 완전히 같다 -> 동시에 실행된 다른 export가 이미 같은
-            # 내용을 배치했다는 뜻이므로, 이 시도는 버리고 기존 버전을 재사용한다.
+            if not _version_dir_is_complete(version_dir):
+                # 기존 디렉터리는 CSV/JSON 내용은 같지만 JSON/XLSX가 없거나
+                # 손상되어 불완전하다(예: 수동 삭제, 이전 실행 중단). 그대로
+                # 재사용하면 CURRENT가 계속 불완전한 디렉터리를 가리킨다 — 방금
+                # 만든 완전한 staged 산출물로 교체(치유)한다.
+                shutil.rmtree(version_dir, ignore_errors=True)
+                _replace_with_retry(staging_dir, version_dir)
+            # else: 기존 디렉터리가 이미 완전하고 내용도 같다 -> 동시에 실행된
+            # 다른 export가 이미 같은 내용을 배치했다는 뜻이므로, 이번 staged
+            # 시도는 버리고 기존 버전을 재사용한다.
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 

@@ -67,6 +67,71 @@ def compute_snapshot_digest(manifest: dict) -> str:
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def compute_source_checksum(manifest: dict) -> str:
+    """draft/frozen 매니페스트 자체의 필드만으로 3주차
+    `register_dataset.compute_version_checksum()`과 동일한 canonical payload를
+    재구성해 `source.checksum`(=id suffix)을 독립적으로 재계산한다.
+
+    [리뷰 P1, 3차] `freeze_dataset_version()`은 `featureOutputFingerprint`만 rows와
+    대조하고 `source.checksum`/`id`는 재검증 없이 그대로 복사했다. 그래서 rows를
+    바꾼 뒤 fingerprint를 새 rows에 맞게 재계산해 신고하면(현재 rows와의 대조는
+    통과) 예전 `source.checksum`/`id`를 그대로 승계할 수 있었고, fingerprint에는
+    들어가지 않지만 checksum 계산에는 들어가는 `labelMapping`만 바꿔도 마찬가지로
+    감지되지 않았다. 이 함수는 `compute_version_checksum()`의 payload를 draft가
+    이미 갖고 있는 필드(`source.files`, `checksumInputs.*`, `split`,
+    `labelTaxonomyVersion`, `labelMapping`, `featureOutputFingerprint`,
+    `labelPolicyVersion`, `snapshotSchemaVersion`)만으로 독립 재구성한다 — week3
+    모듈은 import하지 않는다(`compute_rows_fingerprint`와 같은 이유).
+    """
+    checksum_inputs = manifest.get("checksumInputs") or {}
+    feature_config = checksum_inputs.get("featureConfig") or {}
+    source_files = (manifest.get("source") or {}).get("files") or {}
+    split = manifest.get("split") or {}
+    label_mapping = manifest.get("labelMapping") or {}
+    payload = {
+        "files": {
+            name: {"sha256": info["sha256"], "label": info["label"]}
+            for name, info in sorted(source_files.items())
+        },
+        "window_size": checksum_inputs.get("windowSize"),
+        "hop_size": checksum_inputs.get("hopSize"),
+        "split_ratios": {name: split[name] for name in sorted(split)},
+        "seed": checksum_inputs.get("seed"),
+        "label_taxonomy_version": manifest.get("labelTaxonomyVersion"),
+        "label_mapping": {name: label_mapping[name] for name in sorted(label_mapping)},
+        "feature_pipeline_version": checksum_inputs.get("featurePipelineVersion"),
+        "feature_config": {
+            "sample_rate": feature_config.get("sampleRate"),
+            "frame_length": feature_config.get("frameLength"),
+            "hop_length": feature_config.get("hopLength"),
+            "n_mfcc": feature_config.get("nMfcc"),
+            "band_edges": list(feature_config.get("bandEdges") or []),
+        },
+        "feature_output_fingerprint": manifest.get("featureOutputFingerprint"),
+        "label_policy_version": manifest.get("labelPolicyVersion"),
+        "snapshot_schema_version": manifest.get("snapshotSchemaVersion"),
+        "split_strategy": checksum_inputs.get("splitStrategyKey"),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _require_bool_trusted_legacy(trusted_legacy) -> None:
+    """[리뷰 P1] `trusted_legacy`는 실제 `bool`만 허용한다.
+
+    문자열 `"false"`는 파이썬에서 truthy라서, 예전에는 `if trusted_legacy:` 같은
+    검사에 문자열 `"false"`를 넘겨도 legacy 완화 경로가 켜져 snapshotDigest 없는
+    변조 레코드의 검증·승인·재현성 확인이 통과했다. 호출 즉시 타입을 강제한다.
+    """
+    if not isinstance(trusted_legacy, bool):
+        raise TypeError(
+            "trusted_legacy는 실제 bool이어야 합니다 (문자열 'false' 등은 파이썬에서 "
+            f"truthy로 오인될 수 있습니다): {trusted_legacy!r}"
+        )
+
+
 def is_legacy_v1_frozen(frozen_manifest: dict) -> bool:
     """매니페스트 내용만 보고 v1(legacy) 동결본"처럼 보이는지" 추정한다 — 정보성
     보조 함수일 뿐, 무결성 검증의 신뢰 판단에는 쓰지 않는다.
@@ -126,7 +191,12 @@ def freeze_dataset_version(manifest: dict) -> dict:
 
     missing = [
         key
-        for key in ("labelPolicyVersion", "snapshotSchemaVersion", "featureOutputFingerprint")
+        for key in (
+            "labelPolicyVersion",
+            "snapshotSchemaVersion",
+            "featureOutputFingerprint",
+            "checksumInputs",
+        )
         if not manifest.get(key)
     ]
     if not (manifest.get("source") or {}).get("checksum"):
@@ -146,6 +216,30 @@ def freeze_dataset_version(manifest: dict) -> dict:
             f"실제={current_fingerprint!r}). build_manifest() 이후 rows/라벨이 "
             "변경된 것으로 보입니다 — id/source.checksum도 이 rows를 정직하게 "
             "반영하지 않을 수 있으니 매니페스트를 다시 생성하세요."
+        )
+
+    # [리뷰 P1, 3차] featureOutputFingerprint가 현재 rows와 일치해도, checksum
+    # 계산에는 들어가지만 fingerprint에는 안 들어가는 필드(labelMapping 등)만
+    # 바뀌었거나 rows/fingerprint를 함께 바꿔치기했을 수 있다 — draft가 갖고 있는
+    # 필드만으로 source.checksum(및 거기서 파생된 id suffix)을 독립적으로
+    # 재계산해 대조한다.
+    recomputed_source_checksum = compute_source_checksum(manifest)
+    declared_source_checksum = manifest["source"]["checksum"]
+    if recomputed_source_checksum != declared_source_checksum:
+        raise ValueError(
+            "draft의 source.checksum이 현재 매니페스트 내용(파일 체크섬/전처리·분할 "
+            "설정/라벨 매핑/featureOutputFingerprint 등)으로 재계산한 값과 다릅니다 "
+            f"(신고={declared_source_checksum!r}, 재계산={recomputed_source_checksum!r}). "
+            "build_manifest() 이후 rows나 labelMapping 등이 변경됐지만 id/checksum이 "
+            "갱신되지 않은 것으로 보입니다 — 매니페스트를 다시 생성하세요."
+        )
+    checksum_suffix = recomputed_source_checksum.split(":", 1)[1][:12]
+    declared_id = manifest.get("id") or ""
+    if not declared_id.endswith(checksum_suffix):
+        raise ValueError(
+            f"draft의 id({declared_id!r})가 재계산한 source.checksum의 suffix "
+            f"({checksum_suffix!r})로 끝나지 않습니다 — id와 checksum이 서로 다른 "
+            "내용을 가리키는 것으로 보입니다."
         )
 
     # 얕은 dict()는 중첩 rows 리스트를 원본과 공유한다 — 동결 후 원본 rows를
@@ -175,6 +269,7 @@ def approve_dataset_version(
     v1.3 엄격 검증(`snapshotDigest` 필수)을 적용하므로, schema/digest가 없는 신규
     레코드는 legacy로 봐주지 않고 무조건 거부한다.
     """
+    _require_bool_trusted_legacy(trusted_legacy)
     if frozen_manifest.get("status") != "frozen":
         raise ValueError(
             f"frozen 상태만 승인할 수 있습니다 (현재 status={frozen_manifest.get('status')!r})."
@@ -195,7 +290,7 @@ def approve_dataset_version(
         )
     # (2) v2: 매니페스트 전체 불변 필드 digest — source.license/checksum, samplingRate,
     #     labelPolicyVersion, splitStrategy 등 freeze 이후 변조까지 잡는다.
-    if not trusted_legacy:
+    if trusted_legacy is not True:
         stored_digest = frozen_manifest.get("snapshotDigest")
         if stored_digest is None:
             raise ValueError(
@@ -230,11 +325,12 @@ def verify_frozen_integrity(frozen_manifest: dict, *, trusted_legacy: bool = Fal
     때만 legacy(v1) 완화 검증(datasetChecksum 폴백)을 적용한다(리뷰 P1, 2차).
     기본값(False)에서는 schema/digest가 없는 레코드를 무조건 거부한다.
     """
+    _require_bool_trusted_legacy(trusted_legacy)
     if frozen_manifest.get("status") not in ("frozen", "approved"):
         raise ValueError(
             f"frozen/approved 상태가 아닙니다 (status={frozen_manifest.get('status')!r})."
         )
-    if trusted_legacy:
+    if trusted_legacy is True:
         stored_checksum = frozen_manifest.get("datasetChecksum")
         if stored_checksum is None:
             raise ValueError("동결본에 무결성 검증값(snapshotDigest/datasetChecksum)이 없습니다.")
@@ -273,15 +369,36 @@ def verify_reproducibility(
     identity까지 함께 검증한다. `trusted_legacy=True`(매니페스트 바깥에서 확인한
     사실)일 때만 이 추가 검증을 생략한다(리뷰 P1, 2차 — 매니페스트 필드로는
     legacy 여부를 추정하지 않는다).
+
+    [리뷰 P1, 3차] source.checksum "필드값"을 서로 비교하는 것만으로는, 둘 중
+    하나(특히 recomputed_manifest)의 `source.checksum` 필드 자체가 실제 내용과
+    재계산 없이 다른 값으로 바뀌어도(예: rows/labelMapping은 그대로 두고 checksum
+    문자열만 다른 값으로 교체) 잡아내지 못한다. `checksumInputs`가 양쪽에 모두
+    있으면 `compute_source_checksum()`으로 각자의 canonical checksum을 필드값을
+    신뢰하지 않고 독립적으로 재계산해 대조한다.
     """
+    _require_bool_trusted_legacy(trusted_legacy)
     if frozen_manifest["datasetChecksum"] != compute_dataset_checksum(recomputed_manifest):
         return False
-    if trusted_legacy:
+    if trusted_legacy is True:
         return True
 
     for field in ("labelPolicyVersion", "snapshotSchemaVersion"):
         if frozen_manifest.get(field) != recomputed_manifest.get(field):
             return False
+
+    if frozen_manifest.get("checksumInputs") and recomputed_manifest.get("checksumInputs"):
+        frozen_recomputed_checksum = compute_source_checksum(frozen_manifest)
+        recomputed_recomputed_checksum = compute_source_checksum(recomputed_manifest)
+        if frozen_recomputed_checksum != recomputed_recomputed_checksum:
+            return False
+        frozen_declared_checksum = frozen_manifest.get("snapshotChecksum") or (
+            frozen_manifest.get("source") or {}
+        ).get("checksum")
+        if frozen_recomputed_checksum != frozen_declared_checksum:
+            return False
+        return True
+
     frozen_source_checksum = frozen_manifest.get("snapshotChecksum") or (
         frozen_manifest.get("source") or {}
     ).get("checksum")

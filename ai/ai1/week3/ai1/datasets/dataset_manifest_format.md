@@ -29,6 +29,7 @@ export 행의 라벨 상태(`label_status`/`training_eligible`), manifest 라벨
 | `source.files` | object | 실제 배치된 원본 파일별 `{sha256, label}` — **체크섬으로 원본 추적** |
 | `source.checksum` | string | 원본 파일 `{sha256, label}` 전체 + window/hop 크기 + 분할 비율 + seed + labelTaxonomyVersion + labelMapping + 특징 추출 설정(FeatureConfig: sample_rate/frame_length/hop_length/n_mfcc/band_edges) + `FEATURE_PIPELINE_VERSION` + **실제 산출된 특징값의 fingerprint**(`compute_feature_output_fingerprint()`)로 만든 불변 버전 체크섬(`compute_version_checksum()`) — `id`의 접미사와 동일 값. 실제 정규화 산출물(known_label/특징값)에 영향을 주는 입력을 빠짐없이 포함해야, 같은 파일 sha256에서 source label만 바뀌거나 특징 추출 설정/로직만 바뀐 경우에도 같은 id가 재사용되는 것을 막을 수 있다. fingerprint는 메타데이터가 아니라 최종 특징값 자체를 해시하므로, librosa 유무처럼 소스 코드/설정에는 드러나지 않는 실행 환경 차이(MFCC 0벡터 폴백 등)도 잡아낸다. `operating_condition_holdout`에서는 `seed`가 실제 분할에 전혀 쓰이지 않으므로(부하 tier로 고정) payload의 `seed`를 canonical 값(`None`)으로 정규화해 넣는다 — 그렇지 않으면 rows/split이 완전히 같아도 seed만 바꾸면 다른 `checksum`/`id`가 나왔다(리뷰 P2) |
 | `featureOutputFingerprint` | string | `compute_feature_output_fingerprint(rows)`와 동일한 값을 별도 top-level 필드로도 노출(리뷰 P1, 2차) — `source.checksum`과 달리 **rows만으로 재계산 가능**하다. `dataset_version.freeze_dataset_version()`이 동결 직전 이 값을 rows에서 다시 계산해 대조한다: build 이후 rows/라벨이 바뀐 draft가 (재계산되지 않은) 예전 `id`/`source.checksum`을 그대로 단 채 동결·승인되는 것을 막는다 |
+| `checksumInputs` | object | `{windowSize, hopSize, seed, featurePipelineVersion, featureConfig, splitStrategyKey}` — `compute_version_checksum()` payload 중 rows/labelMapping/split만으로는 재현 불가능한 나머지 입력을 그대로 노출한다(리뷰 P1, 3차). `dataset_version.compute_source_checksum()`이 이 필드와 `source.files`/`split`/`labelMapping` 등 draft 자신의 필드만으로 `source.checksum`을 독립 재계산해 대조한다 — `featureOutputFingerprint`만 rows와 대조하는 것만으로는, rows를 바꾸고 fingerprint를 함께 재계산해 신고하거나(현재 rows와의 대조는 통과) fingerprint에는 안 들어가지만 checksum에는 들어가는 필드(`labelMapping` 등)만 바꿔도 예전 `id`/`source.checksum`이 그대로 승계돼 동결·승인될 수 있었다 |
 | `compatibility.signalType` | string[] | `["vibration"]` |
 | `compatibility.samplingRateHz` | number | `12000` (CWRU Drive-End 12kHz) |
 | `compatibility.units` | object | `{"vibration": "g (raw accelerometer output, uncalibrated)"}` |
@@ -75,6 +76,19 @@ id>/`에 모두 만들고 검증한 뒤 그 디렉터리 자체를 단일 rename
 sha256으로 대조한다. 완전히 같으면(동시 export race) 기존 버전을 그대로 재사용하고, 다르면
 `VersionContentConflictError`로 거부한다 — 조용히 새 내용을 버리고 예전 산출물을 성공으로
 반환하지 않는다.
+
+**CSV뿐 아니라 canonical JSON manifest도 함께 비교한다 (리뷰 P1, 3차).** CSV만 비교하면
+`source.license`나 현재 rows에서 쓰이지 않는 `labelMapping` 항목처럼 CSV에는 안 나타나지만
+JSON에는 나타나는 메타데이터 변경을 놓친다 — 그런 변경만 있으면 CSV는 바이트까지 동일해서
+"동일 내용"으로 오판돼 기존(오래된) JSON manifest를 그대로 두고 재사용을 허용했다. 이제
+`createdAt`만 제외하고 JSON manifest 전체를 함께 대조한다.
+
+**불완전한 기존 버전 디렉터리 치유(리뷰 P1, 3차).** CSV/JSON이 모두 일치해도(진짜 동시
+export race), 기존 `version_dir`의 JSON manifest나 XLSX가 (수동 삭제, 이전 실행 중단
+등으로) 없거나 손상돼 있으면 그 불완전한 디렉터리를 그대로 재사용하지 않는다 —
+`_version_dir_is_complete()`(CSV/JSON/XLSX 모두 존재 + JSON 파싱 가능 + XLSX가
+manifest/rows 시트를 모두 가짐)로 확인해, 불완전하면 기존 디렉터리를 지우고 방금 만든
+완전한 staged 산출물로 교체한다.
 
 ## 라벨 매핑 (`labelMapping`)
 

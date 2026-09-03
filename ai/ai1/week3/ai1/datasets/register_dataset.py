@@ -740,6 +740,26 @@ def build_manifest(
         # 대조한다 — build 이후 rows/라벨이 바뀐 draft가 (재계산 없이 복사된) 이전
         # source.checksum/id로 동결·승인되는 것을 막는다.
         "featureOutputFingerprint": feature_output_fingerprint,
+        # [리뷰 P1, 3차] compute_version_checksum() payload를 만드는 데 쓰인 나머지
+        # 입력(rows/labelMapping만으로는 재현 불가능한 것들)을 그대로 노출한다.
+        # week4 dataset_version.freeze_dataset_version()이 이 필드들로 source.checksum/id를
+        # 독립 재계산해, rows만 바꾸고 featureOutputFingerprint만 재계산하거나
+        # (fingerprint에는 안 들어가지만 checksum에는 들어가는) labelMapping만 바꿔도
+        # 예전 source.checksum/id를 그대로 승계해 동결되는 것을 막는다.
+        "checksumInputs": {
+            "windowSize": window_size,
+            "hopSize": hop_size,
+            "seed": recorded_seed,
+            "featurePipelineVersion": FEATURE_PIPELINE_VERSION,
+            "featureConfig": {
+                "sampleRate": config.sample_rate,
+                "frameLength": config.frame_length,
+                "hopLength": config.hop_length,
+                "nMfcc": config.n_mfcc,
+                "bandEdges": list(config.band_edges),
+            },
+            "splitStrategyKey": split_strategy,
+        },
         "split": recorded_split_ratios,
         "splitStrategy": _SPLIT_STRATEGY_TEXT[split_strategy],
         "holdoutType": holdout_type,

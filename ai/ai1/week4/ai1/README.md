@@ -78,27 +78,36 @@ API 명세서 v1.3에서 추가된 `labelPolicyVersion`(`LABEL-POLICY-V2`)·`sna
 - **`trusted_legacy`는 실제 `bool`만 허용한다(리뷰 P1, 3차).** 문자열 `"false"`는 파이썬에서
   truthy라서, 타입 검증 없이는 legacy 완화 경로가 잘못 켜질 수 있었다 — 이제 `bool`이 아니면
   `TypeError`, `is True`일 때만 완화 경로를 켠다.
-- `register_model_version`은 필수 문자열(version/artifactUri/datasetId/baselineVersion/
-  artifactChecksum)의 nonblank와 `metrics`가 dict인지 검증하고, 불변 필드 전체의
-  `registrationDigest`를 함께 저장한다. `approve_model_version`은 `approved_by`와 명시적인
-  `metric_snapshot`을 모두 필수로 받고(등록 시점 metrics를 암묵적으로 재사용하지 않는다),
-  승인을 canonical 등록 레코드에 결속한다(리뷰 P1, 3차) — `registry`가 주어지면 `version`으로
-  그 안에서 정확히 한 건의 등록 레코드를 조회해 승인 대상으로 삼고, 없으면 `model_version`
-  자신의 `registrationDigest`가 현재 내용과 일치하는지 검증한다(없으면 무조건 거부) — 누가,
-  어떤 지표를 보고 승인했는지 감사 가능해야 한다.
-- `rollback_model_version`은 target이 **실제로 current보다 앞선 승인 버전**인지 검증한다.
-  `approved_history`는 이제 **필수** 인자다(리뷰 P1, 3차 — 생략하면 current/target 객체 자체의
-  `approvedAt`을 신뢰하는 폴백 경로가 있어, registered 상태에 `approvedAt`만 위조해도 롤백이
-  만들어졌다). target/current 모두 계보 안에서 정확히 한 건의 **승인(`status=="approved"`)**
-  canonical 레코드로 존재해야 하며(계보 누락 시 호출자 객체 자체의 값으로 대체하지 않는다,
-  리뷰 P1 2차), **배열 순서가 아니라 각 항목의 실제 `approvedAt`**을 UTC로 파싱해 시간순으로
-  비교한다 — 배열이 역순으로 전달돼도 forward rollback을 막는다. `target_environment`도
-  허용된 환경 값(`production`/`staging`/`development`)이어야 한다.
-- `register_baseline_version`은 필수 ID(baseline/dataset/site/asset)와 `features` 구조·
-  유한값(std>0)을 검증하고 `registrationDigest`를 저장한다. `approve_baseline_version`은
-  `approved_by`(이전에는 검증되지 않았다)와 `reason`을 모두 필수로 받고, `activate_baseline_version`과
-  함께 식별 필드·`registrationDigest`를 재검증해 `status`만 맞춘 임의 객체가 ID 없는
-  active 기준선이 되는 것을 막는다(리뷰 P1, 3차).
+- **`ModelVersionRegistry`/`BaselineVersionRegistry`(리뷰 P1, 5차)** — 이전에는 자유 함수
+  `register_model_version`/`approve_model_version`/`rollback_model_version`이 승인·롤백을
+  호출자가 만든 평범한 list(`registry`/`approved_history`)로 신뢰했다. `registrationDigest`/
+  `approvalDigest`가 공개 함수의 결과라서, 호출자가 임의 레코드에 그 함수로 직접 계산한
+  digest를 채워 넣고 `registry=[그 레코드]`로 전달하면 "자기 서명"이 되어 통과했다.
+  이제 등록·승인된 레코드는 **레지스트리 인스턴스 자신**이 소유한다(`register()`만 기록,
+  `approve()`/`rollback()`/`activate()`는 `version`/`baseline_id` 문자열로 그 레지스트리
+  자체에서만 조회) — `register()`를 거치지 않은 버전·기준선은 어떤 문자열을 대도 조회되지
+  않아 위조가 구조적으로 불가능하다. `register()`/`approve()`/`get()`은 항상 깊은 복사본만
+  반환해, 반환값을 변조해도 저장소 내부 상태는 영향받지 않는다.
+- `registry.register()`는 필수 문자열(version/artifactUri/datasetId/baselineVersion/
+  artifactChecksum)의 nonblank와 `metrics`가 dict인지, `artifactChecksum`이 sha256
+  hexdigest 형식인지(리뷰 P2) 검증하고, 불변 필드 전체의 `registrationDigest`를 함께
+  저장한다. 같은 version을 두 번 등록할 수 없다. `registry.approve(version, ...)`은
+  `approved_by`와 명시적인 `metric_snapshot`을 모두 필수로 받고(등록 시점 metrics를
+  암묵적으로 재사용하지 않는다), version으로 이 레지스트리 안에서 조회한 등록 레코드만
+  승인 대상으로 삼는다 — 누가, 어떤 지표를 보고 승인했는지 감사 가능해야 한다.
+- `registry.rollback(current_version, target_version, ...)`은 target이 **실제로 current보다
+  앞선 승인 버전**인지 검증한다. 계보는 이 레지스트리 자신이 보유한 전체 상태에서 나온다 —
+  별도의 `approved_history` 인자는 없다(리뷰 P1, 5차). current/target 모두 이 레지스트리
+  안에서 실제로 **승인(`status=="approved"`)된** 버전으로 존재해야 하며(등록조차 안 됐거나
+  미승인이면 무조건 거부한다), **호출 순서가 아니라 각 항목의 실제 `approvedAt`**을 UTC로
+  파싱해 시간순으로 비교한다 — 등록·승인 호출 순서가 뒤바뀌어도 forward rollback을 막는다.
+  `target_environment`도 허용된 환경 값(`production`/`staging`/`development`)이어야 한다.
+- `BaselineVersionRegistry().register()`는 필수 ID(baseline/dataset/site/asset)와 `features`
+  구조·유한값(std>0)을 검증하고 `registrationDigest`를 저장하며, 같은 baseline_id를 두 번
+  등록할 수 없다. `registry.approve(baseline_id, ...)`은 `approved_by`(이전에는 검증되지
+  않았다)와 `reason`을 모두 필수로 받고, `registry.activate(baseline_id)`는 이 레지스트리
+  안에서 실제로 승인된 baseline_id만 active로 전이한다 — 등록·승인 없이 status만 맞춘
+  임의 객체로 active 기준선을 만드는 경로 자체가 없다(리뷰 P1, 3차·5차).
 
 **재현성:** 같은 입력·`split_strategy`로 `build_manifest`를 두 번 생성해 체크섬이
 동일함을 확인한다. `split_strategy`가 다르면(specimen_group vs operating_condition_holdout)

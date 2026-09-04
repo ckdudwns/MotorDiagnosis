@@ -163,7 +163,7 @@ week3 모듈을 import하지 않고(`compute_rows_fingerprint`와 같은 이유)
 | `source.checksum` = `snapshotChecksum` | **id 재현성** — 같은 정규화 입력이면 같은 id | 원본 파일 sha256 + 전처리/분할 전략/특징 설정 + 특징 산출물 fingerprint + 정책 버전 |
 | `snapshotDigest` | **변조 탐지** — 동결 이후 내용이 바뀌지 않았는가 | 매니페스트 전체(라이선스 텍스트·rowCount·splitCounts 등 포함) |
 
-## 모델 버전 (`model_version.py`, `ModelVersion`)
+## 모델 버전 (`model_version.py`, `ModelVersionRegistry`, `ModelVersion`)
 
 ```json
 {
@@ -177,59 +177,72 @@ week3 모듈을 import하지 않고(`compute_rows_fingerprint`와 같은 이유)
 }
 ```
 
-`register_model_version()`은 필수 문자열(`version`/`artifact_uri`/`dataset_id`/
-`baseline_version`/`artifact_checksum`)이 비어 있으면 거부하고 `metrics`가 dict가
+### 신뢰 경계 — 왜 자유 함수 + `registry` 인자가 아니라 `ModelVersionRegistry` 클래스인가 (리뷰 P1, 5차)
+
+이전 버전은 자유 함수 `register_model_version()`/`approve_model_version()`/
+`rollback_model_version()`이었고, 승인·롤백은 호출자가 만들어 넘기는 **평범한
+list**(`registry`/`approved_history`)를 등록 이력·승인 계보로 신뢰했다.
+`registrationDigest`/`approvalDigest`는 이 모듈의 공개 함수(`compute_registration_digest`
+등)로 누구나 계산할 수 있어서, 호출자가 임의의 레코드에 그 함수로 직접 계산한
+digest를 채워 넣고 `registry=[그 레코드]`(또는 `approved_history=[...]`)로
+전달하면 "자기 서명"이 되어 승인·롤백이 그대로 통과했다 — "canonical 등록
+이력"이라는 이름의 값이 실제로는 호출자가 무엇이든 담을 수 있는 값이었기
+때문이다(3차·4차 리뷰가 digest 정합성까지는 막았지만, "이 digest 쌍을 가진
+list를 통째로 지어내는" 공격 자체는 막지 못했다).
+
+`ModelVersionRegistry`는 등록·승인된 레코드를 **인스턴스 자신이 소유**한다
+(`self._entries`, 클래스 바깥에 노출하지 않음). `register()`만 여기에 새 항목을
+기록하고, `approve()`/`rollback()`은 호출자가 넘긴 dict/list를 검증 입력으로
+받지 않는다 — `version` 문자열로 **그 레지스트리 자체**에서 조회한 값만
+신뢰한다. 새 `ModelVersionRegistry()`는 빈 저장소이므로, 그 인스턴스의
+`register()`를 실제로 거치지 않은 버전은 어떤 문자열을 대도 조회되지 않는다 —
+"registry=[forged]" 같은 위조가 애초에 구조적으로 불가능하다.
+`register()`/`approve()`/`get()`은 항상 내부 레코드의 **깊은 복사본**만
+반환해, 반환값을 호출자가 수정해도 저장소 내부 상태는 전혀 영향받지 않는다.
+
+### API
+
+`ModelVersionRegistry().register(*, version, artifact_uri, dataset_id, baseline_version,
+metrics, artifact_checksum)`은 필수 문자열이 비어 있으면 거부하고 `metrics`가 dict가
 아니어도 거부한다(리뷰 P1) — 불완전한 레코드가 승인 상태까지 조용히 전이되는 것을
 막는다. `artifact_checksum`(학습 시 저장한 아티팩트의 sha256)도 필수로 받아
-`artifactChecksum`으로 등록 레코드에 보존한다(리뷰 P1, 3차). 등록 시 불변 필드
-전체(`version`/`artifactUri`/`artifactChecksum`/`datasetId`/`baselineVersion`/
-`metrics`, `status`/시각류 제외)에 대한 canonical sha256을 `registrationDigest`로
-함께 저장한다.
+`artifactChecksum`으로 등록 레코드에 보존하며, `sha256:` 뒤에 64자리 16진수가
+오는 형식인지도 검증한다(리뷰 P2). 같은 `version`을 이 레지스트리에 두 번
+등록할 수 없다(재등록 시도는 거부 — 감사 이력이 조용히 덮어써지지 않도록). 등록
+시 불변 필드 전체(`version`/`artifactUri`/`artifactChecksum`/`datasetId`/
+`baselineVersion`/`metrics`, `status`/시각류 제외)에 대한 canonical sha256을
+`registrationDigest`로 함께 저장한다.
 
-상태 머신: `registered --approve_model_version()--> approved`. 승인에는 `approved_by`,
-`reason`, **명시적** `metricSnapshot`(승인 시점에 실제로 검토한 지표 — 승인 후 깊은
-복사로 저장해, 나중에 원본 `metrics`나 재계산 로직이 바뀌어도 승인 당시 근거가 남도록)이
-모두 필수다(FUT-006 계약과 동일, 리뷰 P1). 등록 시점 `metrics`를 암묵적으로 재사용하는
-기본값은 없다 — 누가·어떤 지표로 승인했는지 감사할 수 있어야 한다. 기준선 `features`도
-`register`/`approve`/`activate` 각 단계에서 깊은 복사해, draft 수정이 승인본·active
-기준선으로 새지 않는다.
+상태 머신: `registered --registry.approve(version, ...)--> approved`. 승인에는
+`approved_by`, `reason`, **명시적** `metric_snapshot`(승인 시점에 실제로 검토한
+지표 — 승인 후 깊은 복사로 저장해, 나중에 원본 `metrics`나 재계산 로직이
+바뀌어도 승인 당시 근거가 남도록)이 모두 필수다(FUT-006 계약과 동일, 리뷰 P1).
+`approve()`는 `version` 문자열로 이 레지스트리 안에서 등록 레코드를 조회한다 —
+전달할 수 있는 다른 내용이 없으므로 "등록 레코드와 다른 내용을 승인 대상으로
+전달"하는 공격 자체가 성립하지 않는다.
 
-`approve_model_version(model_version, *, approved_by, reason, metric_snapshot, registry=None)`은
-승인을 canonical 등록 레코드에 결속한다(리뷰 P1, 3차) — 예전에는 `status`만
-`"registered"`이면 `version`/`artifactUri`/`datasetId`/`baselineVersion`이 없는 임의
-객체도, 정상 등록 결과를 등록 이후에 변조한 객체도 그대로 승인됐다.
+`ModelVersionRegistry().rollback(current_version, target_version, *, reason,
+target_environment)`은 target이 **실제로 이전 승인 버전**인지 검증한다 (리뷰 P1):
 
-- `registry`(호출자가 유지하는 canonical 등록 이력, `rollback_model_version`의
-  `approved_history`와 같은 패턴)가 주어지면 `version`으로 그 안에서 정확히 한 건의
-  `registered` 레코드를 조회해 그 레코드를 승인 대상으로 삼는다 — 전달된
-  `model_version`이 그 레코드와 내용이 다르면(예: `artifactUri`를 바꿔 전달) 거부한다.
-- `registry`가 없으면 `model_version` 자신의 `registrationDigest`가 현재 내용과
-  일치하는지 재계산·대조한다 — 이 필드가 없는(`register_model_version()`을 거치지
-  않은) 레코드는 무조건 거부한다.
-
-`rollback_model_version(current, target, *, reason, target_environment, approved_history)`은
-target이 **실제로 이전 승인 버전**인지 검증한다 (리뷰 P1):
-
-- `target.status == "approved"` 이고 `current.version != target.version` (자기 롤백 금지)
-- `approved_history`는 **필수** 인자다(리뷰 P1, 3차) — 예전에는 이 인자를 생략하면
-  `current`/`target` 객체 자체의 `approvedAt` 필드를 그대로 신뢰하는 폴백 경로가 있어서,
-  `registered` 상태인 `current`에 임의의 `approvedAt`만 넣어도(실제 승인 이력 없이)
-  과거 `target`으로의 롤백 액션이 만들어졌다. 이제 호출자가 신뢰 가능한 승인 이력(또는
-  canonical registry)을 항상 제공해야 하고, `current`/`target`은 반드시 그 계보 안에서
-  조회한 값만 쓴다.
-- target/current가 계보 안에서 **정확히 한 건의 승인(`status == "approved"`) canonical
-  레코드**로 존재해야 한다(리뷰 P1, 2차) — 계보에 없으면 호출자가 넘긴 current/target
-  객체 자체의 값으로 대체하지 않고 무조건 거부한다. 그다음 각 항목의 `approvedAt`을
-  실제로 파싱해(UTC 정규화) **배열의 index 순서가 아니라 시간순으로 비교**한다 — history가
-  시간 역순으로 전달돼도 forward rollback을 막는다(이전에는 배열 index로 계보 순서를
-  판단해 역순 배열을 넘기면 우회됐다).
+- `current_version`/`target_version` 모두 **이 레지스트리에 실제로 approve()된**
+  버전이어야 하고(등록만 되고 미승인이거나, 이 레지스트리에 등록조차 된 적
+  없으면 거부), `current_version != target_version`(자기 롤백 금지).
+- 계보는 이 레지스트리 자신이 보유한 전체 상태에서 나온다 — 별도의
+  `approved_history` 인자를 넘길 필요도, 넘길 방법도 없다(리뷰 P1, 5차. 예전에는
+  이 인자를 생략하면 `current`/`target` 객체 자체의 `approvedAt` 필드를 신뢰하는
+  폴백 경로가 있었다).
+- 각 항목의 `approvedAt`을 실제로 파싱해(UTC 정규화) 비교한다 — **호출 순서가
+  아니라 실제 승인 시각 기준**으로 target이 current보다 먼저 승인됐어야 한다
+  (리뷰 P1 — 예전에는 배열 index로 계보 순서를 판단해 역순 배열을 넘기면
+  우회됐다).
 - `target_environment`도 비어있지 않은 허용 환경 값(`production`/`staging`/
   `development`)이어야 한다(리뷰 P1, 3차) — 임의 문자열을 그대로 기록하지 않는다.
 - 반환 레코드에 `targetApprovedAt`를 함께 남긴다.
 
 반환값은 별도의 rollback 액션 레코드(FUT-007 "배포와 롤백을 별도 작업으로 기록")다.
+`rollback()` 자신은 레지스트리 상태를 바꾸지 않는다.
 
-## 기준선 버전 (`BaselineVersion`, FUT-010/011)
+## 기준선 버전 (`BaselineVersionRegistry`, `BaselineVersion`, FUT-010/011)
 
 week2 `baseline.json`과 같은 구조(`mean`/`std`/`normal_range`)를 `features`에 담되,
 설비·시간대 단위로 버전 관리한다:
@@ -246,24 +259,28 @@ week2 `baseline.json`과 같은 구조(`mean`/`std`/`normal_range`)를 `features
 }
 ```
 
-`register_baseline_version()`은 `baseline_id`/`dataset_id`/`site_id`/`asset_id`가
-비어 있거나 `features`가 `{name: {"mean", "std", "normal_range"}}` 구조·유한값(`std`는
-양수)을 만족하지 않으면 거부한다(리뷰 P1) — 등록 시점에 검증된 내용만
-`registrationDigest`(불변 필드 canonical sha256)로 봉인해 이후 approve/activate가
-변조·누락을 탐지한다.
+`BaselineVersionRegistry`는 `ModelVersionRegistry`와 같은 신뢰 경계를 쓴다(리뷰
+P1, 5차) — `register()`/`approve()`/`activate()`는 호출자가 만든 dict를 검증
+입력으로 받지 않고, `baseline_id` 문자열로 이 레지스트리 자체에서 조회한 값만
+신뢰한다. 이전에는 `approve_baseline_version()`/`activate_baseline_version()`이
+전달받은 객체 자체의 `registrationDigest`/`approvalDigest`를 재계산·대조했는데,
+그 두 함수 모두 공개 함수라서 호출자가 register/approve를 한 번도 거치지 않은
+객체에도 두 digest를 직접 계산해 채워 넣으면(자기 서명) 그대로 통과했다.
 
-`approve_baseline_version(baseline_version, *, approved_by, reason)`은 `reason`뿐 아니라
-`approved_by`도 비어있지 않은지 검증한다(리뷰 P1 — 예전에는 `approved_by` 검증이
-누락돼 공백 승인자가 승인 레코드에 그대로 남을 수 있었다). 승인 대상 객체 자체의
-식별 필드·features 구조도 재검증하고, `registrationDigest`가 등록 시점 내용과
-일치하는지 대조해 `register_baseline_version()`을 거치지 않은(또는 등록 이후 변조된)
-객체의 승인을 거부한다.
+`registry.register(*, baseline_id, dataset_id, site_id, asset_id, features,
+time_segment=None)`은 `baseline_id`/`dataset_id`/`site_id`/`asset_id`가 비어
+있거나 `features`가 `{name: {"mean", "std", "normal_range"}}` 구조·유한값(`std`는
+양수)을 만족하지 않으면 거부한다(리뷰 P1). 같은 `baseline_id`를 두 번 등록할 수
+없다.
 
-`activate_baseline_version()`은 `status == "approved"`가 아니면 예외를 던진다 —
-"검증 데이터셋에 연결하고 승인 전 배포 금지"(FUT-011 수용 기준)를 코드 레벨에서
-강제한다. `status`만 맞춘 임의 객체(ID·features 없음)가 그대로 active로 전이되지
-않도록(리뷰 P1) 식별 필드·features를 다시 검증하고, `registrationDigest`가 승인~
-활성화 사이 변조되지 않았는지도 대조한다.
+`registry.approve(baseline_id, *, approved_by, reason)`은 `reason`뿐 아니라
+`approved_by`도 비어있지 않은지 검증한다(리뷰 P1). `baseline_id`로 이 레지스트리
+안에서 draft 레코드를 조회해 승인한다 — 등록된 적 없는 id는 거부된다.
+
+`registry.activate(baseline_id)`는 이 레지스트리 안에서 `status == "approved"`인
+레코드만 배포(active)로 전이한다 — "승인 전 배포 금지"(FUT-011 수용 기준)를
+코드 레벨에서 강제한다. 등록된 적 없거나 아직 승인되지 않은 `baseline_id`는
+거부된다.
 
 ## 대상 확정 후 보완
 

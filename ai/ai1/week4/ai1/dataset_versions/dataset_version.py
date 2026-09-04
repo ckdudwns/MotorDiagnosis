@@ -67,6 +67,29 @@ def compute_snapshot_digest(manifest: dict) -> str:
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+# verify_reproducibility()가 frozen과 recomputed(draft) 전체를 직접 비교할 때 빼는
+# 키. _VOLATILE_MANIFEST_KEYS(생명주기·시간 필드)에 더해, frozen에만 존재하고
+# recomputed(draft)에는 없는 파생 필드(snapshotChecksum — source.checksum과 같은
+# 값의 사본)와, 같은 날 두 번 빌드해도 date 컴포넌트 경계에서 달라질 수 있는 id를
+# 뺀다(id 재현성은 freeze 시점에 이미 checksum suffix로 검증됨).
+_REPRODUCIBILITY_IGNORED_KEYS = _VOLATILE_MANIFEST_KEYS | frozenset({"snapshotChecksum", "id"})
+
+
+def _canonical_comparable_snapshot(manifest: dict) -> dict:
+    """재현성 비교용 canonical snapshot — 생명주기·시간·파생 체크섬 필드만 뺀
+    매니페스트 전체.
+
+    [리뷰 P1] `verify_reproducibility()`는 예전에 `datasetChecksum`(rows+
+    labelMapping+split)과 `compute_source_checksum()`(원본 파일/전처리/특징 설정
+    입력)만 비교했다 — 둘 중 어디에도 들어가지 않는 `source.license`, `name`,
+    `compatibility.samplingRateHz`, 최상위 `splitStrategy`(사람이 읽는 문자열,
+    `checksumInputs.splitStrategyKey`와 별개) 등을 `recomputed_manifest`에서
+    바꿔도 재현 성공으로 오판됐다. 이 스냅샷은 그 필드들까지 포함해 frozen과
+    recomputed **전체**를 직접 비교하는 데 쓴다.
+    """
+    return {k: v for k, v in manifest.items() if k not in _REPRODUCIBILITY_IGNORED_KEYS}
+
+
 def compute_source_checksum(manifest: dict) -> str:
     """draft/frozen 매니페스트 자체의 필드만으로 3주차
     `register_dataset.compute_version_checksum()`과 동일한 canonical payload를
@@ -387,6 +410,14 @@ def verify_reproducibility(
     실제로 재계산됐다는 보장이 없어(예: `samplingRateHz`/`splitStrategy`만 바꾸고
     `source.checksum` 필드는 예전 값 그대로 둔 채 `checksumInputs`만 지우면) 우회할
     수 있었다. 이제 하나라도 없으면 재현 실패로 처리한다.
+
+    [리뷰 P1, 5차] 위 검증들은 모두 `datasetChecksum`/`compute_source_checksum()`
+    payload에 들어가는 필드만 본다 — `source.license`, `name`,
+    `compatibility.samplingRateHz`, 최상위 `splitStrategy`처럼 두 payload 어디에도
+    없는 필드는 recomputed_manifest에서 바꿔도 여전히 재현 성공으로 오판됐다.
+    마지막으로 `_canonical_comparable_snapshot()`(생명주기·시간·파생 체크섬 필드만
+    제외한 매니페스트 전체)로 frozen과 recomputed를 직접 비교해, 위 payload들에
+    포함되지 않는 불변 메타데이터 변경까지 잡아낸다.
     """
     _require_bool_trusted_legacy(trusted_legacy)
     verify_frozen_integrity(frozen_manifest, trusted_legacy=trusted_legacy)
@@ -413,6 +444,11 @@ def verify_reproducibility(
         frozen_manifest.get("source") or {}
     ).get("checksum")
     if frozen_recomputed_checksum != frozen_declared_checksum:
+        return False
+
+    if _canonical_comparable_snapshot(frozen_manifest) != _canonical_comparable_snapshot(
+        recomputed_manifest
+    ):
         return False
     return True
 

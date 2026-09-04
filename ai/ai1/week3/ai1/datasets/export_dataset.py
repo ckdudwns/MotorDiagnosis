@@ -122,6 +122,29 @@ def _resolve_version_dir(versions_dir: str, version_id: str) -> str:
     return candidate
 
 
+# manifest 시트에서 재생성마다 값이 달라지는 필드명. JSON manifest 비교의
+# _MANIFEST_JSON_VOLATILE_KEYS와 같은 이유로 뺀다.
+_MANIFEST_SHEET_VOLATILE_FIELDS = frozenset({"createdAt"})
+
+
+def _canonical_manifest_sheet(ws) -> dict:
+    """manifest 시트([field, value] 행들)를 field -> value dict로 canonical화한다.
+
+    [리뷰 P1] `field` 컬럼은 `manifest_sheet.append(...)` 호출 순서(딕셔너리
+    순회 순서에 의존하는 `labelMapping.*`/`source.files.*` 등 포함)를 그대로
+    반영한다 — 의미가 같은 내용이라도 삽입 순서만 달라지면 raw 행 비교에서
+    다른 것으로 오판된다. field -> value dict로 바꾸면 순서와 무관하게
+    비교되고(파이썬 dict 동등 비교는 키 순서를 보지 않는다), `createdAt`처럼
+    재실행마다 달라지는 필드도 JSON manifest 비교와 동일하게 제외한다.
+    """
+    rows = [[cell.value for cell in row] for row in ws.iter_rows()]
+    return {
+        field: value
+        for field, value in rows[1:]  # 첫 행은 헤더(["field", "value"])
+        if field not in _MANIFEST_SHEET_VOLATILE_FIELDS
+    }
+
+
 def _xlsx_content_matches(staged_path: str, existing_path: str) -> bool:
     """두 XLSX가 시트 이름뿐 아니라 실제 셀 값까지 동일한지 비교한다.
 
@@ -129,6 +152,13 @@ def _xlsx_content_matches(staged_path: str, existing_path: str) -> bool:
     다르므로 바이트 비교를 쓸 수 없다. 예전에는 두 시트("manifest"/"rows")의
     존재 여부만 확인해서, 기존 XLSX의 셀 값이 변조돼도(예: manifest 시트의 특정
     필드) "재사용 가능"으로 오판했다. 시트별 전체 셀 값을 직접 비교한다.
+
+    [리뷰 P1, 5차] "manifest" 시트는 JSON manifest 비교(`_canonical_manifest_json`)와
+    달리 `createdAt`을 빼지 않고 raw 행을 그대로 비교했다 — 같은 입력으로 같은
+    id를 다시 export해도 `createdAt`만 달라지면 (내용은 동일한데도)
+    `VersionContentConflictError`가 났다. "manifest" 시트만 `createdAt`을 뺀
+    field->value dict로 canonical 비교하고, "rows" 시트는 기존처럼 raw 행을
+    엄격하게 비교한다(행 데이터는 재실행마다 값이 달라질 이유가 없다).
     """
     if not os.path.exists(existing_path):
         return False
@@ -140,6 +170,12 @@ def _xlsx_content_matches(staged_path: str, existing_path: str) -> bool:
     if staged_wb.sheetnames != existing_wb.sheetnames:
         return False
     for name in staged_wb.sheetnames:
+        if name == "manifest":
+            if _canonical_manifest_sheet(staged_wb[name]) != _canonical_manifest_sheet(
+                existing_wb[name]
+            ):
+                return False
+            continue
         staged_rows = [
             [cell.value for cell in row] for row in staged_wb[name].iter_rows()
         ]

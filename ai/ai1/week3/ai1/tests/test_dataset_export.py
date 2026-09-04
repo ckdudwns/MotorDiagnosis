@@ -983,6 +983,69 @@ class TestExportDatasetSynthetic(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_repeated_export_with_different_created_at_is_not_rejected(self):
+        """[리뷰 P1, 5차] JSON manifest 비교(`_canonical_manifest_json`)는
+        `createdAt`을 빼지만, 예전 `_xlsx_content_matches`는 manifest 시트를
+        raw 행으로 그대로 비교해서 `createdAt` 행 하나만 달라도 XLSX 비교가
+        실패했다 — 나머지 두 산출물(csv_matches/manifest_matches)은 통과해도
+        `csv_matches and manifest_matches and xlsx_matches`가 False가 되어,
+        내용이 완전히 같은 재-export도 `VersionContentConflictError`로
+        거부됐다."""
+        from export_dataset import VersionContentConflictError
+
+        manifest_a = self._synthetic_manifest()
+        manifest_b = self._synthetic_manifest()
+        manifest_b["createdAt"] = "2026-09-04T00:00:00+00:00"  # 내용은 동일, 생성 시각만 다름
+        self.assertEqual(manifest_a["id"], manifest_b["id"])
+
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_createdat_")
+        try:
+            result_a = export_dataset(manifest_a, tmp_dir)
+            try:
+                result_b = export_dataset(manifest_b, tmp_dir)
+            except VersionContentConflictError:
+                self.fail(
+                    "createdAt만 다른 내용이 동일한 재-export가 "
+                    "VersionContentConflictError로 거부됐습니다."
+                )
+            self.assertEqual(result_a["version_dir"], result_b["version_dir"])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_repeated_export_with_different_label_mapping_insertion_order_is_not_rejected(
+        self,
+    ):
+        """[리뷰 P1, 5차] manifest 시트의 `labelMapping.*` 행은
+        `manifest["labelMapping"].items()` 순회 순서를 그대로 반영한다 — 의미가
+        같은(같은 키-값 쌍) labelMapping이라도 dict 삽입 순서만 다르면 raw 행
+        비교(순서까지 비교)로는 다른 내용으로 오판됐다."""
+        from export_dataset import VersionContentConflictError
+
+        manifest_a = self._synthetic_manifest()
+        manifest_b = self._synthetic_manifest()
+        # 같은 키-값 쌍을 반대 순서로 삽입한 dict — 내용은 동일하다.
+        manifest_b["labelMapping"] = dict(reversed(list(manifest_a["labelMapping"].items())))
+        self.assertEqual(manifest_a["labelMapping"], manifest_b["labelMapping"])
+        self.assertNotEqual(
+            list(manifest_a["labelMapping"].items()),
+            list(manifest_b["labelMapping"].items()),
+        )
+        self.assertEqual(manifest_a["id"], manifest_b["id"])
+
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_maporder_")
+        try:
+            result_a = export_dataset(manifest_a, tmp_dir)
+            try:
+                result_b = export_dataset(manifest_b, tmp_dir)
+            except VersionContentConflictError:
+                self.fail(
+                    "labelMapping 삽입 순서만 다른 재-export가 "
+                    "VersionContentConflictError로 거부됐습니다."
+                )
+            self.assertEqual(result_a["version_dir"], result_b["version_dir"])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def test_same_id_different_label_mapping_rejected_not_silently_reused(self):
         """[리뷰 P1] version_id(=source.checksum)는 export 시점에만 바뀌는 값
         (labelMapping을 export 직전에 수정)을 반영하지 않는다. 같은 id로 먼저

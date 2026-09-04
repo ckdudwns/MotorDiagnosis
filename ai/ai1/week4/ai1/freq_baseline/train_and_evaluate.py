@@ -505,9 +505,9 @@ def score_from_artifact(
     계산하고, 같은 바이트를 `io.BytesIO`로 역직렬화한다. `weights_only=True`(+
     `map_location="cpu"`)로 로드해 pickle 역직렬화가 텐서/기본 타입 이외의 임의
     객체를 실행하지 못하게 제한한다. `expected_checksum`은 호출자가 canonical
-    모델 등록 레코드(`register_model_version()`의 `artifactChecksum`)에서 가져와야
-    한다 — 호출자가 스스로 계산한 값을 넘기면 이 함수의 checksum 검증은
-    동어반복이 된다.
+    모델 등록 레코드(`ModelVersionRegistry.register()`가 반환하는 `artifactChecksum`)
+    에서 가져와야 한다 — 호출자가 스스로 계산한 값을 넘기면 이 함수의 checksum
+    검증은 동어반복이 된다.
 
     - checksum 불일치 → ValueError (역직렬화 전에 거부)
     - 특징 집합이 아티팩트와 다르면 → ValueError

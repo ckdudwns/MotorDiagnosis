@@ -7,6 +7,7 @@ from typing import Any
 
 DEMO_SIGNAL_SOURCE = "ai2-week4-combined-signal-demo"
 DEMO_MODEL_VERSION = "demo-rule-injection-v1"
+MAX_DEMO_ANOMALY_SAMPLES = 120
 
 
 def build_combined_anomaly_samples(
@@ -48,24 +49,34 @@ def build_combined_anomaly_samples(
             scenario_label="normal",
         )
     )
-    for offset in range(duration_sec + 1):
+    offsets = _sample_offsets(duration_sec)
+    for index, offset in enumerate(offsets):
         timestamp = end_at - timedelta(seconds=duration_sec - offset)
+        progress = offset / duration_sec
         samples.append(
             _sample(
                 timestamp=timestamp,
-                sequence=first_sequence + offset + 1,
+                sequence=first_sequence + index + 1,
                 site_id=site_id,
                 asset_id=asset_id,
                 device_id=device_id,
                 rpm=rated_rpm * 0.86,
-                vibration_rms_raw=0.85 + offset * 0.015,
-                acoustic_rms_raw=0.12 + offset * 0.003,
+                vibration_rms_raw=0.85 + progress * 0.15,
+                acoustic_rms_raw=0.12 + progress * 0.03,
                 vibration_peak_hz=118.0,
                 acoustic_peak_hz=760.0,
                 scenario_label="combined_anomaly",
             )
         )
     return samples
+
+
+def _sample_offsets(duration_sec: int) -> list[int]:
+    """Evenly sample an inclusive duration without deleting real telemetry."""
+    if duration_sec + 1 <= MAX_DEMO_ANOMALY_SAMPLES:
+        return list(range(duration_sec + 1))
+    last_index = MAX_DEMO_ANOMALY_SAMPLES - 1
+    return [round(index * duration_sec / last_index) for index in range(last_index + 1)]
 
 
 def _sample(

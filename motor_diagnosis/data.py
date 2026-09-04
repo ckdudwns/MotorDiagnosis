@@ -16,6 +16,7 @@ from typing import Any
 from .demo_signals import (
     DEMO_MODEL_VERSION,
     DEMO_SIGNAL_SOURCE,
+    MAX_DEMO_ANOMALY_SAMPLES,
     build_combined_anomaly_samples,
 )
 
@@ -947,6 +948,8 @@ ALERT_POLICIES = copy_payload(BASE_ALERT_POLICIES)
 QUARANTINED_DEVICE_MESSAGES: list[dict[str, Any]] = []
 MQTT_QUARANTINE_IDEMPOTENCY: dict[str, dict[str, Any]] = {}
 TELEMETRY_RECORDS: list[dict[str, Any]] = []
+DEMO_TELEMETRY_RECORDS: list[dict[str, Any]] = []
+DEMO_TELEMETRY_MAX_RECORDS_PER_ASSET = 1000
 TELEMETRY_IDEMPOTENCY: dict[tuple[str, int], dict[str, str]] = {}
 TELEMETRY_METRICS: dict[str, int | float | str | None] = {
     "requests": 0,
@@ -998,6 +1001,7 @@ def reset_runtime_state() -> None:
         QUARANTINED_DEVICE_MESSAGES.clear()
         MQTT_QUARANTINE_IDEMPOTENCY.clear()
         TELEMETRY_RECORDS.clear()
+        DEMO_TELEMETRY_RECORDS.clear()
         TELEMETRY_IDEMPOTENCY.clear()
         TELEMETRY_METRICS.update(
             {
@@ -3032,11 +3036,16 @@ def _stored_telemetry_for(
     asset_id: str,
     from_timestamp: str | None = None,
     to_timestamp: str | None = None,
+    *,
+    include_demo: bool = True,
 ) -> list[dict[str, Any]]:
     get_asset(site_id, asset_id)
+    records = TELEMETRY_RECORDS
+    if include_demo:
+        records = [*TELEMETRY_RECORDS, *DEMO_TELEMETRY_RECORDS]
     stored = [
         copy_payload(record)
-        for record in TELEMETRY_RECORDS
+        for record in records
         if record["siteId"] == site_id and record["assetId"] == asset_id
     ]
     from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
@@ -3071,7 +3080,7 @@ def telemetry_for(
     )
     if stored or any(
         record["siteId"] == site_id and record["assetId"] == asset_id
-        for record in TELEMETRY_RECORDS
+        for record in [*TELEMETRY_RECORDS, *DEMO_TELEMETRY_RECORDS]
     ):
         return stored
 
@@ -3128,7 +3137,7 @@ def telemetry_units(
         and asset_id
         and any(
             record["siteId"] == site_id and record["assetId"] == asset_id
-            for record in TELEMETRY_RECORDS
+            for record in [*TELEMETRY_RECORDS, *DEMO_TELEMETRY_RECORDS]
         )
     ):
         return {
@@ -3662,44 +3671,32 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             .upper()
         )
         asset = get_asset(site["id"], asset_id)
-        device = next(
-            (
-                item
-                for item in DEVICES
-                if item["siteId"] == site["id"]
-                and item["assetId"] == asset["id"]
-                and item.get("mappingStatus") == "active"
-                and item.get("certificateStatus") == "registered"
-            ),
-            None,
-        )
-        if device is None:
-            raise ApiError(
-                409,
-                "DEMO_DEVICE_NOT_READY",
-                "The selected asset has no active registered telemetry device.",
-            )
         rule = anomaly_rule_for(asset["id"])
         duration_sec = int(rule["durationSec"])
+        demo_device_id = f"DEMO-{asset['id']}"
         existing_sequences = [
             int(record["sequence"])
-            for record in TELEMETRY_RECORDS
-            if record["deviceId"] == device["id"]
+            for record in DEMO_TELEMETRY_RECORDS
+            if record["deviceId"] == demo_device_id
         ]
         samples = build_combined_anomaly_samples(
             site_id=site["id"],
             asset_id=asset["id"],
-            device_id=device["id"],
+            device_id=demo_device_id,
             rated_rpm=float(asset["ratedRpm"]),
             duration_sec=duration_sec,
             first_sequence=max(existing_sequences, default=0) + 1,
             end_at=datetime.now(timezone.utc),
         )
-        demo_principal = copy_payload(
-            TELEMETRY_SERVICE_TOKENS["demo-telemetry-validation-token"]
-        )
-        for sample in samples:
-            ingest_telemetry(demo_principal, sample)
+        DEMO_TELEMETRY_RECORDS.extend(samples)
+        demo_asset_records = [
+            record
+            for record in DEMO_TELEMETRY_RECORDS
+            if record["siteId"] == site["id"] and record["assetId"] == asset["id"]
+        ]
+        overflow = len(demo_asset_records) - DEMO_TELEMETRY_MAX_RECORDS_PER_ASSET
+        for expired_record in demo_asset_records[: max(0, overflow)]:
+            DEMO_TELEMETRY_RECORDS.remove(expired_record)
         # Alert delivery history is durable even when the demo store restarts.
         event_id = f"EV-{secrets.token_hex(12).upper()}"
         event = {
@@ -3709,7 +3706,7 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             "severity": "critical",
             "eventType": "asset_anomaly_candidate",
             "title": f"{asset['name']} anomaly injection event",
-            "deviceId": device["id"],
+            "deviceId": demo_device_id,
             "occurredAt": samples[-1]["timestamp"],
             "time": samples[-1]["timestamp"],
             "duration": f"{duration_sec}s",
@@ -3725,6 +3722,9 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             "isSynthetic": True,
             "source": DEMO_SIGNAL_SOURCE,
             "telemetrySampleCount": len(samples),
+            "telemetryIntervalSec": max(
+                1, math.ceil(duration_sec / (MAX_DEMO_ANOMALY_SAMPLES - 1))
+            ),
             "scenarioLabel": "combined_anomaly",
         }
         _freeze_event_evidence(event)
@@ -6005,6 +6005,7 @@ def _freeze_internal_dataset_snapshot(
             asset["id"],
             from_timestamp=from_timestamp,
             to_timestamp=to_timestamp,
+            include_demo=False,
         )
         source_records.extend(points)
         snapshot[_dataset_snapshot_key(asset["siteId"], asset["id"])] = (

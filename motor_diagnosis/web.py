@@ -187,7 +187,7 @@ def render_page() -> str:
       renderSiteRows();
       renderEvents();
       $("chartTitle").textContent = `${site.name} / ${assetId}`;
-      draw(telem.points, telem.units);
+      draw(telem.points, telem.units, events);
     }
 
     function renderNotifications(rows) {
@@ -214,6 +214,8 @@ def render_page() -> str:
       panel.appendChild(title);
       appendModelField(panel, "Evaluation scope", "Reported metrics are not deployment or field-generalization evidence.");
       appendModelField(panel, "Artifact", model.artifactVerified ? "verified" : "reference only; not verified");
+      appendModelField(panel, "Baseline version", model.baselineVersion);
+      appendModelField(panel, "Baseline features", model.baselineSnapshot?.features);
       appendModelField(panel, "Metrics", model.metrics || {});
       appendModelField(panel, "Known error cases", model.errorCases || []);
       appendModelField(panel, "Domain gap", model.domainGap);
@@ -293,7 +295,7 @@ def render_page() -> str:
       return Number.isFinite(number) ? number : null;
     }
 
-    function draw(points, units) {
+    function draw(points, units, chartEvents = []) {
       latestPoints = points;
       latestUnits = units;
       const c = $("chart"), ctx = c.getContext("2d"), w = c.width, h = c.height, pad = 34;
@@ -338,7 +340,23 @@ def render_page() -> str:
         }
         ctx.fillStyle = color; ctx.font = "12px Segoe UI"; ctx.fillText(name, legendX, 18); legendX += ctx.measureText(name).width + 16;
       }
+      drawEventMarkers(ctx, points, chartEvents, w, h, pad);
       $("chartHint").textContent = "Signals are independently scaled for comparison. Hover for raw values and score evidence.";
+    }
+
+    function drawEventMarkers(ctx, points, chartEvents, width, height, pad) {
+      const firstAt = new Date(points[0].timestamp).getTime();
+      const lastAt = new Date(points[points.length - 1].timestamp).getTime();
+      if (!Number.isFinite(firstAt) || !Number.isFinite(lastAt)) return;
+      for (const event of chartEvents) {
+        const occurredAt = new Date(event.occurredAt).getTime();
+        if (!Number.isFinite(occurredAt) || occurredAt < firstAt || occurredAt > lastAt) continue;
+        const ratio = firstAt === lastAt ? 1 : (occurredAt - firstAt) / (lastAt - firstAt);
+        const x = pad + (width - pad * 2) * ratio;
+        ctx.strokeStyle = "#c2413b"; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.moveTo(x, pad); ctx.lineTo(x, height - pad); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = "#c2413b"; ctx.beginPath(); ctx.arc(x, pad + 8, 4, 0, Math.PI * 2); ctx.fill();
+      }
     }
 
     document.addEventListener("click", async (e) => {

@@ -640,7 +640,7 @@ class Week4HttpTest(unittest.TestCase):
         self.assertEqual(event["source"], "ai2-week4-combined-signal-demo")
         samples = [
             record
-            for record in data.TELEMETRY_RECORDS
+            for record in data.DEMO_TELEMETRY_RECORDS
             if record["source"] == event["source"]
         ]
         self.assertEqual(len(samples), event["telemetrySampleCount"])
@@ -664,6 +664,10 @@ class Week4HttpTest(unittest.TestCase):
         )
         self.assertGreater(samples[-1]["acousticRmsRaw"], samples[0]["acousticRmsRaw"])
         self.assertLess(samples[-1]["rpm"], samples[0]["rpm"])
+        self.assertEqual(data.TELEMETRY_RECORDS, [])
+        self.assertTrue(
+            all(record["deviceId"].startswith("DEMO-") for record in samples)
+        )
         deadline = time.monotonic() + 3
         while True:
             status, alerts = self.request(
@@ -791,6 +795,69 @@ class Week4HttpTest(unittest.TestCase):
             with self.assertRaises(data.ApiError) as error:
                 data.inject_anomaly({"siteId": "SITE-01"})
         self.assertEqual(error.exception.code, "DEMO_DISABLED")
+
+    def test_demo_storage_does_not_consume_physical_device_sequences_or_health(self):
+        principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+        first = telemetry(1)
+        data.ingest_telemetry(principal, first)
+        device = data.get_device(first["deviceId"])
+        before_demo_received_at = device["lastReceivedAt"]
+
+        event = data.inject_anomaly(
+            {"siteId": first["siteId"], "assetId": first["assetId"]}
+        )
+        self.assertEqual(
+            data.get_device(first["deviceId"])["lastReceivedAt"],
+            before_demo_received_at,
+        )
+
+        second = telemetry(2)
+        _, status = data.ingest_telemetry(principal, second)
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            [record["sequence"] for record in data.TELEMETRY_RECORDS], [1, 2]
+        )
+        self.assertNotEqual(
+            data.get_device(first["deviceId"])["lastReceivedAt"],
+            before_demo_received_at,
+        )
+        self.assertNotEqual(event["deviceId"], first["deviceId"])
+        self.assertTrue(
+            all(
+                record["deviceId"] == event["deviceId"]
+                for record in data.DEMO_TELEMETRY_RECORDS
+            )
+        )
+        self.assertNotEqual(before_demo_received_at, "")
+
+    def test_long_demo_duration_is_downsampled_without_deleting_real_telemetry(self):
+        principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+        real_record = telemetry(1)
+        data.ingest_telemetry(principal, real_record)
+        rule = next(
+            item
+            for item in data.ANOMALY_RULES
+            if item["assetId"] == real_record["assetId"]
+        )
+        rule["durationSec"] = 3600
+
+        event = data.inject_anomaly(
+            {"siteId": real_record["siteId"], "assetId": real_record["assetId"]}
+        )
+
+        self.assertEqual(len(data.TELEMETRY_RECORDS), 1)
+        self.assertEqual(data.TELEMETRY_RECORDS[0]["sequence"], 1)
+        self.assertEqual(
+            event["telemetrySampleCount"], data.MAX_DEMO_ANOMALY_SAMPLES + 1
+        )
+        self.assertLess(event["telemetrySampleCount"], event["durationSec"] + 2)
+        self.assertEqual(event["telemetryIntervalSec"], 31)
+        points = data.telemetry_for(real_record["siteId"], real_record["assetId"])
+        self.assertEqual(len(points), event["telemetrySampleCount"] + 1)
+        self.assertEqual(points[0]["deviceId"], event["deviceId"])
+        self.assertTrue(
+            any(point["deviceId"] == real_record["deviceId"] for point in points)
+        )
 
     def test_model_registration_http_contract_and_authorization(self):
         status, dataset = self.request(

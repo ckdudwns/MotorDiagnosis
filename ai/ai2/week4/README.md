@@ -7,13 +7,16 @@ AI-2의 4주차 범위는 `SIM_ANOMALY_01`의 최종 시연과 AI-1 모델 결�
 
 - `POST /api/demo/inject-anomaly`은 기존의 권한 검사와 환경 차단을 그대로 사용한다.
   `DEMO_ENABLED=true`에서만 열리고, `APP_ENV=production`에서는 항상 차단된다.
-- 주입 시 선택 설비의 활성 장치에 정상 1건 뒤 진동·음향·RPM이 함께 변한 raw telemetry를
-  생성한다. 모든 행은 `isSynthetic: true`, `source: ai2-week4-combined-signal-demo`으로
-  표시되며 이벤트와 같은 종료 시각을 사용한다.
+- 주입 시 실측 장치·멱등성 키·health와 분리된 `DEMO-<assetId>` 식별자와 전용 데모 저장소에
+  정상 1건 뒤 진동·음향·RPM이 함께 변한 raw telemetry를 생성한다. 모든 행은
+  `isSynthetic: true`, `source: ai2-week4-combined-signal-demo`으로 표시되며 이벤트와 같은
+  종료 시각을 사용한다.
+- 긴 규칙 지속시간은 최대 120개 이상 샘플(+정상 기준점)으로 균등 다운샘플링한다. 따라서
+  데모가 설비별 실측 1,000건 보존 상한을 소모하거나 기존 실측 데이터를 삭제하지 않는다.
 - raw-only 계약을 지킨다. `vibrationRmsMmS`, `acousticDb`는 항상 `null`이고, 생성값은
   물리 보정값이 아닌 데모용 raw RMS다.
-- 데모 시나리오 라벨은 검증용 service principal로만 기록한다. 일반 ESP/MQTT 수집 토큰은
-  계속 nullable 라벨 계약을 사용한다.
+- 데모 라벨은 전용 데모 저장소에만 기록한다. 일반 ESP/MQTT 수집 토큰은 계속 nullable
+  라벨 계약을 사용하며, 데모가 실측 수집 권한·멱등성 경로를 우회해 사용하지 않는다.
 - 대시보드는 선택한 사이트·설비에 등록된 `GET /api/model-versions` 메타데이터를 표시한다.
   문자열은 DOM `textContent`로만 넣어 등록 메타데이터가 HTML로 실행되지 않는다.
 
@@ -32,10 +35,10 @@ AI-1의 `operating_condition_holdout` F1=1.0은 운전조건 데모 결과일 �
 ## 확인 명령
 
 ```bash
-../.venv/bin/python -m unittest tests.test_week4_backend -v
+.venv/bin/python -m unittest tests.test_week4_backend -v
 node tests/test_week4_dashboard.mjs
-../.venv/bin/python -m compileall -q motor_diagnosis ai/ai2/week4 tests
-../.venv/bin/python -m black --check motor_diagnosis/demo_signals.py motor_diagnosis/data.py motor_diagnosis/web.py tests/test_week4_backend.py
+.venv/bin/python -m compileall -q motor_diagnosis ai/ai2/week4 tests
+.venv/bin/python -m black --check motor_diagnosis/demo_signals.py motor_diagnosis/data.py motor_diagnosis/web.py tests/test_week4_backend.py
 git diff --check
 ```
 

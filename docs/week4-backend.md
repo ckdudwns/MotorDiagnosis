@@ -185,11 +185,13 @@ HTTP 본문 한도는 기존 64KiB다.
 
 `DEMO_ENABLED=true`일 때만 주입 가능하며 `APP_ENV=production`이면 강제로 차단한다.
 설정하지 않으면 버튼도 숨기고 API는 `403 DEMO_DISABLED`를 반환한다.
-주입 API는 선택 설비의 활성 장치에 정상 1건과 지속된 combined anomaly summary telemetry를
-함께 생성한다. 진동·음향·RPM raw 값과 피크 주파수는 데모용 합성값이며 실제 파형, 보정된
-mm/s·dB, AI-1 모델 추론값이 아니다. `vibrationRmsMmS`와 `acousticDb`는 raw-only 계약에
-따라 null이다. 모든 행과 이벤트에는 `isSynthetic/source`를 기록하며 같은 종료 시각의
-스냅샷이 알림에 연결된다.
+주입 API는 실측 장치의 `(deviceId, sequence)` 멱등성 영역·health·원본 저장소와 분리된
+`DEMO-<assetId>` 식별자 및 데모 저장소에 정상 1건과 지속된 combined anomaly summary
+telemetry를 생성한다. 진동·음향·RPM raw 값과 피크 주파수는 데모용 합성값이며 실제 파형,
+보정된 mm/s·dB, AI-1 모델 추론값이 아니다. `vibrationRmsMmS`와 `acousticDb`는 raw-only
+계약에 따라 null이다. 규칙 지속시간이 길면 최대 120개 이상 구간으로 균등 다운샘플링하여
+실측 설비당 1,000건 보존 상한을 소모하지 않는다. 모든 행과 이벤트에는 `isSynthetic/source`를
+기록하며 같은 종료 시각의 스냅샷이 알림에 연결된다.
 
 대시보드는 등록된 model-version 메타데이터만 표시한다. AI-1 reconstruction error를 운영
 `anomalyScore`(0–100)로 변환하는 규칙은 이 MVP에 없으므로, 모델 아티팩트를 실행하거나

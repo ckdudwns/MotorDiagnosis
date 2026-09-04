@@ -5,14 +5,24 @@ import vm from 'node:vm';
 
 const source = readFileSync(new URL('../motor_diagnosis/web.py', import.meta.url), 'utf8');
 const script = source.match(/<script>([\s\S]*?)<\/script>/)[1];
+const canvasCalls = [];
+const canvasContext = {
+  arc(...args) { canvasCalls.push(['arc', ...args]); }, beginPath() {}, clearRect() {},
+  fill() {}, fillRect() {}, fillText() {}, lineTo() {}, moveTo() {}, setLineDash() {},
+  stroke() {}, measureText(text) { return {width: String(text).length * 8}; },
+};
 class Element {
   children = [];
   textContent = '';
   hidden = false;
   value = '';
+  width = 900;
+  height = 280;
   addEventListener() {}
+  append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; this.textContent = ''; }
   appendChild(child) { this.children.push(child); }
+  getContext() { return canvasContext; }
 }
 const elements = new Map();
 const context = vm.createContext({
@@ -48,13 +58,24 @@ context.models = [{
   version: '<model-v1>', deploymentStatus: 'not_deployed', artifactVerified: false,
   metrics: {f1: 1}, errorCases: ['<img src=x onerror=alert(1)>'],
   domainGap: 'different sensor', fieldCalibrationPlan: 'collect normal data',
-  limitations: 'demo only',
+  limitations: 'demo only', baselineVersion: 'BASELINE-001',
+  baselineSnapshot: {features: {rms: 0.08, peakHz: 30}},
 }];
 vm.runInContext('renderModelResult(models)', context);
 assert.equal(modelPanel.children[0].textContent, '<model-v1> · not_deployed');
-assert.match(modelPanel.children[1].textContent, /not deployment/);
-assert.match(modelPanel.children[3].children[0].textContent, /Metrics/);
-assert.match(modelPanel.children[4].textContent, /<img src=x/);
-assert.equal(modelPanel.children[4].children.length, 1);
+assert.match(modelPanel.children[1].children[1], /not deployment/);
+assert.match(modelPanel.children[3].children[0].textContent, /Baseline version/);
+assert.match(modelPanel.children[4].children[0].textContent, /Baseline features/);
+assert.match(modelPanel.children[5].children[0].textContent, /Metrics/);
+assert.match(modelPanel.children[6].children[1], /<img src=x/);
+assert.equal(modelPanel.children[6].children.filter(child => child instanceof Element).length, 1);
 assert.match(source, /api\(`\/api\/model-versions\?siteId=/);
+vm.runInContext(`draw([
+  {timestamp: '2026-09-01T00:00:00Z', vibrationRmsRaw: 0.08, acousticRmsRaw: 0.007, rpm: 1800},
+  {timestamp: '2026-09-01T00:00:10Z', vibrationRmsRaw: 0.9, acousticRmsRaw: 0.12, rpm: 1500},
+], {vibrationRmsRaw: 'raw', acousticRmsRaw: 'raw'}, [
+  {occurredAt: '2026-09-01T00:00:05Z'},
+])`, context);
+assert.ok(canvasCalls.some(call => call[0] === 'arc'));
+assert.match(source, /draw\(telem\.points, telem\.units, events\)/);
 console.log('Week 4 dashboard: notification rendering, XSS-safe text, empty state and demo gating passed.');

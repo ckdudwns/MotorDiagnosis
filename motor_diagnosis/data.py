@@ -3958,9 +3958,8 @@ def _freeze_event_evidence(
         occurred_at = parse_rfc3339("event.occurredAt", event["occurredAt"])
         if "featureSnapshot" not in evidence:
             if points is None:
-                points = telemetry_for(
-                    event["siteId"],
-                    event["assetId"],
+                points = _event_evidence_points(
+                    event,
                     from_timestamp=format_rfc3339(occurred_at - timedelta(minutes=5)),
                     to_timestamp=format_rfc3339(occurred_at + timedelta(minutes=5)),
                 )
@@ -3984,6 +3983,34 @@ def _freeze_event_evidence(
         return copy_payload(evidence)
 
 
+def _is_demo_event(event: dict[str, Any]) -> bool:
+    return bool(event.get("isSynthetic")) and event.get("source") == DEMO_SIGNAL_SOURCE
+
+
+def _event_evidence_points(
+    event: dict[str, Any],
+    *,
+    from_timestamp: str,
+    to_timestamp: str,
+) -> list[dict[str, Any]]:
+    """Return evidence from the event's own telemetry domain only.
+
+    Dashboard charts may combine real and synthetic telemetry.  Event evidence
+    must not: a physical-device event never inherits an AI-2 demo sample.
+    """
+    points = _stored_telemetry_for(
+        event["siteId"],
+        event["assetId"],
+        from_timestamp=from_timestamp,
+        to_timestamp=to_timestamp,
+        include_demo=_is_demo_event(event),
+    )
+    device_id = str(event.get("deviceId") or "").strip().upper()
+    if device_id:
+        points = [point for point in points if point.get("deviceId") == device_id]
+    return points
+
+
 def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
     require_permission(user, "event:read")
     with STORE_LOCK:
@@ -3992,23 +4019,15 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
     occurred_at = parse_rfc3339("event.occurredAt", event["occurredAt"])
     context_from = format_rfc3339(occurred_at - timedelta(minutes=5))
     context_to = format_rfc3339(occurred_at + timedelta(minutes=5))
-    points = telemetry_for(
-        event["siteId"],
-        event["assetId"],
+    points = _event_evidence_points(
+        event,
         from_timestamp=context_from,
         to_timestamp=context_to,
     )
-    context_from_value = occurred_at - timedelta(minutes=5)
-    context_to_value = occurred_at + timedelta(minutes=5)
-    has_stored_raw = any(
-        record["siteId"] == event["siteId"]
-        and record["assetId"] == event["assetId"]
-        and context_from_value
-        <= parse_rfc3339("telemetry.timestamp", record["timestamp"])
-        <= context_to_value
-        for record in TELEMETRY_RECORDS
+    is_demo = _is_demo_event(event)
+    context_source = (
+        "demo" if is_demo and points else "stored" if points else "unavailable"
     )
-    context_source = "stored" if has_stored_raw else "demo" if points else "unavailable"
     _freeze_event_evidence(event, points)
     with STORE_LOCK:
         event_snapshot = copy_payload(get_event(event_id))
@@ -4037,7 +4056,7 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
                 event_snapshot["siteId"], event_snapshot["assetId"]
             ),
             "source": context_source,
-            "rawDataMissing": not has_stored_raw,
+            "rawDataMissing": not bool(points),
         },
         "featureSnapshot": evidence_snapshot["featureSnapshot"],
         "appliedRule": applied_rule,

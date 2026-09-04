@@ -274,9 +274,8 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
         detail = event_detail_for(self.operator, event["id"])
 
-        self.assertIsNotNone(frozen_snapshot)
+        self.assertIsNone(frozen_snapshot)
         self.assertEqual(detail["featureSnapshot"], frozen_snapshot)
-        self.assertNotEqual(detail["featureSnapshot"].get("sequence"), 2)
 
     def test_event_evidence_snapshots_do_not_change_after_late_updates(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
@@ -2153,9 +2152,9 @@ class Week3HttpContractTest(unittest.TestCase):
             detail_before["event"]["thresholdVersion"], "RULE-SITE-01-MOT-02-v1"
         )
         self.assertTrue(detail_before["context"]["rawDataMissing"])
-        self.assertEqual(detail_before["context"]["source"], "demo")
-        self.assertTrue(detail_before["context"]["points"])
-        self.assertIsNotNone(detail_before["featureSnapshot"])
+        self.assertEqual(detail_before["context"]["source"], "unavailable")
+        self.assertEqual(detail_before["context"]["points"], [])
+        self.assertIsNone(detail_before["featureSnapshot"])
         self.assertEqual(detail_before["appliedRule"]["assetId"], "SITE-01-MOT-02")
 
         status, review_result = self.request(

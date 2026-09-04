@@ -17,6 +17,9 @@ AI-2의 4주차 범위는 `SIM_ANOMALY_01`의 최종 시연과 AI-1 모델 결�
   물리 보정값이 아닌 데모용 raw RMS다.
 - 데모 라벨은 전용 데모 저장소에만 기록한다. 일반 ESP/MQTT 수집 토큰은 계속 nullable
   라벨 계약을 사용하며, 데모가 실측 수집 권한·멱등성 경로를 우회해 사용하지 않는다.
+- 대시보드 차트만 실측·데모 telemetry를 함께 표시한다. 실제 이벤트의 상세 증거는 해당
+  `deviceId`의 실측 저장소만 사용하며, 실측 point가 없으면 합성 signal을 대체 증거로 쓰지
+  않고 `unavailable`/missing으로 남긴다.
 - 대시보드는 선택한 사이트·설비에 등록된 `GET /api/model-versions` 메타데이터를 표시한다.
   문자열은 DOM `textContent`로만 넣어 등록 메타데이터가 HTML로 실행되지 않는다.
 

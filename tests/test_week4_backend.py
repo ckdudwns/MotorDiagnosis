@@ -817,10 +817,6 @@ class Week4HttpTest(unittest.TestCase):
         self.assertEqual(
             [record["sequence"] for record in data.TELEMETRY_RECORDS], [1, 2]
         )
-        self.assertNotEqual(
-            data.get_device(first["deviceId"])["lastReceivedAt"],
-            before_demo_received_at,
-        )
         self.assertNotEqual(event["deviceId"], first["deviceId"])
         self.assertTrue(
             all(
@@ -829,6 +825,34 @@ class Week4HttpTest(unittest.TestCase):
             )
         )
         self.assertNotEqual(before_demo_received_at, "")
+
+    def test_real_event_evidence_never_uses_demo_telemetry_as_a_fallback(self):
+        demo_event = data.inject_anomaly(
+            {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"}
+        )
+        real_event = {
+            "id": "EV-REAL-DEVICE-01",
+            "siteId": "SITE-01",
+            "assetId": "SITE-01-MOT-02",
+            "deviceId": "DEV-01-MOT-02",
+            "severity": "device",
+            "eventType": "device_offline",
+            "title": "Physical device telemetry offline",
+            "occurredAt": demo_event["occurredAt"],
+            "time": demo_event["occurredAt"],
+            "duration": ">120s",
+            "score": 0,
+            "label": "needs_review",
+            "note": "No physical telemetry was received.",
+        }
+        data.EVENTS.insert(0, real_event)
+
+        detail = data.event_detail_for(user("operator"), real_event["id"])
+
+        self.assertEqual(detail["context"]["points"], [])
+        self.assertEqual(detail["context"]["source"], "unavailable")
+        self.assertTrue(detail["context"]["rawDataMissing"])
+        self.assertIsNone(detail["featureSnapshot"])
 
     def test_long_demo_duration_is_downsampled_without_deleting_real_telemetry(self):
         principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")

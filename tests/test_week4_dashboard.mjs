@@ -8,7 +8,8 @@ const script = source.match(/<script>([\s\S]*?)<\/script>/)[1];
 const canvasCalls = [];
 const canvasContext = {
   arc(...args) { canvasCalls.push(['arc', ...args]); }, beginPath() {}, clearRect() {},
-  fill() {}, fillRect() {}, fillText() {}, lineTo() {}, moveTo() {}, setLineDash() {},
+  fill() {}, fillRect() {}, fillText() {}, lineTo(...args) { canvasCalls.push(['lineTo', ...args]); },
+  moveTo(...args) { canvasCalls.push(['moveTo', ...args]); }, setLineDash() {},
   stroke() {}, measureText(text) { return {width: String(text).length * 8}; },
 };
 class Element {
@@ -72,10 +73,18 @@ assert.equal(modelPanel.children[6].children.filter(child => child instanceof El
 assert.match(source, /api\(`\/api\/model-versions\?siteId=/);
 vm.runInContext(`draw([
   {timestamp: '2026-09-01T00:00:00Z', vibrationRmsRaw: 0.08, acousticRmsRaw: 0.007, rpm: 1800},
+  {timestamp: '2026-09-01T00:00:01Z', vibrationRmsRaw: 0.5, acousticRmsRaw: 0.06, rpm: 1650},
   {timestamp: '2026-09-01T00:00:10Z', vibrationRmsRaw: 0.9, acousticRmsRaw: 0.12, rpm: 1500},
 ], {vibrationRmsRaw: 'raw', acousticRmsRaw: 'raw'}, [
-  {occurredAt: '2026-09-01T00:00:05Z'},
+  {occurredAt: '2026-09-01T00:00:01Z'},
 ])`, context);
-assert.ok(canvasCalls.some(call => call[0] === 'arc'));
+const expectedX = 34 + (900 - 68) * 0.1;
+assert.ok(canvasCalls.some(call => call[0] === 'arc' && Math.abs(call[1] - expectedX) < 0.001));
+assert.ok(canvasCalls.some(call => call[0] === 'lineTo' && Math.abs(call[1] - expectedX) < 0.001));
+assert.equal(vm.runInContext(`chartPointIndexAtRatio([
+  {timestamp: '2026-09-01T00:00:00Z'},
+  {timestamp: '2026-09-01T00:00:01Z'},
+  {timestamp: '2026-09-01T00:00:10Z'},
+], 0.1)`, context), 1);
 assert.match(source, /draw\(telem\.points, telem\.units, events\)/);
 console.log('Week 4 dashboard: notification rendering, XSS-safe text, empty state and demo gating passed.');

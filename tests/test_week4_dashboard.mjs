@@ -19,11 +19,13 @@ class Element {
   value = '';
   width = 900;
   height = 280;
-  addEventListener() {}
+  listeners = {};
+  addEventListener(name, callback) { this.listeners[name] = callback; }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; this.textContent = ''; }
   appendChild(child) { this.children.push(child); }
   getContext() { return canvasContext; }
+  getBoundingClientRect() { return {left: 0, width: 900}; }
 }
 const elements = new Map();
 const context = vm.createContext({
@@ -86,5 +88,17 @@ assert.equal(vm.runInContext(`chartPointIndexAtRatio([
   {timestamp: '2026-09-01T00:00:01Z'},
   {timestamp: '2026-09-01T00:00:10Z'},
 ], 0.1)`, context), 1);
+vm.runInContext(`draw(Array.from({length: 121}, (_, index) => ({
+  timestamp: new Date(Date.UTC(2026, 8, 1, 0, 0, index)).toISOString(),
+  vibrationRmsRaw: index, acousticRmsRaw: index, rpm: 1800,
+})), {vibrationRmsRaw: 'raw', acousticRmsRaw: 'raw'})`, context);
+const chart = elements.get('chart');
+const hint = elements.get('chartHint');
+chart.listeners.mousemove({clientX: 34});
+assert.match(hint.textContent, /00:00:00\.000Z/);
+chart.listeners.mousemove({clientX: 450});
+assert.match(hint.textContent, /00:01:00\.000Z/);
+chart.listeners.mousemove({clientX: 866});
+assert.match(hint.textContent, /00:02:00\.000Z/);
 assert.match(source, /draw\(telem\.points, telem\.units, events\)/);
 console.log('Week 4 dashboard: notification rendering, XSS-safe text, empty state and demo gating passed.');

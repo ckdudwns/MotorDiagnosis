@@ -624,6 +624,14 @@ class Week4HttpTest(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read())
 
+    def request_csv(self, path, token):
+        request = Request(
+            f"http://127.0.0.1:{self.server.server_port}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urlopen(request, timeout=5) as response:
+            return response.status, response.read().decode("utf-8-sig")
+
     def test_demo_default_off_site_auth_and_automatic_notification_flow(self):
         body = {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"}
         self.assertEqual(
@@ -854,6 +862,66 @@ class Week4HttpTest(unittest.TestCase):
         self.assertTrue(detail["context"]["rawDataMissing"])
         self.assertIsNone(detail["featureSnapshot"])
 
+    def test_demo_data_is_excluded_from_csv_and_dataset_training_labels(self):
+        demo_event = data.inject_anomaly(
+            {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"}
+        )
+        demo_event["reviewed"] = True
+        demo_event["label"] = "confirmed_anomaly"
+        data.EVENTS.insert(
+            0,
+            {
+                "id": "EV-OTHER-TELEMETRY-DOMAIN",
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+                "deviceId": "DEV-01-MOT-02",
+                "severity": "critical",
+                "eventType": "asset_anomaly_candidate",
+                "title": "Different collector domain",
+                "occurredAt": demo_event["occurredAt"],
+                "time": demo_event["occurredAt"],
+                "durationSec": 10,
+                "score": 99,
+                "label": "confirmed_anomaly",
+                "reviewed": True,
+                "source": "other-collector-domain",
+            },
+        )
+        principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+        real_point = telemetry(1, timestamp=data.now_iso())
+        data.ingest_telemetry(principal, real_point)
+        dataset = {
+            "labelMapping": {"confirmed_anomaly": "BEARING_SUSPECT"},
+            "labelTaxonomyVersion": "ACOUSTIC-V1",
+        }
+
+        rows = data._dataset_rows_for_points(
+            dataset,
+            real_point["siteId"],
+            real_point["assetId"],
+            data.TELEMETRY_RECORDS,
+        )
+        live_export = data.dataset_export_for(
+            user("operator"), real_point["siteId"], real_point["assetId"]
+        )
+        status, csv_text = self.request_csv(
+            "/api/export?siteId=SITE-01&assetId=SITE-01-MOT-02",
+            self.tokens["operator"],
+        )
+
+        self.assertEqual(rows[0]["event_id"], None)
+        self.assertEqual(rows[0]["ground_truth_label"], None)
+        self.assertFalse(rows[0]["training_eligible"])
+        self.assertTrue(
+            all(
+                row["device_id"] != demo_event["deviceId"]
+                for row in live_export["rows"]
+            )
+        )
+        self.assertNotIn("DEMO-", csv_text)
+        self.assertNotIn("ai2-week4-combined-signal-demo", csv_text)
+        self.assertEqual(status, 200)
+
     def test_long_demo_duration_is_downsampled_without_deleting_real_telemetry(self):
         principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
         real_record = telemetry(1)
@@ -876,7 +944,9 @@ class Week4HttpTest(unittest.TestCase):
         )
         self.assertLess(event["telemetrySampleCount"], event["durationSec"] + 2)
         self.assertEqual(event["telemetryIntervalSec"], 31)
-        points = data.telemetry_for(real_record["siteId"], real_record["assetId"])
+        points = data.telemetry_for(
+            real_record["siteId"], real_record["assetId"], include_demo=True
+        )
         self.assertEqual(len(points), event["telemetrySampleCount"] + 1)
         self.assertEqual(points[0]["deviceId"], event["deviceId"])
         self.assertTrue(

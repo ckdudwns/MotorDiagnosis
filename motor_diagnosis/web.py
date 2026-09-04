@@ -114,6 +114,7 @@ def render_page() -> str:
   </main>
   <script>
     let token = "", sites = [], events = [], siteSummaries = [], selectedEventId = null, latestPoints = [], latestUnits = {}, renderGeneration = 0, assetGeneration = 0;
+    const CHART_PAD = 34;
     const $ = (id) => document.getElementById(id);
 
     async function api(path, options = {}) {
@@ -321,10 +322,15 @@ def render_page() -> str:
       }, 0);
     }
 
+    function chartPlotRatio(clientX, bounds, canvasWidth) {
+      const canvasX = (clientX - bounds.left) * canvasWidth / bounds.width;
+      return Math.min(1, Math.max(0, (canvasX - CHART_PAD) / (canvasWidth - CHART_PAD * 2)));
+    }
+
     function draw(points, units, chartEvents = []) {
       latestPoints = points;
       latestUnits = units;
-      const c = $("chart"), ctx = c.getContext("2d"), w = c.width, h = c.height, pad = 34;
+      const c = $("chart"), ctx = c.getContext("2d"), w = c.width, h = c.height, pad = CHART_PAD;
       ctx.clearRect(0,0,w,h); ctx.fillStyle = "#fff"; ctx.fillRect(0,0,w,h);
       if (!points.length) {
         ctx.fillStyle = "#66716d"; ctx.font = "16px Segoe UI";
@@ -443,8 +449,9 @@ def render_page() -> str:
     });
     $("chart").addEventListener("mousemove", (event) => {
       if (!latestPoints.length) return;
-      const bounds = $("chart").getBoundingClientRect();
-      const ratio = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
+      const chart = $("chart");
+      const bounds = chart.getBoundingClientRect();
+      const ratio = chartPlotRatio(event.clientX, bounds, chart.width);
       const index = chartPointIndexAtRatio(latestPoints, ratio);
       const point = latestPoints[index];
       const vibration = finiteNumber(point.vibrationRmsRaw ?? point.vibration);

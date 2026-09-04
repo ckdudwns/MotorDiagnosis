@@ -197,6 +197,10 @@ telemetry를 생성한다. 진동·음향·RPM raw 값과 피크 주파수는 �
 상세 증거는 `deviceId`가 같은 실측 저장소만 조회한다. 실측 point가 없을 때 데모 point를
 대체 증거로 고정하지 않고 `unavailable`으로 반환한다.
 
+`/api/export`와 `api/datasets/export`의 학습·내보내기 경로는 데모 telemetry와 데모 이벤트를
+제외한다. 합성 이벤트의 reviewed label은 실측 telemetry의 ground truth 또는 training-eligible
+결과에 연결되지 않는다.
+
 대시보드는 등록된 model-version 메타데이터만 표시한다. AI-1 reconstruction error를 운영
 `anomalyScore`(0–100)로 변환하는 규칙은 이 MVP에 없으므로, 모델 아티팩트를 실행하거나
 점수를 임의 생성하지 않는다.

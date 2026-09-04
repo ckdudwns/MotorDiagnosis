@@ -538,13 +538,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     asset_id,
                     from_timestamp=query.get("from", [None])[0],
                     to_timestamp=query.get("to", [None])[0],
+                    include_demo=True,
                 )
             )
             self.send_json(
                 {
                     "siteId": site_id,
                     "assetId": asset_id,
-                    "units": telemetry_units(site_id, asset_id),
+                    "units": telemetry_units(site_id, asset_id, include_demo=True),
                     "points": points,
                 }
             )

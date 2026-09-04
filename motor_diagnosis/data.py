@@ -3037,7 +3037,7 @@ def _stored_telemetry_for(
     from_timestamp: str | None = None,
     to_timestamp: str | None = None,
     *,
-    include_demo: bool = True,
+    include_demo: bool = False,
 ) -> list[dict[str, Any]]:
     get_asset(site_id, asset_id)
     records = TELEMETRY_RECORDS
@@ -3070,6 +3070,8 @@ def telemetry_for(
     asset_id: str,
     from_timestamp: str | None = None,
     to_timestamp: str | None = None,
+    *,
+    include_demo: bool = False,
 ) -> list[dict[str, Any]]:
     asset = get_asset(site_id, asset_id)
     stored = _stored_telemetry_for(
@@ -3077,12 +3079,20 @@ def telemetry_for(
         asset_id,
         from_timestamp=from_timestamp,
         to_timestamp=to_timestamp,
+        include_demo=include_demo,
     )
-    if stored or any(
+    has_real_records = any(
         record["siteId"] == site_id and record["assetId"] == asset_id
-        for record in [*TELEMETRY_RECORDS, *DEMO_TELEMETRY_RECORDS]
-    ):
+        for record in TELEMETRY_RECORDS
+    )
+    has_demo_records = any(
+        record["siteId"] == site_id and record["assetId"] == asset_id
+        for record in DEMO_TELEMETRY_RECORDS
+    )
+    if stored or has_real_records or (include_demo and has_demo_records):
         return stored
+    if has_demo_records:
+        return []
 
     from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
     to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
@@ -3130,14 +3140,20 @@ def telemetry_for(
 
 
 def telemetry_units(
-    site_id: str | None = None, asset_id: str | None = None
+    site_id: str | None = None,
+    asset_id: str | None = None,
+    *,
+    include_demo: bool = False,
 ) -> dict[str, str]:
+    records = TELEMETRY_RECORDS
+    if include_demo:
+        records = [*TELEMETRY_RECORDS, *DEMO_TELEMETRY_RECORDS]
     if (
         site_id
         and asset_id
         and any(
             record["siteId"] == site_id and record["assetId"] == asset_id
-            for record in [*TELEMETRY_RECORDS, *DEMO_TELEMETRY_RECORDS]
+            for record in records
         )
     ):
         return {
@@ -5591,6 +5607,19 @@ def _event_for_dataset_point(
     return None
 
 
+def _event_matches_dataset_point(event: dict[str, Any], point: dict[str, Any]) -> bool:
+    """Keep synthetic demo events out of real-telemetry training labels."""
+    if _is_demo_event(event) or point.get("source") == DEMO_SIGNAL_SOURCE:
+        return False
+    event_device_id = str(event.get("deviceId") or "").strip().upper()
+    point_device_id = str(point.get("deviceId") or "").strip().upper()
+    if event_device_id and event_device_id != point_device_id:
+        return False
+    event_source = str(event.get("source") or "").strip()
+    point_source = str(point.get("source") or "").strip()
+    return event_source == point_source
+
+
 def _dataset_export_window(
     dataset: dict[str, Any] | None,
     site_id: str,
@@ -5909,7 +5938,13 @@ def _live_dataset_export_snapshot(
             from_timestamp=from_timestamp,
             to_timestamp=to_timestamp,
         )
-        events = copy_payload([item for item in EVENTS if item["assetId"] == asset_id])
+        events = copy_payload(
+            [
+                item
+                for item in EVENTS
+                if item["assetId"] == asset_id and not _is_demo_event(item)
+            ]
+        )
         taxonomies = copy_payload(ACOUSTIC_TAXONOMY_VERSIONS)
         units = copy_payload(telemetry_units(site_id, asset_id))
     return points, events, taxonomies, units, asset
@@ -5936,7 +5971,14 @@ def _dataset_rows_for_points(
     )
     rows = []
     for point in points:
-        matching_event = _event_for_dataset_point(asset_events, point.get("timestamp"))
+        matching_event = _event_for_dataset_point(
+            [
+                event
+                for event in asset_events
+                if _event_matches_dataset_point(event, point)
+            ],
+            point.get("timestamp"),
+        )
         event_label, label_taxonomy_version = _dataset_label_for_event(
             dataset, matching_event
         )

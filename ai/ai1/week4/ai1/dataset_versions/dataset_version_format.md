@@ -22,8 +22,20 @@ API 매핑: `POST/GET /api/datasets`(3주차 MVP-042/043, 이미 구현됨) + `P
 ## 데이터셋 버전 상태 머신
 
 ```
-draft --freeze_dataset_version()--> frozen --approve_dataset_version()--> approved
+draft --freeze_dataset_version()--> frozen --DatasetVersionRegistry.approve(id)--> approved
 ```
+
+**승인은 `DatasetVersionRegistry`를 통해서만 가능하다 (리뷰 P1, 6차).** `Model`/
+`BaselineVersionRegistry`(model_version.py)와 같은 신뢰 경계다 — `DatasetVersionRegistry().freeze(draft)`가
+`freeze_dataset_version()`(아래 v1.3 필수 필드·fingerprint·checksum 교차검증)을 실제로
+거친 결과만 레지스트리 내부 저장소에 `id`로 기록하고, `registry.approve(dataset_id, ...)`는
+그 `id`로 레지스트리 자신에게서 조회한 레코드만 승인 대상으로 삼는다 — 호출자가 만든
+`frozen_manifest` dict를 직접 받지 않는다. 예전에는 `approve_dataset_version(frozen_manifest, ...)`이
+공개 함수라서, `freeze_dataset_version()`을 거친 적 없는 임의 dict도 `compute_dataset_checksum()`/
+`compute_snapshot_digest()`(둘 다 공개 함수)로 자기 자신과만 일관된 checksum/digest를
+채워 넣으면 승인을 통과시킬 수 있었다. 이미 다른 프로세스/시점에 동결된 v1(legacy) 레코드는
+`registry.adopt_legacy_frozen(frozen_manifest)`으로 가져온다(`trusted_legacy=True`와 같은
+계약 — 호출자가 매니페스트 바깥에서 이미 확인한 사실만 전달).
 
 - `draft`: 3주차 `build_manifest()`가 만든 상태. 언제든 재생성 가능.
 - `frozen`: 동결됨. `datasetChecksum`(행 데이터 + 핵심 메타데이터의 sha256)이 함께
@@ -72,7 +84,7 @@ draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다
 - **정책 버전은 `id`(fingerprint)에 포함**: `compute_version_checksum()` payload에
   `label_policy_version`/`snapshot_schema_version`이 들어가므로, 라벨 정책이 바뀐 신규
   데이터셋은 기존 frozen 버전과 **다른 `id`**를 받는다.
-- `approve_dataset_version()`은 frozen을 `copy.deepcopy`하므로 자동 승계되고,
+- `DatasetVersionRegistry.approve()`는 frozen을 `copy.deepcopy`하므로 자동 승계되고,
   `dataset_version_summary()`도 깊은 복사한 뒤 `rows`만 빼므로 자동 노출된다.
 
 ### 신규 동결 필수 필드 · v1 호환 (리뷰 P1)
@@ -85,7 +97,7 @@ draft 매니페스트에서 그대로 물려받아 frozen 산출물에 남긴다
 부재로, 그다음엔 `snapshotSchemaVersion` 부재로 legacy를 판별했는데, 두 시도 모두
 "매니페스트에서 그 필드(들)만 지우면 legacy 관용 경로로 강등된다"는 같은 구조의 우회를
 허용했다(매니페스트는 호출자가 자유롭게 수정 가능한 데이터라서, 판별 기준으로 쓰는 필드가
-무엇이든 함께 지우면 우회된다). 그래서 `approve_dataset_version`/`verify_frozen_integrity`/
+무엇이든 함께 지우면 우회된다). 그래서 `DatasetVersionRegistry.approve`/`verify_frozen_integrity`/
 `verify_reproducibility`는 이제 매니페스트를 보고 추정하지 않고, 호출자가 매니페스트
 **바깥의** 신뢰 가능한 저장소(최초 동결 시점에 별도로 기록해 둔 스키마 버전 메타데이터 등)
 에서 확인한 사실을 `trusted_legacy=True`로 명시적으로 전달할 때만 legacy 완화 검증
@@ -148,13 +160,18 @@ week3 모듈을 import하지 않고(`compute_rows_fingerprint`와 같은 이유)
   시작 전에 하도록 노출한 함수다 — 하류(`train_and_evaluate.run_training_job`)가
   `status=="frozen"`만 보지 않고 이걸 호출한다. `trusted_legacy=True`일 때만
   `datasetChecksum`으로 폴백하고, 기본값에서는 `snapshotDigest`가 없으면 그 자체로 거부한다.
-  `approve_dataset_version`/`verify_frozen_integrity`/`verify_reproducibility` 모두
+  `DatasetVersionRegistry.approve`/`verify_frozen_integrity`/`verify_reproducibility` 모두
   `trusted_legacy`가 실제 `bool`이 아니면(예: 문자열 `"false"` — 파이썬에서 truthy)
   `TypeError`로 즉시 거부한다(리뷰 P1, 3차) — `is True`로만 완화 경로를 켠다.
 - `verify_reproducibility(frozen, recomputed, *, trusted_legacy=False)`도 기본값에서는
   `datasetChecksum`뿐 아니라 `labelPolicyVersion`/`snapshotSchemaVersion`/원본
   `source.checksum`까지 함께 대조한다 — rows/labelMapping/split만 같고 원본·정책 버전이
-  다른 데이터셋을 "재현 성공"으로 오판하지 않도록.
+  다른 데이터셋을 "재현 성공"으로 오판하지 않도록. 매니페스트 전체(생명주기·시간·파생
+  체크섬·id 제외) 비교는 canonical JSON 문자열로 하고(리뷰 P1, 6차 — 파이썬 dict `==`는
+  `False==0`/`12000==12000.0`을 참으로 봐서 JSON 타입만 바뀐 변조를 놓쳤다), `id`는
+  날짜 등 가변 부분을 빼고 마지막 12자리 16진수 checksum suffix만 각자 재계산한
+  `source.checksum` suffix와 일치하는지 검증한다(리뷰 P1, 6차 — 전체를 빼면 완전히
+  무관한 id로 바꿔도 재현 성공으로 오판됐다).
 
 ## `checksum` vs `digest` 역할 구분
 

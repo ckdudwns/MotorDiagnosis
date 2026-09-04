@@ -127,6 +127,9 @@ def _resolve_version_dir(versions_dir: str, version_id: str) -> str:
 _MANIFEST_SHEET_VOLATILE_FIELDS = frozenset({"createdAt"})
 
 
+_MANIFEST_SHEET_HEADER = ["field", "value"]
+
+
 def _canonical_manifest_sheet(ws) -> dict:
     """manifest 시트([field, value] 행들)를 field -> value dict로 canonical화한다.
 
@@ -136,13 +139,39 @@ def _canonical_manifest_sheet(ws) -> dict:
     다른 것으로 오판된다. field -> value dict로 바꾸면 순서와 무관하게
     비교되고(파이썬 dict 동등 비교는 키 순서를 보지 않는다), `createdAt`처럼
     재실행마다 달라지는 필드도 JSON manifest 비교와 동일하게 제외한다.
+
+    [리뷰 P1, 5차] 예전에는 첫 행을 검사 없이(헤더라고 가정만 하고) 그대로
+    버렸다 — 헤더가 변조돼도(예: `["field", "tampered"]`나 데이터 행이 하나 더
+    있는 경우) 탐지하지 못했다. 그리고 `dict` 컴프리헨션은 같은 `field`가 두 번
+    나오면 나중 값으로 조용히 덮어써, 중복 `field` 행으로 원래 값을 가리는 변조도
+    "정상"으로 오판됐다. 이제 첫 행이 정확히 `["field", "value"]`인지, 각 행이
+    `[field, value]` 2열이고 field가 비어있지 않은 문자열인지, 같은 field가
+    (volatile 필드 제외하고) 두 번 나오지 않는지까지 검증한다 — 하나라도 어긋나면
+    ValueError로 거부한다(호출자인 `_xlsx_content_matches`가 "내용 불일치"로
+    처리해 export 재사용을 거부한다).
     """
     rows = [[cell.value for cell in row] for row in ws.iter_rows()]
-    return {
-        field: value
-        for field, value in rows[1:]  # 첫 행은 헤더(["field", "value"])
-        if field not in _MANIFEST_SHEET_VOLATILE_FIELDS
-    }
+    if not rows:
+        raise ValueError("manifest 시트가 비어 있습니다(헤더 행조차 없음).")
+    header, data_rows = rows[0], rows[1:]
+    if header != _MANIFEST_SHEET_HEADER:
+        raise ValueError(
+            f"manifest 시트 헤더가 예상과 다릅니다 (기대={_MANIFEST_SHEET_HEADER!r}, "
+            f"실제={header!r})."
+        )
+    result: dict = {}
+    for row in data_rows:
+        if len(row) != 2:
+            raise ValueError(f"manifest 시트에 [field, value] 형식이 아닌 행이 있습니다: {row!r}")
+        field, value = row
+        if not isinstance(field, str) or not field.strip():
+            raise ValueError(f"manifest 시트의 field가 비어있지 않은 문자열이어야 합니다: {row!r}")
+        if field in _MANIFEST_SHEET_VOLATILE_FIELDS:
+            continue
+        if field in result:
+            raise ValueError(f"manifest 시트에 중복된 field가 있습니다: {field!r}")
+        result[field] = value
+    return result
 
 
 def _xlsx_content_matches(staged_path: str, existing_path: str) -> bool:
@@ -171,9 +200,17 @@ def _xlsx_content_matches(staged_path: str, existing_path: str) -> bool:
         return False
     for name in staged_wb.sheetnames:
         if name == "manifest":
-            if _canonical_manifest_sheet(staged_wb[name]) != _canonical_manifest_sheet(
-                existing_wb[name]
-            ):
+            # [리뷰 P1, 5차] 헤더 변조·중복 field 등으로 canonical화 자체가 실패하면
+            # (staged든 existing이든) "내용이 같다고 안전하게 판단할 수 없다" ==
+            # 불일치로 취급한다 — 여기서 예외가 그대로 새 나가면 호출자
+            # `export_dataset()`이 이 XLSX 재사용 판정 도중 알 수 없는 예외로
+            # 죽는다.
+            try:
+                staged_manifest_sheet = _canonical_manifest_sheet(staged_wb[name])
+                existing_manifest_sheet = _canonical_manifest_sheet(existing_wb[name])
+            except ValueError:
+                return False
+            if staged_manifest_sheet != existing_manifest_sheet:
                 return False
             continue
         staged_rows = [

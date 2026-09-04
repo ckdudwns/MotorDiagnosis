@@ -77,17 +77,36 @@ _NON_FEATURE_ROW_KEYS = frozenset(
 # 모델 입력만 26개로 좁힌다.
 _OPERATING_POINT_FEATURES = frozenset({"vibration_peak_hz"})
 
-DENSE_SPLIT_STRATEGY = (
-    "동결 매니페스트의 split 배정(operating_condition_holdout — 부하조건 기준, specimen "
-    "독립 아님)을 그대로 재사용하고, inline 특징 컬럼(27개 중 운전 조건 결합 특징을 뺀 "
-    "26개)을 직접 입력으로 사용 (재윈도우/재계산 없음 — 학습 입력이 datasetId가 가리키는 "
-    "데이터와 정확히 일치)"
-)
-LSTM_SPLIT_STRATEGY = (
-    f"동일 split 배정 안에서만 동결 매니페스트 rows(inline 특징)를 윈도우 순번으로 정렬해 "
-    f"길이 {SEQ_LEN} 비중첩 시퀀스를 구성 (원본 재로드·재계산 없음, 한 원본 파일의 모든 "
-    "시퀀스는 한 split에만). 분할 자체는 operating_condition_holdout이라 specimen 독립 아님"
-)
+def _independence_note(independent_holdout: bool) -> str:
+    return "specimen 독립" if independent_holdout else "specimen 독립 아님"
+
+
+def _dense_split_strategy_description(frozen_manifest: dict, independent_holdout: bool) -> str:
+    """[리뷰 P2] 예전에는 이 설명이 `operating_condition_holdout — 부하조건 기준,
+    specimen 독립 아님`으로 고정돼 있었다 — specimen-independent 매니페스트
+    (`splitStrategy="specimen_group: ..."`, `independentHoldout=True`)로 학습해도
+    후보 보고서에는 항상 이 문구가 그대로 박혀, 같은 보고서의
+    `metrics.independentHoldout=True`·`domainGap` 설명과 모순됐다. 검증된
+    매니페스트의 실제 `splitStrategy` 문자열과 실제 계산된 독립성으로 설명을
+    동적으로 생성한다."""
+    declared = frozen_manifest.get("splitStrategy") or "(미상)"
+    return (
+        f"동결 매니페스트의 split 배정({declared} — {_independence_note(independent_holdout)})을 "
+        "그대로 재사용하고, inline 특징 컬럼(27개 중 운전 조건 결합 특징을 뺀 26개)을 직접 "
+        "입력으로 사용 (재윈도우/재계산 없음 — 학습 입력이 datasetId가 가리키는 데이터와 "
+        "정확히 일치)"
+    )
+
+
+def _lstm_split_strategy_description(frozen_manifest: dict, independent_holdout: bool) -> str:
+    """[리뷰 P2] dense와 같은 이유로 실제 splitStrategy/독립성을 반영해 동적으로
+    생성한다(예전 고정 문구도 operating_condition_holdout·비독립을 가정했다)."""
+    declared = frozen_manifest.get("splitStrategy") or "(미상)"
+    return (
+        f"동일 split 배정 안에서만 동결 매니페스트 rows(inline 특징)를 윈도우 순번으로 정렬해 "
+        f"길이 {SEQ_LEN} 비중첩 시퀀스를 구성 (원본 재로드·재계산 없음, 한 원본 파일의 모든 "
+        f"시퀀스는 한 split에만). 분할 자체는 {declared} — {_independence_note(independent_holdout)}"
+    )
 
 
 def _matrix_and_labels(samples: list):
@@ -578,6 +597,19 @@ def score_from_artifact(
     scaler = FeatureScaler.from_state(payload["scaler_mean"], payload["scaler_std"])
     tensor = torch.tensor(scaler.transform(arr), dtype=torch.float32)
     errors = reconstruction_error(model, tensor)
+    # [리뷰 P1] 여기까지는 `_validate_artifact_payload()`가 scaler/threshold/sigma의
+    # 유한값은 검증했지만 `state_dict`(가중치) 자체는 검증하지 않는다 — 가중치가
+    # NaN이거나 순전파 도중 오버플로가 나면 `errors`가 NaN이 되고, `errors > threshold`는
+    # NaN과의 비교가 항상 False라서 실제로는 재구성이 완전히 무너진 표본도 전부
+    # "정상"(anomaly 아님)으로 판정된다. verdict를 계산하기 전에 errors 자체가 모두
+    # 유한한지 검증해, 손상된 아티팩트의 추론 결과를 "정상"으로 오판하는 대신 명시적으로
+    # 거부한다.
+    if not np.isfinite(errors).all():
+        raise ValueError(
+            "재구성 오차(errors)에 유한하지 않은 값(NaN/Inf)이 있습니다 — 아티팩트 "
+            "가중치 손상 또는 수치 오버플로가 의심되어 추론 결과를 신뢰할 수 "
+            "없습니다."
+        )
     threshold = payload["threshold"]
     return {
         "errors": errors,
@@ -706,7 +738,7 @@ def run_training_job(
     feature_names, dense_splits = prepare_dense_splits(frozen_manifest)
     dense_candidate, dense_state = _train_and_validate_candidate(
         "dense_autoencoder",
-        DENSE_SPLIT_STRATEGY,
+        _dense_split_strategy_description(frozen_manifest, independent_holdout),
         dense_splits,
         feature_names=feature_names,
         epochs=dense_epochs,
@@ -716,7 +748,7 @@ def run_training_job(
     lstm_splits = prepare_lstm_chunks(frozen_manifest, feature_names)
     lstm_candidate, lstm_state = _train_and_validate_candidate(
         "lstm_autoencoder",
-        LSTM_SPLIT_STRATEGY,
+        _lstm_split_strategy_description(frozen_manifest, independent_holdout),
         lstm_splits,
         feature_names=feature_names,
         epochs=lstm_epochs,

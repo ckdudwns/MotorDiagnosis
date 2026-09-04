@@ -52,9 +52,12 @@ API 명세서 v1.3에서 추가된 `labelPolicyVersion`(`LABEL-POLICY-V2`)·`sna
 
 **무결성 (리뷰 P1 반영):**
 - `compute_snapshot_digest`가 매니페스트 **전체 불변 필드**(source·compatibility·정책
-  버전·splitStrategy·rows 등)를 해시한다. `approve_dataset_version`은 동결 이후 어떤
-  불변 필드가 변조돼도 승인을 거부하고, `verify_frozen_integrity`는 학습 시작 전에
-  같은 검증을 한다.
+  버전·splitStrategy·rows 등)를 해시한다. `DatasetVersionRegistry.approve`는 동결 이후
+  어떤 불변 필드가 변조돼도 승인을 거부하고, `verify_frozen_integrity`는 학습 시작 전에
+  같은 검증을 한다. 승인은 `Model`/`BaselineVersionRegistry`와 동일하게
+  `DatasetVersionRegistry`가 소유한 canonical 레코드만 id로 조회해 이뤄진다 — 호출자가
+  `freeze_dataset_version()`을 거치지 않고 checksum/digest만 자기 자신과 일관되게 채운
+  임의 dict를 직접 승인시킬 수 없다(리뷰 P1, 6차).
 - 신규 동결은 v1.3 필수 필드(`labelPolicyVersion`/`snapshotSchemaVersion`/`source.checksum`/
   `featureOutputFingerprint`)를 요구한다. `featureOutputFingerprint`는 rows만으로 재계산
   가능한 값이라, freeze 시점에 draft가 신고한 값과 현재 rows를 대조해 build 이후 rows/라벨이
@@ -62,7 +65,7 @@ API 명세서 v1.3에서 추가된 `labelPolicyVersion`(`LABEL-POLICY-V2`)·`sna
 - **legacy(v1) 취급은 매니페스트 필드로 추정하지 않는다(리뷰 P1, 2차)** — 매니페스트는
   호출자가 자유롭게 고칠 수 있는 데이터라서, `snapshotDigest` 부재로도 `snapshotSchemaVersion`
   부재로도 판별해봤지만 둘 다 "그 필드(들)만 지우면 우회된다"는 같은 구조로 뚫렸다.
-  `approve_dataset_version`/`verify_frozen_integrity`/`verify_reproducibility`는 이제 호출자가
+  `DatasetVersionRegistry.approve`/`verify_frozen_integrity`/`verify_reproducibility`는 이제 호출자가
   매니페스트 바깥의 신뢰 가능한 저장소에서 확인한 사실을 `trusted_legacy=True`로 명시할
   때만 legacy 완화 검증을 적용한다(기본값 False = 항상 v1.3 엄격 검증).
 - `verify_reproducibility`는 기본값에서 `datasetChecksum`(rows/labelMapping/split)뿐 아니라

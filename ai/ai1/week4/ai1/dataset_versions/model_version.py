@@ -51,7 +51,26 @@ from datetime import datetime, timezone
 # [리뷰 P2] "not-a-sha256" 같은 임의 문자열도 artifactChecksum으로 등록됐다 —
 # 실제 sha256 hexdigest 형식(`sha256:` 뒤에 64자리 16진수)인지 등록 시점에
 # 검증한다.
+#
+# [리뷰 P2, 2차] `re.match()`는 문자열 끝의 개행(`\n`)을 허용한다 — `$`가
+# 문자열 끝 자체뿐 아니라 "끝의 개행 바로 앞"에서도 매치되기 때문에,
+# "sha256:" + 64자리 16진수 + "\n" 같은 값도 그대로 통과해 등록됐다. `fullmatch()`는
+# 문자열 전체가 패턴과 정확히 일치해야 하므로 이런 트레일링 문자를 막는다.
 _SHA256_CHECKSUM_RE = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
+
+
+def _normalize_sha256_checksum(value, *, field: str) -> str:
+    """`sha256:` + 64자리 16진수 형식인지 검증하고, 소문자로 정규화한다.
+
+    [리뷰 P2, 2차] 등록 시점에는 대문자 16진수도 그대로 저장됐지만, 추론 단계
+    (`train_and_evaluate.score_from_artifact`)는 파일 바이트로 다시 계산한
+    `hashlib.sha256(...).hexdigest()`(항상 소문자)와 **정확히 문자열 비교**한다 —
+    등록 시 대문자로 저장된 정상 아티팩트가 그 이유만으로 거부될 수 있었다. 저장
+    전에 소문자로 정규화해 다시는 대소문자 차이로 정상 아티팩트가 거부되지 않게 한다.
+    """
+    if not isinstance(value, str) or not _SHA256_CHECKSUM_RE.fullmatch(value):
+        raise ValueError(f"{field}은 'sha256:' 뒤에 64자리 16진수여야 합니다: {value!r}")
+    return value.lower()
 
 
 def _now_iso() -> str:
@@ -197,17 +216,16 @@ def _build_registered_model_version(
     ]
     if blank:
         raise ValueError(f"다음 필드는 비어있지 않은 문자열이어야 합니다: {blank}")
-    if not _SHA256_CHECKSUM_RE.match(artifact_checksum):
-        raise ValueError(
-            f"artifact_checksum은 'sha256:' 뒤에 64자리 16진수여야 합니다: {artifact_checksum!r}"
-        )
+    normalized_artifact_checksum = _normalize_sha256_checksum(
+        artifact_checksum, field="artifact_checksum"
+    )
     if not isinstance(metrics, dict):
         raise ValueError(f"metrics는 dict여야 합니다: {metrics!r}")
 
     record = {
         "version": version,
         "artifactUri": artifact_uri,
-        "artifactChecksum": artifact_checksum,
+        "artifactChecksum": normalized_artifact_checksum,
         "datasetId": dataset_id,
         "baselineVersion": baseline_version,
         "metrics": copy.deepcopy(metrics),  # 호출자가 이후 원본 metrics를 바꿔도 안전
@@ -471,9 +489,15 @@ def _validate_baseline_features(features) -> None:
             value = spec.get(label)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"features[{name!r}].{label}은 유한한 실수여야 합니다: {value!r}")
+        # [리뷰 P1] 저장소의 실제 week2 baseline.json은 rms_std/kurtosis_std/
+        # spectral_rolloff처럼 구조적으로 std=0.0인 특징을 포함한다(모든 윈도우에서
+        # 값이 상수라 표본표준편차가 정확히 0) — 기존 판정 로직(week2 ANOMALY_RULE_01)도
+        # 이런 near-zero std 특징은 건너뛰고 계속 판정한다. 여기서 std==0을 거부하면
+        # 실제 baseline을 아예 등록할 수 없다. 음수(입력 자체가 잘못된 통계)만 거부하고
+        # 0은 소비자(판정 로직) 정책에 맡긴다.
         std = spec["std"]
-        if std <= 0:
-            raise ValueError(f"features[{name!r}].std는 0보다 커야 합니다: {std!r}")
+        if std < 0:
+            raise ValueError(f"features[{name!r}].std는 음수일 수 없습니다: {std!r}")
         normal_range = spec.get("normal_range")
         if (
             not isinstance(normal_range, (list, tuple))

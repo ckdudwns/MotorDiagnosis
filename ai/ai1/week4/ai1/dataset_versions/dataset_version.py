@@ -7,11 +7,22 @@
 
 상태 머신: draft -> frozen -> approved (역방향 전이 없음, 재시도하려면 새 버전을 만든다)
 근거는 dataset_version_format.md 참고.
+
+[리뷰 P1, 6차] 승인(approve)은 `DatasetVersionRegistry`(model_version.py의
+`ModelVersionRegistry`/`BaselineVersionRegistry`와 동일한 신뢰 경계)를 통해서만
+가능하다 — `freeze_dataset_version()`을 실제로 거쳐 레지스트리 자신이 소유한
+레코드만 `id`로 조회해 승인하므로, 필수 필드 없이 checksum/digest만 자기 자신과
+일관되게 계산해 채운 임의 객체를 직접 승인시킬 수 없다. `freeze_dataset_version()`/
+`verify_frozen_integrity()`/`verify_reproducibility()`는 여전히 공개 함수다 — 이들은
+"이 데이터가 스스로 주장하는 정체성과 실제로 일치하는가"만 검사하는 무결성 점검이라
+(감사 이력에 새 상태를 기록하는 승인과 달리) 학습·배포 등 소비자가 임의의 소스에서
+읽어온 매니페스트를 스스로 재검증하는 데 필요하다.
 """
 
 import copy
 import json
 import hashlib
+import re
 from datetime import datetime, timezone
 
 
@@ -74,10 +85,24 @@ def compute_snapshot_digest(manifest: dict) -> str:
 # 뺀다(id 재현성은 freeze 시점에 이미 checksum suffix로 검증됨).
 _REPRODUCIBILITY_IGNORED_KEYS = _VOLATILE_MANIFEST_KEYS | frozenset({"snapshotChecksum", "id"})
 
+# id의 마지막 "-" 뒤 세그먼트(예: "DS-CWRU-VIBRATION-20260824-abcdef123456"의
+# "abcdef123456")는 source.checksum sha256 hexdigest의 앞 12자다. id 앞부분(이름·
+# 날짜)은 재실행마다 달라질 수 있어 비교에서 빼지만[리뷰 P1, 4차], 이 suffix까지
+# 통째로 빼면 id를 완전히 무관한 문자열로 바꿔도 재현 성공으로 오판된다 — suffix는
+# 반드시 형식(12자리 16진수)과, 각자 매니페스트에서 독립 재계산한 source.checksum의
+# suffix와 일치하는지 검증한다.
+_DATASET_ID_CHECKSUM_SUFFIX_RE = re.compile(r"^[0-9a-f]{12}$")
 
-def _canonical_comparable_snapshot(manifest: dict) -> dict:
-    """재현성 비교용 canonical snapshot — 생명주기·시간·파생 체크섬 필드만 뺀
-    매니페스트 전체.
+
+def _dataset_id_checksum_suffix(manifest_id) -> str:
+    if not isinstance(manifest_id, str) or "-" not in manifest_id:
+        return ""
+    return manifest_id.rsplit("-", 1)[-1]
+
+
+def _canonical_comparable_snapshot(manifest: dict) -> str:
+    """재현성 비교용 canonical snapshot — 생명주기·시간·파생 체크섬 필드(와 id,
+    별도로 검증됨)만 뺀 매니페스트 전체를, canonical JSON 문자열로 직렬화한다.
 
     [리뷰 P1] `verify_reproducibility()`는 예전에 `datasetChecksum`(rows+
     labelMapping+split)과 `compute_source_checksum()`(원본 파일/전처리/특징 설정
@@ -86,8 +111,18 @@ def _canonical_comparable_snapshot(manifest: dict) -> dict:
     `checksumInputs.splitStrategyKey`와 별개) 등을 `recomputed_manifest`에서
     바꿔도 재현 성공으로 오판됐다. 이 스냅샷은 그 필드들까지 포함해 frozen과
     recomputed **전체**를 직접 비교하는 데 쓴다.
+
+    [리뷰 P1, 6차] 이전에는 두 매니페스트를 파이썬 dict로 만들어 `==`로 비교했다.
+    dict 동등 비교는 `False == 0`, `12000 == 12000.0`이 참이라, recomputed_manifest에서
+    JSON 타입만(불리언->정수, 정수->실수) 바꿔도 이 비교는 "동일"로 판정했는데
+    실제로는 `compute_snapshot_digest()`(JSON 직렬화 기반)가 그 타입 차이를 반영해
+    다른 값을 낸다 — verify_reproducibility()==True인데 snapshotDigest는 다른
+    모순이 생겼다. `allow_nan=False` canonical JSON 문자열(`json.dumps`는 `True`/
+    `False`를 `true`/`false`로, `12000.0`을 `"12000.0"`으로 직렬화해 타입을 구분한다)로
+    비교해 이 문제를 없앤다.
     """
-    return {k: v for k, v in manifest.items() if k not in _REPRODUCIBILITY_IGNORED_KEYS}
+    filtered = {k: v for k, v in manifest.items() if k not in _REPRODUCIBILITY_IGNORED_KEYS}
+    return json.dumps(filtered, sort_keys=True, ensure_ascii=False, allow_nan=False)
 
 
 def compute_source_checksum(manifest: dict) -> str:
@@ -281,10 +316,23 @@ def freeze_dataset_version(manifest: dict) -> dict:
     return frozen
 
 
-def approve_dataset_version(
+def _build_approved_dataset_version(
     frozen_manifest: dict, *, approved_by: str, reason: str, trusted_legacy: bool = False
 ) -> dict:
-    """status가 frozen인 데이터셋 버전만 승인할 수 있다.
+    """status가 frozen인 데이터셋 버전만 승인할 수 있다 (`DatasetVersionRegistry.approve()`의
+    내부 로직).
+
+    [리뷰 P1, 6차] 이 함수는 더 이상 공개 API가 아니다 — 호출자가 임의로 만든
+    `frozen_manifest` 객체를 직접 넘길 수 없다. 예전에는 `approve_dataset_version()`이
+    공개 함수라서, 호출자가 `status="frozen"`과 v1.3 필수 필드(`labelPolicyVersion` 등)
+    없이도, `compute_dataset_checksum()`/`compute_snapshot_digest()`(둘 다 공개
+    함수)로 **자기 자신과만** 일관된 `datasetChecksum`/`snapshotDigest`를 계산해
+    채워 넣으면 — 즉 `freeze_dataset_version()`(v1.3 필수 필드·featureOutputFingerprint·
+    source.checksum 교차검증)을 실제로 거친 적이 전혀 없어도 — 승인을 통과시킬 수
+    있었다. `Model`/`BaselineVersionRegistry`와 동일하게, 이제 승인 대상은
+    `DatasetVersionRegistry` 인스턴스 자신이 `freeze()`(또는 `adopt_legacy_frozen()`)를
+    실제로 거쳐 소유하고 있는 레코드만 `id` 문자열로 조회해 승인한다 — 그런 검증을
+    거친 적 없는 임의 객체를 저장소에 주입할 방법이 없다.
 
     `trusted_legacy=True`는 매니페스트 안의 어떤 필드로도 추정하지 않는다 — 호출자가
     매니페스트 바깥의 신뢰 가능한 저장소에서 "이건 v1.3 이전에 이미 동결된 레코드다"를
@@ -297,9 +345,12 @@ def approve_dataset_version(
         raise ValueError(
             f"frozen 상태만 승인할 수 있습니다 (현재 status={frozen_manifest.get('status')!r})."
         )
-    if not approved_by:
+    # [리뷰 P2] reason과 동일하게 문자열 타입과 strip() 결과를 확인한다 —
+    # 공백만 있는 approved_by("   ")도 `not approved_by`는 False라서 통과해
+    # 감사 이력에 사실상 빈 승인자가 저장될 수 있었다.
+    if not isinstance(approved_by, str) or not approved_by.strip():
         raise ValueError("approved_by는 필수입니다.")
-    if not reason or not reason.strip():
+    if not isinstance(reason, str) or not reason.strip():
         raise ValueError("reason은 필수입니다.")
 
     # 동결 이후 내용이 바뀌지 않았는지 승인 직전에 다시 검증한다.
@@ -334,6 +385,94 @@ def approve_dataset_version(
     approved["approvalReason"] = reason
     approved["approvedAt"] = _now_iso()
     return approved
+
+
+class DatasetVersionRegistry:
+    """데이터셋 버전의 canonical(레지스트리 소유) 저장소.
+
+    [리뷰 P1, 6차] `ModelVersionRegistry`/`BaselineVersionRegistry`(model_version.py)와
+    같은 신뢰 경계를 데이터셋 버전에도 적용한다: `self.__entries`는 이 인스턴스
+    밖으로 절대 노출하지 않고, `freeze()`/`adopt_legacy_frozen()`만 여기에 기록한다.
+    `approve()`는 호출자가 만든 `frozen_manifest` dict를 검증 입력으로 받지 않는다 —
+    `dataset_id` 문자열로 이 레지스트리 자체에서 조회한 값만 신뢰한다. 새
+    `DatasetVersionRegistry()`는 빈 저장소이므로, `freeze()`/`adopt_legacy_frozen()`을
+    실제로 거치지 않은 데이터셋은 어떤 id를 대도 조회되지 않는다 — `freeze_dataset_version()`
+    을 우회해 v1.3 필수 필드 없이 자기 자신과만 일관된 checksum/digest를 계산해
+    채운 임의 dict를 승인시키는 공격이 애초에 구조적으로 불가능하다. `freeze()`/
+    `approve()`/`get()`은 항상 내부 레코드의 깊은 복사본만 반환해, 호출자가 반환값을
+    수정해도 저장소 내부 상태는 전혀 영향받지 않는다.
+    """
+
+    def __init__(self):
+        self.__entries: dict = {}
+
+    def freeze(self, manifest: dict) -> dict:
+        """draft 매니페스트를 `freeze_dataset_version()`(v1.3 필수 필드·
+        featureOutputFingerprint·source.checksum 교차검증)으로 동결하고, 그 결과를
+        이 저장소에 canonical 레코드로 기록한다 (FUT 계열 레지스트리의 `register()`에
+        대응).
+
+        같은 `id`를 이 레지스트리에 두 번 동결할 수 없다 — 재동결을 허용하면 이미
+        동결된 id를 조용히 덮어써 감사 이력이 끊긴다.
+        """
+        frozen = freeze_dataset_version(manifest)
+        dataset_id = frozen["id"]
+        if dataset_id in self.__entries:
+            raise ValueError(
+                f"데이터셋 {dataset_id!r}은 이미 이 저장소에 동결되어 있습니다 — 같은 "
+                "id를 재동결하면 기존 감사 이력을 덮어씁니다."
+            )
+        self.__entries[dataset_id] = frozen
+        return copy.deepcopy(frozen)
+
+    def adopt_legacy_frozen(self, frozen_manifest: dict) -> dict:
+        """`freeze()`(신규 v1.3 검증)를 거친 적 없는, 이미 다른 프로세스/시점에
+        동결된 v1(legacy) 레코드를 이 저장소로 가져온다.
+
+        `trusted_legacy=True`와 같은 계약이다 — 호출자가 매니페스트 바깥의 신뢰
+        가능한 저장소(예: 최초 동결 당시 별도로 기록해 둔 이력)에서 이게 진짜
+        과거 동결 기록임을 이미 확인했을 때만 호출해야 한다. `verify_frozen_integrity`
+        (legacy 완화 — `datasetChecksum` 자기 일관성)만 재검증하며, `freeze()`가
+        하는 v1.3 필드·fingerprint·source.checksum 교차검증은 하지 않는다 — 그래도
+        이 메서드를 거치지 않은 레코드는 여전히 `approve()`에서 조회되지 않는다.
+        """
+        verify_frozen_integrity(frozen_manifest, trusted_legacy=True)
+        dataset_id = frozen_manifest.get("id")
+        if not isinstance(dataset_id, str) or not dataset_id.strip():
+            raise ValueError(f"frozen_manifest의 id가 비어있지 않은 문자열이어야 합니다: {dataset_id!r}")
+        if dataset_id in self.__entries:
+            raise ValueError(
+                f"데이터셋 {dataset_id!r}은 이미 이 저장소에 등록되어 있습니다."
+            )
+        self.__entries[dataset_id] = copy.deepcopy(frozen_manifest)
+        return copy.deepcopy(self.__entries[dataset_id])
+
+    def approve(
+        self, dataset_id: str, *, approved_by: str, reason: str, trusted_legacy: bool = False
+    ) -> dict:
+        """이 저장소에 동결된(frozen) 데이터셋만 승인한다.
+
+        `dataset_id`로 이 레지스트리 자신에게서 동결 레코드를 조회한다 — 호출자가
+        레코드 내용을 함께 넘기지 않으므로, `freeze()`/`adopt_legacy_frozen()`을
+        거친 적 없는 id는 어떤 checksum/digest를 자칭하든 조회조차 되지 않는다.
+        """
+        entry = self.__entries.get(dataset_id)
+        if entry is None:
+            raise ValueError(
+                f"데이터셋 {dataset_id!r}이 이 저장소에 동결되어 있지 않습니다 — "
+                "freeze()/adopt_legacy_frozen()을 먼저 호출하세요."
+            )
+        approved = _build_approved_dataset_version(
+            entry, approved_by=approved_by, reason=reason, trusted_legacy=trusted_legacy
+        )
+        self.__entries[dataset_id] = approved
+        return copy.deepcopy(approved)
+
+    def get(self, dataset_id: str):
+        """`dataset_id`의 현재 저장소 상태를 깊은 복사본으로 돌려준다(없으면 None).
+        반환값을 수정해도 저장소 내부 상태는 바뀌지 않는다."""
+        entry = self.__entries.get(dataset_id)
+        return copy.deepcopy(entry) if entry is not None else None
 
 
 def verify_frozen_integrity(frozen_manifest: dict, *, trusted_legacy: bool = False) -> None:
@@ -444,6 +583,22 @@ def verify_reproducibility(
         frozen_manifest.get("source") or {}
     ).get("checksum")
     if frozen_recomputed_checksum != frozen_declared_checksum:
+        return False
+
+    # [리뷰 P1, 4차] id 전체를 비교에서 빼면(이름·날짜 컴포넌트가 재실행마다
+    # 달라질 수 있어서) recomputed_manifest의 id를 완전히 무관한 문자열로 바꿔도
+    # 재현 성공으로 오판된다. id의 마지막 세그먼트(checksum suffix)만은 형식(12자리
+    # 16진수)과, 위에서 이미 독립 재계산한 각자의 source.checksum suffix와 일치하는지
+    # 반드시 검증한다 — 날짜 등 나머지 부분만 다르게 허용한다.
+    expected_suffix = frozen_recomputed_checksum.split(":", 1)[1][:12]
+    frozen_id_suffix = _dataset_id_checksum_suffix(frozen_manifest.get("id"))
+    recomputed_id_suffix = _dataset_id_checksum_suffix(recomputed_manifest.get("id"))
+    if not (
+        _DATASET_ID_CHECKSUM_SUFFIX_RE.match(frozen_id_suffix)
+        and _DATASET_ID_CHECKSUM_SUFFIX_RE.match(recomputed_id_suffix)
+    ):
+        return False
+    if frozen_id_suffix != expected_suffix or recomputed_id_suffix != expected_suffix:
         return False
 
     if _canonical_comparable_snapshot(frozen_manifest) != _canonical_comparable_snapshot(

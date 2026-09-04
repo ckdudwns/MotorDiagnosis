@@ -20,13 +20,16 @@ _WEEK3_DATASETS_DIR = os.path.normpath(
 _CWRU_DATA_DIR = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "..", "week1", "ai1", "data", "external", "cwru")
 )
+_WEEK2_BASELINE_JSON = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "..", "week2", "ai1", "dataset", "baseline.json")
+)
 
 sys.path.insert(0, _DATASET_VERSIONS_DIR)
 sys.path.insert(0, _WEEK3_DATASETS_DIR)
 
 from dataset_version import (  # noqa: E402
     freeze_dataset_version,
-    approve_dataset_version,
+    DatasetVersionRegistry,
     verify_reproducibility,
     verify_frozen_integrity,
     compute_dataset_checksum,
@@ -150,15 +153,14 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         self.assertEqual(frozen["datasetChecksum"], compute_dataset_checksum(frozen))
         self.assertEqual(frozen["snapshotDigest"], compute_snapshot_digest(frozen))
 
-    def test_approve_rejects_post_freeze_row_mutation(self):
-        frozen = freeze_dataset_version(_draft_manifest())
-        frozen["rows"][0]["common_label"] = "TAMPERED"  # 동결 이후 변조
-        with self.assertRaises(ValueError):
-            approve_dataset_version(frozen, approved_by="mgr", reason="검증 완료")
-
     def test_approve_deep_copies_nested_rows(self):
-        frozen = freeze_dataset_version(_draft_manifest())
-        approved = approve_dataset_version(frozen, approved_by="mgr", reason="검증 완료")
+        """[리뷰 P1, 6차] freeze()/approve()가 반환하는 두 사본은 서로 독립적이다 —
+        freeze()가 반환한 사본을 변조해도 registry.approve()가 반환하는 승인
+        레코드에는 영향이 없다(registry 내부 canonical 레코드는 애초에 그 사본과
+        별개다 — TestApproveDatasetVersionBoundToCanonicalRegistration 참고)."""
+        registry = DatasetVersionRegistry()
+        frozen = registry.freeze(_draft_manifest())
+        approved = registry.approve(frozen["id"], approved_by="mgr", reason="검증 완료")
         frozen["rows"][0]["common_label"] = "CHANGED"
         self.assertEqual(approved["rows"][0]["common_label"], "NORMAL")
 
@@ -167,22 +169,36 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         with self.assertRaises(ValueError):
             freeze_dataset_version(frozen)  # 이미 frozen -> 재동결 불가
 
-    def test_approve_requires_frozen(self):
+    def test_approve_requires_freeze_first(self):
+        """draft는 아직 어떤 레지스트리에도 동결(freeze)된 적이 없으므로, 그
+        id로 approve()를 호출해도 조회되지 않는다 — draft를 바로 승인하는
+        경로는 없다."""
         draft = _draft_manifest()
+        registry = DatasetVersionRegistry()
         with self.assertRaises(ValueError):
-            approve_dataset_version(draft, approved_by="mgr", reason="검증 완료")
+            registry.approve(draft["id"], approved_by="mgr", reason="검증 완료")
 
     def test_approve_after_freeze(self):
-        frozen = freeze_dataset_version(_draft_manifest())
-        approved = approve_dataset_version(frozen, approved_by="mgr", reason="검증 완료")
+        registry = DatasetVersionRegistry()
+        frozen = registry.freeze(_draft_manifest())
+        approved = registry.approve(frozen["id"], approved_by="mgr", reason="검증 완료")
         self.assertEqual(approved["status"], "approved")
         self.assertEqual(approved["approvedBy"], "mgr")
         self.assertEqual(approved["approvalReason"], "검증 완료")
 
     def test_approve_blank_reason_rejected(self):
-        frozen = freeze_dataset_version(_draft_manifest())
+        registry = DatasetVersionRegistry()
+        frozen = registry.freeze(_draft_manifest())
         with self.assertRaises(ValueError):
-            approve_dataset_version(frozen, approved_by="mgr", reason="   ")
+            registry.approve(frozen["id"], approved_by="mgr", reason="   ")
+
+    def test_approve_blank_approved_by_rejected(self):
+        """[리뷰 P2] approved_by가 공백만 있는 문자열이어도 reason과 동일하게
+        거부해야 한다 — `not "   "`는 False라서 예전에는 통과했다."""
+        registry = DatasetVersionRegistry()
+        frozen = registry.freeze(_draft_manifest())
+        with self.assertRaises(ValueError):
+            registry.approve(frozen["id"], approved_by="   ", reason="ok")
 
     def test_checksum_changes_when_rows_change(self):
         manifest_a = _draft_manifest()
@@ -253,10 +269,9 @@ class TestDatasetVersionStateMachine(unittest.TestCase):
         self.assertEqual(frozen["datasetChecksum"], compute_dataset_checksum(frozen))
 
     def test_summary_deep_copies_nested_objects_approved(self):
-        approved = approve_dataset_version(
-            freeze_dataset_version(_draft_manifest()),
-            approved_by="mgr", reason="검증 완료",
-        )
+        registry = DatasetVersionRegistry()
+        frozen = registry.freeze(_draft_manifest())
+        approved = registry.approve(frozen["id"], approved_by="mgr", reason="검증 완료")
         summary = dataset_version_summary(approved)
         summary["labelMapping"]["FAULT"] = "TAMPERED"
         self.assertEqual(approved["labelMapping"]["FAULT"], "ANOMALY")
@@ -440,6 +455,51 @@ class TestFreezeRecomputesFullCanonicalIdentity(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_reproducibility(frozen, recomputed)
 
+    def test_verify_reproducibility_false_when_int_field_type_changes_to_float(self):
+        """[리뷰 P1, 6차] 파이썬 dict 비교(`==`)에서 `12000 == 12000.0`이 참이라,
+        recomputed_manifest에서 samplingRateHz를 정수에서 실수로 **타입만** 바꿔도
+        이전에는 (canonical snapshot을 dict로 비교했으므로) 재현 성공으로
+        오판됐다 — 반면 `compute_snapshot_digest()`는 JSON 직렬화 기준이라
+        `12000`과 `12000.0`을 다른 값으로 낸다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        other = _draft_manifest()
+        other["compatibility"]["samplingRateHz"] = 12000.0
+        self.assertFalse(verify_reproducibility(frozen, other))
+
+    def test_verify_reproducibility_false_when_bool_field_type_changes_to_int(self):
+        """[리뷰 P1, 6차] `False == 0`이 파이썬에서 참이라, independentHoldout을
+        `False`에서 정수 `0`으로 타입만 바꿔도 이전에는 재현 성공으로 오판됐다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        other = _draft_manifest()
+        other["independentHoldout"] = 0  # False와 "값"은 같지만 타입이 다름
+        self.assertFalse(verify_reproducibility(frozen, other))
+
+    def test_verify_reproducibility_false_when_recomputed_id_is_totally_unrelated(self):
+        """[리뷰 P1, 6차] id 전체를 비교에서 빼면, 내용은 완전히 동일한
+        recomputed_manifest의 id만 checksum과 무관한 문자열로 바꿔도 재현 성공으로
+        오판됐다 — id의 마지막 12자리 16진수 suffix는 각자 재계산한
+        source.checksum suffix와 일치해야 한다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        other = _draft_manifest()
+        other["id"] = "TOTALLY-UNRELATED-ID"
+        self.assertFalse(verify_reproducibility(frozen, other))
+
+    def test_verify_reproducibility_false_when_id_suffix_is_not_valid_hex_format(self):
+        frozen = freeze_dataset_version(_draft_manifest())
+        other = _draft_manifest()
+        other["id"] = "DS-TEST-001-NOTVALIDHEX12"  # 12자지만 16진수가 아님
+        self.assertFalse(verify_reproducibility(frozen, other))
+
+    def test_verify_reproducibility_true_when_only_id_prefix_differs(self):
+        """id의 checksum suffix(마지막 "-" 뒤 12자리 16진수)만 각자 내용과 일치하면,
+        그 앞의 이름·날짜 부분이 서로 달라도(재실행 날짜가 바뀌는 정상적인 경우)
+        재현 성공으로 처리해야 한다 — suffix가 아닌 부분까지 비교하면 안 된다."""
+        frozen = freeze_dataset_version(_draft_manifest())
+        other = _draft_manifest()
+        suffix = other["id"].rsplit("-", 1)[-1]
+        other["id"] = f"DS-TEST-001-DIFFERENT-BUILD-DATE-{suffix}"
+        self.assertTrue(verify_reproducibility(frozen, other))
+
 
 class TestV13FrozenFields(unittest.TestCase):
     def test_freeze_carries_policy_schema_and_snapshot_checksum(self):
@@ -456,25 +516,32 @@ class TestV13FrozenFields(unittest.TestCase):
 
     def test_approve_carries_new_fields(self):
         draft = _draft_manifest()
-        approved = approve_dataset_version(
-            freeze_dataset_version(draft),
-            approved_by="mgr", reason="검증 완료",
-        )
+        registry = DatasetVersionRegistry()
+        frozen = registry.freeze(draft)
+        approved = registry.approve(frozen["id"], approved_by="mgr", reason="검증 완료")
         self.assertEqual(approved["labelPolicyVersion"], "LABEL-POLICY-V2")
         self.assertEqual(approved["snapshotChecksum"], draft["source"]["checksum"])
         self.assertEqual(approved["snapshotDigest"], compute_snapshot_digest(approved))
 
 
-class TestSnapshotDigestProtectsApproval(unittest.TestCase):
+class TestSnapshotDigestProtectsIntegrity(unittest.TestCase):
     """[리뷰 P1] datasetChecksum(rows+labelMapping+split)만으로는 freeze 이후
-    source.license/checksum, samplingRate, 정책 버전 변조가 승인을 통과한다.
-    snapshotDigest는 매니페스트 전체 불변 필드를 보호한다."""
+    source.license/checksum, samplingRate, 정책 버전 변조를 잡지 못한다.
+    snapshotDigest는 매니페스트 전체 불변 필드를 보호한다.
+
+    [리뷰 P1, 6차] 승인은 이제 `DatasetVersionRegistry`가 소유한 canonical 레코드만
+    id로 조회해 이뤄진다(`TestApproveDatasetVersionBoundToCanonicalRegistration`
+    참고) — 호출자가 들고 있는 frozen 사본을 변조해도 승인 대상 자체에는 영향이
+    없다. 그래서 이 클래스는 그 방어를 실제로 수행하는 `verify_frozen_integrity()`
+    (학습·배포 등 소비자가 임의 소스에서 읽어온 매니페스트를 스스로 재검증할 때
+    쓰는 함수이자, `DatasetVersionRegistry.approve()`가 내부적으로 의존하는 바로
+    그 검증)를 직접 대상으로 삼는다."""
 
     def _tamper_and_expect_reject(self, mutate):
         frozen = freeze_dataset_version(_draft_manifest())
         mutate(frozen)
         with self.assertRaises(ValueError):
-            approve_dataset_version(frozen, approved_by="mgr", reason="검증 완료")
+            verify_frozen_integrity(frozen)
 
     def test_source_license_tamper_rejected(self):
         self._tamper_and_expect_reject(
@@ -506,15 +573,17 @@ class TestSnapshotDigestProtectsApproval(unittest.TestCase):
             lambda f: f.__setitem__("independentHoldout", True)
         )
 
-    def test_untampered_frozen_still_approves(self):
-        frozen = freeze_dataset_version(_draft_manifest())
-        approved = approve_dataset_version(frozen, approved_by="mgr", reason="ok")
+    def test_untampered_frozen_passes_integrity_and_approves(self):
+        registry = DatasetVersionRegistry()
+        frozen = registry.freeze(_draft_manifest())
+        verify_frozen_integrity(frozen)  # no raise
+        approved = registry.approve(frozen["id"], approved_by="mgr", reason="ok")
         self.assertEqual(approved["status"], "approved")
 
     def test_deleting_snapshot_digest_does_not_bypass_integrity_check(self):
         """[리뷰 P1] snapshotDigest 필드를 지워서 v1(legacy) 관용 경로로 강등시키는
         우회를 차단한다. v1.3 동결본(snapshotSchemaVersion 보유)에서 digest만
-        지우고 source.license를 변조해도 승인/무결성 검증이 이를 잡아내야 한다
+        지우고 source.license를 변조해도 무결성 검증이 이를 잡아내야 한다
         (datasetChecksum은 rows/labelMapping/split만 보므로 license 변조를 못
         잡는다 — 예전에는 이 경로로 승인이 통과했다)."""
         frozen = freeze_dataset_version(_draft_manifest())
@@ -524,8 +593,6 @@ class TestSnapshotDigestProtectsApproval(unittest.TestCase):
         self.assertFalse(is_legacy_v1_frozen(frozen))
         with self.assertRaises(ValueError):
             verify_frozen_integrity(frozen)
-        with self.assertRaises(ValueError):
-            approve_dataset_version(frozen, approved_by="mgr", reason="ok")
 
     def test_deleting_snapshot_digest_without_other_tamper_still_rejected(self):
         """digest 삭제 자체만으로도(다른 필드 변조 없이) v1.3 동결본은 거부돼야
@@ -534,8 +601,6 @@ class TestSnapshotDigestProtectsApproval(unittest.TestCase):
         del frozen["snapshotDigest"]
         with self.assertRaises(ValueError):
             verify_frozen_integrity(frozen)
-        with self.assertRaises(ValueError):
-            approve_dataset_version(frozen, approved_by="mgr", reason="ok")
 
     def test_deleting_both_schema_version_and_digest_still_rejected(self):
         """[리뷰 P1, 2차] snapshotSchemaVersion과 snapshotDigest를 **함께** 지워도
@@ -549,8 +614,6 @@ class TestSnapshotDigestProtectsApproval(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             verify_frozen_integrity(frozen)  # trusted_legacy 기본값(False)
-        with self.assertRaises(ValueError):
-            approve_dataset_version(frozen, approved_by="mgr", reason="ok")
 
     def test_trusted_legacy_true_is_required_for_legacy_fallback(self):
         """호출자가 `trusted_legacy=True`를 명시적으로 전달할 때만 legacy(v1)
@@ -559,10 +622,91 @@ class TestSnapshotDigestProtectsApproval(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_frozen_integrity(legacy)  # 기본값 False -> snapshotDigest 없음 거부
         verify_frozen_integrity(legacy, trusted_legacy=True)  # no raise
-        approved = approve_dataset_version(
-            legacy, approved_by="mgr", reason="ok", trusted_legacy=True
-        )
+
+
+class TestApproveDatasetVersionBoundToCanonicalRegistration(unittest.TestCase):
+    """[리뷰 P1, 6차] 승인을 canonical 동결 레코드에 결속한다 — `DatasetVersionRegistry`
+    (model_version.py의 `ModelVersionRegistry`/`BaselineVersionRegistry`와 동일한
+    신뢰 경계).
+
+    이전에는 `approve_dataset_version()`이 공개 함수라서, 호출자가
+    `freeze_dataset_version()`(v1.3 필수 필드·featureOutputFingerprint·
+    source.checksum 교차검증)을 실제로 거친 적 없는 임의 dict도 — 공개 함수인
+    `compute_dataset_checksum()`/`compute_snapshot_digest()`로 **자기 자신과만**
+    일관된 checksum/digest를 계산해 채워 넣기만 하면 — 승인을 통과시킬 수 있었다.
+    `DatasetVersionRegistry`는 승인 대상을 인스턴스 자신이 `freeze()`(또는
+    `adopt_legacy_frozen()`)를 실제로 거쳐 소유하고 있는 저장소에서 `id` 문자열로만
+    조회하므로, 그런 위조가 애초에 구조적으로 불가능하다."""
+
+    def test_approving_never_frozen_id_rejected(self):
+        """이 레지스트리의 `freeze()`를 거친 적 없는 id는 어떤 문자열을 대도
+        조회되지 않는다 — canonical 저장소에 없으면 그걸로 끝이다."""
+        registry = DatasetVersionRegistry()
+        with self.assertRaises(ValueError):
+            registry.approve("never-frozen-id", approved_by="mgr", reason="ok")
+
+    def test_hand_crafted_frozen_object_with_forged_digest_never_reaches_registry(self):
+        """[리뷰 P1] 호출자가 v1.3 필수 필드를 전부 채우고
+        `compute_dataset_checksum()`/`compute_snapshot_digest()`(둘 다 공개 함수)로
+        **자기 자신과만** 일관된 checksum/digest를 계산해 채운 임의 dict를 아무리
+        정교하게 만들어도 — `verify_frozen_integrity()` 자기-일관성 검사 자체는
+        통과하더라도 — `DatasetVersionRegistry.approve()`는 그 dict 자체를 인자로
+        받지 않는다(오직 `id` 문자열만 받는다). `freeze()`를 실제로 거친 적이
+        없으므로 이 레지스트리에 그 dict를 주입할 방법이 없다."""
+        forged = _draft_manifest()
+        forged["status"] = "frozen"
+        forged["frozenAt"] = "2026-01-01T00:00:00+00:00"
+        forged["snapshotChecksum"] = forged["source"]["checksum"]
+        forged["datasetChecksum"] = compute_dataset_checksum(forged)
+        forged["snapshotDigest"] = compute_snapshot_digest(forged)
+        # 자기-일관성 자체는 통과한다 — 그런데도 registry.freeze()를 거친 적이 없다.
+        verify_frozen_integrity(forged)  # no raise
+
+        registry = DatasetVersionRegistry()
+        with self.assertRaises(ValueError):
+            registry.approve(forged["id"], approved_by="mgr", reason="ok")
+
+    def test_mutating_returned_frozen_copy_does_not_affect_registry_state(self):
+        """[리뷰 P1, 6차] `freeze()`가 반환하는 값은 깊은 복사본이다 — 호출자가
+        반환값을 변조해도(id/rows 등을 바꿔도) 레지스트리 내부 상태는 전혀
+        영향받지 않는다. 원래 id는 정상적으로 승인되고, 변조된 값이 가리키는
+        id는(이 레지스트리의 freeze()를 거친 적 없으므로) 승인할 수 없다."""
+        registry = DatasetVersionRegistry()
+        frozen = registry.freeze(_draft_manifest())
+        original_id = frozen["id"]
+        frozen["id"] = "id-tampered"
+        frozen["rows"][0]["common_label"] = "TAMPERED"
+
+        with self.assertRaises(ValueError):
+            registry.approve("id-tampered", approved_by="mgr", reason="ok")
+
+        approved = registry.approve(original_id, approved_by="mgr", reason="ok")
+        self.assertEqual(approved["rows"][0]["common_label"], "NORMAL")
+
+    def test_registry_lookup_approves_canonical_entry(self):
+        registry = DatasetVersionRegistry()
+        frozen = registry.freeze(_draft_manifest())
+        approved = registry.approve(frozen["id"], approved_by="mgr", reason="ok")
         self.assertEqual(approved["status"], "approved")
+        self.assertEqual(approved["rows"], frozen["rows"])
+
+    def test_registry_isolated_between_instances(self):
+        """서로 다른 `DatasetVersionRegistry` 인스턴스는 완전히 독립된 저장소다 —
+        한 인스턴스에 동결된 데이터셋을 다른 인스턴스에서 승인할 수 없다."""
+        registry_a = DatasetVersionRegistry()
+        frozen = registry_a.freeze(_draft_manifest())
+        registry_b = DatasetVersionRegistry()
+        with self.assertRaises(ValueError):
+            registry_b.approve(frozen["id"], approved_by="mgr", reason="ok")
+
+    def test_freeze_rejects_duplicate_id(self):
+        """[리뷰 P1, 6차] 같은 id를 이 레지스트리에 두 번 동결하면 조용히 덮어써
+        감사 이력이 끊긴다 — 명시적으로 거부해야 한다."""
+        registry = DatasetVersionRegistry()
+        draft = _draft_manifest()
+        registry.freeze(draft)
+        with self.assertRaises(ValueError):
+            registry.freeze(copy.deepcopy(draft))
 
 
 class TestFrozenIntegrityVerification(unittest.TestCase):
@@ -590,34 +734,41 @@ class TestFrozenIntegrityVerification(unittest.TestCase):
 
 
 class TestLegacyV1FrozenTolerance(unittest.TestCase):
-    """이미 동결된 v1(snapshotDigest 없음)은 재동결하지 않고, 호출자가
-    `trusted_legacy=True`를 명시할 때만 관용 처리한다 (리뷰 P1, 2차 — legacy
-    여부는 매니페스트 필드로 추정하지 않는다)."""
+    """이미 동결된 v1(snapshotDigest 없음)은 재동결(`freeze()`)하지 않고,
+    `DatasetVersionRegistry.adopt_legacy_frozen()`으로 가져와야만 승인할 수 있다
+    (리뷰 P1, 2차 — legacy 여부는 매니페스트 필드로 추정하지 않는다. 리뷰 P1, 6차 —
+    adopt하지 않은 legacy 레코드는 어떤 id를 대도 승인 대상으로 조회되지 않는다)."""
 
     def test_is_legacy_v1_frozen(self):
         # 정보성 추정일 뿐 — 무결성 검증의 신뢰 판단에는 쓰이지 않는다.
         self.assertTrue(is_legacy_v1_frozen(_legacy_frozen()))
         self.assertFalse(is_legacy_v1_frozen(freeze_dataset_version(_draft_manifest())))
 
-    def test_v1_frozen_approve_still_works_with_trusted_legacy(self):
-        approved = approve_dataset_version(
-            _legacy_frozen(), approved_by="mgr", reason="기존 승인", trusted_legacy=True
+    def test_v1_frozen_approve_still_works_via_adopt_legacy_frozen(self):
+        registry = DatasetVersionRegistry()
+        legacy = registry.adopt_legacy_frozen(_legacy_frozen())
+        approved = registry.approve(
+            legacy["id"], approved_by="mgr", reason="기존 승인", trusted_legacy=True
         )
         self.assertEqual(approved["status"], "approved")
 
     def test_v1_frozen_approve_without_trusted_legacy_rejected(self):
         # trusted_legacy를 명시하지 않으면 v1.3 엄격 검증(snapshotDigest 필수)이
         # 적용돼 legacy 레코드도 거부된다 — 매니페스트 필드로 legacy를 봐주지 않는다.
+        registry = DatasetVersionRegistry()
+        legacy = registry.adopt_legacy_frozen(_legacy_frozen())
         with self.assertRaises(ValueError):
-            approve_dataset_version(_legacy_frozen(), approved_by="mgr", reason="x")
+            registry.approve(legacy["id"], approved_by="mgr", reason="x")
 
-    def test_v1_frozen_approve_rejects_row_tamper(self):
+    def test_adopt_legacy_frozen_rejects_row_tamper(self):
+        """`adopt_legacy_frozen()`도 `verify_frozen_integrity(trusted_legacy=True)`를
+        거치므로, 자기 자신의 datasetChecksum과 어긋나는(rows가 변조된) 레코드는
+        저장소에 들어갈 수조차 없다."""
         frozen = _legacy_frozen()
         frozen["rows"][0]["common_label"] = "TAMPERED"
+        registry = DatasetVersionRegistry()
         with self.assertRaises(ValueError):
-            approve_dataset_version(
-                frozen, approved_by="mgr", reason="x", trusted_legacy=True
-            )
+            registry.adopt_legacy_frozen(frozen)
 
     def test_v1_frozen_integrity_falls_back_to_dataset_checksum_with_trusted_legacy(self):
         verify_frozen_integrity(_legacy_frozen(), trusted_legacy=True)  # no raise
@@ -630,6 +781,19 @@ class TestLegacyV1FrozenTolerance(unittest.TestCase):
         summary = dataset_version_summary(_legacy_frozen())
         self.assertNotIn("rows", summary)
 
+    def test_adopt_legacy_frozen_requires_non_blank_id(self):
+        legacy = _legacy_frozen()
+        legacy["id"] = "   "
+        registry = DatasetVersionRegistry()
+        with self.assertRaises(ValueError):
+            registry.adopt_legacy_frozen(legacy)
+
+    def test_adopt_legacy_frozen_rejects_duplicate_id(self):
+        registry = DatasetVersionRegistry()
+        registry.adopt_legacy_frozen(_legacy_frozen())
+        with self.assertRaises(ValueError):
+            registry.adopt_legacy_frozen(_legacy_frozen())
+
 
 class TestTrustedLegacyRequiresActualBool(unittest.TestCase):
     """[리뷰 P1] trusted_legacy는 실제 bool만 허용한다 — 문자열 "false"는
@@ -637,10 +801,11 @@ class TestTrustedLegacyRequiresActualBool(unittest.TestCase):
     없는 변조 레코드의 검증·승인·재현성 확인이 통과했다."""
 
     def test_approve_rejects_string_false(self):
-        legacy = _legacy_frozen()
+        registry = DatasetVersionRegistry()
+        legacy = registry.adopt_legacy_frozen(_legacy_frozen())
         with self.assertRaises(TypeError):
-            approve_dataset_version(
-                legacy, approved_by="mgr", reason="x", trusted_legacy="false"
+            registry.approve(
+                legacy["id"], approved_by="mgr", reason="x", trusted_legacy="false"
             )
 
     def test_verify_frozen_integrity_rejects_string_false(self):
@@ -655,9 +820,10 @@ class TestTrustedLegacyRequiresActualBool(unittest.TestCase):
             verify_reproducibility(legacy, recomputed, trusted_legacy="false")
 
     def test_approve_rejects_int_one_as_truthy_stand_in(self):
-        legacy = _legacy_frozen()
+        registry = DatasetVersionRegistry()
+        legacy = registry.adopt_legacy_frozen(_legacy_frozen())
         with self.assertRaises(TypeError):
-            approve_dataset_version(legacy, approved_by="mgr", reason="x", trusted_legacy=1)
+            registry.approve(legacy["id"], approved_by="mgr", reason="x", trusted_legacy=1)
 
 
 class TestModelVersionLifecycle(unittest.TestCase):
@@ -765,6 +931,7 @@ class TestRegisterModelVersionValidation(unittest.TestCase):
             "sha256:" + "g" * 64,  # 16진수가 아닌 문자 포함
             "md5:" + "a" * 32,  # 다른 알고리즘 접두사
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  # 접두사 없음
+            "sha256:" + "a" * 64 + "\n",  # [리뷰 P2, 2차] 트레일링 개행 — re.match는 통과시켰다
         ):
             kwargs = dict(self._VALID_KWARGS)
             kwargs["artifact_checksum"] = bad
@@ -776,6 +943,15 @@ class TestRegisterModelVersionValidation(unittest.TestCase):
         kwargs["artifact_checksum"] = "sha256:" + "0123456789abcdef" * 4
         mv = ModelVersionRegistry().register(**kwargs)
         self.assertEqual(mv["artifactChecksum"], "sha256:" + "0123456789abcdef" * 4)
+
+    def test_uppercase_hex_checksum_normalized_to_lowercase(self):
+        """[리뷰 P2, 2차] 등록 시 대문자 16진수를 그대로 저장하면, 추론 단계
+        (`score_from_artifact`)가 파일 바이트로 계산한 `hexdigest()`(항상 소문자)와
+        문자열이 달라 정상 아티팩트가 거부된다. 저장 전에 소문자로 정규화해야 한다."""
+        kwargs = dict(self._VALID_KWARGS)
+        kwargs["artifact_checksum"] = "sha256:" + "ABCDEF0123456789" * 4
+        mv = ModelVersionRegistry().register(**kwargs)
+        self.assertEqual(mv["artifactChecksum"], "sha256:" + "abcdef0123456789" * 4)
 
     def test_registration_digest_matches_recompute(self):
         mv = ModelVersionRegistry().register(**self._VALID_KWARGS)
@@ -1156,14 +1332,30 @@ class TestBaselineVersionValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             BaselineVersionRegistry().register(**kwargs)
 
-    def test_non_positive_std_rejected(self):
-        for bad_std in (0, -0.01, float("nan")):
+    def test_negative_or_nan_std_rejected(self):
+        """[리뷰 P1] 음수·NaN std는 명백히 잘못된 통계이므로 계속 거부한다."""
+        for bad_std in (-0.01, float("nan")):
             kwargs = dict(self._VALID_KWARGS)
             kwargs["features"] = {
                 "rms_mean": {"mean": 0.05, "std": bad_std, "normal_range": [0.03, 0.07]}
             }
             with self.assertRaises(ValueError, msg=f"std={bad_std!r}"):
                 BaselineVersionRegistry().register(**kwargs)
+
+    def test_zero_std_is_accepted(self):
+        """[리뷰 P1] 저장소의 실제 week2 baseline.json은 rms_std/kurtosis_std/
+        spectral_rolloff처럼 모든 윈도우에서 값이 상수라 std가 정확히 0.0인
+        특징을 포함한다(기존 판정 로직도 near-zero std 특징은 건너뛴다) — std==0을
+        거부하면 그 실제 baseline을 등록할 수 없었다. 음수만 거부하고 0은
+        소비자(판정 로직) 정책에 맡긴다."""
+        kwargs = dict(self._VALID_KWARGS)
+        kwargs["features"] = {
+            "spectral_rolloff": {
+                "mean": 1066.40625, "std": 0.0, "normal_range": [1066.40625, 1066.40625]
+            }
+        }
+        bv = BaselineVersionRegistry().register(**kwargs)
+        self.assertEqual(bv["features"]["spectral_rolloff"]["std"], 0.0)
 
     def test_non_finite_mean_rejected(self):
         kwargs = dict(self._VALID_KWARGS)
@@ -1263,6 +1455,57 @@ class TestBaselineVersionValidation(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             BaselineVersionRegistry().register(**kwargs)
+
+
+@unittest.skipUnless(
+    os.path.exists(_WEEK2_BASELINE_JSON),
+    f"week2 baseline.json 없음: {_WEEK2_BASELINE_JSON}",
+)
+class TestRegisterRealWeek2Baseline(unittest.TestCase):
+    """[리뷰 P1] 저장소의 실제 week2/ai1/dataset/baseline.json을 그대로 등록할 수
+    있어야 한다. 이 파일은 rms_std/kurtosis_std/spectral_rolloff처럼 모든 윈도우에서
+    값이 상수라 표본표준편차가 정확히 0.0인 특징을 포함한다 — std==0을 거부하던
+    예전 검증에서는 등록 자체가 실패했다(기존 판정 로직은 이런 near-zero std
+    특징을 건너뛰고 계속 판정하므로, 등록을 막을 이유가 없다)."""
+
+    def _load_features(self) -> dict:
+        import json
+
+        with open(_WEEK2_BASELINE_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+        # baseline.json의 feature 항목은 mean/std/min/max/normal_range를 갖는다 —
+        # BaselineVersionRegistry.register()는 mean/std/normal_range만 검증하고
+        # min/max 등 추가 키는 그대로 통과시킨다.
+        return data["features"]
+
+    def test_real_baseline_registers_successfully(self):
+        features = self._load_features()
+        self.assertIn("rms_std", features)
+        self.assertEqual(features["rms_std"]["std"], 0.0)
+
+        bv = BaselineVersionRegistry().register(
+            baseline_id="BL-CWRU-NORMAL-1",
+            dataset_id="DS-CWRU-VIBRATION-week2-baseline",
+            site_id="SITE-01",
+            asset_id="SITE-01-MOT-01",
+            features=features,
+        )
+        self.assertEqual(bv["status"], "draft")
+        self.assertEqual(bv["features"]["rms_std"]["std"], 0.0)
+        self.assertEqual(bv["features"]["rms_mean"]["mean"], features["rms_mean"]["mean"])
+
+    def test_real_baseline_can_be_approved_and_activated(self):
+        registry = BaselineVersionRegistry()
+        registry.register(
+            baseline_id="BL-CWRU-NORMAL-1",
+            dataset_id="DS-CWRU-VIBRATION-week2-baseline",
+            site_id="SITE-01",
+            asset_id="SITE-01-MOT-01",
+            features=self._load_features(),
+        )
+        registry.approve("BL-CWRU-NORMAL-1", approved_by="mgr", reason="week2 baseline 승인")
+        active = registry.activate("BL-CWRU-NORMAL-1")
+        self.assertEqual(active["status"], "active")
 
 
 @unittest.skipUnless(

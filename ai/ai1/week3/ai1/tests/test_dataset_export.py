@@ -1162,6 +1162,54 @@ class TestExportDatasetSynthetic(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_tampered_xlsx_manifest_header_is_rejected_not_silently_reused(self):
+        """[리뷰 P1, 5차] 예전에는 manifest 시트의 첫 행을 검사 없이 헤더라고
+        가정하고 그대로 버렸다 — 헤더 자체가 변조돼도(예: ["field", "tampered"]) 그
+        사실을 감지하지 못하고 이후 행만 비교했다. 첫 행이 정확히
+        ["field", "value"]인지 검증해야 한다."""
+        from openpyxl import load_workbook
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_xlsx_header_tamper_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+
+            wb = load_workbook(result_1["xlsx_path"])
+            manifest_sheet = wb["manifest"]
+            manifest_sheet["A1"] = "field"
+            manifest_sheet["B1"] = "tampered-header"
+            wb.save(result_1["xlsx_path"])
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_duplicate_field_row_in_xlsx_manifest_is_rejected_not_silently_reused(self):
+        """[리뷰 P1, 5차] `dict` 컴프리헨션은 같은 `field`가 두 번 나오면 나중
+        값으로 조용히 덮어써서, 중복 `field` 행을 추가해 원래 값을 가리는 변조도
+        "정상"으로 오판됐다. 같은 field가 두 번 나오면 거부해야 한다."""
+        from openpyxl import load_workbook
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_xlsx_dup_field_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+
+            wb = load_workbook(result_1["xlsx_path"])
+            manifest_sheet = wb["manifest"]
+            # 기존 "source.license" 값 뒤에 같은 field를 다른 값으로 한 번 더 append —
+            # dict 컴프리헨션이라면 이 값으로 조용히 덮어써졌을 것이다.
+            manifest_sheet.append(["source.license", "DUPLICATE-FIELD-TAMPER"])
+            wb.save(result_1["xlsx_path"])
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def test_missing_manifest_json_raises_incomplete_error_without_auto_recovery(self):
         """[리뷰 P1, 4차] 기존 JSON manifest가 삭제된(또는 이전 실행이 XLSX 저장
         직후 중단된) 채로 남아 있으면, 그 디렉터리가 원래 무엇을 담고 있었는지

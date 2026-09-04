@@ -341,6 +341,31 @@ class TestScoreFromArtifactSchemaValidation(unittest.TestCase):
                     path, bad, input_feature_names=names, expected_checksum=checksum
                 )
 
+    def test_nan_artifact_weights_are_rejected_not_reported_as_normal(self):
+        """[리뷰 P1] 입력은 멀쩡해도 artifact의 state_dict(가중치)가 NaN이면
+        reconstruction_error()가 NaN을 내고, `errors > threshold`는 NaN과의
+        비교가 항상 False라서 재구성이 완전히 무너진 표본도 전부 "정상"(anomaly
+        아님)으로 오판된다. verdict를 계산하기 전에 errors가 모두 유한한지
+        검증해 이런 손상된 아티팩트의 추론을 명시적으로 거부해야 한다."""
+        import hashlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, matrix, _ = self._artifact(tmp)
+
+            payload = torch.load(path, weights_only=True)
+            for key, tensor in payload["state_dict"].items():
+                payload["state_dict"][key] = torch.full_like(tensor, float("nan"))
+            torch.save(payload, path)
+            with open(path, "rb") as f:
+                tampered_checksum = f"sha256:{hashlib.sha256(f.read()).hexdigest()}"
+
+            with self.assertRaises(ValueError):
+                score_from_artifact(
+                    path, matrix, input_feature_names=names,
+                    expected_checksum=tampered_checksum,
+                )
+
 
 class TestScoreFromArtifactChecksumRequired(unittest.TestCase):
     """[리뷰 P1] 추론 전 artifact checksum을 반드시 검증한다 — checksum을 확인하지
@@ -956,6 +981,27 @@ class TestIndependentHoldoutClaimVerified(unittest.TestCase):
         manifest = _frozen_manifest_from_files(files, independent_holdout=True)
         report = run_training_job(manifest, dense_epochs=2, lstm_epochs=2)
         self.assertTrue(report["metrics"]["independentHoldout"])
+
+    def test_candidate_split_strategy_description_matches_actual_independence(self):
+        """[리뷰 P2] 예전에는 후보 보고서의 candidate["splitStrategy"] 설명 문구가
+        `operating_condition_holdout — 부하조건 기준, specimen 독립 아님`으로
+        고정돼 있었다 — specimen-independent 매니페스트로 학습해도 이 문구가 그대로
+        박혀, 같은 보고서의 `metrics.independentHoldout=True`와 모순됐다. 실제
+        검증된 매니페스트의 splitStrategy·독립성으로 동적으로 생성해야 한다."""
+        files = [
+            ("97.mat", "NORMAL", "NORMAL", "train", "SPEC-A"),
+            ("98.mat", "NORMAL", "NORMAL", "validation", "SPEC-B"),
+            ("99.mat", "BEARING_FAULT_INNER", "ANOMALY", "validation", "SPEC-C"),
+            ("100.mat", "NORMAL", "NORMAL", "test", "SPEC-D"),
+            ("105.mat", "BEARING_FAULT_INNER", "ANOMALY", "test", "SPEC-E"),
+        ]
+        manifest = _frozen_manifest_from_files(files, independent_holdout=True)
+        report = run_training_job(manifest, dense_epochs=2, lstm_epochs=2)
+        self.assertTrue(report["metrics"]["independentHoldout"])
+        for candidate in report["candidates"]:
+            self.assertIn(manifest["splitStrategy"], candidate["splitStrategy"])
+            self.assertIn("specimen 독립", candidate["splitStrategy"])
+            self.assertNotIn("specimen 독립 아님", candidate["splitStrategy"])
 
     def test_actual_independence_computed_not_trusted_from_false_declaration(self):
         # independentHoldout=False로 선언해도 실제 rows가 독립이면 실제 계산값

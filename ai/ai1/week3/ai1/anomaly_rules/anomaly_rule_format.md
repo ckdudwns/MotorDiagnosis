@@ -69,6 +69,7 @@ entry = registry.resolve(asset_id="SITE-01-MOT-02", asset_type="MOTOR")
 {
   "start_index": 119,
   "end_index": 296,
+  "// 참고": "인덱스는 예시값 — 정상(0HP 97.mat 119윈도우) 다음 결함 구간에서 이벤트가 열린다",
   "max_deviation_sigma": 12.4,
   "asset_id": "SITE-01-MOT-02",
   "baseline_version": "2026-08-21T08:17:43.221079+00:00",

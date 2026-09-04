@@ -33,13 +33,19 @@ sys.path.insert(0, _DATASETS_DIR)
 from register_dataset import (  # noqa: E402
     build_manifest,
     group_split,
+    operating_condition_split,
     compute_version_checksum,
     compute_feature_output_fingerprint,
+    dataset_export_label_fields,
+    summarize_dataset_labels,
     validate_split_ratios,
     sha256_of_file,
     extract_all_features,
     DATASET_LABEL_MAPPING,
+    DATASET_EXPORT_LABEL_FIELDS,
     LABEL_TAXONOMY_VERSION,
+    LABEL_POLICY_VERSION,
+    SNAPSHOT_SCHEMA_VERSION,
     FEATURE_PIPELINE_VERSION,
     InsufficientAssetGroupsError,
 )
@@ -302,6 +308,21 @@ class TestComputeVersionChecksum(unittest.TestCase):
         차이(MFCC 0벡터 폴백 등)로 실제 산출된 특징값이 달라지면, 다른 입력이
         전부 같아도 fingerprint를 통해 체크섬이 달라져야 한다."""
         changed = self._checksum(feature_output_fingerprint="sha256:different-fingerprint")
+        self.assertNotEqual(self._checksum(), changed)
+
+    def test_changes_when_label_policy_version_changes(self):
+        """라벨 정책 버전이 바뀌면(v1.3) 같은 원본·특징이어도 다른 데이터셋 버전이어야
+        한다 — 신규 데이터셋이 기존 frozen id를 재사용하는 것을 막는다."""
+        changed = self._checksum(label_policy_version="LABEL-POLICY-V3")
+        self.assertNotEqual(self._checksum(), changed)
+
+    def test_changes_when_snapshot_schema_version_changes(self):
+        changed = self._checksum(snapshot_schema_version="3")
+        self.assertNotEqual(self._checksum(), changed)
+
+    def test_changes_when_split_strategy_changes(self):
+        # specimen_group vs operating_condition_holdout는 서로 다른 데이터셋 버전이어야 한다.
+        changed = self._checksum(split_strategy="operating_condition_holdout")
         self.assertNotEqual(self._checksum(), changed)
 
 
@@ -569,6 +590,156 @@ class TestJsonDumpsRejectNonFiniteValues(unittest.TestCase):
             )
 
 
+class TestOperatingConditionSplit(unittest.TestCase):
+    """부하조건 기준 고정 배정 — 결정적(seed 무관), 부하 tier 통째로 한 split에.
+    같은 물리 베어링이 여러 부하에 걸쳐 있으므로 specimen 독립 검증이 아니다."""
+
+    def _recs(self, n_per_hp=3):
+        recs = []
+        for specimen in ("S-A", "S-B"):
+            for hp in (0, 1, 2, 3):
+                recs += [
+                    {"specimen_id": specimen, "load_hp": hp, "label": "NORMAL"}
+                ] * n_per_hp
+        return recs
+
+    def test_deterministic_load_tier_assignment(self):
+        recs = self._recs()
+        a = operating_condition_split(recs)
+        b = operating_condition_split(recs, ratios={"train": 0.1})  # ratios 무시
+        self.assertEqual(a, b)
+        # 0HP->test, 1HP->validation, 2·3HP->train
+        for rec, split in zip(recs, a):
+            expected = {0: "test", 1: "validation", 2: "train", 3: "train"}[rec["load_hp"]]
+            self.assertEqual(split, expected)
+
+    def test_same_specimen_spans_multiple_splits(self):
+        recs = self._recs()
+        splits = operating_condition_split(recs)
+        by_specimen = {}
+        for rec, split in zip(recs, splits):
+            by_specimen.setdefault(rec["specimen_id"], set()).add(split)
+        self.assertTrue(all(len(s) == 3 for s in by_specimen.values()))
+
+    def test_missing_load_hp_raises(self):
+        with self.assertRaises(ValueError):
+            operating_condition_split([{"specimen_id": "x", "label": "NORMAL"}])
+
+
+class TestOperatingConditionHoldoutSeedIndependenceSynthetic(unittest.TestCase):
+    """[리뷰 P2] "미사용 seed가 operating_condition_holdout의 checksum/id에
+    영향을 주지 않는다"는 회귀 테스트가 `TestRegisterAndExportRealCwruData`
+    (CWRU 실데이터가 없으면 클래스 전체가 skip)에만 있어 일반 CI에서는 이
+    회귀를 잡을 수 없었다. `load_cwru_dataset`/`build_source_block`을 모킹해
+    실데이터 없이도 항상 실행되는 합성 버전을 추가한다."""
+
+    def _synthetic_records(self):
+        rng = np.random.default_rng(0)
+        records = []
+        specs = (
+            ("CWRU-NORMAL-BASELINE", "NORMAL"),
+            ("CWRU-IR-0007", "BEARING_FAULT_INNER"),
+        )
+        for specimen_id, label in specs:
+            for load_hp in (0, 1, 2, 3):
+                for i in range(3):
+                    records.append(
+                        {
+                            "sample_id": f"{specimen_id}_{load_hp}_{i:04d}",
+                            "source_label": f"{specimen_id}-{load_hp}hp.mat",
+                            "specimen_id": specimen_id,
+                            "label": label,
+                            "load_hp": load_hp,
+                            "sample_rate": 12000,
+                            "rpm": 1797,
+                            "signal": rng.normal(scale=0.1, size=2048),
+                        }
+                    )
+        return records
+
+    def _synthetic_source(self):
+        return {
+            "type": "external",
+            "uri": "https://example.invalid/cwru",
+            "license": "synthetic-test",
+            "files": {"synthetic.mat": {"sha256": "sha256:" + "a" * 64, "label": "NORMAL"}},
+        }
+
+    def test_operating_condition_holdout_checksum_id_unaffected_by_unused_seed(self):
+        with mock.patch(
+            "register_dataset.load_cwru_dataset", return_value=self._synthetic_records()
+        ), mock.patch(
+            "register_dataset.build_source_block", return_value=self._synthetic_source()
+        ):
+            m1 = build_manifest(
+                data_dir="unused", split_strategy="operating_condition_holdout", seed=1
+            )
+            m2 = build_manifest(
+                data_dir="unused", split_strategy="operating_condition_holdout", seed=999
+            )
+        self.assertEqual(m1["split"], m2["split"])
+        self.assertEqual(m1["source"]["checksum"], m2["source"]["checksum"])
+        self.assertEqual(m1["id"], m2["id"])
+
+
+class TestDatasetExportLabelFields(unittest.TestCase):
+    """API 명세서 v1.3 DatasetExportRow: CWRU known_label은 신뢰된 외부 라벨이므로
+    매핑 성공 행은 verified/training_eligible, 매핑 실패는 unmapped, 라벨 없음은
+    unlabeled. scenario_label 등 텔레메트리 전용 필드는 항상 None."""
+
+    _TAX = "CWRU-FAULT-V1"
+
+    def test_mapped_known_label_is_verified_and_trainable(self):
+        info = dataset_export_label_fields(
+            {"known_label": "BEARING_FAULT_INNER", "common_label": "ANOMALY"},
+            DATASET_LABEL_MAPPING, self._TAX,
+        )
+        self.assertEqual(info["label_status"], "verified")
+        self.assertTrue(info["training_eligible"])
+        self.assertEqual(info["ground_truth_label"], "BEARING_FAULT_INNER")
+        self.assertEqual(info["ground_truth_source"], "dataset_registration")
+        self.assertEqual(info["target_label"], "ANOMALY")
+        self.assertEqual(info["target_label_taxonomy_version"], self._TAX)
+        self.assertIsNone(info["scenario_label"])
+        self.assertFalse(info["event_reviewed"])
+
+    def test_unmapped_known_label_is_excluded_from_training(self):
+        info = dataset_export_label_fields(
+            {"known_label": "UNSEEN_FAULT"}, DATASET_LABEL_MAPPING, self._TAX
+        )
+        self.assertEqual(info["label_status"], "unmapped")
+        self.assertFalse(info["training_eligible"])
+        self.assertEqual(info["ground_truth_label"], "UNSEEN_FAULT")
+        self.assertIsNone(info["target_label"])
+        self.assertIsNone(info["target_label_taxonomy_version"])
+
+    def test_missing_known_label_is_unlabeled(self):
+        for row in ({"known_label": None}, {"known_label": ""}, {}):
+            info = dataset_export_label_fields(row, DATASET_LABEL_MAPPING, self._TAX)
+            self.assertEqual(info["label_status"], "unlabeled")
+            self.assertFalse(info["training_eligible"])
+            self.assertIsNone(info["ground_truth_label"])
+            self.assertIsNone(info["ground_truth_source"])
+
+    def test_summarize_counts_and_split_breakdown(self):
+        rows = [
+            {"known_label": "NORMAL", "split": "train"},
+            {"known_label": "BEARING_FAULT_BALL", "split": "validation"},
+            {"known_label": "UNSEEN", "split": "test"},
+            {"known_label": None, "split": "train"},
+        ]
+        summary = summarize_dataset_labels(rows, DATASET_LABEL_MAPPING, self._TAX)
+        self.assertEqual(
+            summary["labelCounts"],
+            {"verified": 2, "weak": 0, "unlabeled": 1, "unmapped": 1},
+        )
+        self.assertEqual(summary["trainingEligibleCount"], 2)
+        self.assertEqual(
+            summary["trainingEligibleSplitCounts"],
+            {"train": 1, "validation": 1, "test": 0},
+        )
+
+
 class TestExportDatasetSynthetic(unittest.TestCase):
     """CWRU 실데이터 없이도 openpyxl XLSX 내보내기 자체를 검증하는 합성 매니페스트 테스트."""
 
@@ -613,6 +784,8 @@ class TestExportDatasetSynthetic(unittest.TestCase):
             },
             "labelTaxonomyVersion": "CWRU-FAULT-V1",
             "labelMapping": DATASET_LABEL_MAPPING,
+            "labelPolicyVersion": LABEL_POLICY_VERSION,
+            "snapshotSchemaVersion": SNAPSHOT_SCHEMA_VERSION,
             "split": {"train": 0.5, "validation": 0.0, "test": 0.5},
             "splitStrategy": "test",
             "status": "draft",
@@ -620,6 +793,7 @@ class TestExportDatasetSynthetic(unittest.TestCase):
             "createdAt": "1970-01-01T00:00:00+00:00",
             "rowCount": len(rows),
             "splitCounts": {"train": 1, "validation": 0, "test": 1},
+            **summarize_dataset_labels(rows, DATASET_LABEL_MAPPING, "CWRU-FAULT-V1"),
             "rows": rows,
         }
 
@@ -638,6 +812,85 @@ class TestExportDatasetSynthetic(unittest.TestCase):
             self.assertEqual(wb["rows"].max_row - 1, manifest["rowCount"])
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_export_csv_has_v13_label_columns_with_verified_status(self):
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_labels_")
+        try:
+            result = export_dataset(manifest, tmp_dir)
+            with open(result["csv_path"], newline="", encoding="utf-8") as f:
+                csv_rows = list(csv.DictReader(f))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        for field in DATASET_EXPORT_LABEL_FIELDS:
+            self.assertIn(field, csv_rows[0])
+        # 합성 매니페스트의 두 known_label은 모두 labelMapping에 있다 → verified.
+        for row in csv_rows:
+            self.assertEqual(row["label_status"], "verified")
+            self.assertEqual(row["training_eligible"], "True")
+            self.assertEqual(row["ground_truth_source"], "dataset_registration")
+            self.assertEqual(row["ground_truth_label"], row["known_label"])
+            self.assertEqual(row["target_label"], row["common_label"])
+            self.assertEqual(row["target_label_taxonomy_version"], "CWRU-FAULT-V1")
+            self.assertEqual(row["scenario_label"], "")  # CSV 빈 셀
+            self.assertEqual(row["event_reviewed"], "False")
+
+    def test_export_manifest_json_has_label_summary_and_policy_versions(self):
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_summary_")
+        try:
+            result = export_dataset(manifest, tmp_dir)
+            with open(result["manifest_path"], encoding="utf-8") as f:
+                exported = json.load(f)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual(exported["labelPolicyVersion"], LABEL_POLICY_VERSION)
+        self.assertEqual(exported["snapshotSchemaVersion"], SNAPSHOT_SCHEMA_VERSION)
+        self.assertEqual(sum(exported["labelCounts"].values()), exported["rowCount"])
+        self.assertEqual(exported["labelCounts"]["verified"], exported["rowCount"])
+        self.assertEqual(exported["trainingEligibleCount"], exported["rowCount"])
+        self.assertEqual(
+            sum(exported["trainingEligibleSplitCounts"].values()),
+            exported["trainingEligibleCount"],
+        )
+
+    def test_exported_manifest_label_summary_matches_csv_not_stale_cache(self):
+        """[리뷰 P2] JSON manifest의 labelCounts/trainingEligibleCount는
+        build_manifest 시점에 캐시된 값이 아니라 export 시점 (rows, labelMapping)
+        으로 다시 계산해야 한다. labelMapping을 export 직전에 바꾸면 CSV/XLSX
+        행은 새 매핑을 반영하는데 JSON은 예전 집계값을 그대로 보고하던 문제를
+        고정한다."""
+        manifest = self._synthetic_manifest()
+        # BEARING_FAULT_INNER 매핑을 빼서 두 번째 행(105_0000)이 unmapped가
+        # 되도록 한다 — labelMapping은 새 dict로 교체(공유 전역 객체를
+        # 직접 변형하지 않음).
+        manifest["labelMapping"] = {"NORMAL": "NORMAL"}
+        # manifest["labelCounts"]/trainingEligibleCount는 (의도적으로) 예전
+        # 매핑 기준의 오래된 값 그대로 둔다 — export_dataset이 이를 신뢰하지
+        # 않아야 한다.
+        self.assertEqual(manifest["labelCounts"]["verified"], 2)  # 오래된(잘못된) 캐시
+
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_stale_labels_")
+        try:
+            result = export_dataset(manifest, tmp_dir)
+            with open(result["csv_path"], newline="", encoding="utf-8") as f:
+                csv_rows = {row["sample_id"]: row for row in csv.DictReader(f)}
+            with open(result["manifest_path"], encoding="utf-8") as f:
+                exported = json.load(f)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual(csv_rows["97_0000"]["label_status"], "verified")
+        self.assertEqual(csv_rows["105_0000"]["label_status"], "unmapped")
+        self.assertEqual(csv_rows["105_0000"]["training_eligible"], "False")
+
+        # JSON은 CSV와 같은(export 시점 재계산) 집계를 보고해야 한다 — 오래된
+        # "verified: 2" 캐시가 아니라.
+        self.assertEqual(exported["labelCounts"]["verified"], 1)
+        self.assertEqual(exported["labelCounts"]["unmapped"], 1)
+        self.assertEqual(exported["trainingEligibleCount"], 1)
 
     def test_failed_export_does_not_corrupt_previous_version(self):
         """CSV/XLSX/manifest를 output_dir에 바로 순차 기록하면, 뒤쪽 파일
@@ -730,6 +983,292 @@ class TestExportDatasetSynthetic(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_repeated_export_with_different_created_at_is_not_rejected(self):
+        """[리뷰 P1, 5차] JSON manifest 비교(`_canonical_manifest_json`)는
+        `createdAt`을 빼지만, 예전 `_xlsx_content_matches`는 manifest 시트를
+        raw 행으로 그대로 비교해서 `createdAt` 행 하나만 달라도 XLSX 비교가
+        실패했다 — 나머지 두 산출물(csv_matches/manifest_matches)은 통과해도
+        `csv_matches and manifest_matches and xlsx_matches`가 False가 되어,
+        내용이 완전히 같은 재-export도 `VersionContentConflictError`로
+        거부됐다."""
+        from export_dataset import VersionContentConflictError
+
+        manifest_a = self._synthetic_manifest()
+        manifest_b = self._synthetic_manifest()
+        manifest_b["createdAt"] = "2026-09-04T00:00:00+00:00"  # 내용은 동일, 생성 시각만 다름
+        self.assertEqual(manifest_a["id"], manifest_b["id"])
+
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_createdat_")
+        try:
+            result_a = export_dataset(manifest_a, tmp_dir)
+            try:
+                result_b = export_dataset(manifest_b, tmp_dir)
+            except VersionContentConflictError:
+                self.fail(
+                    "createdAt만 다른 내용이 동일한 재-export가 "
+                    "VersionContentConflictError로 거부됐습니다."
+                )
+            self.assertEqual(result_a["version_dir"], result_b["version_dir"])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_repeated_export_with_different_label_mapping_insertion_order_is_not_rejected(
+        self,
+    ):
+        """[리뷰 P1, 5차] manifest 시트의 `labelMapping.*` 행은
+        `manifest["labelMapping"].items()` 순회 순서를 그대로 반영한다 — 의미가
+        같은(같은 키-값 쌍) labelMapping이라도 dict 삽입 순서만 다르면 raw 행
+        비교(순서까지 비교)로는 다른 내용으로 오판됐다."""
+        from export_dataset import VersionContentConflictError
+
+        manifest_a = self._synthetic_manifest()
+        manifest_b = self._synthetic_manifest()
+        # 같은 키-값 쌍을 반대 순서로 삽입한 dict — 내용은 동일하다.
+        manifest_b["labelMapping"] = dict(reversed(list(manifest_a["labelMapping"].items())))
+        self.assertEqual(manifest_a["labelMapping"], manifest_b["labelMapping"])
+        self.assertNotEqual(
+            list(manifest_a["labelMapping"].items()),
+            list(manifest_b["labelMapping"].items()),
+        )
+        self.assertEqual(manifest_a["id"], manifest_b["id"])
+
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_maporder_")
+        try:
+            result_a = export_dataset(manifest_a, tmp_dir)
+            try:
+                result_b = export_dataset(manifest_b, tmp_dir)
+            except VersionContentConflictError:
+                self.fail(
+                    "labelMapping 삽입 순서만 다른 재-export가 "
+                    "VersionContentConflictError로 거부됐습니다."
+                )
+            self.assertEqual(result_a["version_dir"], result_b["version_dir"])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_same_id_different_label_mapping_rejected_not_silently_reused(self):
+        """[리뷰 P1] version_id(=source.checksum)는 export 시점에만 바뀌는 값
+        (labelMapping을 export 직전에 수정)을 반영하지 않는다. 같은 id로 먼저
+        export한 뒤 labelMapping을 바꿔 다시 export하면, 예전 코드는 os.replace()
+        실패를 "동시 export가 이미 같은 내용을 배치했다"는 뜻으로 오해해 새
+        staged 결과(새 unmapped 상태)를 조용히 버리고 기존(오래된 verified 상태)
+        산출물을 그대로 재사용했다 — 두 번째 export가 성공을 반환했지만 CSV에는
+        여전히 예전 라벨 상태가 남는 문제였다."""
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_conflict_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+            with open(result_1["csv_path"], newline="", encoding="utf-8") as f:
+                first_rows = {row["sample_id"]: row for row in csv.DictReader(f)}
+            self.assertEqual(first_rows["105_0000"]["label_status"], "verified")
+
+            # labelMapping을 새 dict로 교체(공유 전역 객체를 직접 변형하지 않음) —
+            # BEARING_FAULT_INNER 매핑을 빼서 105_0000이 unmapped가 되도록 한다.
+            # id/source.checksum은 그대로 두어 첫 export와 동일한 version_id를
+            # 재사용하게 만든다(이게 바로 재현 조건).
+            manifest["labelMapping"] = {"NORMAL": "NORMAL"}
+            self.assertEqual(manifest["id"], self._synthetic_manifest()["id"])
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+
+            # 거부됐으므로 기존(첫 번째) 산출물이 조용히 손상되거나 새 값으로
+            # 바뀌지 않고 그대로 남아 있어야 한다.
+            with open(result_1["csv_path"], newline="", encoding="utf-8") as f:
+                after_rows = {row["sample_id"]: row for row in csv.DictReader(f)}
+            self.assertEqual(after_rows["105_0000"]["label_status"], "verified")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_same_id_metadata_only_change_not_affecting_rows_is_rejected(self):
+        """[리뷰 P1] source.license나 현재 rows에서 사용되지 않는 labelMapping
+        항목만 바뀌면 CSV는 바이트까지 동일하다 — 예전 코드는 CSV만 비교해서
+        이런 경우를 "동일 내용"으로 오판해 기존 JSON manifest(오래된 license
+        텍스트)를 그대로 두고 재사용을 허용했다. CSV뿐 아니라 canonical JSON
+        manifest도 함께 비교해야 한다."""
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_license_conflict_")
+        try:
+            export_dataset(manifest, tmp_dir)
+
+            # license만 변경 — 두 행의 known_label 모두 labelMapping에 그대로
+            # 있으므로 CSV(label_status 등)는 바이트까지 동일하게 재생성된다.
+            manifest["source"] = dict(manifest["source"], license="CHANGED-LICENSE")
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_unused_label_mapping_entry_change_is_rejected_not_silently_reused(self):
+        """CSV에 나타나지 않는(현재 rows의 어떤 known_label과도 매치되지 않는)
+        labelMapping 항목만 추가/변경해도 JSON manifest의 labelMapping 필드는
+        달라진다 — CSV만 비교하면 이 변경을 못 잡고 예전 JSON을 그대로 재사용한다."""
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_unused_mapping_")
+        try:
+            export_dataset(manifest, tmp_dir)
+
+            # 현재 rows의 known_label(NORMAL/BEARING_FAULT_INNER)과 무관한 기존
+            # 항목(BEARING_FAULT_OUTER)의 값만 바꾼다 — CSV의 label_status 파생
+            # 컬럼에는 영향이 없다.
+            self.assertNotIn(
+                "BEARING_FAULT_OUTER", {r["known_label"] for r in manifest["rows"]}
+            )
+            manifest["labelMapping"] = dict(
+                manifest["labelMapping"], BEARING_FAULT_OUTER="OTHER"
+            )
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_tampered_xlsx_cell_value_is_rejected_not_silently_reused(self):
+        """[리뷰 P1, 4차] 기존 XLSX의 셀 값을 변경한 뒤 동일한 manifest를 다시
+        export하면, 시트 이름만 확인하던 예전 검사는 성공을 반환하고 변조된 값도
+        그대로 남겼다. 시트별 셀 값까지 비교해 거부해야 한다."""
+        from openpyxl import load_workbook
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_xlsx_tamper_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+
+            wb = load_workbook(result_1["xlsx_path"])
+            manifest_sheet = wb["manifest"]
+            for row in manifest_sheet.iter_rows():
+                if row[0].value == "source.license":
+                    row[1].value = "TAMPERED-LICENSE"
+                    break
+            else:
+                self.fail("manifest 시트에서 source.license 행을 찾지 못했습니다.")
+            wb.save(result_1["xlsx_path"])
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+
+            # 거부됐으므로 변조된 셀 값이 그대로 남아 있어야 한다(추가 손상 없음).
+            wb_after = load_workbook(result_1["xlsx_path"])
+            values = {row[0].value: row[1].value for row in wb_after["manifest"].iter_rows()}
+            self.assertEqual(values["source.license"], "TAMPERED-LICENSE")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_tampered_xlsx_manifest_header_is_rejected_not_silently_reused(self):
+        """[리뷰 P1, 5차] 예전에는 manifest 시트의 첫 행을 검사 없이 헤더라고
+        가정하고 그대로 버렸다 — 헤더 자체가 변조돼도(예: ["field", "tampered"]) 그
+        사실을 감지하지 못하고 이후 행만 비교했다. 첫 행이 정확히
+        ["field", "value"]인지 검증해야 한다."""
+        from openpyxl import load_workbook
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_xlsx_header_tamper_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+
+            wb = load_workbook(result_1["xlsx_path"])
+            manifest_sheet = wb["manifest"]
+            manifest_sheet["A1"] = "field"
+            manifest_sheet["B1"] = "tampered-header"
+            wb.save(result_1["xlsx_path"])
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_duplicate_field_row_in_xlsx_manifest_is_rejected_not_silently_reused(self):
+        """[리뷰 P1, 5차] `dict` 컴프리헨션은 같은 `field`가 두 번 나오면 나중
+        값으로 조용히 덮어써서, 중복 `field` 행을 추가해 원래 값을 가리는 변조도
+        "정상"으로 오판됐다. 같은 field가 두 번 나오면 거부해야 한다."""
+        from openpyxl import load_workbook
+        from export_dataset import VersionContentConflictError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_xlsx_dup_field_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+
+            wb = load_workbook(result_1["xlsx_path"])
+            manifest_sheet = wb["manifest"]
+            # 기존 "source.license" 값 뒤에 같은 field를 다른 값으로 한 번 더 append —
+            # dict 컴프리헨션이라면 이 값으로 조용히 덮어써졌을 것이다.
+            manifest_sheet.append(["source.license", "DUPLICATE-FIELD-TAMPER"])
+            wb.save(result_1["xlsx_path"])
+
+            with self.assertRaises(VersionContentConflictError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_missing_manifest_json_raises_incomplete_error_without_auto_recovery(self):
+        """[리뷰 P1, 4차] 기존 JSON manifest가 삭제된(또는 이전 실행이 XLSX 저장
+        직후 중단된) 채로 남아 있으면, 그 디렉터리가 원래 무엇을 담고 있었는지
+        신뢰 가능하게 확인할 방법이 없다 — CSV만 같다고(license처럼 CSV에
+        안 나타나는 필드가 실제로는 다를 수 있으므로) 자동으로 덮어써서
+        "치유"하면 안 된다. 명시적인 IncompleteVersionDirectoryError로 멈추고,
+        기존에 남아있던 CSV/XLSX도 건드리지 않아야 한다."""
+        from export_dataset import IncompleteVersionDirectoryError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_incomplete_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+            os.remove(result_1["manifest_path"])  # 손상/삭제 재현
+            self.assertFalse(os.path.exists(result_1["manifest_path"]))
+            with open(result_1["csv_path"], "rb") as f:
+                csv_before = f.read()
+            with open(result_1["xlsx_path"], "rb") as f:
+                xlsx_before = f.read()
+
+            with self.assertRaises(IncompleteVersionDirectoryError):
+                export_dataset(manifest, tmp_dir)
+
+            # 자동 복구를 시도하지 않았으므로 남아있던 CSV/XLSX는 그대로여야 한다
+            # (지워지거나 새로 교체되지 않음).
+            self.assertFalse(os.path.exists(result_1["manifest_path"]))
+            with open(result_1["csv_path"], "rb") as f:
+                self.assertEqual(f.read(), csv_before)
+            with open(result_1["xlsx_path"], "rb") as f:
+                self.assertEqual(f.read(), xlsx_before)
+
+            # staging 디렉터리도 정리돼 남아있지 않아야 한다.
+            versions_dir = os.path.join(tmp_dir, "versions")
+            leftovers = [
+                name
+                for name in os.listdir(versions_dir)
+                if name.startswith(".export-staging-")
+            ]
+            self.assertEqual(leftovers, [])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_corrupted_xlsx_raises_incomplete_error_without_auto_recovery(self):
+        """XLSX가 손상돼 열리지 않는 경우도 같은 방식으로 명시적으로 실패해야
+        한다."""
+        from export_dataset import IncompleteVersionDirectoryError
+
+        manifest = self._synthetic_manifest()
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_corrupt_xlsx_")
+        try:
+            result_1 = export_dataset(manifest, tmp_dir)
+            with open(result_1["xlsx_path"], "wb") as f:
+                f.write(b"not a real xlsx file")
+
+            with self.assertRaises(IncompleteVersionDirectoryError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def test_concurrent_exports_of_different_manifests_never_expose_mixed_version(self):
         """서로 다른 두 버전을 동시에 내보내도, CURRENT가 가리키는 버전의
         csv/xlsx/manifest 세 파일은 항상 같은 버전에서 나온 것이어야 한다
@@ -792,37 +1331,199 @@ class TestExportDatasetSynthetic(unittest.TestCase):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+class TestVersionIdPathTraversal(unittest.TestCase):
+    """[리뷰 P1, 4차] manifest["id"](또는 CURRENT 파일 내용)을 검증 없이
+    파일 경로에 쓰면 "../escaped-version"이나 절대경로 같은 값이 versions_dir
+    밖에 디렉터리를 만들 수 있다."""
+
+    def _manifest_with_id(self, version_id: str) -> dict:
+        rows = [
+            {
+                "sample_id": "97_0000", "source_file": "97.mat",
+                "known_label": "NORMAL", "common_label": "NORMAL",
+                "split": "train", "sample_rate_hz": 12000, "rpm": 1797,
+                "rms_mean": 0.05,
+            }
+        ]
+        return {
+            "id": version_id,
+            "name": "cwru-bearing-vibration-v1",
+            "source": {
+                "type": "external", "uri": "https://example.invalid/cwru",
+                "license": "test", "checksum": "sha256:deadbeef",
+                "files": {"97.mat": {"sha256": "sha256:aaa", "label": "NORMAL"}},
+            },
+            "compatibility": {
+                "signalType": ["vibration"], "samplingRateHz": 12000,
+                "units": {"vibration": "g"},
+                "operatingConditions": {"rpmRange": [1797, 1797], "load": "test"},
+            },
+            "labelTaxonomyVersion": "CWRU-FAULT-V1",
+            "labelMapping": DATASET_LABEL_MAPPING,
+            "labelPolicyVersion": LABEL_POLICY_VERSION,
+            "snapshotSchemaVersion": SNAPSHOT_SCHEMA_VERSION,
+            "split": {"train": 1.0, "validation": 0.0, "test": 0.0},
+            "splitStrategy": "test",
+            "status": "draft",
+            "reason": "synthetic test",
+            "createdAt": "1970-01-01T00:00:00+00:00",
+            "rowCount": len(rows),
+            "splitCounts": {"train": 1, "validation": 0, "test": 0},
+            **summarize_dataset_labels(rows, DATASET_LABEL_MAPPING, "CWRU-FAULT-V1"),
+            "rows": rows,
+        }
+
+    def test_relative_path_escape_in_id_rejected(self):
+        manifest = self._manifest_with_id("../escaped-version")
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal_")
+        try:
+            with self.assertRaises(ValueError):
+                export_dataset(manifest, tmp_dir)
+            # versions_dir 밖(tmp_dir의 부모 등)에 디렉터리가 실제로 생기지
+            # 않았는지 확인한다.
+            escaped_dir = os.path.normpath(os.path.join(tmp_dir, "..", "escaped-version"))
+            self.assertFalse(os.path.exists(escaped_dir))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_nested_relative_path_in_id_rejected(self):
+        manifest = self._manifest_with_id("sub/dir")
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal2_")
+        try:
+            with self.assertRaises(ValueError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_absolute_path_in_id_rejected(self):
+        manifest = self._manifest_with_id(os.path.join(tempfile.gettempdir(), "evil"))
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal3_")
+        try:
+            with self.assertRaises(ValueError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_dot_dot_alone_rejected(self):
+        manifest = self._manifest_with_id("..")
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal4_")
+        try:
+            with self.assertRaises(ValueError):
+                export_dataset(manifest, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_safe_id_still_exports_normally(self):
+        manifest = self._manifest_with_id("DS-CWRU-VIBRATION-19700101-deadbeefcafe")
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal_ok_")
+        try:
+            result = export_dataset(manifest, tmp_dir)
+            self.assertTrue(os.path.exists(result["csv_path"]))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_current_pointer_with_traversal_content_rejected_on_resolve(self):
+        """CURRENT 파일 내용도 신뢰하지 않는다 — export_dataset()이 쓴 값이
+        아니라 외부에서 조작됐을 수 있다."""
+        from export_dataset import resolve_current_version_dir
+
+        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_traversal_current_")
+        try:
+            os.makedirs(os.path.join(tmp_dir, "versions"), exist_ok=True)
+            with open(os.path.join(tmp_dir, "CURRENT"), "w", encoding="utf-8") as f:
+                f.write("../escaped-version")
+            with self.assertRaises(ValueError):
+                resolve_current_version_dir(tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @unittest.skipUnless(_cwru_data_available(), CWRU_SKIP_REASON)
-class TestRegisterManifestRejectsLeakyDefaultSplit(unittest.TestCase):
-    """실제 CWRU 데이터는 라벨당 자산(원본 파일)이 1개뿐이라, 기본 3-way 비율로는
-    그룹을 쪼개지 않고 리크 없는 분할을 만들 수 없다 — build_manifest가 이를
-    조용히 window 셔플로 얼버무리지 않고 명시적으로 실패하는지 확인한다."""
+class TestSpecimenGroupingForCwru(unittest.TestCase):
+    """[리뷰 P1] CWRU 부하별 파일은 독립 자산이 아니라 같은 물리 베어링(specimen)이다.
+    group split은 specimen 단위로 해야 하고, NORMAL specimen은 1개뿐이라 기본
+    3-way는 정직하게 실패해야 한다. 데모용 operating_condition_holdout은 비독립임을
+    플래그로 표시한다."""
 
-    def test_default_ratios_raise_insufficient_asset_groups(self):
-        from register_dataset import InsufficientAssetGroupsError
-
+    def test_specimen_group_3way_fails_because_normal_has_one_specimen(self):
         with self.assertRaises(InsufficientAssetGroupsError):
-            build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)
+            build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)  # 기본 specimen_group 3-way
+
+    def test_fault_only_records_do_support_specimen_independent_3way(self):
+        # NORMAL을 뺀 결함 3클래스는 각 specimen 3개(0.007/0.014/0.021")라 진짜
+        # specimen 독립 3-way split이 가능하다 — grouping 자체가 동작함을 증명.
+        # (register_dataset import 시 load_cwru_vibration 경로가 sys.path에 추가됨)
+        from load_cwru_vibration import load_cwru_dataset as _load
+
+        records = [
+            r for r in _load(_CWRU_DATA_DIR) if r["label"] != "NORMAL"
+        ]
+        splits = group_split(records, seed=42, group_key="specimen_id")
+        by_specimen = {}
+        for rec, split in zip(records, splits):
+            by_specimen.setdefault(rec["specimen_id"], set()).add(split)
+        for specimen, s in by_specimen.items():
+            self.assertEqual(len(s), 1, f"{specimen}가 여러 split에: {s}")
+        self.assertEqual(set(splits), {"train", "validation", "test"})
+
+    def test_operating_condition_holdout_manifest_split_matches_actual_rows(self):
+        """[리뷰 P1] operating_condition_split은 요청 split_ratios를 완전히 무시하고
+        부하 tier로 배정을 고정한다. 예전 build_manifest는 이 무시된 요청값을 그대로
+        매니페스트["split"]/체크섬에 기록해서, 예를 들어 train=1.0/validation=
+        test=0.0을 넘겨도 실제 rows에는 validation/test가 들어가는데 매니페스트는
+        "전부 train"이라고 거짓말했다. 기록된 split은 실제 splitCounts 비율과
+        일치해야 한다."""
+        manifest = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            split_strategy="operating_condition_holdout",
+            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
+        )
+        total = manifest["rowCount"]
+        for name in ("train", "validation", "test"):
+            expected_ratio = manifest["splitCounts"][name] / total
+            self.assertAlmostEqual(manifest["split"][name], expected_ratio, places=9)
+        # 요청한 대로 "전부 train"이 되지는 않았다 — validation/test가 실제로 존재.
+        self.assertGreater(manifest["splitCounts"]["validation"], 0)
+        self.assertGreater(manifest["splitCounts"]["test"], 0)
+
+    def test_operating_condition_holdout_succeeds_but_is_not_independent(self):
+        manifest = build_manifest(
+            data_dir=_CWRU_DATA_DIR, split_strategy="operating_condition_holdout"
+        )
+        self.assertFalse(manifest["independentHoldout"])
+        self.assertEqual(manifest["holdoutType"], "operating_condition")
+        self.assertEqual(sum(manifest["splitCounts"].values()), manifest["rowCount"])
+        self.assertTrue(all(c > 0 for c in manifest["splitCounts"].values()))
+        # 같은 물리 베어링이 train/validation/test에 함께 들어간다 (비독립).
+        splits_by_specimen = {}
+        for row in manifest["rows"]:
+            splits_by_specimen.setdefault(row["specimen_id"], set()).add(row["split"])
+        self.assertTrue(
+            any(len(s) > 1 for s in splits_by_specimen.values()),
+            "operating_condition_holdout인데 specimen이 split을 안 넘나든다?",
+        )
 
 
 @unittest.skipUnless(_cwru_data_available(), CWRU_SKIP_REASON)
 class TestRegisterAndExportRealCwruData(unittest.TestCase):
     """실제 CWRU 데이터로 매니페스트 생성 → CSV/XLSX 내보내기까지 전체 흐름을 검증.
 
-    라벨당 자산이 1개뿐이라 validation/test로 쪼갤 독립 그룹이 없으므로,
-    여기서는 train 전용 비율로 파이프라인 자체(체크섬/라벨매핑/내보내기)를 검증한다.
-    실제 자산이 여러 개 확보되면 기본 3-way 비율로 전환한다.
+    기본 specimen_group은 NORMAL specimen 1개 제약으로 실패하므로
+    operating_condition_holdout(비독립, independentHoldout=False)로 파이프라인
+    전체(분할/체크섬/라벨매핑/내보내기)를 검증한다.
     """
 
     @classmethod
     def setUpClass(cls):
         cls.manifest = build_manifest(
-            data_dir=_CWRU_DATA_DIR,
-            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
-            seed=42,
+            data_dir=_CWRU_DATA_DIR, split_strategy="operating_condition_holdout"
         )
         cls.tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_")
         cls.export_result = export_dataset(cls.manifest, cls.tmp_dir)
+
+    def test_holdout_is_flagged_non_independent(self):
+        self.assertFalse(self.manifest["independentHoldout"])
+        self.assertEqual(self.manifest["holdoutType"], "operating_condition")
 
     @classmethod
     def tearDownClass(cls):
@@ -841,16 +1542,50 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
             recomputed = sha256_of_file(os.path.join(_CWRU_DATA_DIR, filename))
             self.assertEqual(info["sha256"], recomputed)
 
-    def test_id_and_source_checksum_change_with_split_config(self):
+    def test_manifest_has_feature_output_fingerprint(self):
+        self.assertIn("featureOutputFingerprint", self.manifest)
+        self.assertTrue(self.manifest["featureOutputFingerprint"].startswith("sha256:"))
+
+    def test_operating_condition_holdout_checksum_independent_of_unused_seed(self):
+        """[리뷰 P2] operating_condition_split은 seed를 전혀 쓰지 않는다. 실제
+        rows/split이 동일하면 seed만 바꿔도 checksum/id가 달라지면 안 된다."""
         other = build_manifest(
             data_dir=_CWRU_DATA_DIR,
-            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
-            seed=1,  # 다른 seed -> 다른 버전 체크섬/ID여야 함 (같은 날짜라도 충돌 없음)
+            seed=999,
+            split_strategy="operating_condition_holdout",
+        )
+        self.assertEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])
+        self.assertEqual(self.manifest["id"], other["id"])
+
+    def test_id_and_source_checksum_change_with_real_config_change(self):
+        # window_size는 operating_condition_holdout에서도 실제로 rows/특징을
+        # 바꾸는 설정이므로(체크섬 payload에 포함) 다른 버전 체크섬/ID가 나와야 한다.
+        other = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            window_size=1024,
+            hop_size=1024,
+            seed=42,
+            split_strategy="operating_condition_holdout",
         )
         self.assertIn("checksum", self.manifest["source"])
         self.assertNotEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])
         self.assertNotEqual(self.manifest["id"], other["id"])
         self.assertIn(self.manifest["source"]["checksum"].split(":", 1)[1][:12], self.manifest["id"])
+
+    def test_id_and_checksum_ignore_requested_split_ratios(self):
+        """[리뷰 P1] operating_condition_split은 요청 split_ratios를 완전히
+        무시한다. 실제 데이터가 같으면(요청 비율만 다르게 줘도) 매니페스트
+        id/checksum이 같아야 한다 — 예전에는 무시된 입력이 체크섬 payload에
+        그대로 들어가 실제로 동일한 데이터가 다른 버전으로 판정됐다."""
+        other = build_manifest(
+            data_dir=_CWRU_DATA_DIR,
+            split_ratios={"train": 1.0, "validation": 0.0, "test": 0.0},
+            seed=42,
+            split_strategy="operating_condition_holdout",
+        )
+        self.assertEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])
+        self.assertEqual(self.manifest["id"], other["id"])
+        self.assertEqual(self.manifest["split"], other["split"])
 
     def test_label_mapping_applied_to_every_row(self):
         for row in self.manifest["rows"]:
@@ -861,6 +1596,37 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
         with open(self.export_result["csv_path"], newline="", encoding="utf-8") as f:
             csv_rows = list(csv.DictReader(f))
         self.assertEqual(len(csv_rows), self.manifest["rowCount"])
+
+    def test_all_cwru_rows_verified_and_training_eligible(self):
+        # CWRU 원본 라벨 4종은 모두 labelMapping에 있으므로 전 행 verified.
+        self.assertEqual(
+            self.manifest["labelCounts"],
+            {
+                "verified": self.manifest["rowCount"],
+                "weak": 0,
+                "unlabeled": 0,
+                "unmapped": 0,
+            },
+        )
+        self.assertEqual(
+            self.manifest["trainingEligibleCount"], self.manifest["rowCount"]
+        )
+        self.assertEqual(
+            sum(self.manifest["trainingEligibleSplitCounts"].values()),
+            self.manifest["rowCount"],
+        )
+        self.assertEqual(self.manifest["labelPolicyVersion"], LABEL_POLICY_VERSION)
+        self.assertEqual(
+            self.manifest["snapshotSchemaVersion"], SNAPSHOT_SCHEMA_VERSION
+        )
+
+    def test_exported_csv_carries_v13_label_columns(self):
+        with open(self.export_result["csv_path"], newline="", encoding="utf-8") as f:
+            csv_rows = list(csv.DictReader(f))
+        for field in DATASET_EXPORT_LABEL_FIELDS:
+            self.assertIn(field, csv_rows[0])
+        self.assertTrue(all(r["label_status"] == "verified" for r in csv_rows))
+        self.assertTrue(all(r["training_eligible"] == "True" for r in csv_rows))
 
     def test_exported_manifest_json_excludes_rows_and_has_artifact_refs(self):
         with open(self.export_result["manifest_path"], encoding="utf-8") as f:

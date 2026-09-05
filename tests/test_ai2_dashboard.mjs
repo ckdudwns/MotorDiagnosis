@@ -6,6 +6,7 @@ import vm from 'node:vm';
 const source = readFileSync(new URL('../motor_diagnosis/web.py', import.meta.url), 'utf8');
 const script = source.match(/<script>([\s\S]*?)<\/script>/)[1];
 let checks = 0;
+const failures = [];
 const clone = value => JSON.parse(JSON.stringify(value));
 function harness() {
   const calls = [], requests = [], elements = new Map(), intervals = [];
@@ -56,7 +57,18 @@ function detailResponses(path) {
   if (path.endsWith('/notes')) return emptyNotes;
   throw new Error(path);
 }
-async function check(name, callback) {await callback(); checks++; console.log(`PASS ${name}`);}
+async function check(name, callback) {
+  try {await callback(); checks++; console.log(`PASS ${name}`);}
+  catch (error) {failures.push(name); console.error(`FAIL ${name}: ${error.stack}`);}
+}
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => {resolve=yes; reject=no;});
+  return {promise,resolve,reject};
+}
+function notesPage(items) {
+  return {items,total:items.length,latestByCategory:Object.fromEntries(items.map(item => [item.category,item]))};
+}
 
 await check('missing values stay missing; zero remains valid', () => {
   const h = harness();
@@ -291,4 +303,144 @@ await check('rollout PUT keeps its required unchanged fields', async () => {
   assert.deepEqual(clone(h.run('managementPayload()')),{networkProfileId:'NET-STORE-FWD',targetAssetIds:['A1'],installPriority:'normal',note:'new'});
 });
 
+await check('confirmed POST/PATCH is not repeated after the following list GET fails', async () => {
+  for (const method of ['POST','PATCH']) {
+    const h = harness(); h.context.respond = detailResponses; await h.run('selectEvent("E1")');
+    if (method === 'PATCH') h.run('editingNoteId="N1"');
+    h.get('memoText').value='Saved once'; h.get('noteCategory').value='inspection'; h.run('memoDirty=true');
+    h.context.respond = (path,options) => {
+      if (options.method === method) return {...note,text:'Saved once'};
+      throw new Error('list unavailable');
+    };
+    await h.get('saveNote').listeners.click();
+    assert.equal(h.run('memoDirty'),false); assert.equal(h.get('memoText').value,'');
+    assert.match(h.get('notesStatus').textContent,/저장.*완료.*목록.*실패/);
+    await h.get('saveNote').listeners.click();
+    assert.equal(h.requests.filter(item => item.options.method === method).length,1);
+    h.context.respond = () => notesPage([note]); await h.get('notesRefresh').listeners.click();
+    assert.deepEqual(clone(h.run('noteRows.map(item=>item.id)')),['N1']);
+    assert.equal(h.requests.filter(item => item.options.method === method).length,1);
+  }
+});
+
+await check('a failed note write retains its draft and can be retried', async () => {
+  const h = harness(); h.context.respond = detailResponses; await h.run('selectEvent("E1")');
+  h.get('memoText').value='Retry me'; h.get('noteCategory').value='inspection'; h.run('memoDirty=true');
+  h.context.respond = () => {throw new Error('write failed');};
+  await h.get('saveNote').listeners.click();
+  assert.equal(h.run('memoDirty'),true); assert.equal(h.get('memoText').value,'Retry me');
+  h.context.respond = (path,options) => options.method === 'POST' ? note : notesPage([note]);
+  await h.get('saveNote').listeners.click();
+  assert.equal(h.run('memoDirty'),false);
+  assert.equal(h.requests.filter(item => item.options.method === 'POST').length,2);
+});
+
+await check('confirmed write plus failed refresh preserves only the newer draft', async () => {
+  const h = harness(), write = deferred(); h.context.respond = detailResponses; await h.run('selectEvent("E1")');
+  h.get('memoText').value='First draft'; h.get('noteCategory').value='inspection'; h.run('memoDirty=true');
+  h.context.respond = (path,options) => {
+    if (options.method === 'POST') return write.promise;
+    throw new Error('list failed');
+  };
+  const pending = h.get('saveNote').listeners.click(); h.get('memoText').value='Second draft';
+  write.resolve(note); await pending;
+  assert.equal(h.get('memoText').value,'Second draft'); assert.equal(h.run('memoDirty'),true);
+  assert.match(h.get('notesStatus').textContent,/저장.*완료.*목록.*실패/);
+  h.context.respond = (path,options) => options.method === 'POST' ? {...note,id:'NEW'} : notesPage([{...note,id:'NEW'}]);
+  await h.get('saveNote').listeners.click();
+  const payloads = h.requests.filter(item=>item.options.method === 'POST').map(item=>JSON.parse(item.options.body).text);
+  assert.deepEqual(payloads,['First draft','Second draft']);
+});
+
+await check('late delete refresh cannot erase the subsequently saved note', async () => {
+  const h = harness(), oldList = deferred(), listStarted = deferred();
+  h.context.respond = detailResponses; await h.run('selectEvent("E1")');
+  h.context.page = notesPage([note]); h.run('renderNotes(page)');
+  h.context.respond = (path,options) => {
+    if (options.method === 'DELETE') return {deleted:true};
+    listStarted.resolve(); return oldList.promise;
+  };
+  const deletion = h.run('noteAction("N1","delete")'); await listStarted.promise;
+  const saved = {...note,id:'NEW',text:'New note'};
+  h.context.respond = (path,options) => options.method === 'POST' ? saved : notesPage([saved]);
+  h.get('memoText').value='New note'; h.get('noteCategory').value='inspection';
+  await h.get('saveNote').listeners.click();
+  assert.deepEqual(clone(h.run('noteRows.map(item=>item.id)')),['NEW']);
+  oldList.resolve(emptyNotes); await deletion;
+  assert.deepEqual(clone(h.run('noteRows.map(item=>item.id)')),['NEW']);
+});
+
+await check('failed filter or page requests cannot retain selectable old events', async () => {
+  for (const control of ['severityFilter','eventLabelFilter','reviewedFilter','eventSort','eventsNext']) {
+    const h = harness(); h.context.respond = detailResponses; await h.run('selectEvent("OLD")');
+    h.run('events=[{id:"OLD",title:"Old warning",severity:"warning"}]; eventTotal=24; renderEvents(); renderPager("events",1,24); rememberSelection();');
+    h.get(control).value = {severityFilter:'critical',eventLabelFilter:'confirmed_anomaly',reviewedFilter:'true',eventSort:'score_desc'}[control] || '';
+    h.context.respond = () => {throw new Error('filtered request failed');};
+    await h.get(control).listeners[control === 'eventsNext' ? 'click' : 'change']();
+    assert.equal(h.run('events.length'),0,control); assert.equal(h.get('events').children.length,0,control);
+    assert.equal(h.run('selectedEventId'),null); assert.equal(h.get('saveReview').disabled,true);
+    assert.equal(h.get('eventsNext').disabled,true); assert.equal(h.get('eventsPrev').disabled,true);
+    assert.match(h.get('appStatus').textContent,/filtered request failed/);
+  }
+});
+
+await check('the submitted draft is cleared before a delayed GET and subsequent input survives', async () => {
+  const h = harness(), list = deferred(), started = deferred();
+  h.context.respond = detailResponses; await h.run('selectEvent("E1")');
+  h.get('memoText').value='Submitted'; h.get('noteCategory').value='inspection'; h.run('memoDirty=true');
+  h.context.respond = (path,options) => {
+    if (options.method === 'POST') return note;
+    started.resolve(); return list.promise;
+  };
+  const pending = h.get('saveNote').listeners.click(); await started.promise;
+  assert.equal(h.get('memoText').value,''); assert.equal(h.run('memoDirty'),false);
+  h.get('memoText').value='Typed during refresh'; h.run('memoDirty=true');
+  list.resolve(notesPage([note])); await pending;
+  assert.equal(h.get('memoText').value,'Typed during refresh'); assert.equal(h.run('memoDirty'),true);
+});
+
+await check('late note failures and responses from another event cannot replace current state', async () => {
+  const h = harness(), failed = deferred();
+  h.context.respond = detailResponses; await h.run('selectEvent("E1")');
+  h.context.respond = () => failed.promise;
+  const older = h.run('refreshNotes()');
+  h.context.respond = () => notesPage([note]); await h.run('refreshNotes()');
+  failed.reject(new Error('stale failure')); await older;
+  assert.deepEqual(clone(h.run('noteRows.map(item=>item.id)')),['N1']);
+  assert.ok(!h.get('notesStatus').textContent.includes('stale failure'));
+  assert.equal(h.get('notesRefresh').disabled,false);
+  const oldEventList = deferred(); h.context.respond = () => oldEventList.promise;
+  const oldEvent = h.run('refreshNotes()');
+  h.context.respond = path => path === '/api/events/E2/notes' ? notesPage([{...note,id:'E2-NOTE'}]) : detailResponses(path);
+  await h.run('selectEvent("E2")'); oldEventList.resolve(notesPage([note])); await oldEvent;
+  assert.deepEqual(clone(h.run('noteRows.map(item=>item.id)')),['E2-NOTE']);
+});
+
+await check('a pre-filter response stays discarded after failure and refresh recovers the new filter', async () => {
+  const h = harness(), oldTelemetry = deferred();
+  const warning = {id:'OLD',title:'Warning',severity:'warning'}, critical = {id:'NEW',title:'Critical',severity:'critical'};
+  function response(path) {
+    const url = new URL(path,'http://local');
+    if (url.pathname === '/api/telemetry') return {points:[],units:{}};
+    if (url.pathname === '/api/events') return {items:[critical],page:1,size:12,total:1};
+    if (url.pathname === '/api/dashboard/sites-summary' || url.pathname.endsWith('/devices')) return [];
+    if (url.pathname.startsWith('/api/anomaly/rules/') || url.pathname === '/api/health/dependencies') return {};
+    return {items:[]};
+  }
+  h.context.warning = warning; h.run('events=[warning]; eventTotal=1; renderEvents();');
+  h.get('severityFilter').value='warning'; h.run('rememberSelection()');
+  h.context.respond = path => path.startsWith('/api/telemetry?') ? oldTelemetry.promise : response(path);
+  const previous = h.run('render()');
+  h.get('severityFilter').value='critical'; h.context.respond = () => {throw new Error('filter unavailable');};
+  await h.get('severityFilter').listeners.change();
+  oldTelemetry.resolve({points:[],units:{}}); await previous;
+  assert.equal(h.run('events.length'),0); assert.equal(h.get('eventsPage').textContent,'조회 실패');
+  h.context.respond = response; await h.get('refreshBtn').listeners.click();
+  assert.deepEqual(clone(h.run('events.map(item=>item.id)')),['NEW']);
+  assert.equal(h.get('severityFilter').value,'critical'); assert.match(h.get('eventsPage').textContent,/1.*1건/);
+  const queries = h.requests.filter(item=>item.path.startsWith('/api/events?'));
+  assert.ok(queries.some(item=>new URL(item.path,'http://local').searchParams.get('severity') === 'critical'));
+});
+
+assert.deepEqual(failures,[],`${failures.length} behavior checks failed`);
 console.log(`AI2 dashboard: ${checks} behavior checks passed.`);

@@ -149,6 +149,8 @@ def render_page() -> str:
           <button id="saveReview" disabled>Save Review</button>
           <details><summary>전체 검수 변경 이력</summary><div id="reviewHistory" class="history"></div><button id="reviewsMore" class="secondary" hidden>이력 더 보기</button></details>
           <h2>원인·점검·조치 메모</h2>
+          <div id="notesStatus" role="status" aria-live="polite"></div>
+          <button id="notesRefresh" class="secondary" disabled>메모 목록 새로고침</button>
           <div id="eventNotes"></div>
           <label>분류<select id="noteCategory"><option value="root_cause">원인</option><option value="inspection">점검</option><option value="action">조치</option></select></label>
           <label>개별 메모<textarea id="memoText" maxlength="2000"></textarea></label>
@@ -179,6 +181,7 @@ def render_page() -> str:
     let managementGeneration = 0, managementRows = [], managementRow = null, managementInputs = [], managementCreating = false, managementDirty = false, managementScope = null;
     let auditPageNumber = 1, auditGeneration = 0;
     let reviewSaving = false, noteSaving = false, managementSaving = false, noteHistoryGeneration = 0;
+    let noteListGeneration = 0;
     const CHART_PAD = 34;
     const $ = (id) => document.getElementById(id);
 
@@ -439,6 +442,8 @@ def render_page() -> str:
     function clearEventSelection() {
       selectedEventId = null;
       detailGeneration += 1;
+      noteListGeneration += 1;
+      noteRows = [];
       selectedDetail = null;
       reviewDirty = false;
       reviewPage = 1;
@@ -449,6 +454,8 @@ def render_page() -> str:
       $("eventEvidence").textContent = "";
       $("reviewHistory").replaceChildren();
       $("eventNotes").replaceChildren();
+      $("notesStatus").textContent = "";
+      $("notesRefresh").disabled = true;
       $("reviewsMore").hidden = true;
       $("evidenceChart").getContext("2d").clearRect(0, 0, 900, 220);
       cancelNote();
@@ -612,6 +619,7 @@ def render_page() -> str:
       clearEventSelection();
       selectedEventId = eventId;
       const generation = detailGeneration;
+      const notesGeneration = ++noteListGeneration;
       $("eventDetail").textContent = "이벤트 상세를 불러오는 중입니다.";
       renderEvents();
       const [response, reviews, notes] = await Promise.all([
@@ -639,7 +647,10 @@ def render_page() -> str:
       $("saveNote").disabled = noteSaving || !can("event:review");
       for (const id of ["labelSelect","noteInput","reviewReason","memoText","noteCategory","attachmentRefs"]) $(id).disabled = !can("event:review");
       renderReviewHistory(reviews);
-      renderNotes(notes);
+      if (notesGeneration === noteListGeneration) {
+        renderNotes(notes);
+        $("notesRefresh").disabled = false;
+      }
       redrawChart();
     }
     function renderReviewHistory(page, append = false) {
@@ -682,6 +693,28 @@ def render_page() -> str:
         panel.appendChild(row);
       }
     }
+    async function refreshNotes(eventId = selectedEventId, generation = detailGeneration, completedMessage = "") {
+      if (!eventId || generation !== detailGeneration || eventId !== selectedEventId) return;
+      const requestGeneration = ++noteListGeneration;
+      const current = () => generation === detailGeneration && eventId === selectedEventId && requestGeneration === noteListGeneration;
+      // A list refresh is a read-only recovery step, never a retry of the write.
+      noteRows = []; $("eventNotes").replaceChildren();
+      $("notesRefresh").disabled = true;
+      $("notesStatus").className = "notice";
+      $("notesStatus").textContent = completedMessage + "메모 목록을 불러오는 중입니다.";
+      try {
+        const notes = await api(`/api/events/${encodeURIComponent(eventId)}/notes`);
+        if (!current()) return;
+        renderNotes(notes);
+        $("notesStatus").textContent = completedMessage;
+      } catch (error) {
+        if (!current()) return;
+        $("notesStatus").className = "notice error";
+        $("notesStatus").textContent = completedMessage + `목록 새로고침 실패: ${error.message}. 메모 목록 새로고침으로 다시 조회하세요.`;
+      } finally {
+        if (current()) $("notesRefresh").disabled = false;
+      }
+    }
     async function noteAction(noteId, action) {
       const eventId = selectedEventId, generation = detailGeneration;
       const note = noteRows.find(item => item.id === noteId);
@@ -700,10 +733,9 @@ def render_page() -> str:
         $("noteHistory").textContent = JSON.stringify(history, null, 2);
       } else if (action === "delete" && can("event:review") && confirm("이 메모를 삭제할까요? 변경 이력은 보존됩니다.")) {
         await api(`/api/events/${encodeURIComponent(eventId)}/notes/${encodeURIComponent(noteId)}`, {method:"DELETE"});
-        const notes = await api(`/api/events/${encodeURIComponent(eventId)}/notes`);
         if (generation !== detailGeneration) return;
         if (editingNoteId === noteId) cancelNote();
-        renderNotes(notes);
+        await refreshNotes(eventId, generation, "메모 삭제 완료. ");
       }
     }
 
@@ -892,6 +924,21 @@ def render_page() -> str:
       for (const [id,value] of Object.entries(acceptedSelection)) $(id).value = value;
       return false;
     }
+    async function reloadEventSelection() {
+      // Controls already show the new filter/page; old rows must not remain selectable.
+      events = []; eventTotal = 0; renderEvents();
+      $("events").textContent = "이벤트 목록을 불러오는 중입니다.";
+      $("eventsPage").textContent = "조회 중";
+      $("eventsPrev").disabled = true; $("eventsNext").disabled = true;
+      const requestGeneration = renderGeneration + 1;
+      try {await render();}
+      catch (error) {
+        if (requestGeneration !== renderGeneration) return;
+        $("events").textContent = "이벤트 목록 조회에 실패했습니다. 새로고침으로 다시 조회하세요.";
+        $("eventsPage").textContent = "조회 실패";
+        throw error;
+      }
+    }
     function invalidateScope(resetWindow = false) {
       clearEventSelection();
       renderGeneration += 1;
@@ -945,12 +992,12 @@ def render_page() -> str:
     }));
     for (const id of ["severityFilter","eventLabelFilter","reviewedFilter","eventSort"]) $(id).addEventListener("change", () => act(async () => {
       if (!allowSelectionChange()) return;
-      clearEventSelection(); eventPageNumber = 1; rememberSelection(); await render();
+      clearEventSelection(); eventPageNumber = 1; rememberSelection(); await reloadEventSelection();
     }));
     for (const [id,direction] of [["eventsPrev",-1],["eventsNext",1]]) $(id).addEventListener("click", () => act(async () => {
       if (!allowSelectionChange()) return;
       eventPageNumber = Math.max(1, Math.min(Math.ceil(eventTotal / PAGE_SIZE), eventPageNumber + direction));
-      clearEventSelection(); await render();
+      clearEventSelection(); await reloadEventSelection();
     }));
     for (const [id,direction] of [["sitesPrev",-1],["sitesNext",1]]) $(id).addEventListener("click", () => {sitePageNumber = Math.max(1,sitePageNumber + direction); renderSiteRows();});
     for (const id of ["labelSelect","noteInput","reviewReason"]) $(id).addEventListener("input", () => {reviewDirty = true;});
@@ -988,14 +1035,16 @@ def render_page() -> str:
       $("saveNote").disabled = true;
       try {
         await api(`/api/events/${encodeURIComponent(eventId)}/notes${noteId ? "/" + encodeURIComponent(noteId) : ""}`, jsonOptions(noteId ? "PATCH" : "POST", payload));
-        const notes = await api(`/api/events/${encodeURIComponent(eventId)}/notes`);
         if (generation !== detailGeneration) return;
+        // Confirm the write before GET: a failed refresh must not resubmit this draft.
         const unchanged = editingNoteId === noteId && JSON.stringify(draft) === JSON.stringify([$("memoText").value,$("noteCategory").value,$("attachmentRefs").value]);
         if (unchanged) cancelNote();
-        renderNotes(notes); statusMessage(unchanged ? "메모를 저장했습니다." : "이전 메모 입력을 저장했습니다. 이어서 편집한 내용은 아직 저장되지 않았습니다.");
+        statusMessage(unchanged ? "메모를 저장했습니다." : "이전 메모 입력을 저장했습니다. 이어서 편집한 내용은 아직 저장되지 않았습니다.");
+        await refreshNotes(eventId, generation, "메모 저장 완료. ");
       } finally {noteSaving = false; $("saveNote").disabled = !selectedDetail || !can("event:review");}
     }));
     $("cancelNote").addEventListener("click", () => {if (!memoDirty || confirm("메모 편집을 취소할까요?")) cancelNote();});
+    $("notesRefresh").addEventListener("click", () => act(() => refreshNotes()));
     $("reviewsMore").addEventListener("click", () => act(async () => {
       const eventId = selectedEventId, generation = detailGeneration, page = reviewPage + 1;
       $("reviewsMore").disabled = true;

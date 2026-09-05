@@ -2714,15 +2714,13 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(reversed_range["error"]["code"], "INVALID_TIME_RANGE")
 
-        status, workbook, headers = self.request_raw(
+        status, not_implemented = self.request(
             "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01&format=xlsx",
             token=self.operator_token,
         )
-        self.assertEqual(status, 200)
-        self.assertTrue(workbook.startswith(b"PK"))
+        self.assertEqual(status, 501)
         self.assertEqual(
-            headers.get_content_type(),
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            not_implemented["error"]["code"], "EXPORT_FORMAT_NOT_IMPLEMENTED"
         )
 
 

@@ -384,7 +384,6 @@ class AlertService:
         return claimed
 
     def _deliver(self, row):
-        started = time.monotonic()
         error, retryable = None, False
         try:
             if row["channel"] == "stub":
@@ -445,20 +444,6 @@ class AlertService:
         else:
             with self._lock:
                 self._busy.discard(row["channel"])
-        try:
-            data.record_runtime_dependency(
-                "alerts",
-                success=error is None,
-                latency_ms=(time.monotonic() - started) * 1000,
-                error_code=error,
-                detail=(
-                    None
-                    if error is None
-                    else f"Alert delivery failed on {row['channel']}."
-                ),
-            )
-        except Exception:
-            LOGGER.exception("alert_dependency_health_update_failed")
 
     def _flush_results(self):
         with self._lock:

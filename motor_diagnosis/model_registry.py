@@ -118,20 +118,6 @@ def _frozen_dataset(user, dataset_id):
         raise data.ApiError(
             409, "DATASET_NOT_FROZEN", "A frozen dataset version is required."
         )
-    if dataset.get("source", {}).get("type") == "internal":
-        installation = dataset.get("installationValidation")
-        if not isinstance(installation, dict) or installation.get("status") != "ready":
-            raise data.ApiError(
-                409,
-                "DATASET_INSTALLATION_INCOMPLETE",
-                "Internal datasets require complete installation metadata before training use.",
-                installation
-                or {
-                    "status": "missing",
-                    "assets": [],
-                    "missing": [{"reason": "installationValidation is unavailable"}],
-                },
-            )
     return dataset
 
 

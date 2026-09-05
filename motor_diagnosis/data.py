@@ -1143,7 +1143,7 @@ def _restore_runtime_state(payload: dict[str, Any]) -> None:
     _LIFECYCLE_RUNTIMES.clear()
 
 
-def _enforce_runtime_retention() -> None:
+def _enforce_runtime_retention() -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(
         days=int(PARAMETERS["RETENTION_RAW_DAYS"])
     )
@@ -1154,7 +1154,8 @@ def _enforce_runtime_retention() -> None:
                 retained.append(record)
         except ApiError:
             continue
-    if len(retained) != len(TELEMETRY_RECORDS):
+    removed = len(TELEMETRY_RECORDS) - len(retained)
+    if removed:
         TELEMETRY_RECORDS[:] = retained
         retained_keys = {
             (str(item["deviceId"]), int(item["sequence"])) for item in retained
@@ -1162,6 +1163,17 @@ def _enforce_runtime_retention() -> None:
         for key in list(TELEMETRY_IDEMPOTENCY):
             if key not in retained_keys:
                 TELEMETRY_IDEMPOTENCY.pop(key, None)
+    return removed
+
+
+def maintain_runtime_retention() -> int:
+    """Expire raw telemetry even if there have been no application writes.
+
+    The outer state transaction commits only actual deletions and restores
+    both records and idempotency keys if persistence fails.
+    """
+    with STORE_LOCK:
+        return _enforce_runtime_retention()
 
 
 def _persist_runtime_state() -> None:
@@ -1274,6 +1286,12 @@ def configure_runtime_state(database: str | None) -> None:
     STORE_LOCK.set_transaction_hooks(
         _runtime_state_payload, _restore_runtime_state, _runtime_storage_failed
     )
+    try:
+        # Finish expiration before create_server can accept its first request.
+        maintain_runtime_retention()
+    except Exception:
+        close_runtime_state()
+        raise
 
 
 def close_runtime_state() -> None:
@@ -3543,15 +3561,19 @@ def _stored_telemetry_for(
     *,
     include_demo: bool = False,
 ) -> list[dict[str, Any]]:
-    get_asset(site_id, asset_id)
-    records = TELEMETRY_RECORDS
-    if include_demo:
-        records = [*TELEMETRY_RECORDS, *DEMO_TELEMETRY_RECORDS]
-    stored = [
-        copy_payload(record)
-        for record in records
-        if record["siteId"] == site_id and record["assetId"] == asset_id
-    ]
+    with STORE_LOCK:
+        get_asset(site_id, asset_id)
+        records = TELEMETRY_RECORDS
+        if include_demo:
+            records = [*TELEMETRY_RECORDS, *DEMO_TELEMETRY_RECORDS]
+        stored = [
+            copy_payload(record)
+            for record in records
+            if record["siteId"] == site_id and record["assetId"] == asset_id
+        ]
+        retention_cutoff = datetime.now(timezone.utc) - timedelta(
+            days=int(PARAMETERS["RETENTION_RAW_DAYS"])
+        )
     from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
     to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
     if from_value and to_value and from_value > to_value:
@@ -3561,6 +3583,10 @@ def _stored_telemetry_for(
     filtered = []
     for record in stored:
         timestamp = parse_rfc3339("timestamp", record["timestamp"])
+        # The maintenance worker may be between ticks or retrying a DB error.
+        # Expired raw data must not be exposed while physical deletion waits.
+        if timestamp < retention_cutoff:
+            continue
         if from_value and timestamp < from_value:
             continue
         if to_value and timestamp > to_value:
@@ -3864,6 +3890,11 @@ def _sensor_fault_payload(value: Any, reported_at: str) -> dict[str, Any]:
 
 
 def _apply_sensor_health_boundary(device: dict[str, Any], fault: dict[str, Any]) -> None:
+    # update_device_health holds STORE_LOCK while reading this authoritative
+    # mapping and applying the boundary, so replacement cannot race this check.
+    # Inactive devices still retain their own health/fault history.
+    if device.get("mappingStatus") != "active":
+        return
     rule = anomaly_rule_for(device["assetId"])
     lifecycle = _lifecycle_for(device["assetId"], rule)
     context = {

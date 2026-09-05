@@ -52,6 +52,14 @@ are also blocked from baseline/model registration.
 - Sensor health reports close open asset events and reset pending streaks even
   without another telemetry sample. Fault/recovery boundaries are durable;
   delayed measurements at or before the boundary are stored but not reanalyzed.
+- Only the currently active device mapping can apply a sensor-health boundary
+  to the asset lifecycle. Inactive/replaced devices retain their own fault and
+  recovery history without affecting the replacement's events or entry streak.
+- Raw retention runs before a persistent server begins accepting requests and
+  every 60 seconds in a separate worker, even when automatic alerts are disabled.
+  Cleanup saves only when records are removed, rolls back on storage failure,
+  and retries on the next tick. Live reads exclude expired records while cleanup
+  is pending; frozen dataset/evidence snapshots keep their existing contract.
 - Sensor event details expose the sensor health rule snapshot. Categorized notes
   validate PATCH input before mutation and use a durable change sequence for
   latest ordering, including writes in the same second.

@@ -69,6 +69,7 @@ from .data import (
     install_points_for,
     install_points_for_asset,
     logout,
+    maintain_runtime_retention,
     network_profile,
     network_profiles_for_sites,
     parse_rfc3339,
@@ -116,6 +117,7 @@ from .xlsx_export import dataset_xlsx_bytes
 
 LOGGER = logging.getLogger("motor_diagnosis")
 MAX_JSON_BODY_BYTES = 64 * 1024
+RETENTION_MAINTENANCE_INTERVAL_SEC = 60.0
 
 
 def _safe_csv_cell(value: Any) -> Any:
@@ -1463,6 +1465,22 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
         )
         self._alert_worker.start()
 
+    def start_retention_worker(self):
+        self._retention_stop = threading.Event()
+        self._retention_worker = threading.Thread(
+            target=self._run_retention_worker, name="runtime-retention", daemon=True
+        )
+        self._retention_worker.start()
+
+    def _run_retention_worker(self):
+        # Independent of alert delivery and of the HTTP accept loop: expiration
+        # continues on an idle server, including when auto_alerts is disabled.
+        while not self._retention_stop.wait(RETENTION_MAINTENANCE_INTERVAL_SEC):
+            try:
+                maintain_runtime_retention()
+            except Exception:
+                LOGGER.exception("Runtime retention failed; will retry on next tick")
+
     def _run_alert_worker(self):
         # SQLite can wait on another writer. Never perform this work in
         # BaseServer.service_actions(), which runs in the HTTP accept loop.
@@ -1480,6 +1498,10 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
     def server_close(self):
         with self._admission_lock:
             self._closing = True
+        if hasattr(self, "_retention_stop"):
+            self._retention_stop.set()
+            if self._retention_worker.ident is not None:
+                self._retention_worker.join()
         if hasattr(self, "_alert_stop"):
             self._alert_stop.set()
             if self._alert_worker.ident is not None:
@@ -1518,6 +1540,8 @@ def create_server(
             adapters=alert_adapters,
         )
         server.start_alert_worker()
+        if state_database:
+            server.start_retention_worker()
     except Exception:
         server.server_close()
         raise

@@ -77,6 +77,161 @@ class Pr19RegressionTest(unittest.TestCase):
             },
         )
 
+    def replace_device(self):
+        data.update_device(self.admin, "DEV-01-GEN-01", {"mappingStatus": "inactive"})
+        data.create_device(self.admin, "SITE-01", {
+            "id": "DEV-REPLACEMENT-01",
+            "assetId": "SITE-01-GEN-01",
+            "certificateId": "CERT-REPLACEMENT-01",
+            "certificateFingerprint": "fingerprint-replacement-01",
+            "certificateStatus": "registered",
+        })
+
+    def replacement_point(self, sequence, seconds):
+        return {**self.point(sequence, seconds), "deviceId": "DEV-REPLACEMENT-01"}
+
+    def test_replaced_device_fault_and_recovery_do_not_close_new_device_event(self):
+        self.replace_device()
+        for sequence, seconds in ((1, 0), (2, 10)):
+            data.ingest_telemetry(self.ingest, self.replacement_point(sequence, seconds))
+        event_id = self.events()[0]["id"]
+        checkpoint = data.copy_payload(data.LIFECYCLE_CHECKPOINTS)
+        for status, seconds in (("active", 11), ("recovered", 12)):
+            self.health_report(status, seconds)
+            self.assertEqual(data.LIFECYCLE_CHECKPOINTS, checkpoint)
+            self.restart()
+            event = data.get_event(event_id)
+            self.assertEqual(event["deviceId"], "DEV-REPLACEMENT-01")
+            self.assertEqual(event["status"], "open")
+            self.assertEqual(data.LIFECYCLE_CHECKPOINTS, checkpoint)
+            sensor = next(e for e in data.EVENTS if e.get("faultCode") == "adxl345_timeout")
+            self.assertEqual(sensor["deviceId"], "DEV-01-GEN-01")
+            self.assertEqual(sensor["status"], "open" if status == "active" else "closed")
+        # The replacement's own active mapping must still apply health boundaries.
+        data.update_device_health(self.health, "DEV-REPLACEMENT-01", {
+            "reportedAt": self.point(3, 13)["timestamp"],
+            "sensorFaults": [{"code": "adxl345_timeout", "status": "active"}],
+        })
+        self.assertEqual(data.get_event(event_id)["status"], "closed")
+        self.assertEqual(data.get_event(event_id)["endReason"], "sensor_fault_detected")
+
+    def test_replaced_device_fault_does_not_reset_new_device_entry_candidate(self):
+        self.replace_device()
+        data.ingest_telemetry(self.ingest, self.replacement_point(1, 0))
+        checkpoint = data.copy_payload(data.LIFECYCLE_CHECKPOINTS)
+        self.health_report("active", 5)
+        self.assertEqual(data.LIFECYCLE_CHECKPOINTS, checkpoint)
+        data.ingest_telemetry(self.ingest, self.replacement_point(2, 10))
+        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(self.events()[0]["status"], "open")
+
+    def seed_retention_window(self):
+        initial = datetime.now(timezone.utc).replace(microsecond=0)
+        with patch.object(data, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = initial
+            for sequence, age in ((1, 29), (2, 28)):
+                data.ingest_telemetry(self.ingest, telemetry_payload(
+                    sequence, data.format_rfc3339(initial - timedelta(days=age))
+                ))
+        return initial, initial + timedelta(days=2)
+
+    def test_restart_removes_expired_data_before_first_http_read(self):
+        _, future = self.seed_retention_window()
+        data.close_runtime_state()
+        data.reset_runtime_state()
+        with patch.object(data, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = future
+            server = create_server("127.0.0.1", 0, state_database=self.database)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                self.assertEqual([r["sequence"] for r in data.TELEMETRY_RECORDS], [2])
+                self.assertEqual(set(data.TELEMETRY_IDEMPOTENCY), {("DEV-01-GEN-01", 2)})
+                # Login after restart; authentication does not trigger expiration.
+                login = data.authenticate({"username": "admin", "password": "admin123"})
+                connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+                try:
+                    connection.request(
+                        "GET", "/api/telemetry?siteId=SITE-01&assetId=SITE-01-GEN-01",
+                        headers={"Authorization": f"Bearer {login['session']['token']}"},
+                    )
+                    response = connection.getresponse()
+                    body = json.loads(response.read())
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual([r["sequence"] for r in body["points"]], [2])
+                finally:
+                    connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(5)
+            self.restart()
+            self.assertEqual([r["sequence"] for r in data.TELEMETRY_RECORDS], [2])
+
+    def test_retention_worker_expires_idle_data_without_alerts_or_requests(self):
+        initial, future = self.seed_retention_window()
+        expired = threading.Event()
+        real_maintenance = data.maintain_runtime_retention
+
+        def maintenance():
+            count = real_maintenance()
+            if count:
+                expired.set()
+            return count
+
+        with patch.object(data, "datetime", wraps=datetime) as clock, patch(
+            "motor_diagnosis.server.RETENTION_MAINTENANCE_INTERVAL_SEC", 0.02
+        ), patch("motor_diagnosis.server.maintain_runtime_retention", maintenance):
+            clock.now.return_value = initial
+            server = create_server(
+                "127.0.0.1", 0, state_database=self.database, auto_alerts=False
+            )
+            try:
+                clock.now.return_value = future
+                self.assertTrue(expired.wait(3), "idle retention worker did not run")
+                self.assertEqual([r["sequence"] for r in data.TELEMETRY_RECORDS], [2])
+            finally:
+                server.server_close()
+            self.assertFalse(server._retention_worker.is_alive())
+            self.restart()
+            self.assertEqual([r["sequence"] for r in data.TELEMETRY_RECORDS], [2])
+
+    def test_retention_failure_rolls_back_and_reads_hide_expired_records(self):
+        _, future = self.seed_retention_window()
+        with patch.object(data, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = future
+            with patch.object(data._RUNTIME_STATE_STORE, "save", side_effect=sqlite3.OperationalError("disk full")):
+                with self.assertRaises(sqlite3.OperationalError):
+                    data.maintain_runtime_retention()
+            self.assertEqual(len(data.TELEMETRY_RECORDS), 2)
+            self.assertEqual(len(data.TELEMETRY_IDEMPOTENCY), 2)
+            # Physical cleanup can retry later, but expired measurements are
+            # never returned by live telemetry or exported into a new dataset.
+            rows = data.telemetry_for("SITE-01", "SITE-01-GEN-01")
+            self.assertEqual([r["sequence"] for r in rows], [2])
+            exported = data.dataset_export_for(self.admin, "SITE-01", "SITE-01-GEN-01")
+            self.assertEqual([r["sequence"] for r in exported["rows"]], [2])
+            self.assertEqual(data.maintain_runtime_retention(), 1)
+            store = data._RUNTIME_STATE_STORE
+            with patch.object(store, "save", wraps=store.save) as save:
+                self.assertEqual(data.maintain_runtime_retention(), 0)
+                self.assertEqual(data.maintain_runtime_retention(), 0)
+                self.assertEqual(save.call_count, 0)
+            self.restart()
+            self.assertEqual([r["sequence"] for r in data.TELEMETRY_RECORDS], [2])
+
+    def test_startup_cleanup_failure_closes_database_and_can_retry(self):
+        _, future = self.seed_retention_window()
+        data.close_runtime_state()
+        with patch.object(data, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = future
+            with patch.object(data.RuntimeStateStore, "save", side_effect=sqlite3.OperationalError("locked")):
+                with self.assertRaises(sqlite3.OperationalError):
+                    create_server("127.0.0.1", 0, state_database=self.database)
+            self.assertIsNone(data._RUNTIME_STATE_STORE)
+            self.restart()
+            self.assertEqual([r["sequence"] for r in data.TELEMETRY_RECORDS], [2])
+
     def test_failed_note_save_never_leaks_into_later_commit(self):
         before_notes = data.copy_payload(data.EVENT_NOTES)
         before_history = data.copy_payload(data.EVENT_NOTE_HISTORY)
@@ -281,16 +436,21 @@ class Pr19RegressionTest(unittest.TestCase):
                 for i in range(1000)
             )
         store = data._RUNTIME_STATE_STORE
-        with patch.object(store, "save", wraps=store.save) as save:
-            rows = data.dashboard_sites_summary(self.admin)
-            self.assertEqual(len(rows), 65)
-            self.assertLessEqual(save.call_count, 1)
-        with patch.object(store, "save", wraps=store.save) as save:
-            data.dashboard_sites_summary(self.admin)
-            for _ in range(3):
-                data.event_notes_for(self.admin, "EV-241")
-                data.service_health_dependencies()
-            self.assertEqual(save.call_count, 0)
+        observed_at = datetime.now(timezone.utc)
+        # A real clock can cross a device's offline boundary between reads;
+        # that is a legitimate state change, not an unnecessary checkpoint.
+        with patch.object(data, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = observed_at
+            with patch.object(store, "save", wraps=store.save) as save:
+                rows = data.dashboard_sites_summary(self.admin)
+                self.assertEqual(len(rows), 65)
+                self.assertLessEqual(save.call_count, 1)
+            with patch.object(store, "save", wraps=store.save) as save:
+                data.dashboard_sites_summary(self.admin)
+                for _ in range(3):
+                    data.event_notes_for(self.admin, "EV-241")
+                    data.service_health_dependencies()
+                self.assertEqual(save.call_count, 0)
 
     def test_storage_recovers_only_after_a_successful_commit(self):
         with patch.object(data._RUNTIME_STATE_STORE, "save", side_effect=sqlite3.OperationalError("disk full")) as save:

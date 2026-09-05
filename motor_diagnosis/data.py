@@ -5,13 +5,16 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
-import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from ai.ai2.week2.anomaly_score import score_telemetry_point
+from ai.ai2.week3.event_lifecycle import AnomalyEventLifecycle, EventLifecycleConfig
 
 from .demo_signals import (
     DEMO_MODEL_VERSION,
@@ -19,6 +22,7 @@ from .demo_signals import (
     MAX_DEMO_ANOMALY_SAMPLES,
     build_combined_anomaly_samples,
 )
+from .runtime_store import DurableStateLock, RuntimeStateStore
 
 MAX_LOGIN_FAILURES = 5
 LOCK_SECONDS = 15 * 60
@@ -49,6 +53,7 @@ EVENT_LABELS = {
     "sensor_issue",
 }
 EVENT_SEVERITIES = {"normal", "warning", "critical", "device"}
+EVENT_NOTE_CATEGORIES = {"root_cause", "inspection", "action"}
 ALERT_CHANNELS = {"web", "email", "webhook", "stub"}
 ENVIRONMENT_INSPECTION_STATUSES = {
     "not_checked",
@@ -88,7 +93,11 @@ NETWORK_PROFILES = [
         "recommendedTopology": "direct",
         "condition": "Stable wired or Wi-Fi network is available at the site.",
         "architecture": "Sensor node -> MQTT/TLS or HTTP -> central collection API",
-        "requiredEquipment": ["Pico 2 W", "device certificate", "stable power"],
+        "requiredEquipment": [
+            "ESP32-S3 edge node",
+            "device certificate",
+            "stable power",
+        ],
         "qualityChecks": ["RSSI", "packet loss", "display latency under 5 seconds"],
     },
     {
@@ -181,6 +190,8 @@ PARAMETERS = {
     "TELEMETRY_INTERVAL_SEC": 1,
     "ANOMALY_SCORE_THRESHOLD": 75,
     "ANOMALY_HOLD_SEC": 10,
+    "ANOMALY_HYSTERESIS": 5,
+    "ANOMALY_ENABLED": True,
     "DEVICE_OFFLINE_SEC": 120,
     "EDGE_BUFFER_HOURS": 24,
     "RETENTION_RAW_DAYS": 30,
@@ -193,6 +204,8 @@ PARAMETER_DEFINITIONS = {
         "minimum": 1,
         "maximum": 3600,
         "unit": "seconds",
+        "mutable": False,
+        "managedBy": "device_firmware",
     },
     "ANOMALY_SCORE_THRESHOLD": {
         "category": "anomaly",
@@ -200,6 +213,7 @@ PARAMETER_DEFINITIONS = {
         "minimum": 0,
         "maximum": 100,
         "unit": "score",
+        "runtimeTarget": "anomaly_rules.scoreThreshold",
     },
     "ANOMALY_HOLD_SEC": {
         "category": "anomaly",
@@ -207,6 +221,21 @@ PARAMETER_DEFINITIONS = {
         "minimum": 1,
         "maximum": 3600,
         "unit": "seconds",
+        "runtimeTarget": "anomaly_rules.durationSec",
+    },
+    "ANOMALY_HYSTERESIS": {
+        "category": "anomaly",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 50,
+        "unit": "score",
+        "runtimeTarget": "anomaly_rules.hysteresis",
+    },
+    "ANOMALY_ENABLED": {
+        "category": "anomaly",
+        "type": "boolean",
+        "unit": "boolean",
+        "runtimeTarget": "anomaly_rules.active",
     },
     "DEVICE_OFFLINE_SEC": {
         "category": "device",
@@ -221,6 +250,8 @@ PARAMETER_DEFINITIONS = {
         "minimum": 1,
         "maximum": 168,
         "unit": "hours",
+        "mutable": False,
+        "managedBy": "device_firmware",
     },
     "RETENTION_RAW_DAYS": {
         "category": "retention",
@@ -443,9 +474,27 @@ TELEMETRY_SERVICE_TOKENS = {
         "allowedDeviceIds": ["*"],
         "demoOnly": True,
     },
+    "demo-device-health-token": {
+        "id": "service-device-health-demo",
+        "type": "service",
+        "permissions": ["device-health:write"],
+        "allowedDeviceIds": ["*"],
+        "demoOnly": True,
+    },
 }
 
 HARDWARE_PROFILES = [
+    {
+        "id": "HW-ESP32S3-ADXL345-INMP441-WIFI",
+        "name": "ESP32-S3 ADXL345/INMP441 Wi-Fi profile",
+        "boardType": "esp32-s3",
+        "connectivityType": "wifi",
+        "sensors": ["adxl345", "inmp441"],
+        "powerModule": "5v-usb-or-regulated",
+        "enclosure": "ip65",
+        "firmwareFamily": "esp32-edge-node",
+        "active": True,
+    },
     {
         "id": "HW-PICO2W-DUAL-SENSOR-WIFI",
         "name": "Pico 2 W dual-sensor Wi-Fi profile",
@@ -541,9 +590,10 @@ class ApiError(Exception):
     status: int
     code: str
     message: str
+    details: Any | None = None
 
 
-STORE_LOCK = threading.RLock()
+STORE_LOCK = DurableStateLock()
 SESSIONS: dict[str, dict[str, Any]] = {}
 LOGIN_STATE: dict[str, dict[str, float | int]] = {
     user["username"]: {"failures": 0, "lockedUntil": 0.0} for user in USERS
@@ -686,8 +736,8 @@ def build_devices(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "siteId": asset["siteId"],
                 "assetId": asset["id"],
                 "sensorChannels": ["vibration", "acoustic", "rpm"],
-                "firmware": "edge-0.1.0",
-                "firmwareVersion": "edge-0.1.0",
+                "firmware": "esp32-edge-1.0.0",
+                "firmwareVersion": "esp32-edge-1.0.0",
                 "certificate": certificate,
                 "certificateId": certificate["id"],
                 "certificateFingerprint": certificate["fingerprint"],
@@ -704,7 +754,7 @@ def build_devices(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "rssiDbm": -55 - (index % 20),
                 "rebootCount": index % 3,
                 "bufferUsagePct": float((index * 7) % 65),
-                "hardwareProfileId": "HW-PICO2W-DUAL-SENSOR-WIFI",
+                "hardwareProfileId": "HW-ESP32S3-ADXL345-INMP441-WIFI",
                 "hardwareProfileHistory": [],
                 "mappingStatus": "active",
                 "mappingHistory": [
@@ -887,11 +937,11 @@ def build_anomaly_rules(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "assetId": asset["id"],
             "siteId": asset["siteId"],
             "version": f"RULE-{asset['id']}-v1",
-            "scoreThreshold": 75.0,
-            "durationSec": 10,
-            "hysteresis": 5.0,
+            "scoreThreshold": float(PARAMETERS["ANOMALY_SCORE_THRESHOLD"]),
+            "durationSec": int(PARAMETERS["ANOMALY_HOLD_SEC"]),
+            "hysteresis": float(PARAMETERS["ANOMALY_HYSTERESIS"]),
             "mergeWindowSec": 30,
-            "active": True,
+            "active": bool(PARAMETERS["ANOMALY_ENABLED"]),
             "reason": "Initial week 3 anomaly rule",
             "updatedAt": "2026-08-24T00:00:00Z",
             "history": [],
@@ -974,6 +1024,11 @@ DATASET_VERSIONS: list[dict[str, Any]] = []
 MODEL_VERSIONS: list[dict[str, Any]] = []
 BASELINE_VERSIONS: list[dict[str, Any]] = []
 DATASET_SNAPSHOTS: dict[str, dict[str, list[dict[str, Any]]]] = {}
+EVENT_NOTES: list[dict[str, Any]] = []
+EVENT_NOTE_HISTORY: list[dict[str, Any]] = []
+LIFECYCLE_CHECKPOINTS: dict[str, dict[str, Any]] = {}
+_LIFECYCLE_RUNTIMES: dict[str, AnomalyEventLifecycle] = {}
+_RUNTIME_STATE_STORE: RuntimeStateStore | None = None
 ACOUSTIC_TAXONOMY_VERSIONS: list[dict[str, Any]] = [
     {
         "version": "ACOUSTIC-V1",
@@ -983,6 +1038,237 @@ ACOUSTIC_TAXONOMY_VERSIONS: list[dict[str, Any]] = [
         "updatedAt": "2026-08-24T00:00:00Z",
     }
 ]
+
+
+def _runtime_state_payload() -> dict[str, Any]:
+    return {
+        "sites": copy_payload(SITES),
+        "assets": copy_payload(ASSETS),
+        "devices": copy_payload(DEVICES),
+        "events": copy_payload(EVENTS),
+        "rolloutPlans": copy_payload(ROLLOUT_PLAN_RECORDS),
+        "siteNetworkProfiles": copy_payload(SITE_NETWORK_PROFILE_RECORDS),
+        "installPoints": copy_payload(INSTALL_POINTS),
+        "anomalyRules": copy_payload(ANOMALY_RULES),
+        "alertPolicies": copy_payload(ALERT_POLICIES),
+        "parameters": copy_payload(PARAMETERS),
+        "quarantinedMessages": copy_payload(QUARANTINED_DEVICE_MESSAGES),
+        "mqttQuarantineIdempotency": copy_payload(MQTT_QUARANTINE_IDEMPOTENCY),
+        "telemetryRecords": copy_payload(TELEMETRY_RECORDS),
+        "telemetryIdempotency": [
+            {
+                "deviceId": device_id,
+                "sequence": sequence,
+                **copy_payload(value),
+            }
+            for (device_id, sequence), value in TELEMETRY_IDEMPOTENCY.items()
+        ],
+        "telemetryMetrics": copy_payload(TELEMETRY_METRICS),
+        "connectivityTests": copy_payload(CONNECTIVITY_TEST_RECORDS),
+        "serviceDependencies": copy_payload(SERVICE_DEPENDENCIES),
+        "serviceHealthEvents": copy_payload(SERVICE_HEALTH_EVENTS),
+        "eventReviewHistory": copy_payload(EVENT_REVIEW_HISTORY),
+        "eventEvidenceSnapshots": copy_payload(EVENT_EVIDENCE_SNAPSHOTS),
+        "eventNotes": copy_payload(EVENT_NOTES),
+        "eventNoteHistory": copy_payload(EVENT_NOTE_HISTORY),
+        "auditLogs": copy_payload(AUDIT_LOGS),
+        "environmentInspections": copy_payload(ENVIRONMENT_INSPECTIONS),
+        "datasetVersions": copy_payload(DATASET_VERSIONS),
+        "modelVersions": copy_payload(MODEL_VERSIONS),
+        "baselineVersions": copy_payload(BASELINE_VERSIONS),
+        "datasetSnapshots": copy_payload(DATASET_SNAPSHOTS),
+        "acousticTaxonomies": copy_payload(ACOUSTIC_TAXONOMY_VERSIONS),
+        "lifecycleCheckpoints": copy_payload(LIFECYCLE_CHECKPOINTS),
+    }
+
+
+def _restore_runtime_state(payload: dict[str, Any]) -> None:
+    list_fields = {
+        "sites": SITES,
+        "assets": ASSETS,
+        "devices": DEVICES,
+        "events": EVENTS,
+        "rolloutPlans": ROLLOUT_PLAN_RECORDS,
+        "siteNetworkProfiles": SITE_NETWORK_PROFILE_RECORDS,
+        "installPoints": INSTALL_POINTS,
+        "anomalyRules": ANOMALY_RULES,
+        "alertPolicies": ALERT_POLICIES,
+        "quarantinedMessages": QUARANTINED_DEVICE_MESSAGES,
+        "telemetryRecords": TELEMETRY_RECORDS,
+        "connectivityTests": CONNECTIVITY_TEST_RECORDS,
+        "serviceDependencies": SERVICE_DEPENDENCIES,
+        "serviceHealthEvents": SERVICE_HEALTH_EVENTS,
+        "eventReviewHistory": EVENT_REVIEW_HISTORY,
+        "eventNotes": EVENT_NOTES,
+        "eventNoteHistory": EVENT_NOTE_HISTORY,
+        "auditLogs": AUDIT_LOGS,
+        "environmentInspections": ENVIRONMENT_INSPECTIONS,
+        "datasetVersions": DATASET_VERSIONS,
+        "modelVersions": MODEL_VERSIONS,
+        "baselineVersions": BASELINE_VERSIONS,
+        "acousticTaxonomies": ACOUSTIC_TAXONOMY_VERSIONS,
+    }
+    for key, target in list_fields.items():
+        if key in payload:
+            if not isinstance(payload[key], list):
+                raise ValueError(f"Persisted {key} must be a list.")
+            target[:] = copy_payload(payload[key])
+    dict_fields = {
+        "parameters": PARAMETERS,
+        "mqttQuarantineIdempotency": MQTT_QUARANTINE_IDEMPOTENCY,
+        "telemetryMetrics": TELEMETRY_METRICS,
+        "eventEvidenceSnapshots": EVENT_EVIDENCE_SNAPSHOTS,
+        "datasetSnapshots": DATASET_SNAPSHOTS,
+        "lifecycleCheckpoints": LIFECYCLE_CHECKPOINTS,
+    }
+    for key, target in dict_fields.items():
+        if key in payload:
+            if not isinstance(payload[key], dict):
+                raise ValueError(f"Persisted {key} must be an object.")
+            target.clear()
+            target.update(copy_payload(payload[key]))
+    TELEMETRY_IDEMPOTENCY.clear()
+    for item in payload.get("telemetryIdempotency", []):
+        if not isinstance(item, dict):
+            raise ValueError("Persisted telemetry idempotency entry is invalid.")
+        device_id = str(item.get("deviceId") or "").strip().upper()
+        sequence = item.get("sequence")
+        if not device_id or isinstance(sequence, bool) or not isinstance(sequence, int):
+            raise ValueError("Persisted telemetry idempotency key is invalid.")
+        TELEMETRY_IDEMPOTENCY[(device_id, sequence)] = {
+            key: copy_payload(value)
+            for key, value in item.items()
+            if key not in {"deviceId", "sequence"}
+        }
+    _LIFECYCLE_RUNTIMES.clear()
+
+
+def _enforce_runtime_retention() -> None:
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        days=int(PARAMETERS["RETENTION_RAW_DAYS"])
+    )
+    retained = []
+    for record in TELEMETRY_RECORDS:
+        try:
+            if parse_rfc3339("timestamp", record.get("timestamp")) >= cutoff:
+                retained.append(record)
+        except ApiError:
+            continue
+    if len(retained) != len(TELEMETRY_RECORDS):
+        TELEMETRY_RECORDS[:] = retained
+        retained_keys = {
+            (str(item["deviceId"]), int(item["sequence"])) for item in retained
+        }
+        for key in list(TELEMETRY_IDEMPOTENCY):
+            if key not in retained_keys:
+                TELEMETRY_IDEMPOTENCY.pop(key, None)
+
+
+def _persist_runtime_state() -> None:
+    if _RUNTIME_STATE_STORE is None:
+        return
+    started = time.monotonic()
+    _enforce_runtime_retention()
+    dependency = next(
+        (item for item in SERVICE_DEPENDENCIES if item["id"] == "storage"), None
+    )
+    previous_status = str(dependency.get("status") or "ready") if dependency else ""
+    checked_at = now_iso()
+    if dependency is not None:
+        dependency["statusReportCount"] = int(
+            dependency.get("statusReportCount", 0)
+        ) + 1
+        dependency["status"] = "healthy"
+        dependency["lastCheckedAt"] = checked_at
+        dependency["detail"] = None
+        if previous_status not in {"healthy", "ready"}:
+            dependency["lastRecoveryAt"] = checked_at
+            SERVICE_HEALTH_EVENTS.append(
+                {
+                    "dependencyId": "storage",
+                    "status": "recovered",
+                    "occurredAt": checked_at,
+                    "impactScope": dependency["impactScope"],
+                    "detail": "Runtime state checkpoint recovered.",
+                }
+            )
+    try:
+        _RUNTIME_STATE_STORE.save(_runtime_state_payload(), checked_at)
+    except Exception as error:
+        if dependency is not None:
+            dependency["status"] = "degraded"
+            dependency["failureCount"] = int(dependency.get("failureCount", 0)) + 1
+            dependency["lastFailureAt"] = now_iso()
+            dependency["detail"] = "Runtime state checkpoint failed."
+            dependency["latencyMs"] = round(
+                (time.monotonic() - started) * 1000, 2
+            )
+            dependency["errorRatePct"] = round(
+                int(dependency["failureCount"])
+                / int(dependency["statusReportCount"])
+                * 100,
+                2,
+            )
+            SERVICE_HEALTH_EVENTS.append(
+                {
+                    "dependencyId": "storage",
+                    "status": "failure",
+                    "occurredAt": dependency["lastFailureAt"],
+                    "impactScope": dependency["impactScope"],
+                    "errorCode": type(error).__name__,
+                    "detail": dependency["detail"],
+                }
+            )
+            del SERVICE_HEALTH_EVENTS[:-100]
+        raise
+    if dependency is not None:
+        dependency["latencyMs"] = round((time.monotonic() - started) * 1000, 2)
+        dependency["errorRatePct"] = round(
+            int(dependency.get("failureCount", 0))
+            / int(dependency["statusReportCount"])
+            * 100,
+            2,
+        )
+
+
+def configure_runtime_state(database: str | None) -> None:
+    """Attach or detach the durable general-state database.
+
+    Passing ``None`` preserves the isolated in-memory behavior used by unit tests.
+    """
+
+    global _RUNTIME_STATE_STORE
+    STORE_LOCK.set_commit_hook(None)
+    if _RUNTIME_STATE_STORE is not None:
+        _RUNTIME_STATE_STORE.close()
+        _RUNTIME_STATE_STORE = None
+    if not database:
+        return
+    store = RuntimeStateStore(database)
+    with STORE_LOCK:
+        persisted = store.load()
+        if persisted is not None:
+            _restore_runtime_state(persisted)
+        storage_dependency = next(
+            (item for item in SERVICE_DEPENDENCIES if item["id"] == "storage"), None
+        )
+        if storage_dependency is not None:
+            storage_dependency["name"] = "SQLite runtime state storage"
+            storage_dependency["impactScope"] = (
+                "Master data, telemetry, events, reviews and dataset metadata"
+            )
+        _RUNTIME_STATE_STORE = store
+        if persisted is None:
+            _persist_runtime_state()
+    STORE_LOCK.set_commit_hook(_persist_runtime_state)
+
+
+def close_runtime_state() -> None:
+    global _RUNTIME_STATE_STORE
+    STORE_LOCK.set_commit_hook(None)
+    if _RUNTIME_STATE_STORE is not None:
+        _RUNTIME_STATE_STORE.close()
+        _RUNTIME_STATE_STORE = None
 
 
 def reset_runtime_state() -> None:
@@ -1019,6 +1305,8 @@ def reset_runtime_state() -> None:
         SERVICE_DEPENDENCIES[:] = copy_payload(BASE_SERVICE_DEPENDENCIES)
         SERVICE_HEALTH_EVENTS.clear()
         EVENT_REVIEW_HISTORY.clear()
+        EVENT_NOTES.clear()
+        EVENT_NOTE_HISTORY.clear()
         EVENT_EVIDENCE_SNAPSHOTS.clear()
         EVENT_EVIDENCE_SNAPSHOTS.update(copy_payload(BASE_EVENT_EVIDENCE_SNAPSHOTS))
         AUDIT_LOGS.clear()
@@ -1027,6 +1315,8 @@ def reset_runtime_state() -> None:
         MODEL_VERSIONS.clear()
         BASELINE_VERSIONS.clear()
         DATASET_SNAPSHOTS.clear()
+        LIFECYCLE_CHECKPOINTS.clear()
+        _LIFECYCLE_RUNTIMES.clear()
         ACOUSTIC_TAXONOMY_VERSIONS[:] = [
             {
                 "version": "ACOUSTIC-V1",
@@ -2120,7 +2410,9 @@ def create_device(
             required=True,
         )
         firmware_version = str(
-            payload.get("firmwareVersion") or payload.get("firmware") or "edge-0.1.0"
+            payload.get("firmwareVersion")
+            or payload.get("firmware")
+            or "esp32-edge-1.0.0"
         )
         certificate = certificate_payload(payload)
         validate_certificate_for_mapping(certificate, mapping_status)
@@ -2143,7 +2435,10 @@ def create_device(
                 400, "INVALID_NUMBER", "bufferUsagePct must be between 0 and 100."
             )
         hardware_profile_id = (
-            str(payload.get("hardwareProfileId") or "HW-PICO2W-DUAL-SENSOR-WIFI")
+            str(
+                payload.get("hardwareProfileId")
+                or "HW-ESP32S3-ADXL345-INMP441-WIFI"
+            )
             .strip()
             .upper()
         )
@@ -2435,6 +2730,18 @@ def telemetry_principal_for_token(token: str) -> dict[str, Any]:
             401, "AUTH_REQUIRED", "A bearer device or service token is required."
         )
     service = TELEMETRY_SERVICE_TOKENS.get(token)
+    configured_health_token = os.environ.get("DEVICE_HEALTH_TOKEN", "")
+    if (
+        service is None
+        and configured_health_token
+        and hmac.compare_digest(token, configured_health_token)
+    ):
+        service = {
+            "id": "service-device-health",
+            "type": "service",
+            "permissions": ["device-health:write"],
+            "allowedDeviceIds": ["*"],
+        }
     if service:
         if service.get("demoOnly") and os.environ.get(
             "APP_ENV", ""
@@ -2903,6 +3210,154 @@ def recover_device_from_telemetry(device: dict[str, Any], received_at: str) -> N
         _freeze_event_evidence(recovery_event)
 
 
+def _lifecycle_config_for(rule: dict[str, Any]) -> EventLifecycleConfig:
+    interval_sec = max(1, int(PARAMETERS["TELEMETRY_INTERVAL_SEC"]))
+    required_points = max(1, math.ceil(int(rule["durationSec"]) / interval_sec))
+    return EventLifecycleConfig(
+        score_enter=float(rule["scoreThreshold"]),
+        score_exit=max(0.0, float(rule["scoreThreshold"]) - float(rule["hysteresis"])),
+        min_consecutive_enter=required_points,
+        min_consecutive_exit=required_points,
+        merge_gap_sec=int(rule["mergeWindowSec"]),
+        idempotency_cache_size=max(1024, TELEMETRY_MAX_RECORDS_PER_ASSET * 2),
+        rule_version=str(rule["version"]),
+    )
+
+
+def _lifecycle_for(asset_id: str, rule: dict[str, Any]) -> AnomalyEventLifecycle:
+    config = _lifecycle_config_for(rule)
+    lifecycle = _LIFECYCLE_RUNTIMES.get(asset_id)
+    if lifecycle is not None and lifecycle.config == config:
+        return lifecycle
+    checkpoint = LIFECYCLE_CHECKPOINTS.get(asset_id)
+    lifecycle = (
+        AnomalyEventLifecycle.from_snapshot(checkpoint, config=config)
+        if checkpoint is not None
+        else AnomalyEventLifecycle(config)
+    )
+    _LIFECYCLE_RUNTIMES[asset_id] = lifecycle
+    return lifecycle
+
+
+def _lifecycle_event_record(
+    update: dict[str, Any],
+    scored_record: dict[str, Any],
+    rule: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    lifecycle_event = copy_payload(update["event"])
+    event_id = str(lifecycle_event["id"])
+    existing = next((item for item in EVENTS if item["id"] == event_id), None)
+    created = existing is None
+    max_score = int(lifecycle_event.get("maxScore") or 0)
+    start_at = str(lifecycle_event["startAt"])
+    end_at = lifecycle_event.get("endAt")
+    duration_sec = max(
+        0,
+        int(
+            (
+                parse_rfc3339("endAt", end_at or scored_record["timestamp"])
+                - parse_rfc3339("startAt", start_at)
+            ).total_seconds()
+        ),
+    )
+    record = existing or {
+        "id": event_id,
+        "siteId": scored_record["siteId"],
+        "assetId": scored_record["assetId"],
+        "deviceId": scored_record["deviceId"],
+        "eventType": "asset_anomaly_candidate",
+        "title": f"{scored_record['assetId']} anomaly score event",
+        "occurredAt": start_at,
+        "time": start_at,
+        "label": "needs_review",
+        "note": "Generated from accepted telemetry by the AI2 event lifecycle.",
+        "reviewed": False,
+        "reviewedAt": None,
+        "reviewedBy": None,
+        "isSynthetic": bool(scored_record.get("isSynthetic")),
+        "source": scored_record.get("source") or "telemetry_ingest",
+        "triggerTelemetry": copy_payload(scored_record),
+        "triggerEvidence": copy_payload(scored_record.get("anomalyEvidence", [])),
+    }
+    record.update(
+        {
+            "severity": (
+                "critical"
+                if max_score >= float(rule["scoreThreshold"])
+                else "warning"
+            ),
+            "duration": f"{duration_sec}s",
+            "durationSec": duration_sec,
+            "score": lifecycle_event.get("lastScore"),
+            "maxScore": max_score,
+            "status": lifecycle_event["status"],
+            "endAt": end_at,
+            "endReason": lifecycle_event.get("endReason"),
+            "sampleCount": lifecycle_event.get("sampleCount"),
+            "mergeCount": lifecycle_event.get("mergeCount"),
+            "thresholdVersion": lifecycle_event.get("thresholdVersion")
+            or rule["version"],
+            "modelVersion": lifecycle_event.get("modelVersion")
+            or scored_record.get("anomalyModel"),
+            "maxScoreModelVersion": lifecycle_event.get("maxScoreModelVersion"),
+            "classification": "asset_anomaly",
+        }
+    )
+    if created:
+        EVENTS.insert(0, record)
+        site = get_site(record["siteId"])
+        site["eventCount"] = int(site["eventCount"]) + 1
+        _freeze_event_evidence(record)
+    return record, created
+
+
+def process_accepted_telemetry(
+    stored_record: dict[str, Any], scored: dict[str, Any]
+) -> list[dict[str, Any]]:
+    rule = anomaly_rule_for(stored_record["assetId"])
+    active_sensor_fault = next(
+        (
+            event
+            for event in EVENTS
+            if event.get("eventType") == "sensor_fault"
+            and event.get("deviceId") == stored_record["deviceId"]
+            and event.get("status") == "open"
+        ),
+        None,
+    )
+    if not rule.get("active") and active_sensor_fault is None:
+        return []
+    lifecycle = _lifecycle_for(stored_record["assetId"], rule)
+    point = {**stored_record, **scored}
+    updates_applied: list[dict[str, Any]] = []
+
+    def persist(checkpoint: dict[str, Any], updates: list[dict[str, Any]]) -> None:
+        LIFECYCLE_CHECKPOINTS[stored_record["assetId"]] = copy_payload(checkpoint)
+        for update in updates:
+            if "event" in update:
+                event, created = _lifecycle_event_record(
+                    update, point, rule
+                )
+                updates_applied.append(
+                    {"kind": update["kind"], "eventId": event["id"], "created": created}
+                )
+            else:
+                updates_applied.append(copy_payload(update))
+
+    lifecycle.process_point(
+        point,
+        sensor_fault=active_sensor_fault is not None,
+        sensor_fault_reason=(
+            f"device_sensor_fault:{active_sensor_fault['faultCode']}"
+            if active_sensor_fault is not None
+            else None
+        ),
+        telemetry_payload=stored_record,
+        persist_transaction=persist,
+    )
+    return updates_applied
+
+
 def ingest_telemetry(
     principal: dict[str, Any], payload: dict[str, Any]
 ) -> tuple[dict[str, Any], int]:
@@ -2960,6 +3415,8 @@ def ingest_telemetry(
                 "receivedAt": received_at,
                 "labelProvenance": label_provenance,
             }
+            scored = score_telemetry_point(stored_record)
+            stored_record.update(copy_payload(scored))
             TELEMETRY_RECORDS.append(stored_record)
             TELEMETRY_IDEMPOTENCY[idempotency_key] = {
                 "payloadHash": payload_hash,
@@ -2978,19 +3435,39 @@ def ingest_telemetry(
                     (expired_record["deviceId"], int(expired_record["sequence"])), None
                 )
             recover_device_from_telemetry(device, received_at)
+            analysis_started = time.monotonic()
+            lifecycle_updates: list[dict[str, Any]] = []
+            try:
+                lifecycle_updates = process_accepted_telemetry(stored_record, scored)
+            except Exception as error:
+                record_runtime_dependency(
+                    "analysis",
+                    success=False,
+                    latency_ms=(time.monotonic() - analysis_started) * 1000,
+                    error_code=type(error).__name__,
+                    detail="Accepted telemetry was stored but analysis failed.",
+                )
+            else:
+                record_runtime_dependency(
+                    "analysis",
+                    success=True,
+                    latency_ms=(time.monotonic() - analysis_started) * 1000,
+                )
             TELEMETRY_METRICS["accepted"] = int(TELEMETRY_METRICS["accepted"]) + 1
             TELEMETRY_METRICS["lastReceivedAt"] = received_at
             latency_ms = (time.monotonic() - started) * 1000
             TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
             update_ingest_dependency(True, latency_ms)
             return (
-                {
-                    "accepted": True,
-                    "duplicate": False,
-                    "deviceId": record["deviceId"],
-                    "sequence": record["sequence"],
-                    "receivedAt": received_at,
-                },
+                    {
+                        "accepted": True,
+                        "duplicate": False,
+                        "deviceId": record["deviceId"],
+                        "sequence": record["sequence"],
+                        "receivedAt": received_at,
+                        "anomalyScore": scored.get("anomalyScore"),
+                        "lifecycleUpdates": lifecycle_updates,
+                    },
                 201,
             )
         except ApiError as error:
@@ -3261,7 +3738,259 @@ def device_health_for(device_id: str) -> dict[str, Any]:
             "certificateStatus": device["certificateStatus"],
             "mappingStatus": device["mappingStatus"],
             "latestConnectivityTest": latest_connectivity,
+            "activeSensorFaults": copy_payload(device.get("activeSensorFaults", [])),
+            "sensorHealth": device.get("sensorHealth", "healthy"),
         }
+
+
+def _device_health_number(
+    payload: dict[str, Any], key: str, minimum: float, maximum: float
+) -> float | None:
+    if key not in payload:
+        return None
+    value = payload[key]
+    if value is None or isinstance(value, bool):
+        raise ApiError(400, "INVALID_DEVICE_HEALTH", f"{key} must be a number.")
+    parsed = parse_float_value(key, value)
+    if not minimum <= parsed <= maximum:
+        raise ApiError(
+            400,
+            "INVALID_DEVICE_HEALTH",
+            f"{key} must be between {minimum:g} and {maximum:g}.",
+        )
+    return parsed
+
+
+def _device_health_int(
+    payload: dict[str, Any], key: str, minimum: int, maximum: int
+) -> int | None:
+    if key not in payload:
+        return None
+    value = payload[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ApiError(400, "INVALID_DEVICE_HEALTH", f"{key} must be an integer.")
+    if not minimum <= value <= maximum:
+        raise ApiError(
+            400,
+            "INVALID_DEVICE_HEALTH",
+            f"{key} must be between {minimum} and {maximum}.",
+        )
+    return value
+
+
+def _sensor_fault_payload(value: Any, reported_at: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ApiError(
+            400, "INVALID_DEVICE_HEALTH", "sensorFaults entries must be objects."
+        )
+    unknown = set(value) - {"code", "status", "severity", "detail", "occurredAt"}
+    if unknown:
+        raise ApiError(
+            400,
+            "INVALID_DEVICE_HEALTH",
+            "Unknown sensor fault fields: " + ", ".join(sorted(unknown)),
+        )
+    code = str(value.get("code") or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", code):
+        raise ApiError(
+            400,
+            "INVALID_DEVICE_HEALTH",
+            "sensorFaults.code must be a stable lowercase identifier.",
+        )
+    status = str(value.get("status") or "active").strip().lower()
+    if status not in {"active", "recovered"}:
+        raise ApiError(
+            400,
+            "INVALID_DEVICE_HEALTH",
+            "sensorFaults.status must be active or recovered.",
+        )
+    severity = str(value.get("severity") or "warning").strip().lower()
+    if severity not in {"warning", "critical"}:
+        raise ApiError(
+            400,
+            "INVALID_DEVICE_HEALTH",
+            "sensorFaults.severity must be warning or critical.",
+        )
+    detail_value = value.get("detail")
+    if detail_value is not None and not isinstance(detail_value, str):
+        raise ApiError(
+            400, "INVALID_DEVICE_HEALTH", "sensorFaults.detail must be a string."
+        )
+    detail = str(detail_value or "").strip()
+    if len(detail) > 500:
+        raise ApiError(
+            400, "INVALID_DEVICE_HEALTH", "sensorFaults.detail is too long."
+        )
+    occurred_at = format_rfc3339(
+        parse_rfc3339(
+            "sensorFaults.occurredAt",
+            value.get("occurredAt") or reported_at,
+            "INVALID_DEVICE_HEALTH",
+        )
+    )
+    return {
+        "code": code,
+        "status": status,
+        "severity": severity,
+        "detail": detail,
+        "occurredAt": occurred_at,
+    }
+
+
+def update_device_health(
+    principal: dict[str, Any], device_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    permissions = set(principal.get("permissions", []))
+    if "*" not in permissions and "device-health:write" not in permissions:
+        raise ApiError(
+            403,
+            "DEVICE_HEALTH_WRITE_FORBIDDEN",
+            "The token cannot report device health.",
+        )
+    normalized_device_id = str(device_id).strip().upper()
+    allowed_device_ids = principal.get("allowedDeviceIds", ["*"])
+    if "*" not in allowed_device_ids and normalized_device_id not in allowed_device_ids:
+        raise ApiError(
+            403,
+            "DEVICE_HEALTH_WRITE_FORBIDDEN",
+            "The token cannot report health for this device.",
+        )
+    allowed = {
+        "reportedAt",
+        "rssiDbm",
+        "rebootCount",
+        "bufferUsagePct",
+        "firmwareVersion",
+        "sensorFaults",
+    }
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ApiError(
+            400,
+            "INVALID_DEVICE_HEALTH",
+            "Unknown device health fields: " + ", ".join(sorted(unknown)),
+        )
+    reported_at = format_rfc3339(
+        parse_rfc3339(
+            "reportedAt", payload.get("reportedAt") or now_iso(), "INVALID_DEVICE_HEALTH"
+        )
+    )
+    rssi = _device_health_number(payload, "rssiDbm", -120, 0)
+    reboot_count = _device_health_int(payload, "rebootCount", 0, 2_147_483_647)
+    buffer_usage = _device_health_number(payload, "bufferUsagePct", 0, 100)
+    firmware = payload.get("firmwareVersion")
+    if firmware is not None and (
+        not isinstance(firmware, str) or not firmware.strip() or len(firmware.strip()) > 100
+    ):
+        raise ApiError(
+            400,
+            "INVALID_DEVICE_HEALTH",
+            "firmwareVersion must be a non-empty string up to 100 characters.",
+        )
+    sensor_fault_values = payload.get("sensorFaults", [])
+    if not isinstance(sensor_fault_values, list) or len(sensor_fault_values) > 32:
+        raise ApiError(
+            400,
+            "INVALID_DEVICE_HEALTH",
+            "sensorFaults must be a list of at most 32 entries.",
+        )
+    faults = [_sensor_fault_payload(value, reported_at) for value in sensor_fault_values]
+
+    with STORE_LOCK:
+        device = get_device(normalized_device_id)
+        previous_health_report = device.get("lastHealthReportedAt")
+        if previous_health_report and parse_rfc3339(
+            "lastHealthReportedAt", previous_health_report, "INVALID_DEVICE_HEALTH"
+        ) > parse_rfc3339("reportedAt", reported_at, "INVALID_DEVICE_HEALTH"):
+            raise ApiError(
+                409,
+                "STALE_DEVICE_HEALTH",
+                "reportedAt is older than the latest accepted device health report.",
+            )
+        if rssi is not None:
+            device["rssiDbm"] = rssi
+        if reboot_count is not None:
+            device["rebootCount"] = reboot_count
+        if buffer_usage is not None:
+            device["bufferUsagePct"] = buffer_usage
+        if firmware is not None:
+            device["firmwareVersion"] = firmware.strip()
+            device["firmware"] = firmware.strip()
+        device["lastHealthReportedAt"] = reported_at
+        device["lastReceivedAt"] = reported_at
+        device["lastSeenSecAgo"] = 0
+        if device.get("health") == "offline":
+            recover_device_from_telemetry(device, reported_at)
+
+        for fault in faults:
+            existing = next(
+                (
+                    event
+                    for event in EVENTS
+                    if event.get("eventType") == "sensor_fault"
+                    and event.get("deviceId") == device["id"]
+                    and event.get("faultCode") == fault["code"]
+                    and event.get("status") == "open"
+                ),
+                None,
+            )
+            if fault["status"] == "active" and existing is None:
+                event = {
+                    "id": f"EV-SENSOR-{secrets.token_hex(12).upper()}",
+                    "siteId": device["siteId"],
+                    "assetId": device["assetId"],
+                    "deviceId": device["id"],
+                    "severity": fault["severity"],
+                    "eventType": "sensor_fault",
+                    "faultCode": fault["code"],
+                    "title": f"{device['id']} sensor fault: {fault['code']}",
+                    "occurredAt": fault["occurredAt"],
+                    "time": fault["occurredAt"],
+                    "duration": "active",
+                    "durationSec": 0,
+                    "score": 0,
+                    "maxScore": 0,
+                    "label": "sensor_issue",
+                    "note": fault["detail"] or "Device reported a sensor fault.",
+                    "reviewed": False,
+                    "status": "open",
+                    "thresholdVersion": "sensor-health-v1",
+                    "modelVersion": "device-self-report",
+                    "classification": "sensor_fault",
+                    "assetEventExcluded": True,
+                }
+                EVENTS.insert(0, event)
+                _freeze_event_evidence(event)
+                get_site(device["siteId"])["eventCount"] += 1
+            elif fault["status"] == "active" and existing is not None:
+                existing["severity"] = fault["severity"]
+                if fault["detail"]:
+                    existing["note"] = fault["detail"]
+            elif fault["status"] == "recovered" and existing is not None:
+                existing["status"] = "closed"
+                existing["endAt"] = fault["occurredAt"]
+                existing["endReason"] = "sensor_recovered"
+                started = parse_rfc3339("occurredAt", existing["occurredAt"])
+                ended = parse_rfc3339("endAt", existing["endAt"])
+                existing["durationSec"] = max(0, int((ended - started).total_seconds()))
+                existing["duration"] = f"{existing['durationSec']}s"
+
+        active_faults = [
+            {
+                "eventId": event["id"],
+                "code": event["faultCode"],
+                "severity": event["severity"],
+                "occurredAt": event["occurredAt"],
+            }
+            for event in EVENTS
+            if event.get("eventType") == "sensor_fault"
+            and event.get("deviceId") == device["id"]
+            and event.get("status") == "open"
+        ]
+        device["activeSensorFaults"] = active_faults
+        device["sensorHealth"] = "fault" if active_faults else "healthy"
+        device["updatedAt"] = reported_at
+        return device_health_for(device["id"])
 
 
 def dashboard_sites_summary(
@@ -3350,16 +4079,19 @@ def dashboard_sites_summary(
 
 
 def service_health_dependencies() -> dict[str, Any]:
-    dependencies = copy_payload(SERVICE_DEPENDENCIES)
-    degraded = any(item["status"] not in {"healthy", "ready"} for item in dependencies)
-    return {
-        "status": "degraded" if degraded else "healthy",
-        "checkedAt": now_iso(),
-        "dependencies": dependencies,
-        "ingestMetrics": copy_payload(TELEMETRY_METRICS),
-        "quarantinedMessageCount": len(QUARANTINED_DEVICE_MESSAGES),
-        "events": copy_payload(SERVICE_HEALTH_EVENTS[-20:]),
-    }
+    with STORE_LOCK:
+        dependencies = copy_payload(SERVICE_DEPENDENCIES)
+        degraded = any(
+            item["status"] not in {"healthy", "ready"} for item in dependencies
+        )
+        return {
+            "status": "degraded" if degraded else "healthy",
+            "checkedAt": now_iso(),
+            "dependencies": dependencies,
+            "ingestMetrics": copy_payload(TELEMETRY_METRICS),
+            "quarantinedMessageCount": len(QUARANTINED_DEVICE_MESSAGES),
+            "events": copy_payload(SERVICE_HEALTH_EVENTS[-20:]),
+        }
 
 
 def report_service_dependency(
@@ -3461,6 +4193,71 @@ def report_service_dependency(
                     "occurredAt": checked_at,
                     "impactScope": dependency["impactScope"],
                     "detail": detail,
+                }
+            )
+        del SERVICE_HEALTH_EVENTS[:-100]
+        return copy_payload(dependency)
+
+
+def record_runtime_dependency(
+    dependency_id: str,
+    *,
+    success: bool,
+    latency_ms: float,
+    error_code: str | None = None,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    """Record real execution results for backend-owned dependencies."""
+
+    with STORE_LOCK:
+        dependency = next(
+            (item for item in SERVICE_DEPENDENCIES if item["id"] == dependency_id),
+            None,
+        )
+        if dependency is None:
+            raise ApiError(
+                404,
+                "SERVICE_DEPENDENCY_NOT_FOUND",
+                "Service dependency was not found.",
+            )
+        previous_status = str(dependency.get("status") or "ready")
+        checked_at = now_iso()
+        dependency["statusReportCount"] = int(
+            dependency.get("statusReportCount", 0)
+        ) + 1
+        if not success:
+            dependency["failureCount"] = int(dependency.get("failureCount", 0)) + 1
+        dependency["latencyMs"] = round(max(0.0, float(latency_ms)), 2)
+        dependency["errorRatePct"] = round(
+            int(dependency.get("failureCount", 0))
+            / int(dependency["statusReportCount"])
+            * 100,
+            2,
+        )
+        dependency["status"] = "healthy" if success else "degraded"
+        dependency["lastCheckedAt"] = checked_at
+        dependency["detail"] = str(detail).strip()[:500] if detail else None
+        if not success:
+            dependency["lastFailureAt"] = checked_at
+            SERVICE_HEALTH_EVENTS.append(
+                {
+                    "dependencyId": dependency_id,
+                    "status": "failure",
+                    "occurredAt": checked_at,
+                    "impactScope": dependency["impactScope"],
+                    "errorCode": error_code,
+                    "detail": dependency["detail"],
+                }
+            )
+        elif previous_status not in {"healthy", "ready"}:
+            dependency["lastRecoveryAt"] = checked_at
+            SERVICE_HEALTH_EVENTS.append(
+                {
+                    "dependencyId": dependency_id,
+                    "status": "recovered",
+                    "occurredAt": checked_at,
+                    "impactScope": dependency["impactScope"],
+                    "detail": dependency["detail"],
                 }
             )
         del SERVICE_HEALTH_EVENTS[:-100]
@@ -3646,7 +4443,7 @@ def update_device_hardware_profile(
             )
         )
         previous_profile_id = str(
-            device.get("hardwareProfileId") or "HW-PICO2W-DUAL-SENSOR-WIFI"
+            device.get("hardwareProfileId") or "HW-ESP32S3-ADXL345-INMP441-WIFI"
         )
         changed_at = now_iso()
         device["hardwareProfileId"] = profile_id
@@ -3805,6 +4602,270 @@ def review_event(
             site_id=event["siteId"],
         )
         return {"event": copy_payload(event), "review": copy_payload(review)}
+
+
+def _event_note_category(value: Any) -> str:
+    category = str(value or "").strip().lower()
+    if category not in EVENT_NOTE_CATEGORIES:
+        raise ApiError(
+            400,
+            "INVALID_EVENT_NOTE_CATEGORY",
+            "category must be root_cause, inspection, or action.",
+        )
+    return category
+
+
+def _event_note_attachments(payload: dict[str, Any]) -> list[str]:
+    values = payload.get("attachmentRefs", [])
+    if not isinstance(values, list) or len(values) > 20:
+        raise ApiError(
+            400,
+            "INVALID_EVENT_NOTE_ATTACHMENT",
+            "attachmentRefs must be a list of at most 20 references.",
+        )
+    refs = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ApiError(
+                400,
+                "INVALID_EVENT_NOTE_ATTACHMENT",
+                "Each attachment reference must be a string.",
+            )
+        normalized = value.strip()
+        if (
+            not normalized
+            or len(normalized) > 1000
+            or not re.fullmatch(
+                r"(?:https|s3|file|survey|attachment)://[^\s]+", normalized
+            )
+        ):
+            raise ApiError(
+                400,
+                "INVALID_EVENT_NOTE_ATTACHMENT",
+                "Attachment references must use https, s3, file, survey, or attachment URI schemes.",
+            )
+        refs.append(normalized)
+    return list(dict.fromkeys(refs))
+
+
+def _event_note_text(payload: dict[str, Any]) -> str:
+    value = payload.get("text")
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError(400, "MISSING_FIELD", "text is required.")
+    text = value.strip()
+    if len(text) > MAX_REVIEW_NOTE_LENGTH:
+        raise ApiError(
+            400, "NOTE_TOO_LONG", "Event note must be 2000 characters or less."
+        )
+    return text
+
+
+def _event_note_history_entry(
+    user: dict[str, Any], note: dict[str, Any], action: str, before: Any, after: Any
+) -> dict[str, Any]:
+    entry = {
+        "id": f"NOTE-HISTORY-{len(EVENT_NOTE_HISTORY) + 1:06d}",
+        "noteId": note["id"],
+        "eventId": note["eventId"],
+        "action": action,
+        "version": note["version"],
+        "author": {"id": user["id"], "name": user["name"], "role": user["role"]},
+        "changedAt": note["updatedAt"],
+        "before": copy_payload(before),
+        "after": copy_payload(after),
+    }
+    EVENT_NOTE_HISTORY.append(entry)
+    return entry
+
+
+def create_event_note(
+    user: dict[str, Any], event_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "event:review")
+    unknown = set(payload) - {"category", "text", "attachmentRefs"}
+    if unknown:
+        raise ApiError(
+            400,
+            "INVALID_EVENT_NOTE",
+            "Unknown event note fields: " + ", ".join(sorted(unknown)),
+        )
+    with STORE_LOCK:
+        event = get_event(event_id)
+        require_site_access(user, event["siteId"])
+        timestamp = now_iso()
+        note = {
+            "id": f"NOTE-{secrets.token_hex(10).upper()}",
+            "eventId": event["id"],
+            "siteId": event["siteId"],
+            "assetId": event["assetId"],
+            "category": _event_note_category(payload.get("category")),
+            "text": _event_note_text(payload),
+            "attachmentRefs": _event_note_attachments(payload),
+            "author": {
+                "id": user["id"],
+                "name": user["name"],
+                "role": user["role"],
+            },
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+            "deletedAt": None,
+            "version": 1,
+        }
+        EVENT_NOTES.append(note)
+        _event_note_history_entry(user, note, "created", None, note)
+        append_audit_log(
+            user,
+            "event-note.create",
+            "eventNote",
+            note["id"],
+            None,
+            note,
+            "Event note created",
+            site_id=event["siteId"],
+        )
+        return copy_payload(note)
+
+
+def _event_note_for(event_id: str, note_id: str) -> dict[str, Any]:
+    event = get_event(event_id)
+    normalized = note_id.strip().upper()
+    note = next(
+        (
+            item
+            for item in EVENT_NOTES
+            if item["eventId"] == event["id"] and item["id"] == normalized
+        ),
+        None,
+    )
+    if note is None:
+        raise ApiError(404, "EVENT_NOTE_NOT_FOUND", "Event note was not found.")
+    return note
+
+
+def event_notes_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
+    require_permission(user, "event:read")
+    with STORE_LOCK:
+        event = get_event(event_id)
+        require_site_access(user, event["siteId"])
+        rows = sorted(
+            (
+                copy_payload(item)
+                for item in EVENT_NOTES
+                if item["eventId"] == event["id"] and item.get("deletedAt") is None
+            ),
+            key=lambda item: (item["updatedAt"], item["id"]),
+            reverse=True,
+        )
+        latest_by_category = {
+            category: next(
+                (item for item in rows if item["category"] == category), None
+            )
+            for category in sorted(EVENT_NOTE_CATEGORIES)
+        }
+        return {
+            "eventId": event["id"],
+            "items": rows,
+            "latestByCategory": latest_by_category,
+            "total": len(rows),
+        }
+
+
+def event_note_history_for(
+    user: dict[str, Any], event_id: str, note_id: str
+) -> dict[str, Any]:
+    require_permission(user, "event:read")
+    with STORE_LOCK:
+        note = _event_note_for(event_id, note_id)
+        require_site_access(user, note["siteId"])
+        rows = [
+            copy_payload(item)
+            for item in EVENT_NOTE_HISTORY
+            if item["noteId"] == note["id"]
+        ]
+        rows.sort(key=lambda item: (item["changedAt"], item["id"]), reverse=True)
+        return {"noteId": note["id"], "items": rows, "total": len(rows)}
+
+
+def update_event_note(
+    user: dict[str, Any], event_id: str, note_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_permission(user, "event:review")
+    unknown = set(payload) - {"category", "text", "attachmentRefs", "reason"}
+    if unknown:
+        raise ApiError(
+            400,
+            "INVALID_EVENT_NOTE",
+            "Unknown event note fields: " + ", ".join(sorted(unknown)),
+        )
+    if not {"category", "text", "attachmentRefs"}.intersection(payload):
+        raise ApiError(
+            400, "INVALID_EVENT_NOTE", "At least one note field must be updated."
+        )
+    reason = str(payload.get("reason") or "Event note updated").strip()
+    if not reason or len(reason) > MAX_REASON_LENGTH:
+        raise ApiError(
+            400,
+            "INVALID_EVENT_NOTE",
+            "reason must be between 1 and 1000 characters.",
+        )
+    with STORE_LOCK:
+        note = _event_note_for(event_id, note_id)
+        require_site_access(user, note["siteId"])
+        if note.get("deletedAt") is not None:
+            raise ApiError(409, "EVENT_NOTE_DELETED", "Deleted notes are immutable.")
+        before = copy_payload(note)
+        if "category" in payload:
+            note["category"] = _event_note_category(payload["category"])
+        if "text" in payload:
+            note["text"] = _event_note_text(payload)
+        if "attachmentRefs" in payload:
+            note["attachmentRefs"] = _event_note_attachments(payload)
+        note["updatedAt"] = now_iso()
+        note["version"] = int(note["version"]) + 1
+        note["author"] = {
+            "id": user["id"],
+            "name": user["name"],
+            "role": user["role"],
+        }
+        _event_note_history_entry(user, note, "updated", before, note)
+        append_audit_log(
+            user,
+            "event-note.update",
+            "eventNote",
+            note["id"],
+            before,
+            note,
+            reason,
+            site_id=note["siteId"],
+        )
+        return copy_payload(note)
+
+
+def delete_event_note(
+    user: dict[str, Any], event_id: str, note_id: str
+) -> dict[str, Any]:
+    require_permission(user, "event:review")
+    with STORE_LOCK:
+        note = _event_note_for(event_id, note_id)
+        require_site_access(user, note["siteId"])
+        if note.get("deletedAt") is not None:
+            return {"deleted": True, "noteId": note["id"], "duplicate": True}
+        before = copy_payload(note)
+        note["deletedAt"] = now_iso()
+        note["updatedAt"] = note["deletedAt"]
+        note["version"] = int(note["version"]) + 1
+        _event_note_history_entry(user, note, "deleted", before, None)
+        append_audit_log(
+            user,
+            "event-note.delete",
+            "eventNote",
+            note["id"],
+            before,
+            None,
+            "Event note deleted",
+            site_id=note["siteId"],
+        )
+        return {"deleted": True, "noteId": note["id"], "duplicate": False}
 
 
 def baseline_payload(
@@ -4373,6 +5434,12 @@ def update_parameter(
     definition = PARAMETER_DEFINITIONS.get(normalized_key)
     if not definition:
         raise ApiError(404, "PARAMETER_NOT_FOUND", "Parameter was not found.")
+    if definition.get("mutable") is False:
+        raise ApiError(
+            409,
+            "PARAMETER_NOT_RUNTIME_MUTABLE",
+            f"{normalized_key} is managed by {definition.get('managedBy', 'another runtime')}.",
+        )
     if "value" not in payload:
         raise ApiError(400, "MISSING_FIELD", "value is required.")
     reason = required_text(payload, "reason")
@@ -4383,17 +5450,59 @@ def update_parameter(
     effective_at = str(payload.get("effectiveAt") or "").strip() or None
     if effective_at:
         parse_rfc3339("effectiveAt", effective_at)
-    value = _bounded_number(
-        "value",
-        payload["value"],
-        float(definition["minimum"]),
-        float(definition["maximum"]),
-        integer=definition["type"] == "integer",
-    )
+    if definition["type"] == "boolean":
+        if not isinstance(payload["value"], bool):
+            raise ApiError(400, "INVALID_BOOLEAN", "value must be a boolean.")
+        value: int | float | bool = payload["value"]
+    else:
+        value = _bounded_number(
+            "value",
+            payload["value"],
+            float(definition["minimum"]),
+            float(definition["maximum"]),
+            integer=definition["type"] == "integer",
+        )
     with STORE_LOCK:
+        rule_field = {
+            "ANOMALY_SCORE_THRESHOLD": "scoreThreshold",
+            "ANOMALY_HOLD_SEC": "durationSec",
+            "ANOMALY_HYSTERESIS": "hysteresis",
+            "ANOMALY_ENABLED": "active",
+        }.get(normalized_key)
+        if rule_field:
+            for rule in ANOMALY_RULES:
+                next_threshold = (
+                    float(value)
+                    if rule_field == "scoreThreshold"
+                    else float(rule["scoreThreshold"])
+                )
+                next_hysteresis = (
+                    float(value)
+                    if rule_field == "hysteresis"
+                    else float(rule["hysteresis"])
+                )
+                if next_hysteresis >= next_threshold:
+                    raise ApiError(
+                        400,
+                        "INVALID_HYSTERESIS",
+                        "hysteresis must be lower than scoreThreshold for every rule.",
+                    )
         before = PARAMETERS[normalized_key]
         PARAMETERS[normalized_key] = value
         updated_at = now_iso()
+        if rule_field:
+            for rule in ANOMALY_RULES:
+                snapshot = copy_payload(
+                    {key: item for key, item in rule.items() if key != "history"}
+                )
+                rule.setdefault("history", []).append(snapshot)
+                rule[rule_field] = value
+                rule["version"] = (
+                    f"RULE-{rule['assetId']}-v{len(rule['history']) + 1}"
+                )
+                rule["reason"] = reason
+                rule["updatedAt"] = updated_at
+            _LIFECYCLE_RUNTIMES.clear()
         audit = append_audit_log(
             user,
             "parameter.update",
@@ -4718,15 +5827,18 @@ def sensor_faults_for_device(
                 )
             )
     for event in EVENTS:
-        if (
-            event.get("eventType") == "sensor_fault_candidate"
-            and event["assetId"] == device["assetId"]
+        if event.get("eventType") in {"sensor_fault_candidate", "sensor_fault"} and (
+            event.get("deviceId") == device["id"]
+            or (
+                not event.get("deviceId")
+                and event["assetId"] == device["assetId"]
+            )
         ):
             rows.append(
                 {
                     **_sensor_fault_record(
                         device,
-                        "sensor_event",
+                        str(event.get("faultCode") or "sensor_event"),
                         str(event["severity"]),
                         str(event["note"]),
                         str(event["occurredAt"]),
@@ -5354,6 +6466,15 @@ def create_dataset_version(
         }
         snapshot = None
         if source["type"] == "internal":
+            installation_validation = _dataset_installation_validation(user, record)
+            record["installationValidation"] = installation_validation
+            if installation_validation["status"] != "ready":
+                raise ApiError(
+                    409,
+                    "DATASET_INSTALLATION_INCOMPLETE",
+                    "Internal telemetry cannot be frozen until installation metadata is complete.",
+                    installation_validation,
+                )
             snapshot, source_records = _freeze_internal_dataset_snapshot(user, record)
             snapshot_rows = [
                 row for scope_key in sorted(snapshot) for row in snapshot[scope_key]
@@ -5372,6 +6493,13 @@ def create_dataset_version(
             ).hexdigest()
             record["snapshotRecordCount"] = len(snapshot_rows)
             record["snapshotChecksum"] = f"sha256:{snapshot_checksum}"
+        else:
+            record["installationValidation"] = {
+                "status": "not_applicable",
+                "checkedAt": created_at,
+                "assets": [],
+                "missing": [],
+            }
         record["versionFingerprint"] = _dataset_version_fingerprint(
             source,
             compatibility,
@@ -5410,6 +6538,69 @@ def create_dataset_version(
             site_ids=dataset_site_ids,
         )
         return copy_payload(record)
+
+
+def _dataset_installation_validation(
+    user: dict[str, Any], dataset: dict[str, Any]
+) -> dict[str, Any]:
+    required_fields = ("position", "orientation", "mountingMethod", "photoRefs")
+    assets = _dataset_scope_assets(user, dataset)
+    missing = []
+    validated_assets = []
+    for asset in assets:
+        active_points = [
+            item
+            for item in INSTALL_POINTS
+            if item["assetId"] == asset["id"] and item.get("active") is True
+        ]
+        complete = []
+        for point in active_points:
+            point_missing = []
+            for field in required_fields:
+                value = point.get(field)
+                if field == "photoRefs":
+                    if not isinstance(value, list) or not value:
+                        point_missing.append(field)
+                elif not isinstance(value, str) or not value.strip():
+                    point_missing.append(field)
+            if not point_missing:
+                complete.append(point)
+        if complete:
+            validated_assets.append(
+                {
+                    "siteId": asset["siteId"],
+                    "assetId": asset["id"],
+                    "installPointIds": sorted(item["id"] for item in complete),
+                }
+            )
+        else:
+            missing.append(
+                {
+                    "siteId": asset["siteId"],
+                    "assetId": asset["id"],
+                    "missingFields": (
+                        ["activeInstallPoint"]
+                        if not active_points
+                        else sorted(
+                            {
+                                field
+                                for point in active_points
+                                for field in required_fields
+                                if (
+                                    not point.get(field)
+                                    or (field == "photoRefs" and not point.get(field))
+                                )
+                            }
+                        )
+                    ),
+                }
+            )
+    return {
+        "status": "missing" if missing else "ready",
+        "checkedAt": now_iso(),
+        "assets": validated_assets,
+        "missing": missing,
+    }
 
 
 def dataset_version_for(user: dict[str, Any], dataset_id: str) -> dict[str, Any]:

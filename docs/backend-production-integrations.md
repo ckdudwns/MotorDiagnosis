@@ -1,0 +1,36 @@
+# Backend production integrations
+
+The application process now persists general backend state in the SQLite file
+selected by `STATE_DB_PATH` (default: `output/runtime.sqlite3`). The alert outbox
+and MQTT retry queue continue to use their own databases. Unit tests that call
+`create_server()` without `state_database` remain isolated in memory.
+
+## Runtime flow
+
+Accepted telemetry is stored and scored with the existing AI2 baseline scorer.
+The score, active asset rule, sensor-fault state, and durable lifecycle checkpoint
+are passed to the existing AI2 event lifecycle. Started, updated, merged, and
+closed events are stored with their rule/model versions and trigger evidence. The
+alert outbox discovers newly started events through its existing worker.
+
+The global anomaly parameters update all asset rules atomically. Transmission
+interval and edge-buffer parameters are reported as firmware-managed and reject
+runtime writes until a device configuration channel exists.
+
+## Added API contracts
+
+- `GET /api/health` returns an RFC3339 UTC `timestamp`.
+- `POST /api/devices/{deviceId}/health` accepts authenticated RSSI, reboot count,
+  buffer usage, firmware version, and sensor fault/recovery reports. Use
+  `DEVICE_HEALTH_TOKEN` outside demo environments.
+- `GET|POST /api/events/{eventId}/notes` lists or creates categorized notes.
+- `PATCH|DELETE /api/events/{eventId}/notes/{noteId}` updates or soft-deletes one
+  note while retaining author and version history.
+- `GET /api/events/{eventId}/notes/{noteId}/history` returns note history.
+- `GET /api/datasets/export?...&format=xlsx` returns `manifest` and `rows` sheets
+  from the same export snapshot used by CSV.
+
+Internal dataset freezing now requires a complete active install point for each
+selected asset. Missing metadata returns `DATASET_INSTALLATION_INCOMPLETE` with a
+structured `error.details` payload. Legacy internal datasets without this marker
+are also blocked from baseline/model registration.

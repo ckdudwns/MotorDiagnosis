@@ -301,7 +301,7 @@ def main() -> None:
         assert len(labels) >= 5
         assert len(pipelines) == 2
         assert telemetry["units"]["vibrationRmsMmS"] == "mm/s RMS"
-        assert len(telemetry["points"]) == 72
+        assert telemetry["points"] == []
         assert created_site["id"] == "SITE-SMOKE"
         assert created_asset["baseline"]["sampleCount"] == 120
         assert rollout_saved["targetAssetIds"] == [created_asset["id"]]

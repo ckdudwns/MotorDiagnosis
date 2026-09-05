@@ -452,7 +452,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
             )
         self.assertEqual(update_error.exception.code, "VALUE_OUT_OF_RANGE")
         self.assertEqual(get_asset_by_id(asset["id"])["ratedRpm"], 1800)
-        self.assertTrue(telemetry_for("SITE-01", asset["id"]))
+        self.assertEqual(telemetry_for("SITE-01", asset["id"]), [])
 
         for invalid_rpm in (True, 1800.9, 120000.9):
             with self.subTest(create_invalid_rpm=invalid_rpm):
@@ -2552,10 +2552,10 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertIn("label_taxonomy_version", csv_text.splitlines()[0])
         self.assertIn("dataset_split", csv_text.splitlines()[0])
         self.assertIn("operating_conditions", csv_text.splitlines()[0])
-        self.assertIn("api://telemetry", csv_text)
+        self.assertEqual(list(csv.DictReader(csv_text.splitlines())), [])
         self.assertNotIn(dataset_payload["source"]["uri"], csv_text)
         self.assertTrue(headers["x-dataset-checksum"].startswith("sha256:"))
-        self.assertGreater(int(headers["x-dataset-record-count"]), 0)
+        self.assertEqual(int(headers["x-dataset-record-count"]), 0)
 
         TELEMETRY_RECORDS.extend(
             [
@@ -2576,6 +2576,15 @@ class Week3HttpContractTest(unittest.TestCase):
                 )
             ]
         )
+        status, live_csv_body, live_headers = self.request_raw(
+            "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01&format=csv",
+            token=self.operator_token,
+        )
+        self.assertEqual(status, 200)
+        live_rows = list(csv.DictReader(live_csv_body.decode("utf-8-sig").splitlines()))
+        self.assertEqual(len(live_rows), 3)
+        self.assertTrue(all(row["source_uri"] == "api://telemetry" for row in live_rows))
+        self.assertEqual(int(live_headers["x-dataset-record-count"]), 3)
         TELEMETRY_RECORDS[0].update(
             {
                 "vibrationPeakHz": 1037.11,
@@ -2714,13 +2723,15 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(reversed_range["error"]["code"], "INVALID_TIME_RANGE")
 
-        status, not_implemented = self.request(
+        status, workbook, headers = self.request_raw(
             "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01&format=xlsx",
             token=self.operator_token,
         )
-        self.assertEqual(status, 501)
+        self.assertEqual(status, 200)
+        self.assertTrue(workbook.startswith(b"PK"))
         self.assertEqual(
-            not_implemented["error"]["code"], "EXPORT_FORMAT_NOT_IMPLEMENTED"
+            headers.get_content_type(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
 

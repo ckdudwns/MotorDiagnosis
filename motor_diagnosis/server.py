@@ -33,6 +33,8 @@ from .data import (
     assets_for,
     authenticate,
     copy_payload,
+    close_runtime_state,
+    configure_runtime_state,
     create_asset,
     create_connectivity_test,
     create_device,
@@ -51,8 +53,11 @@ from .data import (
     delete_site,
     devices_for,
     device_health_for,
+    update_device_health,
     environment_inspections_for,
     event_detail_for,
+    event_note_history_for,
+    event_notes_for,
     event_reviews_for,
     get_asset_by_id,
     get_device,
@@ -64,6 +69,7 @@ from .data import (
     install_points_for,
     install_points_for_asset,
     logout,
+    maintain_runtime_retention,
     network_profile,
     network_profiles_for_sites,
     parse_rfc3339,
@@ -73,6 +79,9 @@ from .data import (
     require_permission,
     require_site_access,
     review_event,
+    create_event_note,
+    update_event_note,
+    delete_event_note,
     role_policy,
     rollout_plans,
     rollout_plan_for,
@@ -96,16 +105,19 @@ from .data import (
     visible_sites_for_user,
     connectivity_tests_for_device,
     parameters_for,
+    now_iso,
 )
 from .json_validation import loads_strict_json
 from .alerts import AlertService
 from .model_registry import create_baseline_version, create_model_version, versions_for
 from .telemetry_bulk import ingest_telemetry_bulk
 from .web import render_page
+from .xlsx_export import dataset_xlsx_bytes
 
 
 LOGGER = logging.getLogger("motor_diagnosis")
 MAX_JSON_BODY_BYTES = 64 * 1024
+RETENTION_MAINTENANCE_INTERVAL_SEC = 60.0
 
 
 def _safe_csv_cell(value: Any) -> Any:
@@ -193,7 +205,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "Bind Edge AI backend",
-                    "timestamp": time.time(),
+                    "timestamp": now_iso(),
                 }
             )
             return
@@ -523,6 +535,21 @@ class AppHandler(BaseHTTPRequestHandler):
             size = positive_query_int(query, "size", 50, maximum=200)
             self.send_json(event_reviews_for(user, segments[2], page=page, size=size))
             return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "notes"
+        ):
+            self.send_json(event_notes_for(user, segments[2]))
+            return
+        if (
+            len(segments) == 6
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "notes"
+            and segments[5] == "history"
+        ):
+            self.send_json(event_note_history_for(user, segments[2], segments[4]))
+            return
         if segments == ["api", "events"]:
             self.send_json(paginated_events(user, query))
             return
@@ -560,24 +587,26 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if segments == ["api", "datasets", "export"]:
             export_format = query.get("format", ["csv"])[0].strip().lower()
-            if export_format != "csv":
+            if export_format not in {"csv", "xlsx"}:
                 raise ApiError(
-                    501,
-                    "EXPORT_FORMAT_NOT_IMPLEMENTED",
-                    "Only CSV export is available in the week 3 backend.",
+                    400,
+                    "INVALID_EXPORT_FORMAT",
+                    "format must be csv or xlsx.",
                 )
             site_id = required_query(query, "siteId")
             asset_id = required_query(query, "assetId")
-            self.send_dataset_csv(
-                dataset_export_for(
-                    user,
-                    site_id,
-                    asset_id,
-                    dataset_id=query.get("datasetId", [""])[0],
-                    from_timestamp=query.get("from", [None])[0],
-                    to_timestamp=query.get("to", [None])[0],
-                )
+            export = dataset_export_for(
+                user,
+                site_id,
+                asset_id,
+                dataset_id=query.get("datasetId", [""])[0],
+                from_timestamp=query.get("from", [None])[0],
+                to_timestamp=query.get("to", [None])[0],
             )
+            if export_format == "xlsx":
+                self.send_dataset_xlsx(export)
+            else:
+                self.send_dataset_csv(export)
             return
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
@@ -616,6 +645,19 @@ class AppHandler(BaseHTTPRequestHandler):
                 report_service_dependency(
                     telemetry_principal_for_token(self.bearer_token()),
                     "mqtt",
+                    payload,
+                )
+            )
+            return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "health"
+        ):
+            self.send_json(
+                update_device_health(
+                    telemetry_principal_for_token(self.bearer_token()),
+                    segments[2],
                     payload,
                 )
             )
@@ -736,6 +778,13 @@ class AppHandler(BaseHTTPRequestHandler):
             require_permission(user, "event:review")
             self.send_json(review_event(user, segments[2], payload))
             return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "notes"
+        ):
+            self.send_json(create_event_note(user, segments[2], payload), status=201)
+            return
         if segments == ["api", "datasets"]:
             self.send_json(create_dataset_version(user, payload), status=201)
             return
@@ -792,6 +841,13 @@ class AppHandler(BaseHTTPRequestHandler):
         ):
             self.send_json(update_asset(user, segments[2], segments[4], payload))
             return
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "notes"
+        ):
+            self.send_json(update_event_note(user, segments[2], segments[4], payload))
+            return
         if len(segments) == 3 and segments[:2] == ["api", "devices"]:
             self.send_json(update_device(user, segments[2], payload))
             return
@@ -820,6 +876,13 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if len(segments) == 3 and segments[:2] == ["api", "devices"]:
             self.send_json(delete_device(user, segments[2]))
+            return
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "notes"
+        ):
+            self.send_json(delete_event_note(user, segments[2], segments[4]))
             return
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
@@ -884,9 +947,10 @@ class AppHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_error_json(self, exc: ApiError) -> None:
-        self.send_json(
-            {"error": {"code": exc.code, "message": exc.message}}, status=exc.status
-        )
+        error = {"code": exc.code, "message": exc.message}
+        if exc.details is not None:
+            error["details"] = exc.details
+        self.send_json({"error": error}, status=exc.status)
 
     def send_text(
         self,
@@ -1135,6 +1199,28 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_dataset_xlsx(self, export: dict[str, Any]) -> None:
+        manifest = export["manifest"]
+        body = dataset_xlsx_bytes(export)
+        filename = f"{manifest['siteId']}_{manifest['assetId']}_dataset.xlsx"
+        self.send_response(200)
+        self.send_header(
+            "content-type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.send_header("content-disposition", f'attachment; filename="{filename}"')
+        self.send_header("x-dataset-checksum", manifest["checksum"])
+        self.send_header("x-dataset-record-count", str(manifest["recordCount"]))
+        self.send_header("cache-control", "no-store")
+        self.send_header("access-control-allow-origin", "*")
+        self.send_header(
+            "access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        )
+        self.send_header("access-control-allow-headers", "authorization, content-type")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def send_common_headers(self, content_type: str, content_length: int) -> None:
         self.send_header("content-type", content_type)
         self.send_header("cache-control", "no-store")
@@ -1346,12 +1432,54 @@ def optional_boolean_query(query: dict[str, list[str]], key: str) -> bool | None
 
 
 class MotorDiagnosisServer(ThreadingHTTPServer):
+    # ThreadingHTTPServer defaults to daemon request threads, which are not
+    # joined by server_close. A 2xx write must commit before its DB is closed.
+    daemon_threads = False
+    block_on_close = True
+
+    def __init__(self, *args, **kwargs):
+        self._admission_lock = threading.Lock()
+        self._closing = False
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        with self._admission_lock:
+            if self._closing:
+                self.shutdown_request(request)
+                return
+            # Include thread registration in the admission fence so close()
+            # cannot miss an accepted request that has not started running yet.
+            super().process_request(request, client_address)
+
+    def get_request(self):
+        request, address = super().get_request()
+        # A client that never finishes its headers/body cannot hold shutdown
+        # indefinitely now that accepted request threads are drained.
+        request.settimeout(30.0)
+        return request, address
+
     def start_alert_worker(self):
         self._alert_stop = threading.Event()
         self._alert_worker = threading.Thread(
             target=self._run_alert_worker, name="alert-outbox", daemon=True
         )
         self._alert_worker.start()
+
+    def start_retention_worker(self):
+        self._retention_stop = threading.Event()
+        self._retention_worker = threading.Thread(
+            target=self._run_retention_worker, name="runtime-retention", daemon=True
+        )
+        self._retention_worker.start()
+
+    def _run_retention_worker(self):
+        # Independent of alert delivery and of the HTTP accept loop: expiration
+        # continues on an idle server, including when auto_alerts is disabled.
+        while not self._retention_stop.wait(RETENTION_MAINTENANCE_INTERVAL_SEC):
+            try:
+                maintain_runtime_retention()
+            except Exception:
+                LOGGER.exception("Runtime retention failed; will retry on next tick")
 
     def _run_alert_worker(self):
         # SQLite can wait on another writer. Never perform this work in
@@ -1368,6 +1496,12 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
                 )
 
     def server_close(self):
+        with self._admission_lock:
+            self._closing = True
+        if hasattr(self, "_retention_stop"):
+            self._retention_stop.set()
+            if self._retention_worker.ident is not None:
+                self._retention_worker.join()
         if hasattr(self, "_alert_stop"):
             self._alert_stop.set()
             if self._alert_worker.ident is not None:
@@ -1375,6 +1509,7 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
         super().server_close()
         if hasattr(self, "alerts"):
             self.alerts.close()
+        close_runtime_state()
 
 
 def create_server(
@@ -1385,10 +1520,16 @@ def create_server(
     alert_database=":memory:",
     alert_adapters=None,
     auto_alerts=True,
+    state_database=None,
 ) -> ThreadingHTTPServer:
     if demo_enabled is None:
         demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
-    server = MotorDiagnosisServer((host, port), AppHandler)
+    configure_runtime_state(state_database)
+    try:
+        server = MotorDiagnosisServer((host, port), AppHandler)
+    except Exception:
+        close_runtime_state()
+        raise
     server.demo_enabled = (
         bool(demo_enabled) and os.environ.get("APP_ENV", "").lower() != "production"
     )
@@ -1399,6 +1540,8 @@ def create_server(
             adapters=alert_adapters,
         )
         server.start_alert_worker()
+        if state_database:
+            server.start_retention_worker()
     except Exception:
         server.server_close()
         raise

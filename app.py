@@ -18,6 +18,7 @@ def main() -> None:
         PORT,
         alert_database=os.environ.get("ALERT_DB_PATH", "output/alerts.sqlite3"),
         alert_adapters=configured_adapters(),
+        state_database=os.environ.get("STATE_DB_PATH", "output/runtime.sqlite3"),
     )
     print(f"Bind Edge AI app is running at http://{HOST}:{PORT}")
     print("Press Ctrl+C to stop.")

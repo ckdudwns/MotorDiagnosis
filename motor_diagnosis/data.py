@@ -4069,7 +4069,9 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
             "to": context_to,
             "points": copy_payload(points),
             "units": telemetry_units(
-                event_snapshot["siteId"], event_snapshot["assetId"]
+                event_snapshot["siteId"],
+                event_snapshot["assetId"],
+                include_demo=is_demo,
             ),
             "source": context_source,
             "rawDataMissing": not bool(points),
@@ -5608,7 +5610,12 @@ def _event_for_dataset_point(
 
 
 def _event_matches_dataset_point(event: dict[str, Any], point: dict[str, Any]) -> bool:
-    """Keep synthetic demo events out of real-telemetry training labels."""
+    """Match real telemetry labels without mixing demo or source domains.
+
+    Legacy physical events may not record a source.  Those events remain
+    compatible with real telemetry from the same device/time window.  When an
+    event does declare a source, it scopes the label to that exact collector.
+    """
     if _is_demo_event(event) or point.get("source") == DEMO_SIGNAL_SOURCE:
         return False
     event_device_id = str(event.get("deviceId") or "").strip().upper()
@@ -5617,7 +5624,7 @@ def _event_matches_dataset_point(event: dict[str, Any], point: dict[str, Any]) -
         return False
     event_source = str(event.get("source") or "").strip()
     point_source = str(point.get("source") or "").strip()
-    return event_source == point_source
+    return not event_source or event_source == point_source
 
 
 def _dataset_export_window(

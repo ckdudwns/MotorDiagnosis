@@ -22,7 +22,10 @@ AI-2의 4주차 범위는 `SIM_ANOMALY_01`의 최종 시연과 AI-1 모델 결�
   않고 `unavailable`/missing으로 남긴다.
 - CSV와 `api/datasets/export`를 포함한 학습·내보내기 경로는 데모 telemetry와 데모 이벤트를
   모두 제외한다. 따라서 합성 이벤트의 검토 결과가 실측 행의 ground truth나 학습 대상이 되지
-  않는다.
+  않는다. 이전에 기록된 실측 이벤트처럼 `source`가 없는 이벤트는 같은 장치·시간 구간의
+  실측 telemetry와 연결하고, event에 `source`가 있을 때만 같은 source를 요구한다.
+- 데모 이벤트 상세는 raw telemetry에 맞는 raw 단위만 반환한다. 보정값 필드는 모두 `null`이므로
+  mm/s RMS·dB 단위를 함께 반환하지 않는다.
 - 대시보드는 선택한 사이트·설비에 등록된 `GET /api/model-versions` 메타데이터를 표시한다.
   문자열은 DOM `textContent`로만 넣어 등록 메타데이터가 HTML로 실행되지 않는다.
 

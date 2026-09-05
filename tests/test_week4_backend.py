@@ -862,6 +862,50 @@ class Week4HttpTest(unittest.TestCase):
         self.assertTrue(detail["context"]["rawDataMissing"])
         self.assertIsNone(detail["featureSnapshot"])
 
+    def test_demo_event_detail_uses_raw_telemetry_units(self):
+        demo_event = data.inject_anomaly(
+            {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"}
+        )
+
+        detail = data.event_detail_for(user("operator"), demo_event["id"])
+
+        self.assertTrue(detail["context"]["points"])
+        self.assertEqual(detail["context"]["source"], "demo")
+        self.assertIn("vibrationRmsRaw", detail["context"]["units"])
+        self.assertIn("acousticRmsRaw", detail["context"]["units"])
+        self.assertNotIn("vibrationRmsMmS", detail["context"]["units"])
+        self.assertNotIn("acousticDb", detail["context"]["units"])
+
+    def test_source_less_real_event_keeps_reviewed_training_label(self):
+        event = next(item for item in data.EVENTS if item["id"] == "EV-241")
+        event["reviewed"] = True
+        event["label"] = "confirmed_anomaly"
+        occurred_at = data.parse_rfc3339("occurredAt", event["occurredAt"])
+        principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+        real_point = telemetry(
+            1,
+            timestamp=data.format_rfc3339(occurred_at + timedelta(seconds=1)),
+        )
+        real_point["isSynthetic"] = False
+        real_point["source"] = "esp32"
+        data.ingest_telemetry(principal, real_point)
+        dataset = {
+            "labelMapping": {"confirmed_anomaly": "BEARING_SUSPECT"},
+            "labelTaxonomyVersion": "ACOUSTIC-V1",
+        }
+
+        rows = data._dataset_rows_for_points(
+            dataset,
+            real_point["siteId"],
+            real_point["assetId"],
+            data.TELEMETRY_RECORDS,
+        )
+
+        self.assertEqual(rows[0]["event_id"], "EV-241")
+        self.assertEqual(rows[0]["ground_truth_label"], "confirmed_anomaly")
+        self.assertEqual(rows[0]["target_label"], "BEARING_SUSPECT")
+        self.assertTrue(rows[0]["training_eligible"])
+
     def test_demo_data_is_excluded_from_csv_and_dataset_training_labels(self):
         demo_event = data.inject_anomaly(
             {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"}

@@ -15,14 +15,15 @@ def render_page() -> str:
     header { display:flex; justify-content:space-between; gap:16px; align-items:center; padding:18px 22px; background:#17231f; color:white; }
     header h1 { margin:0; font-size:21px; }
     header span { color:#b8c9c2; font-size:13px; }
-    main { padding:18px; display:grid; gap:14px; }
+    main { padding:24px; display:grid; gap:18px; max-width:1600px; margin:auto; }
+    #appPanel { display:grid; gap:18px; }
     .toolbar, .grid, .kpis, .login { display:grid; gap:10px; }
     .login { grid-template-columns:1fr 1fr 140px; align-items:end; }
     .toolbar { grid-template-columns:repeat(5, minmax(150px, 1fr)); }
     .grid { grid-template-columns:1fr 1.2fr; }
     .kpis { grid-template-columns:repeat(4, 1fr); }
     .panel, .kpi { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; box-shadow:0 14px 32px rgba(23,33,31,.07); }
-    .kpi span, label, th, small { color:var(--muted); font-size:12px; font-weight:700; }
+    .kpi span, label, th, small { color:var(--muted); font-size:14px; font-weight:600; }
     .kpi strong { display:block; margin-top:6px; font-size:27px; }
     h2 { margin:0 0 12px; font-size:17px; }
     input, select, button, textarea { width:100%; min-height:38px; border:1px solid var(--line); border-radius:7px; padding:8px 10px; font:inherit; }
@@ -54,6 +55,20 @@ def render_page() -> str:
     label { display:grid; gap:4px; font-size:14px; }
     .wide { grid-column:1 / -1; }
     .history { max-height:300px; overflow:auto; }
+    .workspace-nav { display:flex; flex-wrap:wrap; gap:8px; border-bottom:1px solid var(--line); padding-bottom:12px; }
+    .workspace-nav button { width:auto; min-width:140px; padding:12px 18px; background:var(--panel); color:var(--muted); border-color:var(--line); }
+    .workspace-nav button[aria-pressed="true"] { background:var(--teal); color:white; border-color:var(--teal); }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible { outline:3px solid var(--blue); outline-offset:3px; }
+    .workspace-title { margin:0; font-size:22px; }
+    .facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:12px 0; }
+    .facts div { min-width:0; padding:12px; background:var(--bg); border-radius:6px; }
+    .facts dt { font-size:14px; color:var(--muted); margin-bottom:6px; }
+    .facts dd { margin:0; font-weight:600; overflow-wrap:anywhere; white-space:pre-wrap; }
+    .history-card { padding:14px 0; border-bottom:1px solid var(--line); }
+    .history-card p { white-space:pre-wrap; overflow-wrap:anywhere; }
+    .status-table { min-width:680px; }
+    .status-table caption { text-align:left; font-weight:700; padding:12px 0; }
+    .status-table td { font-size:14px; overflow-wrap:anywhere; }
     #evidenceChart { height:220px; }
     textarea { resize:vertical; min-height:90px; }
     [hidden] { display:none !important; }
@@ -67,24 +82,31 @@ def render_page() -> str:
   </header>
   <main>
     <section class="login panel" id="loginPanel">
-      <label>User<input id="username" value="admin" autocomplete="username"></label>
-      <label>Password<input id="password" type="password" autocomplete="current-password"></label>
-      <button id="loginBtn">Login</button>
+      <label>사용자<input id="username" value="admin" autocomplete="username"></label>
+      <label>비밀번호<input id="password" type="password" autocomplete="current-password"></label>
+      <button id="loginBtn">로그인</button>
     </section>
     <section id="appPanel" hidden>
       <div id="appStatus" class="notice" role="status" aria-live="polite" hidden></div>
+      <nav class="workspace-nav" aria-label="업무 화면">
+        <button id="navOverview" aria-pressed="true" aria-controls="siteKpis sitesPanel notificationsPanel modelPanel healthPanel">운영 현황</button>
+        <button id="navEvents" aria-pressed="false" aria-controls="exportPanel chartPanel eventListPanel eventReviewPanel">이벤트 검수</button>
+        <button id="navManagement" aria-pressed="false" aria-controls="managementPanel">운영 관리</button>
+      </nav>
+      <h2 id="viewHeading" class="workspace-title">운영 현황</h2>
       <section class="toolbar panel">
-        <label>Site<select id="siteSelect"></select></label>
-        <label>Asset<select id="assetSelect"></select></label>
-        <label>Period<select id="periodSelect">
-          <option value="1">Last 1 hour</option>
-          <option value="6">Last 6 hours</option>
-          <option value="24" selected>Last 24 hours</option>
+        <label>사이트<select id="siteSelect"></select></label>
+        <label>설비<select id="assetSelect"></select></label>
+        <label>조회 기간<select id="periodSelect">
+          <option value="1">최근 1시간</option>
+          <option value="6">최근 6시간</option>
+          <option value="24" selected>최근 24시간</option>
         </select></label>
-        <button id="refreshBtn">Refresh</button>
-        <button class="danger" id="injectBtn" hidden>Inject Anomaly (Demo)</button>
+        <button id="refreshBtn">새로고침</button>
+        <button class="danger" id="injectBtn" hidden>데모 이상 주입</button>
       </section>
-      <section class="panel">
+      <section class="panel" id="exportPanel" hidden>
+        <h2>조회 범위·내보내기</h2>
         <div class="subgrid">
           <label>조회 시작 (현지 시각)<input id="fromInput" type="datetime-local" step="1"></label>
           <label>조회 종료 (현지 시각)<input id="toInput" type="datetime-local" step="1"></label>
@@ -94,27 +116,27 @@ def render_page() -> str:
         <div class="actions"><button id="applyRange">기간 적용</button><button id="exportBtn" class="secondary" disabled>선택 조건 내보내기</button></div>
         <small id="exportScope">내보내기는 설비·조회 기간·데이터셋 버전을 사용합니다. 아래 이벤트 목록 필터는 신호 데이터에 적용되지 않습니다.</small>
       </section>
-      <section class="kpis">
-        <div class="kpi"><span>Visible Sites</span><strong id="siteCount">-</strong></div>
-        <div class="kpi"><span>Online Devices</span><strong id="onlineCount">-</strong></div>
-        <div class="kpi"><span>Warning Assets</span><strong id="warningAssets">-</strong></div>
-        <div class="kpi"><span>Critical Assets</span><strong id="criticalAssets">-</strong></div>
+      <section class="kpis" id="siteKpis" aria-label="전체 접근 가능 사이트 현황">
+        <div class="kpi"><span>사이트</span><strong id="siteCount">-</strong></div>
+        <div class="kpi"><span>온라인 장치</span><strong id="onlineCount">-</strong></div>
+        <div class="kpi"><span>주의 설비</span><strong id="warningAssets">-</strong></div>
+        <div class="kpi"><span>위험 설비</span><strong id="criticalAssets">-</strong></div>
       </section>
       <section class="grid">
-        <article class="panel">
-          <h2>Site Summary</h2>
-          <div class="table-scroll"><table><thead><tr><th>Site</th><th>Region</th><th>Status</th><th>Normal</th><th>Warning</th><th>Critical</th><th>Unreviewed</th><th>Last received</th><th>Devices</th></tr></thead><tbody id="siteRows"></tbody></table></div>
+        <article class="panel wide" id="sitesPanel">
+          <h2>전체 사이트 현황</h2>
+          <div class="table-scroll"><table><thead><tr><th>사이트</th><th>지역</th><th>상태</th><th>정상</th><th>주의</th><th>위험</th><th>미검수</th><th>최근 수신</th><th>장치</th></tr></thead><tbody id="siteRows"></tbody></table></div>
           <div class="actions"><button id="sitesPrev" class="secondary">이전</button><span id="sitesPage"></span><button id="sitesNext" class="secondary">다음</button></div>
         </article>
-        <article class="panel">
-          <h2 id="chartTitle">Telemetry</h2>
+        <article class="panel wide" id="chartPanel" hidden>
+          <h2 id="chartTitle">설비 신호</h2>
           <canvas id="chart" width="900" height="280"></canvas>
-          <small id="chartHint">Hover the chart to inspect a timestamp and raw values.</small>
+          <small id="chartHint">차트에 마우스를 올리거나 클릭하면 해당 시점의 원시값을 확인할 수 있습니다.</small>
           <div class="actions"><button id="zoomIn" class="secondary">확대</button><button id="panLeft" class="secondary">이전 구간</button><button id="panRight" class="secondary">다음 구간</button><button id="zoomReset" class="secondary">전체 구간</button></div>
           <small id="chartRange"></small>
         </article>
-        <article class="panel">
-          <h2>Events</h2>
+        <article class="panel" id="eventListPanel" hidden>
+          <h2>이벤트 목록</h2>
           <div class="subgrid">
             <label>심각도<select id="severityFilter"><option value="">전체</option><option value="critical">Critical</option><option value="warning">Warning</option><option value="device">Device</option></select></label>
             <label>라벨<select id="eventLabelFilter"><option value="">전체</option><option value="needs_review">Needs review</option><option value="normal_false_positive">Normal / false positive</option><option value="confirmed_anomaly">Confirmed anomaly</option><option value="sensor_issue">Sensor issue</option><option value="repair_completed">Repair completed</option></select></label>
@@ -124,29 +146,30 @@ def render_page() -> str:
           <div id="events" class="event-list"></div>
           <div class="actions"><button id="eventsPrev" class="secondary">이전</button><span id="eventsPage"></span><button id="eventsNext" class="secondary">다음</button></div>
         </article>
-        <article class="panel">
-          <h2>Web Notifications</h2>
+        <article class="panel" id="notificationsPanel">
+          <h2>웹 알림</h2>
           <div id="notifications" role="status" aria-live="polite">No notifications.</div>
         </article>
-        <article class="panel">
-          <h2>AI Baseline Result</h2>
+        <article class="panel" id="modelPanel">
+          <h2>AI 기준선·모델 정보</h2>
           <div id="modelResult" role="status" aria-live="polite">Loading model metadata.</div>
         </article>
-        <article class="panel detail">
-          <h2>Event Review</h2>
-          <div id="eventDetail">Select an event.</div>
+        <article class="panel detail" id="eventReviewPanel" hidden>
+          <h2>이벤트 상세·검수</h2>
+          <div id="eventDetail">목록에서 이벤트를 선택하세요.</div>
           <canvas id="evidenceChart" width="900" height="220" aria-label="선택 이벤트 전후 신호"></canvas>
+          <div id="evidenceSummary"></div>
           <details><summary>특징·규칙·장치 스냅샷</summary><pre id="eventEvidence"></pre></details>
-          <label>Label<select id="labelSelect">
+          <label>검수 라벨<select id="labelSelect">
             <option value="needs_review">Needs review</option>
             <option value="normal_false_positive">Normal / false positive</option>
             <option value="confirmed_anomaly">Confirmed anomaly</option>
             <option value="sensor_issue">Sensor issue</option>
             <option value="repair_completed">Repair completed</option>
           </select></label>
-          <label>Note<textarea id="noteInput"></textarea></label>
+          <label>검수 요약 메모<textarea id="noteInput"></textarea></label>
           <label>검수 변경 사유<input id="reviewReason" maxlength="1000"></label>
-          <button id="saveReview" disabled>Save Review</button>
+          <button id="saveReview" disabled>검수 저장</button>
           <details><summary>전체 검수 변경 이력</summary><div id="reviewHistory" class="history"></div><button id="reviewsMore" class="secondary" hidden>이력 더 보기</button></details>
           <h2>원인·점검·조치 메모</h2>
           <div id="notesStatus" role="status" aria-live="polite"></div>
@@ -158,15 +181,15 @@ def render_page() -> str:
           <div class="actions"><button id="saveNote" disabled>메모 등록</button><button id="cancelNote" class="secondary">편집 취소</button></div>
           <div id="noteHistory" class="history"></div>
         </article>
-        <article class="panel wide"><h2>장치·서비스 상태</h2><div id="deviceHealth" class="table-scroll"></div><div id="serviceHealth"></div></article>
-        <article class="panel wide" id="managementPanel">
+        <article class="panel wide" id="healthPanel"><h2>선택 사이트의 장치·서비스 상태</h2><div id="deviceHealth" class="table-scroll"></div><div id="serviceHealth" class="table-scroll"></div></article>
+        <article class="panel wide" id="managementPanel" hidden>
           <h2>운영 관리</h2>
           <div class="subgrid"><label>관리 항목<select id="managementKind"></select></label><label>항목 선택<select id="managementRecord"></select></label></div>
           <div class="actions"><button id="managementLoad" class="secondary">목록 새로고침</button><button id="managementNew" class="secondary" hidden>신규 등록</button><button id="managementDelete" class="danger" hidden>삭제</button></div>
           <div id="managementStatus" class="notice" role="status"></div>
           <form id="managementForm"><div id="managementFields" class="subgrid"></div><label>변경 사유<input id="managementReason" maxlength="1000" required></label><button id="managementSave" type="submit" hidden>변경 저장</button></form>
           <details><summary>현재 등록 정보·이력</summary><pre id="managementDetail"></pre></details>
-          <section id="auditPanel" hidden><h2>감사 기록</h2><div class="subgrid"><label>작업 종류<input id="auditAction"></label><label>대상 종류<input id="auditTarget"></label><label>작성자 ID<input id="auditActor"></label></div><div class="actions"><button id="auditLoad" class="secondary">조회</button><button id="auditPrev" class="secondary">이전</button><span id="auditPage"></span><button id="auditNext" class="secondary">다음</button></div><div id="auditRows" class="history"></div></section>
+          <section id="auditPanel" hidden><h2>감사 기록</h2><div class="subgrid"><label>작업 종류<input id="auditAction"></label><label>대상 종류<input id="auditTarget"></label><label>작성자 ID<input id="auditActor"></label></div><div class="actions"><button id="auditLoad" class="secondary">조회</button><button id="auditPrev" class="secondary">이전</button><span id="auditPage"></span><button id="auditNext" class="secondary">다음</button></div><div id="auditRows" class="history table-scroll"></div></section>
         </article>
       </section>
     </section>
@@ -182,6 +205,7 @@ def render_page() -> str:
     let auditPageNumber = 1, auditGeneration = 0;
     let reviewSaving = false, noteSaving = false, managementSaving = false, noteHistoryGeneration = 0;
     let noteListGeneration = 0;
+    let currentView = "overview";
     const CHART_PAD = 34;
     const $ = (id) => document.getElementById(id);
 
@@ -226,6 +250,23 @@ def render_page() -> str:
     }
 
     function can(permission) { return permissions.includes("*") || permissions.includes(permission); }
+    const WORKSPACE_VIEWS = {
+      overview:{button:"navOverview",title:"운영 현황",panels:["siteKpis","sitesPanel","notificationsPanel","modelPanel","healthPanel"]},
+      events:{button:"navEvents",title:"이벤트 검수",panels:["exportPanel","chartPanel","eventListPanel","eventReviewPanel"]},
+      management:{button:"navManagement",title:"운영 관리",panels:["managementPanel"]},
+    };
+    function hasManagementAccess() {return can("audit-log:read") || Object.values(MANAGEMENT).some(config => can(config.permission + ":read"));}
+    function setView(view) {
+      if (!Object.hasOwn(WORKSPACE_VIEWS, view) || (view === "management" && !hasManagementAccess())) return;
+      currentView = view;
+      for (const [name,config] of Object.entries(WORKSPACE_VIEWS)) {
+        $(config.button).setAttribute("aria-pressed", String(name === view));
+        for (const id of config.panels) $(id).hidden = name !== view;
+      }
+      $("navManagement").hidden = !hasManagementAccess();
+      $("viewHeading").textContent = WORKSPACE_VIEWS[view].title;
+      if (view === "events") redrawChart();
+    }
     function statusMessage(message, error = false) {
       $("appStatus").hidden = !message;
       $("appStatus").className = error ? "notice error" : "notice";
@@ -336,21 +377,67 @@ def render_page() -> str:
       const panel = $("deviceHealth");
       panel.replaceChildren();
       if (!devices.length) panel.textContent = "조회 가능한 장치가 없습니다.";
-      for (const health of devices) {
-        const box = document.createElement("details");
-        const title = document.createElement("summary");
-        title.textContent = `${health.deviceId || health.id} · ${health.health || health.status || "상태 미수신"}`;
-        const metrics = document.createElement("p");
-        metrics.textContent = `RSSI ${health.rssiDbm ?? "-"} dBm · 재부팅 ${health.rebootCount ?? "-"}회 · 버퍼 ${health.bufferUsagePct ?? "-"}% · 센서 ${health.sensorHealth || "미수신"} · 오류 ${(health.activeSensorFaults || []).length}건`;
-        const values = document.createElement("pre");
-        values.textContent = JSON.stringify(health, null, 2);
-        box.append(title, values); panel.append(metrics, box);
+      else {
+        panel.appendChild(statusTable("장치별 수집 상태", ["장치 / 설비","연결","최근 수신","RSSI","재부팅","버퍼","센서 / 활성 오류"], devices.map(health => [
+          `${displayValue(health.deviceId || health.id)} / ${displayValue(health.assetId)}`,
+          statusLabel(health.health || health.status), formatLocalTime(health.lastReceivedAt),
+          measuredValue(health.rssiDbm," dBm"), measuredValue(health.rebootCount,"회"), measuredValue(health.bufferUsagePct,"%"),
+          `${statusLabel(health.sensorHealth)} / ${Array.isArray(health.activeSensorFaults) ? health.activeSensorFaults.length + "건" : "미수신"}`,
+        ])));
+        panel.appendChild(rawDetails("장치별 상세 정보·고장 기록", devices));
       }
       const servicePanel = $("serviceHealth"); servicePanel.replaceChildren();
       if (!dependencies || dependencies.error) servicePanel.textContent = dependencies?.error || "서비스 상태 조회 권한이 없습니다.";
       else {
-        const values = document.createElement("pre"); values.textContent = JSON.stringify(dependencies, null, 2); servicePanel.appendChild(values);
+        servicePanel.appendChild(facts([
+          ["서비스 종합 상태",statusLabel(dependencies.status)], ["조회 시각",formatLocalTime(dependencies.checkedAt)],
+          ["격리된 메시지",measuredValue(dependencies.quarantinedMessageCount,"건")],
+        ]));
+        const rows = dependencies.dependencies || [];
+        if (rows.length) servicePanel.appendChild(statusTable("서비스별 상태", ["서비스","상태","응답 지연","오류율","최근 장애","최근 복구","영향 범위"], rows.map(item => [
+          item.name || item.id, statusLabel(item.status), measuredValue(item.latencyMs," ms"), measuredValue(item.errorRatePct,"%"),
+          formatLocalTime(item.lastFailureAt), formatLocalTime(item.lastRecoveryAt), item.impactScope,
+        ])));
+        servicePanel.appendChild(rawDetails("수집 지표·서비스 상태 원문", dependencies));
       }
+    }
+
+    function displayValue(value) {return value === null || value === undefined || value === "" ? "—" : String(value);}
+    function measuredValue(value, unit) {const number = finiteNumber(value); return number === null ? "미수신" : `${number}${unit}`;}
+    function statusLabel(value) {
+      const labels = {online:"온라인",offline:"오프라인",healthy:"정상",ready:"준비",degraded:"성능 저하",fault:"고장",unknown:"상태 미수신"};
+      return Object.hasOwn(labels,value) ? labels[value] : displayValue(value);
+    }
+    function reviewLabel(value) {
+      const labels = {needs_review:"검수 필요",normal_false_positive:"정상 / 오탐",confirmed_anomaly:"이상 확인",sensor_issue:"센서 문제",repair_completed:"조치 완료"};
+      return Object.hasOwn(labels,value) ? labels[value] : displayValue(value);
+    }
+    function facts(entries) {
+      const list = document.createElement("dl"); list.className = "facts";
+      for (const [label,value] of entries) {
+        const group = document.createElement("div"), term = document.createElement("dt"), description = document.createElement("dd");
+        term.textContent = label; description.textContent = displayValue(value);
+        group.append(term,description); list.appendChild(group);
+      }
+      return list;
+    }
+    function statusTable(caption, headings, rows) {
+      const table = document.createElement("table"); table.className = "status-table";
+      const title = document.createElement("caption"); title.textContent = caption;
+      const head = document.createElement("thead"), header = document.createElement("tr"), body = document.createElement("tbody");
+      for (const heading of headings) {const cell = document.createElement("th"); cell.scope = "col"; cell.textContent = heading; header.appendChild(cell);}
+      head.appendChild(header);
+      for (const values of rows) {
+        const row = document.createElement("tr");
+        for (const value of values) {const cell = document.createElement("td"); cell.textContent = displayValue(value); row.appendChild(cell);}
+        body.appendChild(row);
+      }
+      table.append(title,head,body); return table;
+    }
+    function rawDetails(label, value) {
+      const details = document.createElement("details"), title = document.createElement("summary"), content = document.createElement("pre");
+      title.textContent = label; content.textContent = JSON.stringify(value,null,2);
+      details.append(title,content); return details;
     }
 
     function renderNotifications(rows) {
@@ -447,11 +534,12 @@ def render_page() -> str:
       selectedDetail = null;
       reviewDirty = false;
       reviewPage = 1;
-      $("eventDetail").textContent = "Select an event.";
+      $("eventDetail").textContent = "목록에서 이벤트를 선택하세요.";
       $("labelSelect").value = "needs_review";
       $("noteInput").value = "";
       $("reviewReason").value = "";
       $("eventEvidence").textContent = "";
+      $("evidenceSummary").replaceChildren();
       $("reviewHistory").replaceChildren();
       $("eventNotes").replaceChildren();
       $("notesStatus").textContent = "";
@@ -464,6 +552,7 @@ def render_page() -> str:
     }
 
     function formatLocalTime(timestamp) {
+      if (timestamp === null || timestamp === undefined || timestamp === "") return "—";
       const value = new Date(timestamp);
       if (Number.isNaN(value.getTime())) return "-";
       return new Intl.DateTimeFormat("ko-KR", {
@@ -640,6 +729,14 @@ def render_page() -> str:
       missing.textContent = response.context.rawDataMissing ? "원본 신호 없음: 보관기간 만료 또는 미수신. 보존된 특징·버전만 표시합니다." : `전후 신호 ${response.context.points.length}건 · 출처 ${response.context.source}`;
       detail.appendChild(missing);
       $("eventEvidence").textContent = JSON.stringify({context:{from:response.context.from, to:response.context.to, source:response.context.source}, featureSnapshot:response.featureSnapshot, appliedRule:response.appliedRule, modelVersion:response.modelVersion, deviceSnapshot:response.deviceSnapshot}, null, 2);
+      const rule = response.appliedRule || {};
+      $("evidenceSummary").replaceChildren(facts([
+        ["이벤트 ID",event.id], ["모델 버전",response.modelVersion], ["규칙 버전",rule.version],
+        ["장치",response.deviceSnapshot?.deviceId || response.deviceSnapshot?.id],
+        ["진입 점수 임계값",rule.scoreThreshold], ["규칙 지속시간",measuredValue(rule.durationSec,"초")],
+        ["규칙 활성",rule.active === true ? "활성" : rule.active === false ? "비활성" : "미수신"],
+        ["신호 출처",response.context.source],
+      ]));
       draw(response.context.points, response.context.units, [event], "evidenceChart", response.appliedRule);
       $("labelSelect").value = event.label;
       $("noteInput").value = event.note || "";
@@ -656,8 +753,9 @@ def render_page() -> str:
     function renderReviewHistory(page, append = false) {
       if (!append) $("reviewHistory").replaceChildren();
       for (const item of page.items) {
-        const row = document.createElement("pre");
-        row.textContent = JSON.stringify(item, null, 2);
+        const row = document.createElement("section"); row.className = "history-card";
+        const title = document.createElement("b"); title.textContent = `${formatLocalTime(item.changedAt)} · ${displayValue(item.actor?.name || item.actor?.id)}`;
+        row.append(title, facts([["이전 라벨",reviewLabel(item.before?.label)],["변경 라벨",reviewLabel(item.after?.label)],["변경 사유",item.reason],["변경 메모",item.after?.note]]), rawDetails("검수 기록 원문",item));
         $("reviewHistory").appendChild(row);
       }
       if (!page.total) $("reviewHistory").textContent = "검수 변경 이력이 없습니다.";
@@ -676,7 +774,7 @@ def render_page() -> str:
       const panel = $("eventNotes"); panel.replaceChildren();
       if (!noteRows.length) panel.textContent = "등록된 개별 메모가 없습니다.";
       for (const note of noteRows) {
-        const row = document.createElement("section");
+        const row = document.createElement("section"); row.className = "history-card";
         const text = document.createElement("p");
         text.textContent = `${response.latestByCategory[note.category]?.id === note.id ? "[최신] " : ""}${note.category} · ${note.author?.name || ""} · ${formatLocalTime(note.updatedAt)}\n${note.text}`;
         row.appendChild(text);
@@ -773,6 +871,7 @@ def render_page() -> str:
       setOptions($("managementKind"), kinds, row => row[0], row => row[1].label);
       $("managementPanel").hidden = !kinds.length && !can("audit-log:read");
       $("auditPanel").hidden = !can("audit-log:read");
+      setView(currentView === "management" && !hasManagementAccess() ? "overview" : currentView);
     }
     function invalidateManagement() {
       managementGeneration++; auditGeneration++;
@@ -912,7 +1011,15 @@ def render_page() -> str:
       const query = new URLSearchParams({page:auditPageNumber,size:PAGE_SIZE,action:$("auditAction").value,targetType:$("auditTarget").value,actorId:$("auditActor").value});
       const result = await api(`/api/audit-logs?${query}`);
       if (generation !== auditGeneration) return;
-      $("auditRows").textContent = result.items.length ? JSON.stringify(result.items, null, 2) : "감사 기록이 없습니다.";
+      const panel = $("auditRows"); panel.replaceChildren();
+      if (!result.items.length) panel.textContent = "감사 기록이 없습니다.";
+      else {
+        panel.appendChild(statusTable("변경 감사 기록", ["변경 시각","작성자","작업","대상","변경 사유"], result.items.map(item => [
+          formatLocalTime(item.changedAt), item.actor?.name || item.actor?.id, item.action,
+          `${displayValue(item.targetType)} / ${displayValue(item.targetId)}`, item.reason,
+        ])));
+        panel.appendChild(rawDetails("변경 전·후 원문",result.items));
+      }
       renderPager("audit", result.page, result.total);
     }
 
@@ -960,6 +1067,7 @@ def render_page() -> str:
       if (row) act(() => selectEvent(row.dataset.id));
     });
     $("loginBtn").addEventListener("click", () => login().then(rememberSelection).catch(error => alert(error.message)));
+    for (const [view,config] of Object.entries(WORKSPACE_VIEWS)) $(config.button).addEventListener("click", () => setView(view));
     $("siteSelect").addEventListener("change", async () => {
       if (!allowSelectionChange()) return;
       invalidateScope(true);

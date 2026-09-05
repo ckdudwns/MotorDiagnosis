@@ -1169,8 +1169,10 @@ def _persist_runtime_state() -> None:
         return
     started = time.monotonic()
     _enforce_runtime_retention()
+    proposed = _runtime_state_payload()
     dependency = next(
-        (item for item in SERVICE_DEPENDENCIES if item["id"] == "storage"), None
+        (item for item in proposed["serviceDependencies"] if item["id"] == "storage"),
+        None,
     )
     previous_status = str(dependency.get("status") or "ready") if dependency else ""
     checked_at = now_iso()
@@ -1183,7 +1185,7 @@ def _persist_runtime_state() -> None:
         dependency["detail"] = None
         if previous_status not in {"healthy", "ready"}:
             dependency["lastRecoveryAt"] = checked_at
-            SERVICE_HEALTH_EVENTS.append(
+            proposed["serviceHealthEvents"].append(
                 {
                     "dependencyId": "storage",
                     "status": "recovered",
@@ -1192,43 +1194,50 @@ def _persist_runtime_state() -> None:
                     "detail": "Runtime state checkpoint recovered.",
                 }
             )
-    try:
-        _RUNTIME_STATE_STORE.save(_runtime_state_payload(), checked_at)
-    except Exception as error:
-        if dependency is not None:
-            dependency["status"] = "degraded"
-            dependency["failureCount"] = int(dependency.get("failureCount", 0)) + 1
-            dependency["lastFailureAt"] = now_iso()
-            dependency["detail"] = "Runtime state checkpoint failed."
-            dependency["latencyMs"] = round(
-                (time.monotonic() - started) * 1000, 2
-            )
-            dependency["errorRatePct"] = round(
-                int(dependency["failureCount"])
-                / int(dependency["statusReportCount"])
-                * 100,
-                2,
-            )
-            SERVICE_HEALTH_EVENTS.append(
-                {
-                    "dependencyId": "storage",
-                    "status": "failure",
-                    "occurredAt": dependency["lastFailureAt"],
-                    "impactScope": dependency["impactScope"],
-                    "errorCode": type(error).__name__,
-                    "detail": dependency["detail"],
-                }
-            )
-            del SERVICE_HEALTH_EVENTS[:-100]
-        raise
     if dependency is not None:
-        dependency["latencyMs"] = round((time.monotonic() - started) * 1000, 2)
         dependency["errorRatePct"] = round(
             int(dependency.get("failureCount", 0))
             / int(dependency["statusReportCount"])
             * 100,
             2,
         )
+    del proposed["serviceHealthEvents"][:-100]
+    # Recovery belongs to this proposed checkpoint. Publish it only after the
+    # SQLite transaction commits; a failed attempt never reports recovery.
+    _RUNTIME_STATE_STORE.save(proposed, checked_at)
+    if dependency is not None:
+        dependency["latencyMs"] = round((time.monotonic() - started) * 1000, 2)
+        current = next(item for item in SERVICE_DEPENDENCIES if item["id"] == "storage")
+        current.update(dependency)
+    SERVICE_HEALTH_EVENTS[:] = proposed["serviceHealthEvents"]
+
+
+def _runtime_storage_failed(error: Exception) -> None:
+    """Record the failed attempt after the rejected transaction is restored."""
+    dependency = next(
+        (item for item in SERVICE_DEPENDENCIES if item["id"] == "storage"), None
+    )
+    if dependency is None:
+        return
+    dependency["status"] = "degraded"
+    dependency["statusReportCount"] = int(dependency.get("statusReportCount", 0)) + 1
+    dependency["failureCount"] = int(dependency.get("failureCount", 0)) + 1
+    dependency["lastFailureAt"] = now_iso()
+    dependency["detail"] = "Runtime state checkpoint failed."
+    dependency["errorRatePct"] = round(
+        dependency["failureCount"] / dependency["statusReportCount"] * 100, 2
+    )
+    SERVICE_HEALTH_EVENTS.append(
+        {
+            "dependencyId": "storage",
+            "status": "failure",
+            "occurredAt": dependency["lastFailureAt"],
+            "impactScope": dependency["impactScope"],
+            "errorCode": type(error).__name__,
+            "detail": dependency["detail"],
+        }
+    )
+    del SERVICE_HEALTH_EVENTS[:-100]
 
 
 def configure_runtime_state(database: str | None) -> None:
@@ -1239,6 +1248,7 @@ def configure_runtime_state(database: str | None) -> None:
 
     global _RUNTIME_STATE_STORE
     STORE_LOCK.set_commit_hook(None)
+    STORE_LOCK.set_transaction_hooks()
     if _RUNTIME_STATE_STORE is not None:
         _RUNTIME_STATE_STORE.close()
         _RUNTIME_STATE_STORE = None
@@ -1261,14 +1271,19 @@ def configure_runtime_state(database: str | None) -> None:
         if persisted is None:
             _persist_runtime_state()
     STORE_LOCK.set_commit_hook(_persist_runtime_state)
+    STORE_LOCK.set_transaction_hooks(
+        _runtime_state_payload, _restore_runtime_state, _runtime_storage_failed
+    )
 
 
 def close_runtime_state() -> None:
     global _RUNTIME_STATE_STORE
-    STORE_LOCK.set_commit_hook(None)
-    if _RUNTIME_STATE_STORE is not None:
-        _RUNTIME_STATE_STORE.close()
-        _RUNTIME_STATE_STORE = None
+    with STORE_LOCK:
+        STORE_LOCK.set_commit_hook(None)
+        STORE_LOCK.set_transaction_hooks()
+        if _RUNTIME_STATE_STORE is not None:
+            _RUNTIME_STATE_STORE.close()
+            _RUNTIME_STATE_STORE = None
 
 
 def reset_runtime_state() -> None:
@@ -3211,13 +3226,13 @@ def recover_device_from_telemetry(device: dict[str, Any], received_at: str) -> N
 
 
 def _lifecycle_config_for(rule: dict[str, Any]) -> EventLifecycleConfig:
-    interval_sec = max(1, int(PARAMETERS["TELEMETRY_INTERVAL_SEC"]))
-    required_points = max(1, math.ceil(int(rule["durationSec"]) / interval_sec))
     return EventLifecycleConfig(
         score_enter=float(rule["scoreThreshold"]),
         score_exit=max(0.0, float(rule["scoreThreshold"]) - float(rule["hysteresis"])),
-        min_consecutive_enter=required_points,
-        min_consecutive_exit=required_points,
+        min_consecutive_enter=1,
+        min_consecutive_exit=1,
+        min_duration_enter_sec=float(rule["durationSec"]),
+        min_duration_exit_sec=float(rule["durationSec"]),
         merge_gap_sec=int(rule["mergeWindowSec"]),
         idempotency_cache_size=max(1024, TELEMETRY_MAX_RECORDS_PER_ASSET * 2),
         rule_version=str(rule["version"]),
@@ -3362,115 +3377,13 @@ def ingest_telemetry(
     principal: dict[str, Any], payload: dict[str, Any]
 ) -> tuple[dict[str, Any], int]:
     started = time.monotonic()
-    with STORE_LOCK:
-        TELEMETRY_METRICS["requests"] = int(TELEMETRY_METRICS["requests"]) + 1
-        try:
-            record = normalize_telemetry_payload(payload)
-            principal_can_ingest(principal, record["deviceId"])
-            label_fields = principal_can_submit_telemetry_labels(principal, record)
-            device = validate_telemetry_mapping(record)
-            payload_hash = hashlib.sha256(
-                json.dumps(
-                    record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-            ).hexdigest()
-            idempotency_key = (record["deviceId"], int(record["sequence"]))
-            existing = TELEMETRY_IDEMPOTENCY.get(idempotency_key)
-            if existing:
-                if existing["payloadHash"] != payload_hash:
-                    raise ApiError(
-                        409,
-                        "SEQUENCE_CONFLICT",
-                        "The same deviceId and sequence already exist with a different payload.",
-                    )
-                TELEMETRY_METRICS["duplicates"] = (
-                    int(TELEMETRY_METRICS["duplicates"]) + 1
-                )
-                latency_ms = (time.monotonic() - started) * 1000
-                TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
-                update_ingest_dependency(True, latency_ms)
-                return (
-                    {
-                        "accepted": True,
-                        "duplicate": True,
-                        "deviceId": record["deviceId"],
-                        "sequence": record["sequence"],
-                        "receivedAt": existing["receivedAt"],
-                    },
-                    200,
-                )
-
-            received_at = format_rfc3339(datetime.now(timezone.utc))
-            label_provenance = None
-            if label_fields:
-                label_provenance = {
-                    "principalId": str(principal.get("id") or "unknown"),
-                    "principalType": str(principal.get("type") or "unknown"),
-                    "submittedAt": received_at,
-                    "fields": sorted(label_fields),
-                    "verifiedByServer": True,
-                }
-            stored_record = {
-                **record,
-                "receivedAt": received_at,
-                "labelProvenance": label_provenance,
-            }
-            scored = score_telemetry_point(stored_record)
-            stored_record.update(copy_payload(scored))
-            TELEMETRY_RECORDS.append(stored_record)
-            TELEMETRY_IDEMPOTENCY[idempotency_key] = {
-                "payloadHash": payload_hash,
-                "receivedAt": received_at,
-            }
-            asset_records = [
-                item
-                for item in TELEMETRY_RECORDS
-                if item["siteId"] == record["siteId"]
-                and item["assetId"] == record["assetId"]
-            ]
-            overflow = len(asset_records) - TELEMETRY_MAX_RECORDS_PER_ASSET
-            for expired_record in asset_records[: max(0, overflow)]:
-                TELEMETRY_RECORDS.remove(expired_record)
-                TELEMETRY_IDEMPOTENCY.pop(
-                    (expired_record["deviceId"], int(expired_record["sequence"])), None
-                )
-            recover_device_from_telemetry(device, received_at)
-            analysis_started = time.monotonic()
-            lifecycle_updates: list[dict[str, Any]] = []
-            try:
-                lifecycle_updates = process_accepted_telemetry(stored_record, scored)
-            except Exception as error:
-                record_runtime_dependency(
-                    "analysis",
-                    success=False,
-                    latency_ms=(time.monotonic() - analysis_started) * 1000,
-                    error_code=type(error).__name__,
-                    detail="Accepted telemetry was stored but analysis failed.",
-                )
-            else:
-                record_runtime_dependency(
-                    "analysis",
-                    success=True,
-                    latency_ms=(time.monotonic() - analysis_started) * 1000,
-                )
-            TELEMETRY_METRICS["accepted"] = int(TELEMETRY_METRICS["accepted"]) + 1
-            TELEMETRY_METRICS["lastReceivedAt"] = received_at
-            latency_ms = (time.monotonic() - started) * 1000
-            TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
-            update_ingest_dependency(True, latency_ms)
-            return (
-                    {
-                        "accepted": True,
-                        "duplicate": False,
-                        "deviceId": record["deviceId"],
-                        "sequence": record["sequence"],
-                        "receivedAt": received_at,
-                        "anomalyScore": scored.get("anomalyScore"),
-                        "lifecycleUpdates": lifecycle_updates,
-                    },
-                201,
-            )
-        except ApiError as error:
+    try:
+        return _accept_telemetry(principal, payload)
+    except ApiError as error:
+        # The failed ingest transaction has already unwound. Intentionally
+        # persist rejection diagnostics, then return the original API error.
+        with STORE_LOCK:
+            TELEMETRY_METRICS["requests"] = int(TELEMETRY_METRICS["requests"]) + 1
             TELEMETRY_METRICS["rejected"] = int(TELEMETRY_METRICS["rejected"]) + 1
             if error.code == "SEQUENCE_CONFLICT":
                 TELEMETRY_METRICS["conflicts"] = int(TELEMETRY_METRICS["conflicts"]) + 1
@@ -3478,7 +3391,121 @@ def ingest_telemetry(
             latency_ms = (time.monotonic() - started) * 1000
             TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
             update_ingest_dependency(False, latency_ms, error)
-            raise
+        raise
+
+
+def _accept_telemetry(
+    principal: dict[str, Any], payload: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    started = time.monotonic()
+    with STORE_LOCK:
+        record = normalize_telemetry_payload(payload)
+        principal_can_ingest(principal, record["deviceId"])
+        label_fields = principal_can_submit_telemetry_labels(principal, record)
+        device = validate_telemetry_mapping(record)
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        idempotency_key = (record["deviceId"], int(record["sequence"]))
+        existing = TELEMETRY_IDEMPOTENCY.get(idempotency_key)
+        if existing:
+            if existing["payloadHash"] != payload_hash:
+                raise ApiError(
+                    409,
+                    "SEQUENCE_CONFLICT",
+                    "The same deviceId and sequence already exist with a different payload.",
+                )
+            TELEMETRY_METRICS["duplicates"] = (
+                int(TELEMETRY_METRICS["duplicates"]) + 1
+            )
+            TELEMETRY_METRICS["requests"] = int(TELEMETRY_METRICS["requests"]) + 1
+            latency_ms = (time.monotonic() - started) * 1000
+            TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
+            update_ingest_dependency(True, latency_ms)
+            return (
+                {
+                    "accepted": True,
+                    "duplicate": True,
+                    "deviceId": record["deviceId"],
+                    "sequence": record["sequence"],
+                    "receivedAt": existing["receivedAt"],
+                },
+                200,
+            )
+
+        received_at = format_rfc3339(datetime.now(timezone.utc))
+        label_provenance = None
+        if label_fields:
+            label_provenance = {
+                "principalId": str(principal.get("id") or "unknown"),
+                "principalType": str(principal.get("type") or "unknown"),
+                "submittedAt": received_at,
+                "fields": sorted(label_fields),
+                "verifiedByServer": True,
+            }
+        stored_record = {
+            **record,
+            "receivedAt": received_at,
+            "labelProvenance": label_provenance,
+        }
+        scored = score_telemetry_point(stored_record)
+        stored_record.update(copy_payload(scored))
+        TELEMETRY_RECORDS.append(stored_record)
+        TELEMETRY_IDEMPOTENCY[idempotency_key] = {
+            "payloadHash": payload_hash,
+            "receivedAt": received_at,
+        }
+        asset_records = [
+            item
+            for item in TELEMETRY_RECORDS
+            if item["siteId"] == record["siteId"]
+            and item["assetId"] == record["assetId"]
+        ]
+        overflow = len(asset_records) - TELEMETRY_MAX_RECORDS_PER_ASSET
+        for expired_record in asset_records[: max(0, overflow)]:
+            TELEMETRY_RECORDS.remove(expired_record)
+            TELEMETRY_IDEMPOTENCY.pop(
+                (expired_record["deviceId"], int(expired_record["sequence"])), None
+            )
+        recover_device_from_telemetry(device, received_at)
+        analysis_started = time.monotonic()
+        lifecycle_updates: list[dict[str, Any]] = []
+        try:
+            lifecycle_updates = process_accepted_telemetry(stored_record, scored)
+        except Exception as error:
+            record_runtime_dependency(
+                "analysis",
+                success=False,
+                latency_ms=(time.monotonic() - analysis_started) * 1000,
+                error_code=type(error).__name__,
+                detail="Accepted telemetry was stored but analysis failed.",
+            )
+        else:
+            record_runtime_dependency(
+                "analysis",
+                success=True,
+                latency_ms=(time.monotonic() - analysis_started) * 1000,
+            )
+        TELEMETRY_METRICS["accepted"] = int(TELEMETRY_METRICS["accepted"]) + 1
+        TELEMETRY_METRICS["requests"] = int(TELEMETRY_METRICS["requests"]) + 1
+        TELEMETRY_METRICS["lastReceivedAt"] = received_at
+        latency_ms = (time.monotonic() - started) * 1000
+        TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
+        update_ingest_dependency(True, latency_ms)
+        return (
+            {
+                "accepted": True,
+                "duplicate": False,
+                "deviceId": record["deviceId"],
+                "sequence": record["sequence"],
+                "receivedAt": received_at,
+                "anomalyScore": scored.get("anomalyScore"),
+                "lifecycleUpdates": lifecycle_updates,
+            },
+            201,
+        )
 
 
 def _telemetry_sort_key(record: dict[str, Any]) -> tuple[str, str, int, str]:
@@ -3672,7 +3699,6 @@ def device_health_for(device_id: str) -> dict[str, Any]:
             else datetime.now(timezone.utc)
         )
         elapsed = _device_elapsed_seconds(device)
-        device["lastSeenSecAgo"] = max(0, elapsed)
         offline_threshold = int(PARAMETERS["DEVICE_OFFLINE_SEC"])
         if elapsed > offline_threshold and device.get("health") != "offline":
             previous_health = str(device.get("health") or "unknown")
@@ -3726,7 +3752,7 @@ def device_health_for(device_id: str) -> dict[str, Any]:
             "assetId": device["assetId"],
             "health": device["health"],
             "lastReceivedAt": device.get("lastReceivedAt"),
-            "lastSeenSecAgo": device["lastSeenSecAgo"],
+            "lastSeenSecAgo": max(0, elapsed),
             "offlineThresholdSec": offline_threshold,
             "offlineSince": device.get("offlineSince"),
             "lastRecoveredAt": device.get("lastRecoveredAt"),
@@ -3835,6 +3861,30 @@ def _sensor_fault_payload(value: Any, reported_at: str) -> dict[str, Any]:
         "detail": detail,
         "occurredAt": occurred_at,
     }
+
+
+def _apply_sensor_health_boundary(device: dict[str, Any], fault: dict[str, Any]) -> None:
+    rule = anomaly_rule_for(device["assetId"])
+    lifecycle = _lifecycle_for(device["assetId"], rule)
+    context = {
+        "siteId": device["siteId"],
+        "assetId": device["assetId"],
+        "deviceId": device["id"],
+        "timestamp": fault["occurredAt"],
+    }
+
+    def persist(checkpoint: dict[str, Any], updates: list[dict[str, Any]]) -> None:
+        LIFECYCLE_CHECKPOINTS[device["assetId"]] = copy_payload(checkpoint)
+        for update in updates:
+            if "event" in update:
+                _lifecycle_event_record(update, context, rule)
+
+    lifecycle.process_sensor_fault(
+        device["assetId"],
+        fault["occurredAt"],
+        reason=f"device_sensor_fault:{fault['code']}",
+        persist_transaction=persist,
+    )
 
 
 def update_device_health(
@@ -3955,6 +4005,13 @@ def update_device_health(
                     "reviewed": False,
                     "status": "open",
                     "thresholdVersion": "sensor-health-v1",
+                    "ruleSnapshot": {
+                        "version": "sensor-health-v1",
+                        "type": "device_sensor_health",
+                        "faultCode": fault["code"],
+                        "source": "device-self-report",
+                        "assetEventExcluded": True,
+                    },
                     "modelVersion": "device-self-report",
                     "classification": "sensor_fault",
                     "assetEventExcluded": True,
@@ -3974,6 +4031,9 @@ def update_device_health(
                 ended = parse_rfc3339("endAt", existing["endAt"])
                 existing["durationSec"] = max(0, int((ended - started).total_seconds()))
                 existing["duration"] = f"{existing['durationSec']}s"
+
+            if fault["status"] == "active" or existing is not None:
+                _apply_sensor_health_boundary(device, fault)
 
         active_faults = [
             {
@@ -3998,6 +4058,18 @@ def dashboard_sites_summary(
     region: str = "",
     status: str = "",
     live_asset_statuses: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    # Device offline transitions belong to one summary transaction, regardless
+    # of how many devices the caller can see.
+    with STORE_LOCK:
+        return _dashboard_sites_summary(user, region, status, live_asset_statuses)
+
+
+def _dashboard_sites_summary(
+    user: dict[str, Any],
+    region: str,
+    status: str,
+    live_asset_statuses: dict[str, str] | None,
 ) -> list[dict[str, Any]]:
     require_permission(user, "dashboard:read")
     rows = []
@@ -4710,6 +4782,7 @@ def create_event_note(
             "updatedAt": timestamp,
             "deletedAt": None,
             "version": 1,
+            "changeSequence": len(EVENT_NOTE_HISTORY) + 1,
         }
         EVENT_NOTES.append(note)
         _event_note_history_entry(user, note, "created", None, note)
@@ -4747,13 +4820,20 @@ def event_notes_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
     with STORE_LOCK:
         event = get_event(event_id)
         require_site_access(user, event["siteId"])
+        history_order = {
+            item["noteId"]: index
+            for index, item in enumerate(EVENT_NOTE_HISTORY, 1)
+        }
         rows = sorted(
             (
                 copy_payload(item)
                 for item in EVENT_NOTES
                 if item["eventId"] == event["id"] and item.get("deletedAt") is None
             ),
-            key=lambda item: (item["updatedAt"], item["id"]),
+            key=lambda item: (
+                int(item.get("changeSequence", history_order.get(item["id"], 0))),
+                item["updatedAt"], item["id"],
+            ),
             reverse=True,
         )
         latest_by_category = {
@@ -4782,7 +4862,7 @@ def event_note_history_for(
             for item in EVENT_NOTE_HISTORY
             if item["noteId"] == note["id"]
         ]
-        rows.sort(key=lambda item: (item["changedAt"], item["id"]), reverse=True)
+        rows.sort(key=lambda item: int(item["version"]), reverse=True)
         return {"noteId": note["id"], "items": rows, "total": len(rows)}
 
 
@@ -4814,14 +4894,17 @@ def update_event_note(
         if note.get("deletedAt") is not None:
             raise ApiError(409, "EVENT_NOTE_DELETED", "Deleted notes are immutable.")
         before = copy_payload(note)
+        candidate = copy_payload(note)
         if "category" in payload:
-            note["category"] = _event_note_category(payload["category"])
+            candidate["category"] = _event_note_category(payload["category"])
         if "text" in payload:
-            note["text"] = _event_note_text(payload)
+            candidate["text"] = _event_note_text(payload)
         if "attachmentRefs" in payload:
-            note["attachmentRefs"] = _event_note_attachments(payload)
+            candidate["attachmentRefs"] = _event_note_attachments(payload)
+        note.update(candidate)
         note["updatedAt"] = now_iso()
         note["version"] = int(note["version"]) + 1
+        note["changeSequence"] = len(EVENT_NOTE_HISTORY) + 1
         note["author"] = {
             "id": user["id"],
             "name": user["name"],
@@ -4854,6 +4937,7 @@ def delete_event_note(
         note["deletedAt"] = now_iso()
         note["updatedAt"] = note["deletedAt"]
         note["version"] = int(note["version"]) + 1
+        note["changeSequence"] = len(EVENT_NOTE_HISTORY) + 1
         _event_note_history_entry(user, note, "deleted", before, None)
         append_audit_log(
             user,
@@ -4909,7 +4993,9 @@ def required_text(payload: dict[str, Any], key: str) -> str:
 
 def get_event(event_id: str) -> dict[str, Any]:
     normalized = event_id.strip().upper()
-    event = next((item for item in EVENTS if item["id"] == normalized), None)
+    # AI2 IDs include UUIDs, whose hexadecimal letters are lower-case. Match
+    # without changing the durable ID referenced by checkpoints and evidence.
+    event = next((item for item in EVENTS if item["id"].upper() == normalized), None)
     if not event:
         raise ApiError(404, "EVENT_NOT_FOUND", "Event was not found.")
     return event
@@ -5118,11 +5204,20 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
         )
         evidence_snapshot = copy_payload(EVENT_EVIDENCE_SNAPSHOTS[event_snapshot["id"]])
     threshold_version = str(event_snapshot.get("thresholdVersion") or "").strip()
-    applied_rule = (
-        anomaly_rule_version_for(event_snapshot["assetId"], threshold_version)
-        if threshold_version
-        else None
-    )
+    if event_snapshot.get("eventType") == "sensor_fault":
+        applied_rule = copy_payload(event_snapshot.get("ruleSnapshot") or {
+            "version": "sensor-health-v1",
+            "type": "device_sensor_health",
+            "faultCode": event_snapshot.get("faultCode"),
+            "source": "device-self-report",
+            "assetEventExcluded": True,
+        })
+    else:
+        applied_rule = (
+            anomaly_rule_version_for(event_snapshot["assetId"], threshold_version)
+            if threshold_version
+            else None
+        )
     return {
         "event": event_snapshot,
         "context": {

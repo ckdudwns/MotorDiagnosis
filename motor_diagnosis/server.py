@@ -1430,6 +1430,32 @@ def optional_boolean_query(query: dict[str, list[str]], key: str) -> bool | None
 
 
 class MotorDiagnosisServer(ThreadingHTTPServer):
+    # ThreadingHTTPServer defaults to daemon request threads, which are not
+    # joined by server_close. A 2xx write must commit before its DB is closed.
+    daemon_threads = False
+    block_on_close = True
+
+    def __init__(self, *args, **kwargs):
+        self._admission_lock = threading.Lock()
+        self._closing = False
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        with self._admission_lock:
+            if self._closing:
+                self.shutdown_request(request)
+                return
+            # Include thread registration in the admission fence so close()
+            # cannot miss an accepted request that has not started running yet.
+            super().process_request(request, client_address)
+
+    def get_request(self):
+        request, address = super().get_request()
+        # A client that never finishes its headers/body cannot hold shutdown
+        # indefinitely now that accepted request threads are drained.
+        request.settimeout(30.0)
+        return request, address
+
     def start_alert_worker(self):
         self._alert_stop = threading.Event()
         self._alert_worker = threading.Thread(
@@ -1452,6 +1478,8 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
                 )
 
     def server_close(self):
+        with self._admission_lock:
+            self._closing = True
         if hasattr(self, "_alert_stop"):
             self._alert_stop.set()
             if self._alert_worker.ident is not None:

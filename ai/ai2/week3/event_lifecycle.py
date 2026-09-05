@@ -54,6 +54,8 @@ class EventLifecycleConfig:
     merge_gap_sec: int = 30
     idempotency_cache_size: int = 1024
     rule_version: str = "ai2-week3-v1"
+    min_duration_enter_sec: float = 0.0
+    min_duration_exit_sec: float = 0.0
 
     def __post_init__(self) -> None:
         for name in ("score_enter", "score_exit"):
@@ -89,6 +91,15 @@ class EventLifecycleConfig:
             )
         if not self.rule_version.strip():
             raise ValueError("rule_version must not be empty.")
+        for name in ("min_duration_enter_sec", "min_duration_exit_sec"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be finite non-negative seconds.")
 
 
 @dataclass
@@ -105,6 +116,7 @@ class _AssetState:
     last_processed_at: datetime | None = None
     last_point_identity: tuple[object, ...] | None = None
     last_processing_key: tuple[datetime, str, int, datetime] | None = None
+    sensor_fault_boundary_at: datetime | None = None
 
 
 def _finite_score(point: dict[str, Any]) -> float | None:
@@ -520,7 +532,8 @@ class AnomalyEventLifecycle:
             "idempotency_cache_size",
             "rule_version",
         }
-        if set(snapshot_config) != config_keys:
+        optional_keys = {"min_duration_enter_sec", "min_duration_exit_sec"}
+        if not config_keys <= set(snapshot_config) <= config_keys | optional_keys:
             raise ValueError(
                 "snapshot config fields must exactly match schema version 2."
             )
@@ -574,6 +587,8 @@ class AnomalyEventLifecycle:
                 "merge_gap_sec": self.config.merge_gap_sec,
                 "idempotency_cache_size": self.config.idempotency_cache_size,
                 "rule_version": self.config.rule_version,
+                "min_duration_enter_sec": self.config.min_duration_enter_sec,
+                "min_duration_exit_sec": self.config.min_duration_exit_sec,
             },
             "processedTelemetry": _history_to_snapshot(processed_telemetry),
             "sequenceWatermarks": _watermarks_to_snapshot(sequence_watermarks),
@@ -600,6 +615,10 @@ class AnomalyEventLifecycle:
                     ),
                     "lastProcessingKey": _processing_key_to_snapshot(
                         state.last_processing_key
+                    ),
+                    "sensorFaultBoundaryAt": (
+                        state.sensor_fault_boundary_at.isoformat()
+                        if state.sensor_fault_boundary_at is not None else None
                     ),
                 }
                 for asset_id, state in states.items()
@@ -685,7 +704,9 @@ class AnomalyEventLifecycle:
             _parse_timestamp(last_processed_at) != last_processing_key[0]
         ):
             raise ValueError("snapshot lastProcessedAt and order key do not match.")
+        boundary = stored.get("sensorFaultBoundaryAt")
         return _AssetState(
+            sensor_fault_boundary_at=_parse_timestamp(boundary) if boundary else None,
             candidate_count=candidate_count,
             candidate_start_at=candidate_start_at,
             candidate_start_model_version=candidate_start_model,
@@ -757,6 +778,52 @@ class AnomalyEventLifecycle:
                     raise ValueError(f"point and telemetry_payload {key} must match.")
             elif point_value != payload_value:
                 raise ValueError("point and telemetry_payload sequence must match.")
+
+    def process_sensor_fault(
+        self,
+        asset_id: str,
+        timestamp: str,
+        *,
+        reason: str = "sensor_fault_detected",
+        persist_transaction: PersistTransaction | None = None,
+    ) -> list[dict[str, Any]]:
+        """Apply a health boundary without inventing a telemetry sample/MID."""
+        if self._persistence_owner_thread_id == threading.get_ident():
+            raise RuntimeError("process_sensor_fault cannot run from persist_transaction.")
+        if not isinstance(asset_id, str) or not asset_id.strip():
+            raise ValueError("assetId must be a non-empty string.")
+        asset_id = asset_id.strip().upper()
+        boundary = _parse_timestamp(timestamp)
+        with self._lock:
+            state = copy.deepcopy(self._states.get(asset_id, _AssetState()))
+            # Delayed health still closes the current event without moving the
+            # boundary behind a measurement already processed for this asset.
+            boundary = max(
+                value for value in (
+                    boundary, state.last_processed_at, state.sensor_fault_boundary_at
+                ) if value is not None
+            )
+            state.sensor_fault_boundary_at = boundary
+            updates = self._suppress_for_sensor_fault(
+                state, asset_id, boundary.isoformat().replace("+00:00", "Z"), reason
+            )
+            candidate_states = copy.deepcopy(self._states)
+            candidate_states[asset_id] = state
+            next_revision = self._revision + 1
+            checkpoint = self._snapshot_for_states(
+                candidate_states, self._processed_telemetry,
+                self._sequence_watermarks, next_revision,
+            )
+            checkpoint["expectedRevision"] = self._revision
+            if persist_transaction is not None:
+                self._persistence_owner_thread_id = threading.get_ident()
+                try:
+                    persist_transaction(checkpoint, copy.deepcopy(updates))
+                finally:
+                    self._persistence_owner_thread_id = None
+            self._states = candidate_states
+            self._revision = next_revision
+            return updates
 
     def process_point(
         self,
@@ -850,6 +917,11 @@ class AnomalyEventLifecycle:
             ):
                 return []
             if (
+                state.sensor_fault_boundary_at is not None
+                and parsed_timestamp <= state.sensor_fault_boundary_at
+            ):
+                raise ValueError("point must be later than the sensor health boundary.")
+            if (
                 state.last_processing_key is not None
                 and processing_key != state.last_processing_key
                 and not _is_processing_key_ordered(
@@ -929,7 +1001,13 @@ class AnomalyEventLifecycle:
         if state.candidate_count == 1 or score > state.candidate_max_score:
             state.candidate_max_score = score
             state.candidate_max_score_model_version = model_version
-        if state.candidate_count < self.config.min_consecutive_enter:
+        elapsed = (
+            _parse_timestamp(timestamp) - _parse_timestamp(state.candidate_start_at)
+        ).total_seconds()
+        if (
+            state.candidate_count < self.config.min_consecutive_enter
+            or elapsed < self.config.min_duration_enter_sec
+        ):
             return []
 
         start_at = state.candidate_start_at
@@ -1029,7 +1107,13 @@ class AnomalyEventLifecycle:
         state.exit_count += 1
         if state.exit_start_at is None:
             state.exit_start_at = timestamp
-        if state.exit_count < self.config.min_consecutive_exit:
+        elapsed = (
+            _parse_timestamp(timestamp) - _parse_timestamp(state.exit_start_at)
+        ).total_seconds()
+        if (
+            state.exit_count < self.config.min_consecutive_exit
+            or elapsed < self.config.min_duration_exit_sec
+        ):
             return [{"kind": "asset_event_updated", "event": _event_view(event)}]
 
         event["endAt"] = timestamp

@@ -34,3 +34,26 @@ Internal dataset freezing now requires a complete active install point for each
 selected asset. Missing metadata returns `DATASET_INSTALLATION_INCOMPLETE` with a
 structured `error.details` payload. Legacy internal datasets without this marker
 are also blocked from baseline/model registration.
+
+## Failure and timing contracts
+
+- A failed state commit restores application memory and lifecycle checkpoints
+  before returning an error. Rejected telemetry diagnostics are persisted in a
+  separate successful transaction; they do not admit the rejected measurement.
+- Read-only state access does not save a checkpoint. A site summary batches any
+  newly detected offline transitions into at most one checkpoint.
+- Storage recovery history is published only when its checkpoint has committed.
+- Shutdown stops accepting new requests and drains accepted requests before
+  closing the state DB. Client socket inactivity is limited to 30 seconds.
+- `durationSec` measures elapsed telemetry timestamps for both entry and exit.
+  Faster samples do not shorten it; buffered samples use measurement time.
+  The shared AI2 lifecycle keeps count-based defaults for its other callers and
+  accepts older checkpoints without the optional elapsed-duration settings.
+- Sensor health reports close open asset events and reset pending streaks even
+  without another telemetry sample. Fault/recovery boundaries are durable;
+  delayed measurements at or before the boundary are stored but not reanalyzed.
+- Sensor event details expose the sensor health rule snapshot. Categorized notes
+  validate PATCH input before mutation and use a durable change sequence for
+  latest ordering, including writes in the same second.
+- XLSX strings use OOXML escapes for XML-forbidden characters and protect literal
+  escape-shaped text. The export snapshot and CSV values remain unchanged.

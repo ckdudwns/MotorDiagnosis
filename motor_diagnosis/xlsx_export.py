@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import re
 from typing import Any
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -53,6 +54,25 @@ def _column_name(index: int) -> str:
     return result
 
 
+def _ooxml_text(value: str) -> str:
+    # ST_Xstring encodes XML-forbidden UTF-16 units as _xHHHH_. Protect
+    # literal escape-shaped strings first so a note containing "_x0001_"
+    # is not decoded as a control character by spreadsheet readers.
+    value = re.sub(r"_x[0-9a-fA-F]{4}_", lambda match: "_x005F_" + match[0][1:], value)
+    encoded = []
+    for char in value:
+        code = ord(char)
+        if (
+            code < 0x20 and char not in "\t\n"
+            or 0xD800 <= code <= 0xDFFF
+            or code in {0xFFFE, 0xFFFF}
+        ):
+            encoded.append(f"_x{code:04X}_")
+        else:
+            encoded.append(char)
+    return escape("".join(encoded), {'"': "&quot;"})
+
+
 def _cell(reference: str, value: Any) -> str:
     if value is None:
         return f'<c r="{reference}"/>'
@@ -70,7 +90,7 @@ def _cell(reference: str, value: Any) -> str:
             sort_keys=True,
             separators=(",", ":"),
         )
-    text = escape(str(value), {'"': "&quot;"})
+    text = _ooxml_text(str(value))
     return (
         f'<c r="{reference}" t="inlineStr"><is>'
         f'<t xml:space="preserve">{text}</t></is></c>'

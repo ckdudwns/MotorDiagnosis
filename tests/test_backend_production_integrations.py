@@ -68,7 +68,7 @@ class BackendProductionIntegrationTest(unittest.TestCase):
     def test_accepted_telemetry_drives_score_lifecycle_and_evidence(self):
         started = datetime.now(timezone.utc) - timedelta(seconds=12)
         result = None
-        for offset in range(10):
+        for offset in range(11):
             result, status = data.ingest_telemetry(
                 self.ingest,
                 telemetry_payload(
@@ -158,16 +158,15 @@ class BackendProductionIntegrationTest(unittest.TestCase):
                     datetime.now(timezone.utc) - timedelta(days=2)
                 ),
             )
-            data.TELEMETRY_RECORDS.append(expired)
-            data.TELEMETRY_IDEMPOTENCY[("DEV-01-GEN-01", 999)] = {
-                "payloadHash": "expired",
-                "receivedAt": expired["timestamp"],
-            }
             with data.STORE_LOCK:
-                pass
+                data.TELEMETRY_RECORDS.append(expired)
+                data.TELEMETRY_IDEMPOTENCY[("DEV-01-GEN-01", 999)] = {
+                    "payloadHash": "expired",
+                    "receivedAt": expired["timestamp"],
+                }
             self.assertNotIn(("DEV-01-GEN-01", 999), data.TELEMETRY_IDEMPOTENCY)
             started = datetime.now(timezone.utc) - timedelta(seconds=12)
-            for offset in range(10):
+            for offset in range(11):
                 data.ingest_telemetry(
                     self.ingest,
                     telemetry_payload(
@@ -186,7 +185,7 @@ class BackendProductionIntegrationTest(unittest.TestCase):
             self.assertFalse(expected_event_ids.intersection(item["id"] for item in data.EVENTS))
 
             data.configure_runtime_state(database)
-            self.assertEqual(len(data.TELEMETRY_RECORDS), 10)
+            self.assertEqual(len(data.TELEMETRY_RECORDS), 11)
             self.assertIn(("DEV-01-GEN-01", 10), data.TELEMETRY_IDEMPOTENCY)
             self.assertTrue(expected_event_ids.issubset(item["id"] for item in data.EVENTS))
             self.assertIn("SITE-01-GEN-01", data.LIFECYCLE_CHECKPOINTS)
@@ -296,6 +295,15 @@ class BackendProductionIntegrationTest(unittest.TestCase):
             self.ingest, telemetry_payload(1, timestamp, vibration=1.0)
         )
         self.assertEqual(status, 201)
+        self.assertEqual(result["lifecycleUpdates"], [])
+        result, status = data.ingest_telemetry(
+            self.ingest,
+            telemetry_payload(
+                2,
+                data.format_rfc3339(data.parse_rfc3339("timestamp", timestamp) + timedelta(seconds=1)),
+                vibration=1.0,
+            ),
+        )
         self.assertEqual(result["lifecycleUpdates"][0]["kind"], "asset_event_started")
 
 

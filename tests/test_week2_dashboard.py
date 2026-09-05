@@ -71,4 +71,4 @@ class Week2DashboardTest(unittest.TestCase):
             page,
         )
         self.assertIn("if (!await renderAssets(assetRequestGeneration)) return;", page)
-        self.assertIn('$("refreshBtn").addEventListener("click", render);', page)
+        self.assertIn('$("refreshBtn").addEventListener("click", () => act(async () => {', page)

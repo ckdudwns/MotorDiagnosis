@@ -92,6 +92,10 @@ def render_page() -> str:
           <h2>Web Notifications</h2>
           <div id="notifications" role="status" aria-live="polite">No notifications.</div>
         </article>
+        <article class="panel">
+          <h2>AI Baseline Result</h2>
+          <div id="modelResult" role="status" aria-live="polite">Loading model metadata.</div>
+        </article>
         <article class="panel detail">
           <h2>Event Review</h2>
           <div id="eventDetail">Select an event.</div>
@@ -110,6 +114,7 @@ def render_page() -> str:
   </main>
   <script>
     let token = "", sites = [], events = [], siteSummaries = [], selectedEventId = null, latestPoints = [], latestUnits = {}, renderGeneration = 0, assetGeneration = 0;
+    const CHART_PAD = 34;
     const $ = (id) => document.getElementById(id);
 
     async function api(path, options = {}) {
@@ -163,16 +168,18 @@ def render_page() -> str:
       const assetId = $("assetSelect").value;
       const periodHours = Number($("periodSelect").value);
       const from = new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString();
-      const [telem, summaries, eventPage, alertPage] = await Promise.all([
+      const [telem, summaries, eventPage, alertPage, modelPage] = await Promise.all([
         api(`/api/telemetry?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
         api("/api/dashboard/sites-summary"),
         api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}`),
         api(`/api/alerts?siteId=${site.id}&channel=web&status=sent&size=10`),
+        api(`/api/model-versions?siteId=${site.id}&assetId=${assetId}&status=draft&size=1`),
       ]);
       if (requestGeneration !== renderGeneration) return;
       siteSummaries = summaries;
       events = eventPage.items;
       renderNotifications(alertPage.items);
+      renderModelResult(modelPage.items);
       if (!events.some(event => event.id === selectedEventId)) clearEventSelection();
       $("siteCount").textContent = siteSummaries.length;
       $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
@@ -181,7 +188,7 @@ def render_page() -> str:
       renderSiteRows();
       renderEvents();
       $("chartTitle").textContent = `${site.name} / ${assetId}`;
-      draw(telem.points, telem.units);
+      draw(telem.points, telem.units, events);
     }
 
     function renderNotifications(rows) {
@@ -193,6 +200,38 @@ def render_page() -> str:
         item.textContent = `${row.isTest ? "[TEST] " : ""}${row.event.isSynthetic ? "[SYNTHETIC] " : ""}${row.event.title} · ${new Date(row.deliveredAt).toLocaleString()}`;
         panel.appendChild(item);
       });
+    }
+
+    function renderModelResult(rows) {
+      const panel = $("modelResult");
+      panel.replaceChildren();
+      const model = rows[0];
+      if (!model) {
+        panel.textContent = "No model metadata is registered for this asset. AI-1 reconstruction error is not mapped to anomalyScore in this MVP.";
+        return;
+      }
+      const title = document.createElement("b");
+      title.textContent = `${model.version} · ${model.deploymentStatus || "not_deployed"}`;
+      panel.appendChild(title);
+      appendModelField(panel, "Evaluation scope", "Reported metrics are not deployment or field-generalization evidence.");
+      appendModelField(panel, "Artifact", model.artifactVerified ? "verified" : "reference only; not verified");
+      appendModelField(panel, "Baseline version", model.baselineVersion);
+      appendModelField(panel, "Baseline features", model.baselineSnapshot?.features);
+      appendModelField(panel, "Metrics", model.metrics || {});
+      appendModelField(panel, "Known error cases", model.errorCases || []);
+      appendModelField(panel, "Domain gap", model.domainGap);
+      appendModelField(panel, "Field calibration", model.fieldCalibrationPlan);
+      appendModelField(panel, "Limitations", model.limitations);
+    }
+
+    function appendModelField(panel, label, value) {
+      if (value === null || value === undefined || value === "" || (Array.isArray(value) && !value.length)) return;
+      const row = document.createElement("p");
+      const name = document.createElement("b");
+      name.textContent = `${label}: `;
+      const text = Array.isArray(value) ? value.join("; ") : typeof value === "object" ? JSON.stringify(value) : String(value);
+      row.append(name, text);
+      panel.appendChild(row);
     }
 
     function setOptions(select, rows, valueOf, labelOf) {
@@ -257,10 +296,41 @@ def render_page() -> str:
       return Number.isFinite(number) ? number : null;
     }
 
-    function draw(points, units) {
+    function chartTimeRange(points) {
+      const firstAt = new Date(points[0]?.timestamp).getTime();
+      const lastAt = new Date(points[points.length - 1]?.timestamp).getTime();
+      return Number.isFinite(firstAt) && Number.isFinite(lastAt) && lastAt >= firstAt ? {firstAt, lastAt} : null;
+    }
+
+    function chartXForPoint(point, index, pointCount, width, pad, timeRange) {
+      const timestamp = new Date(point.timestamp).getTime();
+      if (timeRange && Number.isFinite(timestamp)) {
+        const ratio = timeRange.firstAt === timeRange.lastAt ? 1 : (timestamp - timeRange.firstAt) / (timeRange.lastAt - timeRange.firstAt);
+        return pad + (width - pad * 2) * ratio;
+      }
+      return pad + (width - pad * 2) * index / Math.max(1, pointCount - 1);
+    }
+
+    function chartPointIndexAtRatio(points, ratio) {
+      const timeRange = chartTimeRange(points);
+      if (!timeRange) return Math.round(ratio * (points.length - 1));
+      const target = timeRange.firstAt + (timeRange.lastAt - timeRange.firstAt) * ratio;
+      return points.reduce((best, point, index) => {
+        const currentAt = new Date(point.timestamp).getTime();
+        const bestAt = new Date(points[best].timestamp).getTime();
+        return Math.abs(currentAt - target) < Math.abs(bestAt - target) ? index : best;
+      }, 0);
+    }
+
+    function chartPlotRatio(clientX, bounds, canvasWidth) {
+      const canvasX = (clientX - bounds.left) * canvasWidth / bounds.width;
+      return Math.min(1, Math.max(0, (canvasX - CHART_PAD) / (canvasWidth - CHART_PAD * 2)));
+    }
+
+    function draw(points, units, chartEvents = []) {
       latestPoints = points;
       latestUnits = units;
-      const c = $("chart"), ctx = c.getContext("2d"), w = c.width, h = c.height, pad = 34;
+      const c = $("chart"), ctx = c.getContext("2d"), w = c.width, h = c.height, pad = CHART_PAD;
       ctx.clearRect(0,0,w,h); ctx.fillStyle = "#fff"; ctx.fillRect(0,0,w,h);
       if (!points.length) {
         ctx.fillStyle = "#66716d"; ctx.font = "16px Segoe UI";
@@ -268,6 +338,7 @@ def render_page() -> str:
         $("chartHint").textContent = "No telemetry is available for the selected site, asset, and period.";
         return;
       }
+      const timeRange = chartTimeRange(points);
       ctx.strokeStyle = "#d8ded9"; ctx.lineWidth = 1;
       for (let i=0;i<=4;i++){ const y=pad+(h-pad*2)/4*i; ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(w-pad,y); ctx.stroke(); }
       const series = [
@@ -288,7 +359,7 @@ def render_page() -> str:
         points.forEach((p,i)=>{
           const value = map(p);
           if (value === null) { started = false; return; }
-          const x = pad + (w-pad*2)*i/Math.max(1, points.length-1);
+          const x = chartXForPoint(p, i, points.length, w, pad, timeRange);
           const y = pad + (h-pad*2)*(1-(value-min)/range);
           if (started) ctx.lineTo(x,y); else { ctx.moveTo(x,y); started = true; }
         });
@@ -296,13 +367,27 @@ def render_page() -> str:
         if (values.length === 1) {
           const pointIndex = points.findIndex(point => map(point) !== null);
           const value = map(points[pointIndex]);
-          const x = pad + (w-pad*2)*pointIndex/Math.max(1, points.length-1);
+          const x = chartXForPoint(points[pointIndex], pointIndex, points.length, w, pad, timeRange);
           const y = pad + (h-pad*2)*(1-(value-min)/range);
           ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
         }
         ctx.fillStyle = color; ctx.font = "12px Segoe UI"; ctx.fillText(name, legendX, 18); legendX += ctx.measureText(name).width + 16;
       }
+      drawEventMarkers(ctx, points, chartEvents, w, h, pad, timeRange);
       $("chartHint").textContent = "Signals are independently scaled for comparison. Hover for raw values and score evidence.";
+    }
+
+    function drawEventMarkers(ctx, points, chartEvents, width, height, pad, timeRange) {
+      if (!timeRange) return;
+      for (const event of chartEvents) {
+        const occurredAt = new Date(event.occurredAt).getTime();
+        if (!Number.isFinite(occurredAt) || occurredAt < timeRange.firstAt || occurredAt > timeRange.lastAt) continue;
+        const ratio = timeRange.firstAt === timeRange.lastAt ? 1 : (occurredAt - timeRange.firstAt) / (timeRange.lastAt - timeRange.firstAt);
+        const x = pad + (width - pad * 2) * ratio;
+        ctx.strokeStyle = "#c2413b"; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.moveTo(x, pad); ctx.lineTo(x, height - pad); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = "#c2413b"; ctx.beginPath(); ctx.arc(x, pad + 8, 4, 0, Math.PI * 2); ctx.fill();
+      }
     }
 
     document.addEventListener("click", async (e) => {
@@ -364,9 +449,10 @@ def render_page() -> str:
     });
     $("chart").addEventListener("mousemove", (event) => {
       if (!latestPoints.length) return;
-      const bounds = $("chart").getBoundingClientRect();
-      const ratio = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
-      const index = Math.round(ratio * (latestPoints.length - 1));
+      const chart = $("chart");
+      const bounds = chart.getBoundingClientRect();
+      const ratio = chartPlotRatio(event.clientX, bounds, chart.width);
+      const index = chartPointIndexAtRatio(latestPoints, ratio);
       const point = latestPoints[index];
       const vibration = finiteNumber(point.vibrationRmsRaw ?? point.vibration);
       const acoustic = finiteNumber(point.acousticRmsRaw ?? point.acoustic);

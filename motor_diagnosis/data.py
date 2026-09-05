@@ -13,6 +13,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .demo_signals import (
+    DEMO_MODEL_VERSION,
+    DEMO_SIGNAL_SOURCE,
+    MAX_DEMO_ANOMALY_SAMPLES,
+    build_combined_anomaly_samples,
+)
+
 MAX_LOGIN_FAILURES = 5
 LOCK_SECONDS = 15 * 60
 SESSION_SECONDS = 60 * 60
@@ -941,6 +948,8 @@ ALERT_POLICIES = copy_payload(BASE_ALERT_POLICIES)
 QUARANTINED_DEVICE_MESSAGES: list[dict[str, Any]] = []
 MQTT_QUARANTINE_IDEMPOTENCY: dict[str, dict[str, Any]] = {}
 TELEMETRY_RECORDS: list[dict[str, Any]] = []
+DEMO_TELEMETRY_RECORDS: list[dict[str, Any]] = []
+DEMO_TELEMETRY_MAX_RECORDS_PER_ASSET = 1000
 TELEMETRY_IDEMPOTENCY: dict[tuple[str, int], dict[str, str]] = {}
 TELEMETRY_METRICS: dict[str, int | float | str | None] = {
     "requests": 0,
@@ -992,6 +1001,7 @@ def reset_runtime_state() -> None:
         QUARANTINED_DEVICE_MESSAGES.clear()
         MQTT_QUARANTINE_IDEMPOTENCY.clear()
         TELEMETRY_RECORDS.clear()
+        DEMO_TELEMETRY_RECORDS.clear()
         TELEMETRY_IDEMPOTENCY.clear()
         TELEMETRY_METRICS.update(
             {
@@ -3026,11 +3036,16 @@ def _stored_telemetry_for(
     asset_id: str,
     from_timestamp: str | None = None,
     to_timestamp: str | None = None,
+    *,
+    include_demo: bool = False,
 ) -> list[dict[str, Any]]:
     get_asset(site_id, asset_id)
+    records = TELEMETRY_RECORDS
+    if include_demo:
+        records = [*TELEMETRY_RECORDS, *DEMO_TELEMETRY_RECORDS]
     stored = [
         copy_payload(record)
-        for record in TELEMETRY_RECORDS
+        for record in records
         if record["siteId"] == site_id and record["assetId"] == asset_id
     ]
     from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
@@ -3055,6 +3070,8 @@ def telemetry_for(
     asset_id: str,
     from_timestamp: str | None = None,
     to_timestamp: str | None = None,
+    *,
+    include_demo: bool = False,
 ) -> list[dict[str, Any]]:
     asset = get_asset(site_id, asset_id)
     stored = _stored_telemetry_for(
@@ -3062,12 +3079,20 @@ def telemetry_for(
         asset_id,
         from_timestamp=from_timestamp,
         to_timestamp=to_timestamp,
+        include_demo=include_demo,
     )
-    if stored or any(
+    has_real_records = any(
         record["siteId"] == site_id and record["assetId"] == asset_id
         for record in TELEMETRY_RECORDS
-    ):
+    )
+    has_demo_records = any(
+        record["siteId"] == site_id and record["assetId"] == asset_id
+        for record in DEMO_TELEMETRY_RECORDS
+    )
+    if stored or has_real_records or (include_demo and has_demo_records):
         return stored
+    if has_demo_records:
+        return []
 
     from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
     to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
@@ -3115,14 +3140,20 @@ def telemetry_for(
 
 
 def telemetry_units(
-    site_id: str | None = None, asset_id: str | None = None
+    site_id: str | None = None,
+    asset_id: str | None = None,
+    *,
+    include_demo: bool = False,
 ) -> dict[str, str]:
+    records = TELEMETRY_RECORDS
+    if include_demo:
+        records = [*TELEMETRY_RECORDS, *DEMO_TELEMETRY_RECORDS]
     if (
         site_id
         and asset_id
         and any(
             record["siteId"] == site_id and record["assetId"] == asset_id
-            for record in TELEMETRY_RECORDS
+            for record in records
         )
     ):
         return {
@@ -3643,6 +3674,10 @@ def update_device_hardware_profile(
 
 
 def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
+    if os.environ.get("APP_ENV", "").strip().lower() == "production":
+        raise ApiError(
+            403, "DEMO_DISABLED", "Demo injection is disabled in production."
+        )
     site_id = str(payload.get("siteId") or "SITE-01").strip().upper()
     with STORE_LOCK:
         site = get_site(site_id)
@@ -3652,6 +3687,32 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             .upper()
         )
         asset = get_asset(site["id"], asset_id)
+        rule = anomaly_rule_for(asset["id"])
+        duration_sec = int(rule["durationSec"])
+        demo_device_id = f"DEMO-{asset['id']}"
+        existing_sequences = [
+            int(record["sequence"])
+            for record in DEMO_TELEMETRY_RECORDS
+            if record["deviceId"] == demo_device_id
+        ]
+        samples = build_combined_anomaly_samples(
+            site_id=site["id"],
+            asset_id=asset["id"],
+            device_id=demo_device_id,
+            rated_rpm=float(asset["ratedRpm"]),
+            duration_sec=duration_sec,
+            first_sequence=max(existing_sequences, default=0) + 1,
+            end_at=datetime.now(timezone.utc),
+        )
+        DEMO_TELEMETRY_RECORDS.extend(samples)
+        demo_asset_records = [
+            record
+            for record in DEMO_TELEMETRY_RECORDS
+            if record["siteId"] == site["id"] and record["assetId"] == asset["id"]
+        ]
+        overflow = len(demo_asset_records) - DEMO_TELEMETRY_MAX_RECORDS_PER_ASSET
+        for expired_record in demo_asset_records[: max(0, overflow)]:
+            DEMO_TELEMETRY_RECORDS.remove(expired_record)
         # Alert delivery history is durable even when the demo store restarts.
         event_id = f"EV-{secrets.token_hex(12).upper()}"
         event = {
@@ -3661,20 +3722,26 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             "severity": "critical",
             "eventType": "asset_anomaly_candidate",
             "title": f"{asset['name']} anomaly injection event",
-            "occurredAt": now_iso(),
-            "time": now_text(),
-            "duration": "10s",
-            "durationSec": 10,
+            "deviceId": demo_device_id,
+            "occurredAt": samples[-1]["timestamp"],
+            "time": samples[-1]["timestamp"],
+            "duration": f"{duration_sec}s",
+            "durationSec": duration_sec,
             "score": 94,
             "maxScore": 94,
             "label": "needs_review",
             "note": "This event was generated by the demo anomaly injection API.",
             "reviewed": False,
             "status": "open",
-            "thresholdVersion": anomaly_rule_for(asset["id"])["version"],
-            "modelVersion": "demo-anomaly-injection-v1",
+            "thresholdVersion": rule["version"],
+            "modelVersion": DEMO_MODEL_VERSION,
             "isSynthetic": True,
-            "source": "demo-injection",
+            "source": DEMO_SIGNAL_SOURCE,
+            "telemetrySampleCount": len(samples),
+            "telemetryIntervalSec": max(
+                1, math.ceil(duration_sec / (MAX_DEMO_ANOMALY_SAMPLES - 1))
+            ),
+            "scenarioLabel": "combined_anomaly",
         }
         _freeze_event_evidence(event)
         EVENTS.insert(0, event)
@@ -3907,9 +3974,8 @@ def _freeze_event_evidence(
         occurred_at = parse_rfc3339("event.occurredAt", event["occurredAt"])
         if "featureSnapshot" not in evidence:
             if points is None:
-                points = telemetry_for(
-                    event["siteId"],
-                    event["assetId"],
+                points = _event_evidence_points(
+                    event,
                     from_timestamp=format_rfc3339(occurred_at - timedelta(minutes=5)),
                     to_timestamp=format_rfc3339(occurred_at + timedelta(minutes=5)),
                 )
@@ -3933,6 +3999,34 @@ def _freeze_event_evidence(
         return copy_payload(evidence)
 
 
+def _is_demo_event(event: dict[str, Any]) -> bool:
+    return bool(event.get("isSynthetic")) and event.get("source") == DEMO_SIGNAL_SOURCE
+
+
+def _event_evidence_points(
+    event: dict[str, Any],
+    *,
+    from_timestamp: str,
+    to_timestamp: str,
+) -> list[dict[str, Any]]:
+    """Return evidence from the event's own telemetry domain only.
+
+    Dashboard charts may combine real and synthetic telemetry.  Event evidence
+    must not: a physical-device event never inherits an AI-2 demo sample.
+    """
+    points = _stored_telemetry_for(
+        event["siteId"],
+        event["assetId"],
+        from_timestamp=from_timestamp,
+        to_timestamp=to_timestamp,
+        include_demo=_is_demo_event(event),
+    )
+    device_id = str(event.get("deviceId") or "").strip().upper()
+    if device_id:
+        points = [point for point in points if point.get("deviceId") == device_id]
+    return points
+
+
 def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
     require_permission(user, "event:read")
     with STORE_LOCK:
@@ -3941,23 +4035,15 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
     occurred_at = parse_rfc3339("event.occurredAt", event["occurredAt"])
     context_from = format_rfc3339(occurred_at - timedelta(minutes=5))
     context_to = format_rfc3339(occurred_at + timedelta(minutes=5))
-    points = telemetry_for(
-        event["siteId"],
-        event["assetId"],
+    points = _event_evidence_points(
+        event,
         from_timestamp=context_from,
         to_timestamp=context_to,
     )
-    context_from_value = occurred_at - timedelta(minutes=5)
-    context_to_value = occurred_at + timedelta(minutes=5)
-    has_stored_raw = any(
-        record["siteId"] == event["siteId"]
-        and record["assetId"] == event["assetId"]
-        and context_from_value
-        <= parse_rfc3339("telemetry.timestamp", record["timestamp"])
-        <= context_to_value
-        for record in TELEMETRY_RECORDS
+    is_demo = _is_demo_event(event)
+    context_source = (
+        "demo" if is_demo and points else "stored" if points else "unavailable"
     )
-    context_source = "stored" if has_stored_raw else "demo" if points else "unavailable"
     _freeze_event_evidence(event, points)
     with STORE_LOCK:
         event_snapshot = copy_payload(get_event(event_id))
@@ -3983,10 +4069,12 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
             "to": context_to,
             "points": copy_payload(points),
             "units": telemetry_units(
-                event_snapshot["siteId"], event_snapshot["assetId"]
+                event_snapshot["siteId"],
+                event_snapshot["assetId"],
+                include_demo=is_demo,
             ),
             "source": context_source,
-            "rawDataMissing": not has_stored_raw,
+            "rawDataMissing": not bool(points),
         },
         "featureSnapshot": evidence_snapshot["featureSnapshot"],
         "appliedRule": applied_rule,
@@ -5521,6 +5609,24 @@ def _event_for_dataset_point(
     return None
 
 
+def _event_matches_dataset_point(event: dict[str, Any], point: dict[str, Any]) -> bool:
+    """Match real telemetry labels without mixing demo or source domains.
+
+    Legacy physical events may not record a source.  Those events remain
+    compatible with real telemetry from the same device/time window.  When an
+    event does declare a source, it scopes the label to that exact collector.
+    """
+    if _is_demo_event(event) or point.get("source") == DEMO_SIGNAL_SOURCE:
+        return False
+    event_device_id = str(event.get("deviceId") or "").strip().upper()
+    point_device_id = str(point.get("deviceId") or "").strip().upper()
+    if event_device_id and event_device_id != point_device_id:
+        return False
+    event_source = str(event.get("source") or "").strip()
+    point_source = str(point.get("source") or "").strip()
+    return not event_source or event_source == point_source
+
+
 def _dataset_export_window(
     dataset: dict[str, Any] | None,
     site_id: str,
@@ -5596,9 +5702,7 @@ def _dataset_export_window(
 def _active_dataset_taxonomy(
     taxonomies: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    taxonomy_versions = (
-        ACOUSTIC_TAXONOMY_VERSIONS if taxonomies is None else taxonomies
-    )
+    taxonomy_versions = ACOUSTIC_TAXONOMY_VERSIONS if taxonomies is None else taxonomies
     return next(
         (item for item in reversed(taxonomy_versions) if item.get("active")),
         None,
@@ -5659,9 +5763,7 @@ def _dataset_target_label(
             (
                 item
                 for item in (
-                    ACOUSTIC_TAXONOMY_VERSIONS
-                    if taxonomies is None
-                    else taxonomies
+                    ACOUSTIC_TAXONOMY_VERSIONS if taxonomies is None else taxonomies
                 )
                 if item["version"] == dataset["labelTaxonomyVersion"]
             ),
@@ -5844,7 +5946,11 @@ def _live_dataset_export_snapshot(
             to_timestamp=to_timestamp,
         )
         events = copy_payload(
-            [item for item in EVENTS if item["assetId"] == asset_id]
+            [
+                item
+                for item in EVENTS
+                if item["assetId"] == asset_id and not _is_demo_event(item)
+            ]
         )
         taxonomies = copy_payload(ACOUSTIC_TAXONOMY_VERSIONS)
         units = copy_payload(telemetry_units(site_id, asset_id))
@@ -5872,7 +5978,14 @@ def _dataset_rows_for_points(
     )
     rows = []
     for point in points:
-        matching_event = _event_for_dataset_point(asset_events, point.get("timestamp"))
+        matching_event = _event_for_dataset_point(
+            [
+                event
+                for event in asset_events
+                if _event_matches_dataset_point(event, point)
+            ],
+            point.get("timestamp"),
+        )
         event_label, label_taxonomy_version = _dataset_label_for_event(
             dataset, matching_event
         )
@@ -5960,6 +6073,7 @@ def _freeze_internal_dataset_snapshot(
             asset["id"],
             from_timestamp=from_timestamp,
             to_timestamp=to_timestamp,
+            include_demo=False,
         )
         source_records.extend(points)
         snapshot[_dataset_snapshot_key(asset["siteId"], asset["id"])] = (

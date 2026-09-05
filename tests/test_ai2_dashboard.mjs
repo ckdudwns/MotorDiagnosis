@@ -15,8 +15,11 @@ function harness() {
   class Element {
     children = []; textContent = ''; hidden = false; disabled = false; value = '';
     width = 900; height = 280; listeners = {}; dataset = {};
+    attributes = {};
     constructor(tag = 'div') {this.tagName = tag;}
     addEventListener(name, callback) {this.listeners[name] = callback;}
+    setAttribute(name, value) {this.attributes[name] = String(value);}
+    getAttribute(name) {return this.attributes[name] ?? null;}
     append(...children) {this.children.push(...children);}
     appendChild(child) {this.children.push(child);}
     replaceChildren(...children) {this.children = children; this.textContent = ''; if (this.tagName === 'select') this.value = children[0]?.value || '';}
@@ -69,6 +72,8 @@ function deferred() {
 function notesPage(items) {
   return {items,total:items.length,latestByCategory:Object.fromEntries(items.map(item => [item.category,item]))};
 }
+const textOf = element => typeof element === 'string' ? element : element.textContent + element.children.map(textOf).join(' ');
+const tableRows = table => table.children.find(child => child.tagName === 'tbody').children;
 
 await check('missing values stay missing; zero remains valid', () => {
   const h = harness();
@@ -282,7 +287,7 @@ await check('scope invalidation clears stale signals while preserving site summa
 
 await check('device health exposes zero readings and sensor fault count', () => {
   const h = harness(); h.run('renderHealth([{deviceId:"D1",health:"online",rssiDbm:0,rebootCount:0,bufferUsagePct:0,sensorHealth:"fault",activeSensorFaults:[{}]}],{})');
-  assert.match(h.get('deviceHealth').children[0].textContent,/RSSI 0 dBm.*재부팅 0회.*버퍼 0%.*오류 1건/);
+  assert.deepEqual(tableRows(h.get('deviceHealth').children[0])[0].children.map(cell => cell.textContent), ['D1 / —','온라인','—','0 dBm','0회','0%','고장 / 1건']);
 });
 
 await check('a memo started during review save is not discarded', async () => {
@@ -440,6 +445,135 @@ await check('a pre-filter response stays discarded after failure and refresh rec
   assert.equal(h.get('severityFilter').value,'critical'); assert.match(h.get('eventsPage').textContent,/1.*1건/);
   const queries = h.requests.filter(item=>item.path.startsWith('/api/events?'));
   assert.ok(queries.some(item=>new URL(item.path,'http://local').searchParams.get('severity') === 'critical'));
+});
+
+await check('workspace navigation is wired to unique existing panels', () => {
+  const ids = [...source.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]);
+  assert.equal(new Set(ids).size,ids.length);
+  const h = harness();
+  for (const config of Object.values(clone(h.run('WORKSPACE_VIEWS')))) {
+    assert.ok(ids.includes(config.button));
+    assert.equal(typeof h.get(config.button).listeners.click,'function');
+    const button = source.match(new RegExp(`<button id="${config.button}"[^>]+>`))[0];
+    const controlled = button.match(/aria-controls="([^"]+)"/)[1].split(' ');
+    assert.deepEqual(controlled,config.panels);
+    for (const id of config.panels) assert.ok(ids.includes(id));
+  }
+  assert.match(source,/\[hidden\] \{ display:none !important;/);
+  assert.match(source,/@media \(max-width:900px\)/);
+});
+
+await check('each workspace reveals only its panels without new API requests', () => {
+  const h = harness(); h.run('setupManagement()');
+  assert.equal(h.get('managementPanel').hidden,true);
+  const views = clone(h.run('WORKSPACE_VIEWS'));
+  for (const view of ['events','management','overview']) {
+    h.get(views[view].button).listeners.click();
+    for (const [name,config] of Object.entries(views)) {
+      assert.equal(h.get(config.button).getAttribute('aria-pressed'),String(name === view));
+      for (const panel of config.panels) assert.equal(h.get(panel).hidden,name !== view,panel);
+    }
+    assert.equal(h.get('viewHeading').textContent,views[view].title);
+  }
+  assert.equal(h.requests.length,0);
+  h.run('setView("not-a-view")'); assert.equal(h.run('currentView'),'overview');
+});
+
+await check('navigation preserves review, memo, management drafts and chart selection', async () => {
+  const h = harness(); h.context.respond = detailResponses; await h.run('selectEvent("E1")');
+  h.run(`allPoints=Array.from({length:11},(_,i)=>({timestamp:new Date(Date.UTC(2026,8,6,0,0,i)).toISOString(),rpm:1000+i}));
+    redrawChart(); zoomChart(.5); chartSelectionAt=Date.UTC(2026,8,6,0,0,5);
+    reviewDirty=true; memoDirty=true; managementDirty=true; eventPageNumber=3; editingNoteId='N1';`);
+  for (const [id,value] of Object.entries({noteInput:'review draft',reviewReason:'review reason',memoText:'memo draft',attachmentRefs:'survey://draft',managementReason:'management draft',severityFilter:'critical'})) h.get(id).value=value;
+  const before = clone(h.run('[chartViewport,chartSelectionAt,detailGeneration,noteListGeneration,managementGeneration,selectedDetail,eventPageNumber]'));
+  const calls = h.requests.length;
+  h.context.confirm = () => {throw new Error('Navigation must not discard or confirm drafts');};
+  h.run('setView("events"); setView("management"); setView("overview"); setView("events")');
+  assert.deepEqual(clone(h.run('[chartViewport,chartSelectionAt,detailGeneration,noteListGeneration,managementGeneration,selectedDetail,eventPageNumber]')),before);
+  assert.equal(h.get('memoText').value,'memo draft'); assert.equal(h.get('noteInput').value,'review draft');
+  assert.equal(h.get('managementReason').value,'management draft'); assert.equal(h.get('reviewReason').value,'review reason');
+  assert.equal(h.get('attachmentRefs').value,'survey://draft'); assert.equal(h.get('severityFilter').value,'critical');
+  assert.deepEqual(clone(h.run('[reviewDirty,memoDirty,managementDirty,editingNoteId]')),[true,true,true,'N1']);
+  assert.equal(h.requests.length,calls);
+});
+
+await check('management navigation respects read access including audit-only users', () => {
+  const h = harness(); h.run('permissions=["event:read"]; setupManagement(); setView("management")');
+  assert.equal(h.get('navManagement').hidden,true); assert.equal(h.get('managementPanel').hidden,true);
+  assert.equal(h.run('currentView'),'overview');
+  h.run('permissions=["audit-log:read"]; setupManagement(); setView("management")');
+  assert.equal(h.get('navManagement').hidden,false); assert.equal(h.get('auditPanel').hidden,false);
+  assert.equal(h.get('managementKind').children.length,0); assert.equal(h.run('can("site:write")'),false);
+  h.run('permissions=["event:read"]; setupManagement()');
+  assert.equal(h.run('currentView'),'overview'); assert.equal(h.get('managementPanel').hidden,true);
+});
+
+await check('health tables distinguish missing readings, zero and reported degraded states', () => {
+  const h = harness();
+  h.run(`renderHealth([{deviceId:'<img onerror=attack()>',rssiDbm:null,rebootCount:null,bufferUsagePct:null}],{
+    status:'degraded',checkedAt:null,quarantinedMessageCount:0,
+    dependencies:[{id:'storage',status:'degraded',latencyMs:0,errorRatePct:0,lastFailureAt:null,lastRecoveryAt:null,impactScope:'<script>attack()</script>'}]
+  })`);
+  const device = tableRows(h.get('deviceHealth').children[0])[0];
+  assert.equal(device.children[0].textContent,'<img onerror=attack()> / —'); assert.equal(device.children[0].children.length,0);
+  assert.deepEqual(device.children.slice(3,6).map(cell=>cell.textContent),['미수신','미수신','미수신']);
+  assert.equal(device.children[6].textContent,'— / 미수신');
+  const service = tableRows(h.get('serviceHealth').children[1])[0];
+  assert.deepEqual(service.children.map(cell=>cell.textContent),['storage','성능 저하','0 ms','0%','—','—','<script>attack()</script>']);
+  assert.equal(service.children.at(-1).children.length,0);
+  assert.match(textOf(h.get('serviceHealth').children[0]),/격리된 메시지.*0건/);
+  h.run('renderHealth([],{error:"권한 없음"})');
+  assert.equal(h.get('deviceHealth').children.length,0); assert.equal(h.get('serviceHealth').children.length,0);
+  assert.equal(h.get('serviceHealth').textContent,'권한 없음');
+});
+
+await check('evidence summary uses the selected snapshot and clears when selection changes', async () => {
+  const h = harness(); h.context.respond = path => path.includes('/anomaly/events/') ? {...detail('E1'),appliedRule:{version:'RULE-0',scoreThreshold:0,durationSec:0,active:false}} : detailResponses(path);
+  await h.run('selectEvent("E1")');
+  const summary = textOf(h.get('evidenceSummary'));
+  assert.match(summary,/모델 버전.*score-v1/); assert.match(summary,/규칙 버전.*RULE-0/);
+  assert.match(summary,/진입 점수 임계값.*0/); assert.match(summary,/규칙 지속시간.*0초/);
+  assert.match(summary,/규칙 활성.*비활성/); assert.match(summary,/신호 출처.*unavailable/);
+  h.run('clearEventSelection()'); assert.equal(h.get('evidenceSummary').children.length,0);
+  assert.equal(h.run('formatLocalTime(null)'),'—'); assert.equal(h.run('formatLocalTime(undefined)'),'—');
+  assert.equal(h.run('formatLocalTime("")'),'—'); assert.notEqual(h.run('formatLocalTime(0)'),'—');
+});
+
+await check('review cards show actor, reason and label transitions as safe text', () => {
+  const h = harness(); h.run(`renderReviewHistory({items:[{id:'R1',changedAt:null,actor:{name:'<img>'},before:{label:'needs_review'},after:{label:'confirmed_anomaly',note:'<script>draft</script>'},reason:'checked sensor'}],page:1,size:20,total:1})`);
+  const card = h.get('reviewHistory').children[0], summary = textOf(card.children[1]);
+  assert.equal(card.children[0].textContent,'— · <img>'); assert.equal(card.children[0].children.length,0);
+  assert.match(summary,/이전 라벨.*검수 필요.*변경 라벨.*이상 확인/);
+  assert.match(summary,/변경 사유.*checked sensor/); assert.match(summary,/<script>draft<\/script>/);
+  assert.equal(card.children[2].tagName,'details');
+});
+
+await check('audit tables render latest requested page and retain raw before-after evidence', async () => {
+  const h = harness(), old = deferred(); h.context.respond = () => old.promise;
+  const pending = h.run('loadAudit()');
+  h.context.respond = () => ({items:[{id:'NEW',actor:{name:'Operator'},action:'update',targetType:'asset',targetId:'A1',reason:'<script>reason</script>',before:{ratedRpm:1000},after:{ratedRpm:1200}}],page:2,total:13});
+  h.run('auditPageNumber=2'); await h.run('loadAudit()');
+  old.resolve({items:[{id:'OLD',reason:'outdated'}],page:1,total:1}); await pending;
+  const row = tableRows(h.get('auditRows').children[0])[0];
+  assert.deepEqual(row.children.map(cell=>cell.textContent),['—','Operator','update','asset / A1','<script>reason</script>']);
+  assert.equal(row.children.at(-1).children.length,0);
+  assert.match(textOf(h.get('auditRows').children[1]),/ratedRpm.*1000/s);
+  assert.match(h.get('auditPage').textContent,/2 \/ 2.*13/);
+});
+
+await check('a background render never reopens overview or clears hidden event drafts', async () => {
+  const h = harness(); h.run('setView("events"); memoDirty=true'); h.get('memoText').value='hidden draft';
+  h.context.respond = path => {
+    if (path.startsWith('/api/telemetry')) return {points:[],units:{}};
+    if (path.startsWith('/api/events')) return {items:[],page:1,size:12,total:0};
+    if (path.includes('sites-summary') || path.endsWith('/devices')) return [];
+    if (path.includes('/anomaly/rules/') || path.includes('/health/dependencies')) return {};
+    return {items:[]};
+  };
+  h.run('setView("management")'); await h.run('render()');
+  assert.equal(h.run('currentView'),'management'); assert.equal(h.get('managementPanel').hidden,false);
+  assert.equal(h.get('siteKpis').hidden,true); assert.equal(h.get('eventReviewPanel').hidden,true);
+  assert.equal(h.get('memoText').value,'hidden draft'); assert.equal(h.run('memoDirty'),true);
 });
 
 assert.deepEqual(failures,[],`${failures.length} behavior checks failed`);

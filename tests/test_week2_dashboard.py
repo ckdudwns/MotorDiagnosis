@@ -22,7 +22,7 @@ class Week2DashboardTest(unittest.TestCase):
         page = render_page()
 
         for text in (
-            "<th>Region</th>",
+            "<th>지역</th>",
             "site.normalAssets",
             "site.warningAssets",
             "site.criticalAssets",

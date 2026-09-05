@@ -35,7 +35,9 @@ from register_dataset import (  # noqa: E402
 )
 
 
-def _replace_with_retry(src: str, dst: str, attempts: int = 10, delay: float = 0.05) -> None:
+def _replace_with_retry(
+    src: str, dst: str, attempts: int = 10, delay: float = 0.05
+) -> None:
     """os.replace()를 짧은 backoff로 재시도한다.
 
     Windows에서는 방금 만든 파일/디렉터리를 백신·검색 인덱서가 짧게
@@ -162,10 +164,14 @@ def _canonical_manifest_sheet(ws) -> dict:
     result: dict = {}
     for row in data_rows:
         if len(row) != 2:
-            raise ValueError(f"manifest 시트에 [field, value] 형식이 아닌 행이 있습니다: {row!r}")
+            raise ValueError(
+                f"manifest 시트에 [field, value] 형식이 아닌 행이 있습니다: {row!r}"
+            )
         field, value = row
         if not isinstance(field, str) or not field.strip():
-            raise ValueError(f"manifest 시트의 field가 비어있지 않은 문자열이어야 합니다: {row!r}")
+            raise ValueError(
+                f"manifest 시트의 field가 비어있지 않은 문자열이어야 합니다: {row!r}"
+            )
         if field in _MANIFEST_SHEET_VOLATILE_FIELDS:
             continue
         if field in result:
@@ -260,7 +266,9 @@ def _version_dir_is_complete(version_dir: str) -> bool:
         return False
 
 
-def _manifest_without_rows(manifest: dict, artifact_refs: dict, label_summary: dict) -> dict:
+def _manifest_without_rows(
+    manifest: dict, artifact_refs: dict, label_summary: dict
+) -> dict:
     """GET /api/datasets/{id} 응답 형태 (rows 제외, artifactRefs 포함).
 
     [리뷰 P2] labelCounts/trainingEligibleCount/trainingEligibleSplitCounts는
@@ -344,17 +352,49 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
             manifest_sheet.append([f"source.files.{filename}.sha256", info["sha256"]])
             manifest_sheet.append([f"source.files.{filename}.label", info["label"]])
         manifest_sheet.append(
-            ["compatibility.signalType", ",".join(manifest["compatibility"]["signalType"])]
+            [
+                "compatibility.signalType",
+                ",".join(manifest["compatibility"]["signalType"]),
+            ]
         )
         manifest_sheet.append(
-            ["compatibility.samplingRateHz", manifest["compatibility"]["samplingRateHz"]]
+            [
+                "compatibility.samplingRateHz",
+                manifest["compatibility"]["samplingRateHz"],
+            ]
         )
+        for modality, unit in manifest["compatibility"]["units"].items():
+            manifest_sheet.append([f"compatibility.units.{modality}", unit])
+        for condition, value in manifest["compatibility"][
+            "operatingConditions"
+        ].items():
+            if isinstance(value, (dict, list)):
+                value = json.dumps(
+                    value, ensure_ascii=False, sort_keys=True, allow_nan=False
+                )
+            manifest_sheet.append(
+                [f"compatibility.operatingConditions.{condition}", value]
+            )
+        for field in ("featureNames", "labelCriteria", "checksumInputs"):
+            if field in manifest:
+                manifest_sheet.append(
+                    [
+                        field,
+                        json.dumps(
+                            manifest[field],
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            allow_nan=False,
+                        ),
+                    ]
+                )
+        if "channel" in manifest["compatibility"]:
+            manifest_sheet.append(
+                ["compatibility.channel", manifest["compatibility"]["channel"]]
+            )
         manifest_sheet.append(
-            ["compatibility.units.vibration", manifest["compatibility"]["units"]["vibration"]]
+            ["labelTaxonomyVersion", manifest["labelTaxonomyVersion"]]
         )
-        rpm_range = manifest["compatibility"]["operatingConditions"]["rpmRange"]
-        manifest_sheet.append(["compatibility.operatingConditions.rpmRange", str(rpm_range)])
-        manifest_sheet.append(["labelTaxonomyVersion", manifest["labelTaxonomyVersion"]])
         manifest_sheet.append(
             ["labelPolicyVersion", manifest.get("labelPolicyVersion")]
         )
@@ -379,9 +419,7 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
             ["trainingEligibleCount", label_summary["trainingEligibleCount"]]
         )
         for split_name, count in label_summary["trainingEligibleSplitCounts"].items():
-            manifest_sheet.append(
-                [f"trainingEligibleSplitCounts.{split_name}", count]
-            )
+            manifest_sheet.append([f"trainingEligibleSplitCounts.{split_name}", count])
 
         rows_sheet = wb.create_sheet("rows")
         rows_sheet.append(fieldnames)
@@ -527,14 +565,21 @@ def resolve_current_version_dir(output_dir: str) -> str:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="CWRU 데이터셋 매니페스트를 CSV/XLSX로 내보내기"
+        description="진동/음향 데이터셋 매니페스트를 CSV/XLSX로 내보내기"
+    )
+    parser.add_argument(
+        "--manifest", help="Inline-row JSON manifest; skips CWRU loading"
     )
     parser.add_argument("--data-dir", default=_DEFAULT_DATA_DIR)
-    parser.add_argument("--train-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["train"])
+    parser.add_argument(
+        "--train-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["train"]
+    )
     parser.add_argument(
         "--validation-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["validation"]
     )
-    parser.add_argument("--test-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["test"])
+    parser.add_argument(
+        "--test-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["test"]
+    )
     parser.add_argument(
         "--split-strategy",
         choices=SPLIT_STRATEGIES,
@@ -552,15 +597,19 @@ if __name__ == "__main__":
 
     # 기본 specimen_group은 CWRU의 NORMAL specimen 1개 제약으로 3-way에서
     # InsufficientAssetGroupsError를 낸다 (의도된 정직한 실패).
-    manifest = build_manifest(
-        data_dir=args.data_dir,
-        split_ratios={
-            "train": args.train_ratio,
-            "validation": args.validation_ratio,
-            "test": args.test_ratio,
-        },
-        split_strategy=args.split_strategy,
-    )
+    if args.manifest:
+        with open(args.manifest, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    else:
+        manifest = build_manifest(
+            data_dir=args.data_dir,
+            split_ratios={
+                "train": args.train_ratio,
+                "validation": args.validation_ratio,
+                "test": args.test_ratio,
+            },
+            split_strategy=args.split_strategy,
+        )
     result = export_dataset(manifest, args.output_dir)
 
     print(f"{result['row_count']}행 내보내기 완료")

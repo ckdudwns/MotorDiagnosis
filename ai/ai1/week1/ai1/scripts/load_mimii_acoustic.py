@@ -43,7 +43,11 @@ def load_wav_signal(file_path: str) -> tuple:
         data = data[:, 0]  # 첫 채널(마이크 0)만 사용
 
     # 정수형 PCM이면 float로 정규화
-    if np.issubdtype(data.dtype, np.integer):
+    if np.issubdtype(data.dtype, np.unsignedinteger):
+        # WAV 8-bit PCM silence is 128, not 0; remove its DC offset first.
+        midpoint = (np.iinfo(data.dtype).max + 1) / 2
+        data = (data.astype(np.float64) - midpoint) / midpoint
+    elif np.issubdtype(data.dtype, np.integer):
         max_val = np.iinfo(data.dtype).max
         data = data.astype(np.float64) / max_val
     else:
@@ -107,6 +111,10 @@ def load_mimii_pump_dataset(pump_dir: str, machine_ids: list = None) -> list:
                         "sample_rate": sample_rate,
                         "signal": signal,
                         "machine_id": machine_id,
+                        "source_file": os.path.relpath(wav_path, pump_dir).replace(
+                            os.sep, "/"
+                        ),
+                        "source_path": os.path.abspath(wav_path),
                     }
                 )
 

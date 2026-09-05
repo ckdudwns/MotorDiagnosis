@@ -576,14 +576,12 @@ class Week1BackendTest(unittest.TestCase):
         self.assertEqual(context.exception.status, 404)
         self.assertEqual(context.exception.code, "SITE_NOT_FOUND")
 
-    def test_telemetry_contains_units_and_72_points(self) -> None:
+    def test_empty_telemetry_contains_units_without_fabricated_points(self) -> None:
         points = telemetry_for("SITE-01", "SITE-01-MOT-02")
         units = telemetry_units()
 
-        self.assertEqual(len(points), 72)
+        self.assertEqual(points, [])
         self.assertEqual(units["vibrationRmsMmS"], "mm/s RMS")
-        self.assertLessEqual({"vibrationRmsMmS", "acousticDb", "anomalyScore"}, set(points[0]))
-        self.assertTrue(all(0 <= point["anomalyScore"] <= 100 for point in points))
 
     def test_error_response_shape_is_safe_json(self) -> None:
         handler = DummyHandler()

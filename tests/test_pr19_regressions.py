@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import http.client
 import io
 import json
@@ -125,15 +126,134 @@ class Pr19RegressionTest(unittest.TestCase):
         self.assertEqual(len(self.events()), 1)
         self.assertEqual(self.events()[0]["status"], "open")
 
-    def seed_retention_window(self):
+    def seed_retention_window(self, ages=(29, 28)):
         initial = datetime.now(timezone.utc).replace(microsecond=0)
         with patch.object(data, "datetime", wraps=datetime) as clock:
             clock.now.return_value = initial
-            for sequence, age in ((1, 29), (2, 28)):
+            for sequence, age in enumerate(ages, start=1):
                 data.ingest_telemetry(self.ingest, telemetry_payload(
                     sequence, data.format_rfc3339(initial - timedelta(days=age))
                 ))
         return initial, initial + timedelta(days=2)
+
+    def assert_empty_http_telemetry_and_exports(self, server):
+        login = data.authenticate({"username": "admin", "password": "admin123"})
+        headers = {"Authorization": f"Bearer {login['session']['token']}"}
+        scope = "siteId=SITE-01&assetId=SITE-01-GEN-01"
+
+        def get(path):
+            connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+            try:
+                connection.request("GET", path, headers=headers)
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 200, body)
+                return body
+            finally:
+                connection.close()
+
+        self.assertEqual(json.loads(get(f"/api/telemetry?{scope}"))["points"], [])
+        exported = data.dataset_export_for(self.admin, "SITE-01", "SITE-01-GEN-01")
+        self.assertEqual(exported["rows"], [])
+        for field in ("recordCount", "sourceRecordCount", "normalizedRecordCount",
+                      "trainingEligibleCount"):
+            self.assertEqual(exported["manifest"][field], 0)
+        self.assertEqual(sum(exported["manifest"]["splitCounts"].values()), 0)
+        for path in (f"/api/export?{scope}", f"/api/datasets/export?{scope}&format=csv"):
+            with self.subTest(path=path):
+                rows = csv.DictReader(io.StringIO(get(path).decode("utf-8-sig")))
+                self.assertTrue(rows.fieldnames)
+                self.assertEqual(list(rows), [])
+        workbook = get(f"/api/datasets/export?{scope}&format=xlsx")
+        with ZipFile(io.BytesIO(workbook)) as archive:
+            sheet = ElementTree.fromstring(archive.read("xl/worksheets/sheet2.xml"))
+            manifest_sheet = ElementTree.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        rows = sheet.findall("{*}sheetData/{*}row")
+        self.assertEqual(len(rows), 1)  # Column headers, no fabricated measurements.
+        self.assertTrue(rows[0].findall("{*}c"))
+        manifest_values = {}
+        for row in manifest_sheet.findall("{*}sheetData/{*}row"):
+            cells = row.findall("{*}c")
+            manifest_values["".join(cells[0].itertext())] = "".join(cells[1].itertext())
+        self.assertEqual(manifest_values["recordCount"], "0")
+
+    def test_all_expired_restart_returns_empty_http_telemetry_and_exports(self):
+        _, future = self.seed_retention_window(ages=(29,))
+        data.close_runtime_state()
+        data.reset_runtime_state()
+        with patch.object(data, "datetime", wraps=datetime) as clock, patch.dict(
+            "os.environ", {"APP_ENV": "production", "DEMO_ENABLED": "false"}
+        ):
+            clock.now.return_value = future
+            server = create_server(
+                "127.0.0.1", 0, state_database=self.database,
+                demo_enabled=False, auto_alerts=False,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                self.assertFalse(server.demo_enabled)
+                self.assertEqual(data.TELEMETRY_RECORDS, [])
+                self.assertEqual(data.TELEMETRY_IDEMPOTENCY, {})
+                self.assert_empty_http_telemetry_and_exports(server)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(5)
+            self.restart()
+            self.assertEqual(data.telemetry_for("SITE-01", "SITE-01-GEN-01"), [])
+
+    def test_all_expired_periodic_cleanup_does_not_create_fallback_points(self):
+        initial, future = self.seed_retention_window(ages=(29,))
+        expired = threading.Event()
+        real_maintenance = data.maintain_runtime_retention
+
+        def maintenance():
+            removed = real_maintenance()
+            if removed:
+                expired.set()
+            return removed
+
+        with patch.object(data, "datetime", wraps=datetime) as clock, patch(
+            "motor_diagnosis.server.RETENTION_MAINTENANCE_INTERVAL_SEC", 0.02
+        ), patch("motor_diagnosis.server.maintain_runtime_retention", maintenance):
+            clock.now.return_value = initial
+            server = create_server(
+                "127.0.0.1", 0, state_database=self.database, auto_alerts=False,
+                demo_enabled=False,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                clock.now.return_value = future
+                self.assertTrue(expired.wait(3), "idle retention worker did not run")
+                self.assertEqual(data.TELEMETRY_RECORDS, [])
+                self.assert_empty_http_telemetry_and_exports(server)
+                # Collection resumes with only the newly accepted measurement.
+                data.ingest_telemetry(self.ingest, telemetry_payload(
+                    2, data.format_rfc3339(future)
+                ))
+                points = data.telemetry_for("SITE-01", "SITE-01-GEN-01")
+                self.assertEqual([point["sequence"] for point in points], [2])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(5)
+
+    def test_empty_telemetry_only_shows_explicitly_injected_demo_records(self):
+        for include_demo in (False, True):
+            self.assertEqual(data.telemetry_for(
+                "SITE-01", "SITE-01-GEN-01", include_demo=include_demo
+            ), [])
+        event = data.inject_anomaly({"siteId": "SITE-01", "assetId": "SITE-01-GEN-01"})
+        demo = data.telemetry_for("SITE-01", "SITE-01-GEN-01", include_demo=True)
+        self.assertEqual(len(demo), event["telemetrySampleCount"])
+        self.assertTrue(all(point["isSynthetic"] for point in demo))
+        self.assertTrue(all(point["source"] == data.DEMO_SIGNAL_SOURCE for point in demo))
+        self.assertEqual(data.telemetry_for("SITE-01", "SITE-01-GEN-01"), [])
+        self.assertEqual(data.dataset_export_for(
+            self.admin, "SITE-01", "SITE-01-GEN-01"
+        )["rows"], [])
 
     def test_restart_removes_expired_data_before_first_http_read(self):
         _, future = self.seed_retention_window()

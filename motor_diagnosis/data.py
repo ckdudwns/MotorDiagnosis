@@ -3603,70 +3603,17 @@ def telemetry_for(
     *,
     include_demo: bool = False,
 ) -> list[dict[str, Any]]:
-    asset = get_asset(site_id, asset_id)
-    stored = _stored_telemetry_for(
+    """Read stored measurements; an empty window never fabricates samples.
+
+    Demo samples must be explicitly injected and requested with include_demo.
+    """
+    return _stored_telemetry_for(
         site_id,
         asset_id,
         from_timestamp=from_timestamp,
         to_timestamp=to_timestamp,
         include_demo=include_demo,
     )
-    has_real_records = any(
-        record["siteId"] == site_id and record["assetId"] == asset_id
-        for record in TELEMETRY_RECORDS
-    )
-    has_demo_records = any(
-        record["siteId"] == site_id and record["assetId"] == asset_id
-        for record in DEMO_TELEMETRY_RECORDS
-    )
-    if stored or has_real_records or (include_demo and has_demo_records):
-        return stored
-    if has_demo_records:
-        return []
-
-    from_value = parse_rfc3339("from", from_timestamp) if from_timestamp else None
-    to_value = parse_rfc3339("to", to_timestamp) if to_timestamp else None
-
-    seed = sum(ord(ch) for ch in asset["id"])
-    points = []
-    current = datetime.now(timezone.utc)
-    for index in range(72):
-        vibration = (
-            1.8
-            + math.sin(index / 7 + seed / 11) * 0.28
-            + ((seed + index * 13) % 19) / 100
-        )
-        acoustic = (
-            52 + math.sin(index / 8 + seed / 8) * 4 + ((seed + index * 7) % 9) / 2
-        )
-        rpm = asset["ratedRpm"] + math.sin(index / 11) * 18 + ((seed + index * 3) % 12)
-        score = 34 + max(0, vibration - 1.9) * 18 + max(0, acoustic - 54) * 1.6
-        if asset["id"].endswith("MOT-02") and index > 52:
-            score += 25
-        points.append(
-            {
-                "minute": index - 71,
-                "timestamp": format_rfc3339(current - timedelta(minutes=71 - index)),
-                "vibration": round(vibration, 2),
-                "vibrationRmsMmS": round(vibration, 2),
-                "acoustic": round(acoustic, 1),
-                "acousticDb": round(acoustic, 1),
-                "rpm": round(rpm),
-                "score": min(98, round(score)),
-                "anomalyScore": min(98, round(score)),
-            }
-        )
-    if not from_value and not to_value:
-        return points
-    return [
-        point
-        for point in points
-        if (
-            not from_value
-            or parse_rfc3339("timestamp", point["timestamp"]) >= from_value
-        )
-        and (not to_value or parse_rfc3339("timestamp", point["timestamp"]) <= to_value)
-    ]
 
 
 def telemetry_units(
@@ -7256,11 +7203,13 @@ def _live_dataset_export_snapshot(
 ]:
     with STORE_LOCK:
         asset = copy_payload(get_asset(site_id, asset_id))
-        points = telemetry_for(
+        # Dataset exports use persisted measurements, never display/demo data.
+        points = _stored_telemetry_for(
             site_id,
             asset_id,
             from_timestamp=from_timestamp,
             to_timestamp=to_timestamp,
+            include_demo=False,
         )
         events = copy_payload(
             [
@@ -7539,7 +7488,7 @@ def dataset_export_for(
                 "units": units,
                 "operatingConditions": {
                     "ratedRpm": live_asset.get("ratedRpm"),
-                    "source": "live_or_demo_telemetry",
+                    "source": "live_telemetry",
                 },
             }
         ),

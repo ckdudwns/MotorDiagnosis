@@ -60,6 +60,11 @@ are also blocked from baseline/model registration.
   Cleanup saves only when records are removed, rolls back on storage failure,
   and retries on the next tick. Live reads exclude expired records while cleanup
   is pending; frozen dataset/evidence snapshots keep their existing contract.
+- Live telemetry never fabricates replacement samples for an empty asset or time
+  window, including after every raw measurement expires. CSV/XLSX exports contain
+  headers but no measurement rows and report zero records in the manifest.
+  Explicitly injected demo samples remain available to demo-inclusive reads;
+  live dataset exports read the real telemetry store directly and exclude them.
 - Sensor event details expose the sensor health rule snapshot. Categorized notes
   validate PATCH input before mutation and use a durable change sequence for
   latest ordering, including writes in the same second.

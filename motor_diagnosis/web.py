@@ -567,6 +567,20 @@ def render_page() -> str:
       return Number.isFinite(number) ? number : null;
     }
 
+    function rpmValue(point) {
+      if (Object.hasOwn(point, "rpmStatus") && point.rpmStatus !== "valid") return null;
+      return finiteNumber(point.rpm);
+    }
+
+    function rpmDescription(point) {
+      const status = {valid:"유효 보고값", unavailable:"미취득", stale:"오래된 측정", invalid:"무효"}[point.rpmStatus]
+        ?? (Object.hasOwn(point, "rpmStatus") ? "알 수 없는 상태" : "상태정보 없음");
+      const value = rpmValue(point);
+      const observation = Object.hasOwn(point, "rpmStatus")
+        ? ` · RPM 측정 시각: ${point.rpmMeasuredAt ?? "없음"} · RPM 출처: ${point.rpmSource ?? "미설정"}` : "";
+      return `RPM: ${value === null ? "미수신" : value} (${status})${observation}`;
+    }
+
     function chartTimeRange(points) {
       const firstAt = new Date(points[0]?.timestamp).getTime();
       const lastAt = new Date(points[points.length - 1]?.timestamp).getTime();
@@ -624,7 +638,7 @@ def render_page() -> str:
         ["anomaly score", "#c2413b", p => finiteNumber(p.anomalyScore ?? p.score), 0, 100],
         [units.vibrationRmsRaw ? "vibration raw RMS" : "demo vibration (mm/s RMS)", "#14796f", p => finiteNumber(p.vibrationRmsRaw ?? p.vibration), null, null],
         [units.acousticRmsRaw ? "acoustic raw RMS" : "demo acoustic (dB)", "#4453a8", p => finiteNumber(p.acousticRmsRaw ?? p.acoustic), null, null],
-        ["RPM", "#b7791f", p => finiteNumber(p.rpm), null, null],
+        ["RPM (보고값)", "#b7791f", p => rpmValue(p), null, null],
       ];
       let legendX = pad;
       for (const [name,color,map,fixedMin,fixedMax] of series) {
@@ -1219,7 +1233,7 @@ def render_page() -> str:
       const score = finiteNumber(point.anomalyScore ?? point.score);
       const vibrationLabel = latestUnits.vibrationRmsRaw ? "vibration raw RMS" : "demo vibration (mm/s RMS)";
       const acousticLabel = latestUnits.acousticRmsRaw ? "acoustic raw RMS" : "demo acoustic (dB)";
-      $("chartHint").textContent = `${point.timestamp} · ${vibrationLabel}: ${vibration ?? "-"} · ${acousticLabel}: ${acoustic ?? "-"} · RPM: ${point.rpm ?? "-"} · score: ${score ?? "unavailable"} (${point.anomalyStatus ?? "-"})`;
+      $("chartHint").textContent = `${point.timestamp} · ${vibrationLabel}: ${vibration ?? "-"} · ${acousticLabel}: ${acoustic ?? "-"} · ${rpmDescription(point)} · score: ${score ?? "unavailable"} (${point.anomalyStatus ?? "-"})`;
     });
     setInterval(() => {
       if (!token || !selectedSite() || !$("assetSelect").value) return;

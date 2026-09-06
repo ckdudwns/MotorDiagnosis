@@ -576,5 +576,45 @@ await check('a background render never reopens overview or clears hidden event d
   assert.equal(h.get('memoText').value,'hidden draft'); assert.equal(h.run('memoDirty'),true);
 });
 
+await check('RPM quality keeps a measured stop but gaps stale and invalid values', () => {
+  const h = harness();
+  assert.equal(h.run('rpmValue({rpm:0,rpmStatus:"valid"})'),0);
+  assert.equal(h.run('rpmValue({rpm:1450.25,rpmStatus:"valid"})'),1450.25);
+  for (const status of ['stale','invalid','unavailable','unexpected',null]) {
+    assert.equal(h.run(`rpmValue({rpm:1450,rpmStatus:${JSON.stringify(status)}})`),null);
+  }
+  assert.equal(h.run('rpmValue({rpm:null,rpmStatus:"valid"})'),null);
+  assert.match(h.run('rpmDescription({rpm:0,rpmStatus:"valid"})'),/RPM: 0 \(유효 보고값\)/);
+});
+
+await check('legacy RPM never acquires an invented measured status or rated fallback', () => {
+  const h = harness();
+  assert.equal(h.run('rpmValue({rpm:1500})'),1500);
+  assert.equal(h.run('rpmValue({rpm:null,ratedRpm:1800})'),null);
+  assert.match(h.run('rpmDescription({rpm:1500})'),/상태정보 없음/);
+  assert.match(h.run('rpmDescription({rpm:null,rpmStatus:"unavailable"})'),/미취득/);
+});
+
+await check('RPM hover displays original measurement time and source as text', () => {
+  const h = harness();
+  h.run(`latestPoints=[{timestamp:'2026-09-06T00:02:00Z',rpm:0,rpmStatus:'valid',rpmMeasuredAt:'2026-09-06T00:00:00Z',rpmSource:'<img onerror=attack()>'}];`);
+  h.get('chart').listeners.mousemove({clientX:100});
+  const hint = h.get('chartHint');
+  assert.match(hint.textContent,/RPM: 0 \(유효 보고값\)/);
+  assert.match(hint.textContent,/RPM 측정 시각: 2026-09-06T00:00:00Z/);
+  assert.match(hint.textContent,/RPM 출처: <img onerror=attack\(\)>/);
+  assert.equal(hint.children.length,0);
+});
+
+await check('shipped chart uses RPM quality rather than a leftover numeric value', () => {
+  const h = harness();
+  h.run(`draw([{timestamp:'2026-09-06T00:00:00Z',rpm:999,rpmStatus:'stale'},{timestamp:'2026-09-06T00:00:01Z',rpm:777,rpmStatus:'invalid'}], {});`);
+  assert.ok(!h.calls.some(call => call[0]==='fillText' && String(call[1]).includes('RPM')));
+  assert.equal(h.calls.filter(call => call[0]==='arc').length,0);
+  h.run(`draw([{timestamp:'2026-09-06T00:00:00Z',rpm:0,rpmStatus:'valid'},{timestamp:'2026-09-06T00:00:01Z',rpm:777,rpmStatus:'invalid'}], {});`);
+  assert.ok(h.calls.some(call => call[0]==='fillText' && String(call[1]).includes('RPM (보고값)')));
+  assert.equal(h.calls.filter(call => call[0]==='arc').length,1);
+});
+
 assert.deepEqual(failures,[],`${failures.length} behavior checks failed`);
 console.log(`AI2 dashboard: ${checks} behavior checks passed.`);

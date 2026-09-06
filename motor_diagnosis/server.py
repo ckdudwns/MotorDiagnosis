@@ -1176,6 +1176,11 @@ class AppHandler(BaseHTTPRequestHandler):
             "training_eligible_split_counts",
             "split_policy",
         ]
+        fieldnames.extend(
+            key
+            for key in ("rpm_status", "rpm_measured_at", "rpm_source")
+            if any(key in row for row in rows)
+        )
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()

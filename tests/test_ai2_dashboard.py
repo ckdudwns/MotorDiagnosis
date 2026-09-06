@@ -29,7 +29,7 @@ class Ai2DashboardScriptTest(unittest.TestCase):
             capture_output=True, text=True, encoding="utf-8", timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("39 behavior checks passed", result.stdout)
+        self.assertIn("43 behavior checks passed", result.stdout)
 
 
 class Ai2DashboardHttpTest(unittest.TestCase):

@@ -1,7 +1,7 @@
 /*
  * MotorDiagnosis Edge Node
  *
- * Firmware Version : v1.2-beta.11.8.5
+ * Firmware Version : v1.3-iot-health.2
  * Revision Summary :
  *   P1 Atomic Queue Recovery
  *   P2 Unlabeled Real Telemetry Contract
@@ -50,6 +50,8 @@
 #include <LittleFS.h>
 #include <arduinoFFT.h>
 #include "driver/i2s.h"
+#include "freertos/queue.h"
+#include "esp_timer.h"
 
 #include <time.h>
 #include <sys/time.h>
@@ -57,8 +59,10 @@
 #include <stddef.h>
 #include <algorithm>
 #include <cstring>
+#include <atomic>
 
 #include "firmware_logic.h"
+#include "device_health.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -71,7 +75,7 @@
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.2-beta.11.8.5";
+    "v1.3-iot-health.2";
 
 // =====================================================
 // Test Config
@@ -124,6 +128,17 @@ const char* HEALTH_URL =
 
 const char* INGEST_TOKEN =
     INGEST_TOKEN_VALUE;
+
+// Existing ignored secrets.h files still compile; reporting stays disabled
+// until a separate limited-scope credential and matching device URL are set.
+#ifndef DEVICE_HEALTH_URL_VALUE
+#define DEVICE_HEALTH_URL_VALUE ""
+#endif
+#ifndef DEVICE_HEALTH_TOKEN_VALUE
+#define DEVICE_HEALTH_TOKEN_VALUE ""
+#endif
+const char* DEVICE_HEALTH_URL = DEVICE_HEALTH_URL_VALUE;
+const char* DEVICE_HEALTH_TOKEN = DEVICE_HEALTH_TOKEN_VALUE;
 
 #ifndef BACKEND_CA_CERT_VALUE
 #define BACKEND_CA_CERT_VALUE ""
@@ -573,6 +588,26 @@ TaskHandle_t audioCaptureTaskHandle =
 volatile bool vibrationFinished =
     false;
 
+std::atomic<bool> vibrationBusy{false};
+bool vibrationChannelValid = false; // protected by vibrationResultMutex
+std::atomic<bool> audioReady{false};
+std::atomic<bool> audioReinitializeRequested{false};
+std::atomic<uint32_t> audioErrorGeneration{0};
+struct SensorObservation {
+    DeviceHealth::Fault fault;
+    bool active;
+    uint64_t observedMs;
+};
+QueueHandle_t sensorObservations = nullptr;
+DeviceHealth::SensorRetry adxlRetry;
+bool adxlInitFailed = false;
+DeviceHealth::Journal healthJournal = DeviceHealth::emptyJournal();
+DeviceHealth::ReportSchedule healthSchedule;
+DeviceHealth::Metrics lastHealthMetrics;
+bool healthJournalUsable = true;
+bool healthJournalDirty = false;
+bool healthObservationBlocked = false;
+
 // =====================================================
 // Persistent / Network State
 // =====================================================
@@ -632,6 +667,14 @@ String getTimestamp();
 bool syncTime();
 
 bool syncTimeFromBackend();
+
+uint64_t healthUptimeMs();
+int64_t currentHealthEpochMs();
+bool observeSensorFault(DeviceHealth::Fault fault, bool active, uint64_t observedMs);
+void serviceDeviceHealth();
+void serviceSensors();
+bool initializeDeviceHealth();
+void queueAudioFault(DeviceHealth::Fault fault, uint64_t observedMs);
 
 // =====================================================
 // ADXL345
@@ -792,7 +835,11 @@ bool initADXL345()
         0x08
     );
 
-    return true;
+    // SPI has no ACK: verify identity and configuration read-back.
+    return adxlRead(REG_DEVID) == 0xE5 &&
+           (adxlRead(REG_DATA_FORMAT) & 0x0F) == 0x0B &&
+           (adxlRead(REG_POWER_CTL) & 0x08) != 0 &&
+           (adxlRead(REG_BW_RATE) & 0x0F) == 0x0D;
 }
 
 // =====================================================
@@ -888,6 +935,8 @@ bool initINMP441()
             "[I2S] Pin setup failed: %d\n",
             result
         );
+
+        i2s_driver_uninstall(I2S_PORT);
 
         return false;
     }
@@ -1182,55 +1231,52 @@ uint64_t getAudioTotalSamples()
     return value;
 }
 
-void audioCaptureTask(
-    void* parameter
-)
+void audioCaptureTask(void* parameter)
 {
-    int32_t dmaSamples[
-        AUDIO_DMA_READ_SAMPLES
-    ];
-
+    (void)parameter;
+    int32_t dmaSamples[AUDIO_DMA_READ_SAMPLES];
+    DeviceHealth::SensorRetry retry;
     while (true)
     {
-        size_t bytesRead =
-            0;
-
-        esp_err_t status =
-            i2s_read(
-                I2S_PORT,
-                dmaSamples,
-                sizeof(dmaSamples),
-                &bytesRead,
-                portMAX_DELAY
-            );
-
-        if (
-            status != ESP_OK
-        )
+        if (audioReinitializeRequested.exchange(false) && retry.ready())
         {
-            Serial.printf(
-                "[AUDIO] Continuous I2S read error: %d\n",
-                status
-            );
-
-            delay(10);
+            audioReady.store(false);
+            const uint64_t errorAt = healthUptimeMs();
+            audioErrorGeneration.fetch_add(1);
+            i2s_driver_uninstall(I2S_PORT);
+            retry.failed(millis());
+            queueAudioFault(DeviceHealth::Fault::I2S_CHANNEL, errorAt);
+        }
+        if (!retry.ready())
+        {
+            if (retry.due(millis()))
+            {
+                const bool initialized = initINMP441();
+                retry.attempted(millis(), initialized);
+                audioReady.store(initialized);
+                if (!initialized) queueAudioFault(DeviceHealth::Fault::I2S_INIT, healthUptimeMs());
+            }
+            if (!retry.ready()) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+        }
+        size_t bytesRead = 0;
+        const esp_err_t status = i2s_read(I2S_PORT, dmaSamples, sizeof(dmaSamples),
+                                         &bytesRead, pdMS_TO_TICKS(100));
+        if (status != ESP_OK || bytesRead == 0 ||
+            bytesRead > sizeof(dmaSamples) || bytesRead % sizeof(int32_t) != 0)
+        {
+            audioReady.store(false);
+            const uint64_t errorAt = healthUptimeMs();
+            audioErrorGeneration.fetch_add(1);
+            Serial.printf("[AUDIO] Channel error/timeout: %d, bytes=%u\n", status,
+                          static_cast<unsigned>(bytesRead));
+            // This task alone owns I2S; no concurrent uninstall/read.
+            i2s_driver_uninstall(I2S_PORT);
+            retry.failed(millis());
+            queueAudioFault(DeviceHealth::Fault::I2S_CHANNEL, errorAt);
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-
-        size_t sampleCount =
-            bytesRead /
-            sizeof(int32_t);
-
-        if (
-            sampleCount >
-            0
-        )
-        {
-            appendAudioSamplesToRing(
-                dmaSamples,
-                sampleCount
-            );
-        }
+        appendAudioSamplesToRing(dmaSamples, bytesRead / sizeof(int32_t));
     }
 }
 
@@ -1558,34 +1604,22 @@ AcousticFeatures analyzeCommonAudioWindow(
 // Vibration Task
 // =====================================================
 
-void vibrationTask(
-    void* parameter
-)
+void vibrationTask(void* parameter)
 {
+    (void)parameter;
     while (true)
     {
-        ulTaskNotifyTake(
-            pdTRUE,
-            portMAX_DELAY
-        );
-
-        VibrationFeatures local =
-            acquireVibration();
-
-        xSemaphoreTake(
-            vibrationResultMutex,
-            portMAX_DELAY
-        );
-
-        vibrationResult =
-            local;
-
-        vibrationFinished =
-            true;
-
-        xSemaphoreGive(
-            vibrationResultMutex
-        );
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        bool channelValid = adxlRead(REG_DEVID) == 0xE5;
+        VibrationFeatures local;
+        if (channelValid) local = acquireVibration();
+        channelValid = channelValid && adxlRead(REG_DEVID) == 0xE5;
+        xSemaphoreTake(vibrationResultMutex, portMAX_DELAY);
+        vibrationResult = local;
+        vibrationChannelValid = channelValid;
+        vibrationFinished = true;
+        vibrationBusy.store(false);
+        xSemaphoreGive(vibrationResultMutex);
     }
 }
 
@@ -1598,6 +1632,12 @@ bool acquireSynchronizedFeatures(
     AcousticFeatures& audio
 )
 {
+    if (vibrationBusy.load())
+    {
+        observeSensorFault(DeviceHealth::Fault::VIBRATION_TIMEOUT, true, healthUptimeMs());
+        return false; // A late worker must finish before another request.
+    }
+    const uint32_t audioGeneration = audioErrorGeneration.load();
     Serial.println();
     Serial.println(
         "[SYNC] Starting synchronized vibration + acoustic acquisition..."
@@ -1624,6 +1664,7 @@ bool acquireSynchronizedFeatures(
     uint32_t startedMs =
         millis();
 
+    vibrationBusy.store(true);
     xTaskNotifyGive(
         vibrationTaskHandle
     );
@@ -1660,10 +1701,22 @@ bool acquireSynchronizedFeatures(
                 "[SYNC] Vibration acquisition timeout."
             );
 
+            observeSensorFault(DeviceHealth::Fault::VIBRATION_TIMEOUT, true, healthUptimeMs());
+
             return false;
         }
 
         delay(1);
+    }
+
+    xSemaphoreTake(vibrationResultMutex, portMAX_DELAY);
+    const bool validVibration = vibrationChannelValid;
+    xSemaphoreGive(vibrationResultMutex);
+    if (!validVibration)
+    {
+        adxlRetry.failed(millis());
+        observeSensorFault(DeviceHealth::Fault::ADXL_CHANNEL, true, healthUptimeMs());
+        return false;
     }
 
     // The common acoustic interval is exactly 10,240 samples = 0.64 s.
@@ -1689,6 +1742,8 @@ bool acquireSynchronizedFeatures(
                 "[SYNC] Acoustic common-window timeout."
             );
 
+            observeSensorFault(DeviceHealth::Fault::AUDIO_WINDOW, true, healthUptimeMs());
+
             return false;
         }
 
@@ -1707,6 +1762,8 @@ bool acquireSynchronizedFeatures(
             "[SYNC] Failed to copy synchronized acoustic window."
         );
 
+        observeSensorFault(DeviceHealth::Fault::AUDIO_WINDOW, true, healthUptimeMs());
+
         return false;
     }
 
@@ -1721,6 +1778,22 @@ bool acquireSynchronizedFeatures(
     xSemaphoreGive(
         vibrationResultMutex
     );
+
+    if (!audioReady.load() || audioGeneration != audioErrorGeneration.load())
+    {
+        // The audio owner queues the actual occurrence time; serviceSensors()
+        // drains it after this acquisition fails, without replacing it with now.
+        return false; // No features across a discontinuous DMA stream.
+    }
+
+    if (!DeviceHealth::hasPcmVariation(commonAudioWindow, COMMON_AUDIO_SAMPLES))
+    {
+        // A whole constant digital window is a suspected stuck/missing channel,
+        // not evidence of a perfectly healthy silent machine.
+        audioReinitializeRequested.store(true);
+        observeSensorFault(DeviceHealth::Fault::I2S_CHANNEL, true, healthUptimeMs());
+        return false;
+    }
 
     audio =
         analyzeCommonAudioWindow(
@@ -5785,6 +5858,18 @@ void replayQueueBatch()
             continue;
         }
 
+        const auto order = DeviceHealth::dispatchOrder(
+            healthJournal, true, packet.timestampResolved,
+            static_cast<int64_t>(packet.epochSeconds) * 1000LL,
+            bootSessionId, healthUptimeMs(), currentHealthEpochMs());
+        if (!order.telemetry)
+        {
+            // The next health transition must commit before this later point.
+            // Re-evaluate for EVERY head, not just once per replay batch.
+            commitConsumedWatermark();
+            return;
+        }
+
         const uint32_t sequence =
             packet.sequence;
 
@@ -6140,6 +6225,188 @@ bool initPersistentStorage()
 // Setup
 // =====================================================
 
+// Device-health outbox is independent of the telemetry ring and sequence.
+// Only the main task mutates it or Preferences; sensor tasks expose observations.
+uint64_t healthUptimeMs()
+{
+    return static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+}
+
+int64_t currentHealthEpochMs()
+{
+    if (!timeReady) return 0;
+    timeval now;
+    gettimeofday(&now, nullptr);
+    return static_cast<int64_t>(now.tv_sec) * 1000LL + now.tv_usec / 1000;
+}
+
+bool persistHealthJournal(const DeviceHealth::Journal& candidate)
+{
+    if (!DeviceHealth::validJournal(candidate)) return false;
+    const size_t written = preferences.putBytes("healthJournal", &candidate, sizeof(candidate));
+    DeviceHealth::Journal readback;
+    return written == sizeof(candidate) &&
+           preferences.getBytes("healthJournal", &readback, sizeof(readback)) == sizeof(readback) &&
+           DeviceHealth::validJournal(readback) && memcmp(&candidate, &readback, sizeof(candidate)) == 0;
+}
+
+bool initializeDeviceHealth()
+{
+    if (preferences.isKey("healthJournal"))
+    {
+        if (preferences.getBytesLength("healthJournal") != sizeof(healthJournal) ||
+            preferences.getBytes("healthJournal", &healthJournal, sizeof(healthJournal)) != sizeof(healthJournal) ||
+            !DeviceHealth::validJournal(healthJournal))
+        {
+            healthJournalUsable = false;
+            Serial.println("[HEALTH] Journal invalid; preserved for inspection. Sensor acquisition paused.");
+            return false;
+        }
+    }
+    else
+    {
+        healthJournalDirty = !persistHealthJournal(healthJournal);
+    }
+    if (!*DEVICE_HEALTH_URL || !*DEVICE_HEALTH_TOKEN ||
+        strcmp(DEVICE_HEALTH_TOKEN, "YOUR_DEVICE_HEALTH_TOKEN") == 0)
+        Serial.println("[HEALTH] Configure the separate device-health URL/token; reporting is not provisioned.");
+    return !healthJournalDirty;
+}
+
+bool observeSensorFault(DeviceHealth::Fault fault, bool active, uint64_t observedMs)
+{
+    if (!healthJournalUsable) return false;
+    DeviceHealth::Journal candidate = healthJournal;
+    const uint64_t age = healthUptimeMs() - observedMs;
+    const int64_t now = currentHealthEpochMs();
+    const int64_t observedEpoch = now >= 1700000000000LL &&
+        age <= static_cast<uint64_t>(now - 1700000000000LL) ? now - static_cast<int64_t>(age) : 0;
+    if (!DeviceHealth::observe(candidate, fault, active, bootSessionId, observedMs, observedEpoch))
+    {
+        healthObservationBlocked = true;
+        Serial.println("[HEALTH] Transition queue full/invalid; sensing paused until it can be recorded.");
+        return false;
+    }
+    if (candidate.crc == healthJournal.crc) return !healthJournalDirty;
+    // Retain an uncommitted observation in RAM, but never transmit/continue
+    // sensing until the NVS write/read-back succeeds. No silent drop on error.
+    healthJournal = candidate;
+    healthJournalDirty = !persistHealthJournal(candidate);
+    if (healthJournalDirty)
+        Serial.println("[HEALTH] Observation not durable yet; retrying storage, sensing paused.");
+    return !healthJournalDirty;
+}
+
+void serviceSensors()
+{
+    healthObservationBlocked = false;
+    if (!healthJournalUsable || healthJournalDirty) return;
+    if (healthJournal.count == DeviceHealth::JOURNAL_CAPACITY)
+    {
+        healthObservationBlocked = true;
+        return;
+    }
+    if (!vibrationBusy.load() && adxlRetry.due(millis()))
+    {
+        const bool initialized = initADXL345();
+        adxlInitFailed = !initialized;
+        adxlRetry.attempted(millis(), initialized);
+    }
+    if (adxlRetry.attempts())
+        observeSensorFault(DeviceHealth::Fault::ADXL_INIT, adxlInitFailed, healthUptimeMs());
+    SensorObservation observation;
+    // Peek until the observation is durably recorded. A failed write or full
+    // journal cannot discard a short-lived audio failure between main loops.
+    while (xQueuePeek(sensorObservations, &observation, 0) == pdTRUE)
+    {
+        if (!observeSensorFault(observation.fault, observation.active, observation.observedMs)) break;
+        xQueueReceive(sensorObservations, &observation, 0);
+    }
+}
+
+void queueAudioFault(DeviceHealth::Fault fault, uint64_t observedMs)
+{
+    const SensorObservation observation{fault, true, observedMs};
+    // Bounded queue with backpressure, not a lossy mailbox. This task owns no
+    // mutex or live I2S read while waiting; the main task keeps servicing HTTP.
+    xQueueSend(sensorObservations, &observation, portMAX_DELAY);
+}
+
+void serviceDeviceHealth()
+{
+    if (!healthJournalUsable) return;
+    static uint32_t lastStorageRetry = 0;
+    if (healthJournalDirty)
+    {
+        if (millis() - lastStorageRetry >= 5000U)
+        {
+            lastStorageRetry = millis();
+            healthJournalDirty = !persistHealthJournal(healthJournal);
+        }
+        if (healthJournalDirty) return;
+    }
+    if (WiFi.status() != WL_CONNECTED || !timeReady || !*DEVICE_HEALTH_URL ||
+        !*DEVICE_HEALTH_TOKEN || strcmp(DEVICE_HEALTH_TOKEN, "YOUR_DEVICE_HEALTH_TOKEN") == 0) return;
+    DeviceHealth::Metrics metrics;
+    metrics.rssiDbm = std::max(-120, std::min(0, static_cast<int>(WiFi.RSSI())));
+    metrics.rebootCount = std::min<uint32_t>(bootSessionId - 1U, 2147483647U);
+    metrics.queuedRecords = queueCount;
+    metrics.queueCapacity = QUEUE_CAPACITY;
+    metrics.firmwareVersion = FIRMWARE_VERSION;
+    if (!healthSchedule.due(millis(), DeviceHealth::metricsChanged(lastHealthMetrics, metrics),
+                            healthJournal.count != 0)) return;
+    const int64_t epochMs = currentHealthEpochMs();
+    const uint64_t reportMonotonic = healthUptimeMs();
+    TelemetryPacket oldest;
+    BinaryTelemetryRecord raw;
+    uint64_t ordinal = 0;
+    bool queued = !queueIsEmpty();
+    const bool headKnown = queued &&
+        readOldestPersistent(oldest, ordinal, raw) == QueueReadResult::READY;
+    queued = !queueIsEmpty(); // Reading may safely skip proven corruption.
+    const auto order = DeviceHealth::dispatchOrder(
+        healthJournal, queued, headKnown,
+        static_cast<int64_t>(oldest.epochSeconds) * 1000LL,
+        bootSessionId, reportMonotonic, epochMs);
+    const bool includesFaults = order.transition || order.snapshot;
+    // Current metrics need not wait for an old backlog, but they must not
+    // advance analysis boundaries or acknowledge a deferred fault transition.
+    const std::string body = DeviceHealth::payload(
+        healthJournal, metrics, bootSessionId, reportMonotonic, epochMs, includesFaults);
+    bool accepted = false;
+    if (!body.empty())
+    {
+        HTTPClient http;
+        WiFiClientSecure secureClient;
+        secureClient.setHandshakeTimeout(3);
+        http.setConnectTimeout(1500);
+        http.setTimeout(1500);
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        if (beginBackendHttp(http, secureClient, DEVICE_HEALTH_URL))
+        {
+            http.addHeader("Content-Type", "application/json");
+            http.addHeader("Authorization", String("Bearer ") + DEVICE_HEALTH_TOKEN);
+            const int status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
+            const String response = status == 200 ? http.getString() : String();
+            accepted = DeviceHealth::accepted(status, response.c_str(), DEVICE_ID, epochMs);
+            Serial.printf("[HEALTH] HTTP %d, confirmed=%s, pending=%u\n", status,
+                          accepted ? "yes" : "no", static_cast<unsigned>(healthJournal.count));
+            http.end();
+        }
+    }
+    if (accepted && order.transition && healthJournal.count)
+    {
+        DeviceHealth::Journal candidate = healthJournal;
+        DeviceHealth::acknowledgeHead(candidate, bootSessionId, reportMonotonic, epochMs);
+        // A failed ACK-marker write leaves the old head for an idempotent retry.
+        // Never send its successor until this removal is durable.
+        if (persistHealthJournal(candidate)) healthJournal = candidate;
+        else accepted = false;
+    }
+    healthSchedule.completed(millis(), accepted);
+    if (accepted) lastHealthMetrics = metrics;
+}
+
 void setup()
 {
     Serial.begin(
@@ -6243,6 +6510,8 @@ void setup()
         }
     }
 
+    initializeDeviceHealth();
+
     pinMode(
         ADXL_CS,
         OUTPUT
@@ -6260,45 +6529,19 @@ void setup()
         ADXL_CS
     );
 
-    if (
-        !initADXL345()
-    )
-    {
-        Serial.println(
-            "[FATAL] ADXL345 failed."
-        );
-
-        while (true)
-        {
-            delay(1000);
-        }
-    }
-
-    if (
-        !initINMP441()
-    )
-    {
-        Serial.println(
-            "[FATAL] INMP441 failed."
-        );
-
-        while (true)
-        {
-            delay(1000);
-        }
-    }
-
     vibrationResultMutex =
         xSemaphoreCreateMutex();
 
     audioRingMutex =
         xSemaphoreCreateMutex();
 
+    sensorObservations = xQueueCreate(32, sizeof(SensorObservation));
+
     if (
         vibrationResultMutex ==
             nullptr ||
         audioRingMutex ==
-            nullptr
+            nullptr || sensorObservations == nullptr
     )
     {
         Serial.println(
@@ -6311,7 +6554,7 @@ void setup()
         }
     }
 
-    xTaskCreatePinnedToCore(
+    const BaseType_t vibrationCreated = xTaskCreatePinnedToCore(
         vibrationTask,
         "VibrationTask",
         8192,
@@ -6324,7 +6567,7 @@ void setup()
     // P5:
     // Continuous audio task never waits for per-cycle notification.
     // It continuously drains I2S so stale DMA samples do not accumulate.
-    xTaskCreatePinnedToCore(
+    const BaseType_t audioCreated = xTaskCreatePinnedToCore(
         audioCaptureTask,
         "AudioCaptureTask",
         8192,
@@ -6333,6 +6576,12 @@ void setup()
         &audioCaptureTaskHandle,
         1
     );
+
+    if (vibrationCreated != pdPASS || audioCreated != pdPASS)
+    {
+        Serial.println("[FATAL] Sensor task allocation failed; no unsafe acquisition.");
+        while (true) { delay(1000); }
+    }
 
     Serial.println(
         "[OK] Vibration Task -> Core 0"
@@ -6423,13 +6672,17 @@ void loop()
 
     serviceWiFi();
 
-    // Recover absolute time when network becomes available.
+    static uint32_t lastTimeSyncAttempt = 0;
+    static bool timeSyncAttempted = false;
+    // Recover absolute time with bounded attempts, including sensor-fault mode.
     if (
         WiFi.status() ==
             WL_CONNECTED &&
-        !timeReady
+        !timeReady && (!timeSyncAttempted || millis() - lastTimeSyncAttempt >= 30000U)
     )
     {
+        timeSyncAttempted = true;
+        lastTimeSyncAttempt = millis();
         if (
             syncTime()
         )
@@ -6447,6 +6700,9 @@ void loop()
     {
         persistCurrentSessionTimeAnchor();
     }
+
+    serviceSensors();
+    serviceDeviceHealth(); // Metrics only while an older telemetry head exists.
 
     // Replay only a bounded slice of old data before each fresh
     // measurement. This prevents a full 24-hour backlog from starving
@@ -6468,8 +6724,26 @@ void loop()
     // P5: one common 0.64 s vibration/acoustic window
     // =================================================
 
+    if (!adxlRetry.ready() || !audioReady.load() || !healthJournalUsable ||
+        healthJournalDirty || healthObservationBlocked)
+    {
+        delay(200); // Wi-Fi, health reporting and bounded replay remain alive.
+        return;
+    }
+
+    // Telemetry UTC has whole-second precision, health has milliseconds.
+    // Start a new window only after the acknowledged boundary's second, rather
+    // than creating a fresh point that the backend would reject as <= boundary.
+    if (timeReady && currentHealthEpochMs() / 1000LL * 1000LL <=
+        DeviceHealth::acknowledgedBoundary(healthJournal))
+    {
+        delay(200);
+        return;
+    }
+
     VibrationFeatures vib;
     AcousticFeatures audio;
+    const uint32_t acquisitionAudioGeneration = audioErrorGeneration.load();
 
     if (
         !acquireSynchronizedFeatures(
@@ -6481,6 +6755,8 @@ void loop()
         Serial.println(
             "[SENSOR] Synchronized acquisition failed."
         );
+        serviceSensors();
+        serviceDeviceHealth();
 
         delay(
             MEASUREMENT_INTERVAL_MS
@@ -6507,11 +6783,32 @@ void loop()
         Serial.println(
             "[SENSOR] Invalid NaN/Inf measurement."
         );
+        observeSensorFault(DeviceHealth::Fault::INVALID_FEATURES, true, healthUptimeMs());
+        serviceDeviceHealth();
 
         delay(
             MEASUREMENT_INTERVAL_MS
         );
 
+        return;
+    }
+
+    // A successful synchronized, finite window is the recovery evidence;
+    // successful driver installation alone cannot clear runtime sensor faults.
+    if (!audioReady.load() || acquisitionAudioGeneration != audioErrorGeneration.load())
+    {
+        serviceSensors();
+        serviceDeviceHealth();
+        delay(MEASUREMENT_INTERVAL_MS);
+        return;
+    }
+    for (size_t code = 0; code < DeviceHealth::FAULT_COUNT; ++code)
+        observeSensorFault(static_cast<DeviceHealth::Fault>(code), false, healthUptimeMs());
+    // Send these observations on the next service pass. An HTTP health request
+    // here would shift the fresh packet timestamp after the measured window.
+    if (healthJournalDirty || healthObservationBlocked)
+    {
+        delay(MEASUREMENT_INTERVAL_MS);
         return;
     }
 
@@ -6579,7 +6876,8 @@ void loop()
         return;
     }
 
-    // Existing backlog always wins FIFO.
+    // Existing backlog and pending health transitions always win the ordered
+    // dispatcher. Do not bypass a deferred health boundary via direct POST.
     //
     // replayQueueBatch() consumed only a bounded number of oldest
     // records at the start of this loop. If backlog remains, this fresh
@@ -6587,7 +6885,7 @@ void loop()
     // telemetry. Therefore catch-up and acquisition are interleaved
     // without reordering packets.
     if (
-        !queueIsEmpty()
+        !queueIsEmpty() || healthJournal.count != 0
     )
     {
         if (

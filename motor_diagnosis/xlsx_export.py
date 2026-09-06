@@ -117,7 +117,12 @@ def dataset_xlsx_bytes(export: dict[str, Any]) -> bytes:
 
     manifest = export["manifest"]
     source_rows = export["rows"]
-    headers = list(source_rows[0]) if source_rows else list(DATASET_ROW_FIELDS)
+    # Optional observation fields may first appear after a legacy row.
+    headers = (
+        list(dict.fromkeys(key for row in source_rows for key in row))
+        if source_rows
+        else list(DATASET_ROW_FIELDS)
+    )
     manifest_rows = [["field", "value"], *[[key, value] for key, value in manifest.items()]]
     data_rows = [headers]
     data_rows.extend([[row.get(key) for key in headers] for row in source_rows])

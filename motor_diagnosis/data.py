@@ -11,7 +11,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NoReturn
 
 from ai.ai2.week2.anomaly_score import score_telemetry_point
 from ai.ai2.week3.event_lifecycle import AnomalyEventLifecycle, EventLifecycleConfig
@@ -2894,6 +2894,96 @@ def telemetry_optional_text(payload: dict[str, Any], key: str) -> str | None:
     return value.strip() or None
 
 
+def normalize_rpm_observation(
+    payload: dict[str, Any], timestamp: datetime
+) -> dict[str, Any]:
+    """Validate optional equipment feedback without upgrading legacy RPM to measured."""
+    fields = {"rpmStatus", "rpmMeasuredAt", "rpmSource"}
+    if not fields.intersection(payload):
+        # Preserve legacy normalization, including its idempotency hash.
+        return {"rpm": telemetry_number(payload, "rpm", required=False, nullable=True)}
+
+    def reject(message: str) -> NoReturn:
+        raise ApiError(400, "INVALID_TELEMETRY_PAYLOAD", message)
+
+    if not (fields | {"rpm"}).issubset(payload):
+        reject("rpm, rpmStatus, rpmMeasuredAt and rpmSource must be supplied together.")
+    status = payload["rpmStatus"]
+    if not isinstance(status, str) or status not in {
+        "valid",
+        "unavailable",
+        "stale",
+        "invalid",
+    }:
+        reject("rpmStatus must be valid, unavailable, stale or invalid.")
+    source = payload["rpmSource"]
+    if source is not None:
+        if (
+            not isinstance(source, str)
+            or not source.strip()
+            or len(source) > 160
+            or not source.isprintable()
+        ):
+            reject(
+                "rpmSource must be null or a nonblank identifier of at most 160 characters without control characters."
+            )
+        source = source.strip()
+    measured_at = payload["rpmMeasuredAt"]
+    if measured_at is not None:
+        if (
+            not isinstance(measured_at, str)
+            or re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})",
+                measured_at,
+            )
+            is None
+        ):
+            reject(
+                "rpmMeasuredAt must be an RFC3339 timestamp (up to six fractional digits) or null."
+            )
+        # Limit offset components as fromisoformat also accepts overflowing minutes.
+        if measured_at[-1:] not in {"Z", "z"} and (
+            int(measured_at[-5:-3]) > 23 or int(measured_at[-2:]) > 59
+        ):
+            reject("rpmMeasuredAt has an invalid timezone offset.")
+        if measured_at.endswith("-00:00"):
+            reject("rpmMeasuredAt must have a known UTC offset.")
+        try:
+            measured = parse_rfc3339(
+                "rpmMeasuredAt", measured_at.upper(), "INVALID_TELEMETRY_PAYLOAD"
+            )
+        except OverflowError:
+            reject("rpmMeasuredAt is outside the supported UTC date range.")
+        if measured > timestamp:
+            reject("rpmMeasuredAt must not be after the telemetry timestamp.")
+        measured_at = format_rfc3339(measured)
+    rpm = payload["rpm"]
+    if status == "valid":
+        if source is None or measured_at is None:
+            reject("Valid RPM requires rpmSource and rpmMeasuredAt.")
+        if not isinstance(rpm, (int, float)) or isinstance(rpm, bool):
+            reject("Valid RPM must be a finite nonnegative JSON number.")
+        rpm = telemetry_number(payload, "rpm", required=True, nullable=False)
+        if rpm < 0:
+            reject("Valid RPM must be nonnegative; zero represents a measured stop.")
+        if payload.get("isSynthetic"):
+            reject("Synthetic telemetry must not claim valid equipment RPM feedback.")
+    elif rpm is not None:
+        reject("Unavailable, stale or invalid RPM must be null, not a fallback value.")
+    if status == "stale" and (source is None or measured_at is None):
+        reject("Stale RPM requires the source and timestamp of the last observation.")
+    if status == "unavailable" and measured_at is not None:
+        reject("Unavailable RPM has no observation; rpmMeasuredAt must be null.")
+    if measured_at is not None and source is None:
+        reject("An RPM observation timestamp requires rpmSource.")
+    return {
+        "rpm": rpm,
+        "rpmStatus": status,
+        "rpmMeasuredAt": measured_at,
+        "rpmSource": source,
+    }
+
+
 def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
     allowed_fields = {
         "timestamp",
@@ -2902,6 +2992,9 @@ def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "assetId",
         "deviceId",
         "rpm",
+        "rpmStatus",
+        "rpmMeasuredAt",
+        "rpmSource",
         "vibrationRmsRaw",
         "vibrationRmsMmS",
         "vibrationPeakHz",
@@ -3014,7 +3107,7 @@ def normalize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "timestamp": format_rfc3339(timestamp),
         "sequence": sequence,
         **identifiers,
-        "rpm": telemetry_number(payload, "rpm", required=False, nullable=True),
+        **normalize_rpm_observation(payload, timestamp),
         "vibrationRmsRaw": vibration_rms_raw,
         "vibrationRmsMmS": None,
         "vibrationPeakHz": telemetry_number(
@@ -7317,6 +7410,14 @@ def _dataset_rows_for_points(
             "training_eligible": training_eligible,
             "event_reviewed": event_reviewed,
         }
+        # Leave pre-extension/frozen rows unchanged. New observations retain their
+        # own quality and provenance rather than borrowing asset.ratedRpm.
+        if "rpmStatus" in point:
+            row.update(
+                rpm_status=point["rpmStatus"],
+                rpm_measured_at=point.get("rpmMeasuredAt"),
+                rpm_source=point.get("rpmSource"),
+            )
         rows.append({key: _safe_tabular_value(value) for key, value in row.items()})
     return rows
 

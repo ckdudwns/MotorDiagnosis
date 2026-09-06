@@ -16,7 +16,7 @@ function harness() {
   class Element {
     children = []; textContent = ''; hidden = false; disabled = false; value = '';
     width = 900; height = 280; listeners = {}; dataset = {};
-    attributes = {};
+    attributes = {}; style = {};
     constructor(tag = 'div') {this.tagName = tag;}
     addEventListener(name, callback) {this.listeners[name] = callback;}
     setAttribute(name, value) {this.attributes[name] = String(value);}
@@ -32,7 +32,7 @@ function harness() {
   const get = id => {if (!elements.has(id)) elements.set(id,new Element(selectIds.has(id) ? 'select' : 'div')); return elements.get(id);};
   const context = vm.createContext({
     document:{body:new Element(),getElementById:get,createElement:tag => new Element(tag),addEventListener() {}},
-    URL, URLSearchParams, crypto:{randomUUID}, setTimeout, console, setInterval:fn => intervals.push(fn), confirm:() => true, alert:message => {throw new Error(message);},
+    URL, URLSearchParams, atob, Blob, crypto:{randomUUID}, setTimeout, console, setInterval:fn => intervals.push(fn), confirm:() => true, alert:message => {throw new Error(message);},
     fetch:async (path,options = {}) => {
       requests.push({path,options});
       const body = await context.respond(path,options);
@@ -110,7 +110,7 @@ await check('late event detail cannot overwrite the newer selection', async () =
   assert.equal(h.run('selectedEventId'),'NEW'); assert.equal(h.run('selectedDetail.event.id'),'NEW');
   assert.match(h.get('eventDetail').children[0].textContent,/NEW/);
   assert.equal(h.get('eventDetail').children[0].children.length,0);
-  assert.match(h.get('eventDetail').children.at(-1).textContent,/원본 신호 없음/);
+  assert.match(textOf(h.get('eventDetail')),/요약 시계열 없음/);
   assert.match(h.get('eventEvidence').textContent,/saved-feature/);
 });
 
@@ -724,10 +724,10 @@ await check('AI cancelled refresh, page, filter and selection preserve the unsav
   assert.equal(h.get('modelStatusFilter').value,'draft'); assert.equal(h.run('modelQueuePage'),1);
 });
 
-const opsDefaults = {measurementIntervalMs:3000,replayBatchSize:4};
+const opsDefaults = {measurementIntervalMs:3000,replayBatchSize:4,healthReportIntervalMs:30000};
 const opsRow = id => ({id,siteId:'S1',assetId:'A1',mappingStatus:'active',certificateStatus:'registered',firmwareVersion:'test-only'});
 function opsCommand(version=1, changes={}) {
-  return {version,commandId:'a'.repeat(32),settings:{measurementIntervalMs:6000,replayBatchSize:2},state:'pending',result:null,siteId:'S1',assetId:'A1',reason:'fixture reason',requestedBy:'tester',requestedAt:'2026-09-06T00:00:00Z',...changes};
+  return {version,commandId:'a'.repeat(32),settings:{measurementIntervalMs:6000,replayBatchSize:2,healthReportIntervalMs:30000},state:'pending',result:null,siteId:'S1',assetId:'A1',reason:'fixture reason',requestedBy:'tester',requestedAt:'2026-09-06T00:00:00Z',...changes};
 }
 function opsConfigResult(id='D1', command=null, scope={}) {
   return {deviceId:id,siteId:'S1',assetId:'A1',version:command?.version || 0,desired:command,lastApplied:null,scopeChanged:false,defaults:opsDefaults,limits:{},...scope};
@@ -818,7 +818,7 @@ await check('operations publish validates bounds reason confirmation and keeps p
   opsDraft(h); h.context.confirm=()=>false; await h.run('publishOpsConfig()'); assert.equal(h.requests.length,calls);
   h.context.confirm=()=>true; h.context.respond=async()=>opsCommand(); await h.run('publishOpsConfig()');
   const sent=JSON.parse(h.requests.at(-1).options.body);
-  assert.deepEqual(sent,{expectedVersion:0,settings:{measurementIntervalMs:6000,replayBatchSize:2},reason:'fixture reason'});
+  assert.deepEqual(sent,{expectedVersion:0,settings:{measurementIntervalMs:6000,replayBatchSize:2,healthReportIntervalMs:30000},reason:'fixture reason'});
   assert.equal(h.run('opsConfig.lastApplied'),null); assert.match(h.get('opsConfigStatus').textContent,/적용 성공 보고 대기/);
   assert.equal(h.get('opsConfigReason').value,''); assert.equal(h.run('opsDirty'),false);
 });
@@ -961,6 +961,77 @@ await check('operations publication stays disabled until empty configuration map
     assert.equal(h.get('opsConfigPublish').disabled,!matches);
     assert.equal(h.get('opsConfigReason').value,'fixture reason');
   }
+});
+
+await check('installation snapshots and unknown history render safely without fetching photos', async () => {
+  const h=harness(); h.context.respond=path=>{
+    const result=detailResponses(path);
+    if(path.includes('/anomaly/events/')) result.installationSnapshot={status:'recorded',effectiveAt:'2026-09-07T00:00:00Z',points:[{id:'IP1',position:'<img onerror=attack()>',orientation:'X',mountingMethod:'bolt',photoRefs:['https://example.invalid/private.jpg']}]};
+    return result;
+  };
+  await h.run('selectEvent("E1")');
+  assert.match(textOf(h.get('eventDetail')),/<img onerror=attack\(\)>/);
+  assert.match(textOf(h.get('eventDetail')),/private.jpg/);
+  assert.ok(!h.requests.some(r=>r.path.includes('example.invalid')));
+  h.context.respond=detailResponses; await h.run('selectEvent("E2")');
+  assert.match(textOf(h.get('eventDetail')),/기록된 과거 설치 정보 없음/);
+});
+await check('health interval UI rejects bounds and sends the selected integer', async () => {
+  const h=opsHarness(); await h.run('loadDeviceOperations()'); opsDraft(h);
+  h.get('opsHealthInterval').value='9999'; await h.run('publishOpsConfig()');
+  assert.ok(!h.requests.some(r=>r.options.method==='PUT'));
+  const original=h.context.respond;
+  h.context.respond=(path,options)=>options.method==='PUT'?{desired:opsCommand(1,{settings:JSON.parse(options.body).settings})}:original(path,options);
+  h.get('opsHealthInterval').value='120000'; await h.run('publishOpsConfig()');
+  assert.equal(JSON.parse(h.requests.find(r=>r.options.method==='PUT').options.body).settings.healthReportIntervalMs,120000);
+});
+const analysisList=(changes={})=>({deviceId:'D1',siteId:'S1',assetId:'A1',items:[],requests:[],nextCursor:null,...changes});
+await check('waveform request ACK loss reuses identity and successful write survives list failure', async () => {
+  const h=opsHarness(); await h.run('loadDeviceOperations()');
+  h.get('opsAnalysisReason').value='inspect sound'; let lose=true;
+  h.context.respond=(path,options)=>{
+    if(path.endsWith('/requests')) {if(lose) {lose=false;throw new Error('ACK lost');} return {...JSON.parse(options.body),status:'pending'};}
+    throw new Error('list failed');
+  };
+  await h.run('requestOpsWaveform()');
+  const first=JSON.parse(h.requests.at(-1).options.body);
+  assert.equal(h.get('opsAnalysisReason').value,'inspect sound');
+  await h.run('requestOpsWaveform()');
+  const posts=h.requests.filter(r=>r.options.method==='POST');
+  assert.deepEqual(JSON.parse(posts[1].options.body),first);
+  assert.equal(h.get('opsAnalysisReason').value,''); assert.equal(h.run('analysisIntent'),null);
+  assert.match(h.get('opsAnalysisStatus').textContent,/요청 저장 완료.*목록 조회 실패/);
+  await h.run('requestOpsWaveform()'); assert.equal(h.requests.filter(r=>r.options.method==='POST').length,2);
+});
+await check('waveform reads reject remapped scope even when the history is empty', async () => {
+  const h=opsHarness(); await h.run('loadDeviceOperations()');
+  h.context.respond=()=>analysisList({assetId:'A2'});
+  await h.run('loadOpsAnalysis()');
+  assert.equal(h.run('opsDevice'),null);
+  assert.equal(h.get('opsAnalysisRequest').disabled,true);
+});
+await check('late waveform list cannot replace a newer request and pagination is reachable', async () => {
+  const h=opsHarness(); await h.run('loadDeviceOperations()'); const late=deferred(); let count=0;
+  h.context.respond=()=>++count===1?late.promise:analysisList({requests:[{id:'new',status:'pending',reason:'latest'}],nextCursor:'opaque-next'});
+  const old=h.run('loadOpsAnalysis()'); await h.run('loadOpsAnalysis()'); late.resolve(analysisList()); await old;
+  assert.match(textOf(h.get('opsAnalysisRows')),/latest/);
+  const next=h.get('opsAnalysisRows').children.at(-1);
+  h.context.respond=path=>{assert.match(path,/cursor=opaque-next/);return analysisList();};
+  await next.listeners.click(); await new Promise(resolve=>setTimeout(resolve,0));
+  assert.ok(h.requests.some(r=>r.path.includes('cursor=opaque-next')));
+});
+await check('raw preview decodes float32 and summaries never expose a waveform button', async () => {
+  const h=opsHarness(); await h.run('loadDeviceOperations()');
+  const channel={sampleCount:4,sampleRateHz:800,unit:'g',samplesFloat32LE:Buffer.from(new Float32Array([0,1,-1,0]).buffer).toString('base64')};
+  const row={id:'a'.repeat(32),deviceId:'D1',siteId:'S1',assetId:'A1',timestamp:'2026-09-07T00:00:00Z',hasWaveform:true,channels:{vibrationX:channel}};
+  h.context.respond=path=>path.startsWith('/api/analysis/')?{frame:row}:analysisList({items:[row]});
+  await h.run('loadOpsAnalysis()');
+  const card=h.get('opsAnalysisRows').children[0];
+  await card.children.find(c=>c.tagName==='button').listeners.click();
+  assert.ok(h.calls.some(c=>c[0]==='stroke'));
+  assert.match(textOf(card),/분석 JSON 저장/);
+  h.context.respond=()=>analysisList({items:[{...row,hasWaveform:false}]}); await h.run('loadOpsAnalysis()');
+  assert.ok(!h.get('opsAnalysisRows').children[0].children.some(c=>c.tagName==='button'));
 });
 
 assert.deepEqual(failures,[],`${failures.length} behavior checks failed`);

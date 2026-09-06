@@ -109,6 +109,7 @@ from .data import (
 )
 from .json_validation import loads_strict_json
 from .alerts import AlertService
+from .edge_analysis import AnalysisStore
 from .model_registry import create_baseline_version, create_model_version, versions_for
 from .ai_results import submit_result, review_model
 from .telemetry_bulk import ingest_telemetry_bulk
@@ -116,7 +117,6 @@ from .web import render_page
 from .xlsx_export import dataset_xlsx_bytes
 from . import remote_config
 from .communication_quality import CommunicationQualityStore
-
 
 LOGGER = logging.getLogger("motor_diagnosis")
 MAX_JSON_BODY_BYTES = 64 * 1024
@@ -223,7 +223,32 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "devices"]
+            and segments[3:] == ["analysis", "pending"]
+        ):
+            self.send_json(
+                self.server.analysis.pending(
+                    telemetry_principal_for_token(self.bearer_token()), segments[2]
+                )
+            )
+            return
         user = self.require_user()
+        if len(segments) == 3 and segments[:2] == ["api", "analysis"]:
+            self.send_json(self.server.analysis.detail(user, segments[2]))
+            return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "analysis"
+        ):
+            self.send_json(
+                self.server.analysis.list_device(
+                    user, segments[2], cursor=query.get("cursor", [None])[0]
+                )
+            )
+            return
 
         if (
             len(segments) == 4
@@ -558,6 +583,15 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if len(segments) == 4 and segments[:3] == ["api", "anomaly", "events"]:
             detail = event_detail_for(user, segments[3])
+            if has_permission(user, "telemetry:read"):
+                detail["analysis"] = self.server.analysis.list_for(
+                    user,
+                    detail["event"]["siteId"],
+                    detail["event"]["assetId"],
+                    device_id=detail["event"].get("deviceId"),
+                    start=parse_rfc3339("from", detail["context"]["from"]).timestamp(),
+                    end=parse_rfc3339("to", detail["context"]["to"]).timestamp(),
+                )
             if detail["context"]["source"] == "stored":
                 detail["context"]["points"] = annotate_telemetry_points(
                     detail["context"]["points"]
@@ -649,7 +683,30 @@ class AppHandler(BaseHTTPRequestHandler):
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
     def route_post(self, segments: list[str]) -> None:
-        payload = self.read_json()
+        analysis_path = (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "analysis"
+        )
+        payload = (
+            self.read_json(maximum=1024 * 1024) if analysis_path else self.read_json()
+        )
+        if analysis_path:
+            result, status = self.server.analysis.ingest(
+                telemetry_principal_for_token(self.bearer_token()), segments[2], payload
+            )
+            self.send_json(result, status=status)
+            return
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "devices"]
+            and segments[3:] == ["analysis", "requests"]
+        ):
+            self.send_json(
+                self.server.analysis.request(self.require_user(), segments[2], payload),
+                status=201,
+            )
+            return
         if segments == ["api", "auth", "login"]:
             self.send_json(authenticate(payload))
             return
@@ -711,7 +768,9 @@ class AppHandler(BaseHTTPRequestHandler):
             and segments[3:] == ["configuration", "result"]
         ):
             self.send_json(
-                remote_config.report_configuration(self.bearer_token(), segments[2], payload)
+                remote_config.report_configuration(
+                    self.bearer_token(), segments[2], payload
+                )
             )
             return
 
@@ -830,7 +889,11 @@ class AppHandler(BaseHTTPRequestHandler):
         if segments == ["api", "baseline-versions"]:
             self.send_json(create_baseline_version(user, payload), status=201)
             return
-        if len(segments) == 4 and segments[:2] == ["api", "model-versions"] and segments[3] == "reviews":
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "model-versions"]
+            and segments[3] == "reviews"
+        ):
             self.send_json(review_model(user, segments[2], payload))
             return
         if segments == ["api", "model-versions"]:
@@ -973,7 +1036,7 @@ class AppHandler(BaseHTTPRequestHandler):
             raise ApiError(401, "AUTH_REQUIRED", "A bearer session token is required.")
         return token
 
-    def read_json(self) -> dict[str, Any]:
+    def read_json(self, *, maximum=MAX_JSON_BODY_BYTES) -> dict[str, Any]:
         length_text = self.headers.get("content-length", "0")
         try:
             length = int(length_text)
@@ -983,9 +1046,11 @@ class AppHandler(BaseHTTPRequestHandler):
             ) from exc
         if length < 0:
             raise ApiError(400, "INVALID_CONTENT_LENGTH", "Content-Length is invalid.")
-        if length > MAX_JSON_BODY_BYTES:
+        if length > maximum:
             raise ApiError(
-                413, "REQUEST_TOO_LARGE", "Request body must be 64KB or less."
+                413,
+                "REQUEST_TOO_LARGE",
+                f"Request body must be {maximum} bytes or less.",
             )
         if length == 0:
             return {}
@@ -1564,6 +1629,10 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
                 self.communication_quality.prune()
             except Exception:
                 LOGGER.exception("Quality retention failed; will retry on next tick")
+            try:
+                self.analysis.prune()
+            except Exception:
+                LOGGER.exception("Analysis retention failed; will retry on next tick")
 
     def _run_alert_worker(self):
         # SQLite can wait on another writer. Never perform this work in
@@ -1595,6 +1664,8 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
             self.communication_quality.close()
         if hasattr(self, "alerts"):
             self.alerts.close()
+        if hasattr(self, "analysis"):
+            self.analysis.close()
         close_runtime_state()
 
 
@@ -1608,6 +1679,7 @@ def create_server(
     auto_alerts=True,
     state_database=None,
     communication_database=":memory:",
+    analysis_database=":memory:",
 ) -> ThreadingHTTPServer:
     if demo_enabled is None:
         demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
@@ -1622,15 +1694,18 @@ def create_server(
     )
     server.auto_alerts = auto_alerts
     try:
-        server.communication_quality = CommunicationQualityStore(
-            communication_database
-        )
+        server.analysis = AnalysisStore(analysis_database)
+        server.communication_quality = CommunicationQualityStore(communication_database)
         server.alerts = AlertService(
             alert_database,
             adapters=alert_adapters,
         )
         server.start_alert_worker()
-        if state_database or communication_database != ":memory:":
+        if (
+            state_database
+            or communication_database != ":memory:"
+            or analysis_database != ":memory:"
+        ):
             server.start_retention_worker()
     except Exception:
         server.server_close()

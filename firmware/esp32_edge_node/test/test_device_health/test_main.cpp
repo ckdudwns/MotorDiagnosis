@@ -211,6 +211,21 @@ void testScheduleSurvivesMillisWrap() {
     TEST_ASSERT_FALSE(schedule.due(0x100U, true, true));
     TEST_ASSERT_TRUE(schedule.due(0xFFFFFF00U + 30000U, false, false));
 }
+void testRemoteIntervalNeverDelaysFaultOrRetry() {
+    ReportSchedule schedule;
+    TEST_ASSERT_TRUE(schedule.setInterval(300000)); schedule.completed(0, true);
+    TEST_ASSERT_FALSE(schedule.due(299999, false, false));
+    TEST_ASSERT_TRUE(schedule.due(300000, false, false));
+    TEST_ASSERT_TRUE(schedule.due(5000, true, false));
+    TEST_ASSERT_TRUE(schedule.due(5000, false, true));
+    TEST_ASSERT_TRUE(schedule.setInterval(10000));
+    TEST_ASSERT_FALSE(schedule.due(9999, false, false));
+    TEST_ASSERT_TRUE(schedule.due(10000, false, false));
+    TEST_ASSERT_FALSE(schedule.setInterval(9999)); TEST_ASSERT_FALSE(schedule.setInterval(300001));
+    schedule.completed(10000, false); schedule.setInterval(300000);
+    TEST_ASSERT_FALSE(schedule.due(19999, true, true));
+    TEST_ASSERT_TRUE(schedule.due(20000, true, true));
+}
 void testMetricChangesAreDebounced() {
     auto previous = metrics(); auto current = previous;
     current.rssiDbm -= 4; TEST_ASSERT_FALSE(metricsChanged(previous, current));
@@ -385,6 +400,7 @@ int main(int argc, char** argv) {
     RUN_TEST(testReportSchedulePeriodicChangeAndMinimumInterval);
     RUN_TEST(testFailedReportingHasCappedBackoffAndRecovers);
     RUN_TEST(testScheduleSurvivesMillisWrap);
+    RUN_TEST(testRemoteIntervalNeverDelaysFaultOrRetry);
     RUN_TEST(testMetricChangesAreDebounced);
     RUN_TEST(testSensorInitRetriesAreBoundedAndSpaced);
     RUN_TEST(testRuntimeRecoveryUsesSameBoundedBudget);

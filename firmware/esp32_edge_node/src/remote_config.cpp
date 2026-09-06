@@ -30,10 +30,10 @@ bool storedText(const char* value, std::size_t capacity) {
     for (; end != value + capacity; ++end) if (*end) return false;
     return true;
 }
-std::uint32_t checksum(const Blob& blob) {
+template<class T> std::uint32_t checksum(const T& blob) {
     const auto* bytes = reinterpret_cast<const unsigned char*>(&blob);
     std::uint32_t crc = 0xFFFFFFFFU;
-    for (std::size_t i = 0; i < offsetof(Blob, crc); ++i) {
+    for (std::size_t i = 0; i < offsetof(T, crc); ++i) {
         crc ^= bytes[i];
         for (unsigned bit = 0; bit < 8; ++bit)
             crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320U : 0);
@@ -58,8 +58,8 @@ bool unsignedInteger(JsonVariantConst value) {
 }
 } // namespace
 
-bool validBlob(const Blob& blob, const Identity& identity) {
-    return blob.magic == MAGIC && blob.schema == 1 && blob.version >= 1 &&
+template<class T> bool validStored(const T& blob, const Identity& identity) {
+    return blob.magic == MAGIC && blob.version >= 1 &&
         blob.version <= MAX_VERSION && settingsValid(blob.measurementIntervalMs, blob.replayBatchSize) &&
         storedText(blob.commandId, sizeof(blob.commandId)) && commandIdValid(blob.commandId) &&
         storedText(blob.deviceId, sizeof(blob.deviceId)) &&
@@ -69,6 +69,22 @@ bool validBlob(const Blob& blob, const Identity& identity) {
         std::strcmp(blob.deviceId, identity.deviceId) == 0 &&
         std::strcmp(blob.siteId, identity.siteId) == 0 &&
         std::strcmp(blob.assetId, identity.assetId) == 0 && blob.crc == checksum(blob);
+}
+
+bool validBlob(const Blob& blob, const Identity& identity) {
+    return validStored(blob, identity) && blob.schema == 2 &&
+        (blob.commandSchema == 1 || blob.commandSchema == 2) &&
+        blob.healthReportIntervalMs >= 10000 && blob.healthReportIntervalMs <= 300000;
+}
+
+bool Controller::restoreLegacy(const LegacyBlob& blob, const Identity& identity) {
+    if (blob.schema != 1 || !validStored(blob, identity)) return false;
+    Blob candidate;
+    static_assert(offsetof(Blob, healthReportIntervalMs) == offsetof(LegacyBlob, crc), "Legacy prefix changed");
+    std::memcpy(&candidate, &blob, offsetof(LegacyBlob, crc));
+    candidate.schema = 2;
+    candidate.crc = checksum(candidate);
+    return restore(candidate, identity);
 }
 
 bool Controller::restore(const Blob& blob, const Identity& identity) {
@@ -85,6 +101,8 @@ Result Controller::appliedResult() const {
     result.commandId = active_.commandId;
     result.measurementIntervalMs = active_.measurementIntervalMs;
     result.replayBatchSize = active_.replayBatchSize;
+    result.healthReportIntervalMs = active_.healthReportIntervalMs;
+    result.commandSchema = active_.commandSchema;
     return result;
 }
 
@@ -95,7 +113,8 @@ Result Controller::receive(const char* json, const Identity& identity, Persist p
     JsonDocument document;
     if (deserializeJson(document, json, DeserializationOption::NestingLimit(5)) ||
         !document.is<JsonObject>() || document.size() != 5 ||
-        !unsignedInteger(document["schemaVersion"]) || document["schemaVersion"].as<std::uint32_t>() != 1 ||
+        !unsignedInteger(document["schemaVersion"]) ||
+        (document["schemaVersion"].as<std::uint32_t>() != 1 && document["schemaVersion"].as<std::uint32_t>() != 2) ||
         !equalText(document["deviceId"], identity.deviceId) ||
         !equalText(document["siteId"], identity.siteId) ||
         !equalText(document["assetId"], identity.assetId) || !document["desired"].is<JsonObject>()) return result;
@@ -108,8 +127,12 @@ Result Controller::receive(const char* json, const Identity& identity, Persist p
     result.status = Status::REJECTED;
     result.errorCode = "invalid_config";
     JsonObjectConst settings = desired["settings"].as<JsonObjectConst>();
-    if (desired.size() != 3 || settings.isNull() || settings.size() != 2 ||
+    const unsigned schema = document["schemaVersion"];
+    if (desired.size() != 3 || settings.isNull() || settings.size() != (schema == 2 ? 3U : 2U) ||
         !unsignedInteger(settings["measurementIntervalMs"]) || !unsignedInteger(settings["replayBatchSize"])) return result;
+    if (schema == 2 && !unsignedInteger(settings["healthReportIntervalMs"])) return result;
+    const std::uint32_t health = schema == 2 ? settings["healthReportIntervalMs"].as<std::uint32_t>() : active_.healthReportIntervalMs;
+    if (health < 10000 || health > 300000) return result;
     const std::uint32_t interval = settings["measurementIntervalMs"];
     const std::uint32_t batch = settings["replayBatchSize"];
     if (!settingsValid(interval, batch)) return result;
@@ -118,14 +141,17 @@ Result Controller::receive(const char* json, const Identity& identity, Persist p
         return result;
     }
     if (result.version == active_.version) {
-        if (result.commandId == active_.commandId && interval == active_.measurementIntervalMs && batch == active_.replayBatchSize)
+        if (result.commandId == active_.commandId && interval == active_.measurementIntervalMs && batch == active_.replayBatchSize &&
+            schema == active_.commandSchema && health == active_.healthReportIntervalMs)
             return appliedResult(); // ACK retry: no flash write, no reapplication.
         result.errorCode = "version_conflict";
         return result;
     }
     Blob candidate;
     candidate.magic = MAGIC;
-    candidate.schema = 1;
+    candidate.schema = 2;
+    candidate.commandSchema = schema;
+    candidate.healthReportIntervalMs = health;
     candidate.version = result.version;
     candidate.measurementIntervalMs = interval;
     candidate.replayBatchSize = batch;
@@ -152,6 +178,7 @@ std::string resultPayload(const Result& result) {
     if (result.status == Status::APPLIED) {
         document["settings"]["measurementIntervalMs"] = result.measurementIntervalMs;
         document["settings"]["replayBatchSize"] = result.replayBatchSize;
+        if (result.commandSchema == 2) document["settings"]["healthReportIntervalMs"] = result.healthReportIntervalMs;
         document["errorCode"] = nullptr;
     } else {
         document["settings"] = nullptr;

@@ -12,7 +12,6 @@ import math
 from pathlib import Path
 from typing import Any
 
-
 BASELINE_PATH = (
     Path(__file__).resolve().parents[2]
     / "ai1"
@@ -54,6 +53,19 @@ def score_telemetry_point(
     A score remains zero within AI-1's configured normal range (mean ± 3σ).
     Outside that range it rises linearly and reaches 100 at a 6σ deviation.
     """
+    if str(point.get("anomalyModel", "")).startswith("asset-signal-rules-v1:"):
+        # These fields were produced at ingest with frozen, asset-scoped rules.
+        # Queries must not replace historical decisions with the demo baseline.
+        return {
+            key: point.get(key)
+            for key in (
+                "anomalyScore",
+                "anomalyStatus",
+                "anomalyModel",
+                "anomalyEvidence",
+                "anomalyCombination",
+            )
+        }
     if baseline is None:
         baseline = load_baseline()
     value = finite_number(point.get(INPUT_FIELD))

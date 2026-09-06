@@ -19,7 +19,7 @@ struct Identity {
 
 // One atomic NVS value contains BOTH the version and every live setting.
 // Fixed-width fields and zero-filled strings keep CRC/readback deterministic.
-struct Blob {
+struct LegacyBlob {
     std::uint32_t magic = 0;
     std::uint32_t schema = 0;
     std::uint32_t version = 0;
@@ -31,7 +31,22 @@ struct Blob {
     char assetId[64] = {};
     std::uint32_t crc = 0;
 };
-static_assert(sizeof(Blob) == 252, "Remote configuration storage layout changed.");
+static_assert(sizeof(LegacyBlob) == 252, "Legacy configuration storage layout changed.");
+struct Blob {
+    std::uint32_t magic = 0;
+    std::uint32_t schema = 0;
+    std::uint32_t version = 0;
+    std::uint32_t measurementIntervalMs = DEFAULT_INTERVAL_MS;
+    std::uint32_t replayBatchSize = DEFAULT_REPLAY_BATCH;
+    char commandId[36] = {};
+    char deviceId[64] = {};
+    char siteId[64] = {};
+    char assetId[64] = {};
+    std::uint32_t healthReportIntervalMs = 30000;
+    std::uint32_t commandSchema = 1;
+    std::uint32_t crc = 0;
+};
+static_assert(sizeof(Blob) == 260, "Configuration v2 storage layout changed.");
 
 enum class Status { NONE, APPLIED, FAILED, REJECTED };
 struct Result {
@@ -40,6 +55,8 @@ struct Result {
     std::string commandId;
     std::uint32_t measurementIntervalMs = 0;
     std::uint32_t replayBatchSize = 0;
+    std::uint32_t healthReportIntervalMs = 30000;
+    std::uint32_t commandSchema = 1;
     std::string errorCode;
 };
 
@@ -53,6 +70,7 @@ class Controller {
 public:
     const Blob& active() const { return active_; }
     bool restore(const Blob& blob, const Identity& identity);
+    bool restoreLegacy(const LegacyBlob& blob, const Identity& identity);
     Result appliedResult() const;
     // Malformed/unscoped envelopes produce NONE; never apply guessed values.
     Result receive(const char* json, const Identity& identity, Persist persist,

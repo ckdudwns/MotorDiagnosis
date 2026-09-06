@@ -6,7 +6,6 @@ import os
 from motor_diagnosis.server import create_server
 from motor_diagnosis.alerts import configured_adapters
 
-
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PORT", "8787"))
 
@@ -19,6 +18,7 @@ def main() -> None:
         alert_database=os.environ.get("ALERT_DB_PATH", "output/alerts.sqlite3"),
         alert_adapters=configured_adapters(),
         state_database=os.environ.get("STATE_DB_PATH", "output/runtime.sqlite3"),
+        analysis_database=os.environ.get("ANALYSIS_DB_PATH", "output/analysis.sqlite3"),
         communication_database=os.environ.get(
             "COMMUNICATION_QUALITY_DB_PATH", "output/communication-quality.sqlite3"
         ),

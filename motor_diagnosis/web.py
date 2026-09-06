@@ -229,8 +229,9 @@ def render_page() -> str:
           <div class="subgrid">
             <label>측정 후 대기 시간 (ms)<input id="opsInterval" type="number" min="3000" max="60000" step="1" disabled></label>
             <label>루프당 버퍼 재전송 상한 (건)<input id="opsReplay" type="number" min="1" max="4" step="1" disabled></label>
+            <label>정기 상태 보고 간격 (ms)<input id="opsHealthInterval" type="number" min="10000" max="300000" step="1" disabled></label>
           </div>
-          <small>대기 시간 3,000–60,000ms, 재전송 1–4건. 정확한 측정 시작 간격은 취득·전송 처리 시간 때문에 달라질 수 있습니다.</small>
+          <small>대기 시간 3,000–60,000ms, 재전송 1–4건, 정기 상태 보고 10,000–300,000ms. 고장·복구는 별도 보고하며 실제 측정 시작 간격은 취득·전송 시간에 따라 달라집니다.</small>
           <label>설정 변경 사유<textarea id="opsConfigReason" maxlength="1000" disabled></textarea></label>
           <div class="actions"><button id="opsConfigPublish" disabled>설정 요청 발행</button><button id="opsConfigCancel" class="secondary" disabled>편집 취소</button></div>
           <div id="opsConfigStatus" role="status" aria-live="polite"></div>
@@ -238,6 +239,11 @@ def render_page() -> str:
           <button id="opsHistoryLoad" class="secondary">이력 새로고침</button>
           <div id="opsHistoryStatus" role="status"></div><div id="opsHistoryRows" class="table-scroll"></div>
           <div class="actions"><button id="opsHistoryPrev" class="secondary" disabled>이전 이력</button><span id="opsHistoryPage"></span><button id="opsHistoryNext" class="secondary" disabled>다음 이력</button></div>
+          <h3>분석 특징·요청한 원시 파형</h3>
+          <p class="notice">분석 채널을 활성화한 장치에서만 수신합니다. 평상시 특징량은 30초 간격이며, 원시 음향·진동 파형은 요청 후 다음 정상 0.64초 구간만 보존합니다. 요청은 5분 후 만료되며 실제 수신 전에는 완료가 아닙니다.</p>
+          <label>원시 파형 요청 사유<input id="opsAnalysisReason" maxlength="1000" disabled></label>
+          <div class="actions"><button id="opsAnalysisRequest" disabled>다음 구간 파형 보존 요청</button><button id="opsAnalysisLoad" class="secondary" disabled>분석 기록 조회</button></div>
+          <div id="opsAnalysisStatus" role="status"></div><div id="opsAnalysisRows"></div><div id="opsWaveform"></div>
         </article>
       </section>
     </section>
@@ -251,6 +257,7 @@ def render_page() -> str:
     const PAGE_SIZE = 12;
     let managementGeneration = 0, managementRows = [], managementRow = null, managementInputs = [], managementCreating = false, managementDirty = false, managementScope = null;
     let auditPageNumber = 1, auditGeneration = 0;
+    let analysisGeneration = 0, analysisBusy = false, analysisIntent = null;
     let modelQueueGeneration = 0, modelReviewGeneration = 0, modelQueueRows = [], modelReviewRow = null;
     let modelQueuePage = 1, modelQueueTotal = 0, modelReviewBusy = false, pendingModelReview = null;
     let reviewSaving = false, noteSaving = false, managementSaving = false, noteHistoryGeneration = 0;
@@ -807,8 +814,22 @@ def render_page() -> str:
       detail.append(title, document.createElement("br"), `${formatLocalTime(event.occurredAt)} · ${event.duration ?? "-"} · 점수 ${event.maxScore ?? event.score ?? "-"}`, document.createElement("br"), event.note || "");
       const missing = document.createElement("p");
       missing.className = "notice";
-      missing.textContent = response.context.rawDataMissing ? "원본 신호 없음: 보관기간 만료 또는 미수신. 보존된 특징·버전만 표시합니다." : `전후 신호 ${response.context.points.length}건 · 출처 ${response.context.source}`;
+      missing.textContent = response.context.rawDataMissing ? "요약 시계열 없음: 보관기간 만료 또는 미수신. 보존된 특징·버전만 표시합니다." : `전후 요약 시계열 ${response.context.points.length}건 · 출처 ${response.context.source} (원시 파형은 별도 분석 기록에서 확인)`;
       detail.appendChild(missing);
+      if (response.analysis) {
+        const analysis = document.createElement("section");
+        detail.appendChild(analysis);
+        renderAnalysisRows(analysis,response.analysis,()=>detailGeneration===generation && selectedEventId===eventId);
+      }
+      const installation = response.installationSnapshot;
+      if (installation?.status === "recorded") {
+        detail.appendChild(facts([["설치 정보 기준 시각",formatLocalTime(installation.effectiveAt)]]));
+        for (const point of installation.points || []) detail.appendChild(facts([
+          ["설치점",point.id],["위치",point.position],["방향",point.orientation],
+          ["고정 방식",point.mountingMethod],["음향 방향",point.acousticDirection],
+          ["사진 참조",(point.photoRefs || []).join(" · ")],["설치 버전 시각",formatLocalTime(point.versionAt)]
+        ]));
+      } else detail.appendChild(facts([["발생 당시 설치 정보","미확인 — 기록된 과거 설치 정보 없음"]]));
       $("eventEvidence").textContent = JSON.stringify({context:{from:response.context.from, to:response.context.to, source:response.context.source}, featureSnapshot:response.featureSnapshot, appliedRule:response.appliedRule, modelVersion:response.modelVersion, deviceSnapshot:response.deviceSnapshot}, null, 2);
       const rule = response.appliedRule || {};
       $("evidenceSummary").replaceChildren(facts([
@@ -1221,7 +1242,7 @@ def render_page() -> str:
     }
     function opsControls() {
       const edit = opsCanEdit() && !opsSaving && !opsUncertain;
-      for (const id of ["opsInterval","opsReplay","opsConfigReason"]) $(id).disabled = !edit;
+      for (const id of ["opsInterval","opsReplay","opsHealthInterval","opsConfigReason"]) $(id).disabled = !edit;
       $("opsConfigPublish").disabled = !edit;
       $("opsConfigCancel").disabled = !edit || !opsDirty;
       $("opsConfigLoad").disabled = !opsDevice || opsSaving;
@@ -1229,22 +1250,111 @@ def render_page() -> str:
       $("opsReload").disabled = opsSaving;
       $("opsQualityLoad").disabled = !opsDevice;
       $("opsHistoryLoad").disabled = !opsDevice;
+      $("opsAnalysisLoad").disabled = !opsDevice || analysisBusy || !can("telemetry:read");
+      $("opsAnalysisRequest").disabled = !opsDevice || analysisBusy || !can("telemetry:read") || !can("device:write") || opsDevice.mappingStatus !== "active";
+      $("opsAnalysisReason").disabled = $("opsAnalysisRequest").disabled;
     }
     function clearOpsDevice() {
+      analysisGeneration++; analysisBusy = false; analysisIntent = null;
+      for (const id of ["opsAnalysisRows","opsWaveform"]) $(id).replaceChildren();
+      $("opsAnalysisReason").value = ""; $("opsAnalysisStatus").textContent = "";
       opsGeneration++; opsConfigGeneration++; opsQualityGeneration++; opsHealthGeneration++; opsHistoryGeneration++;
       opsDevice = null; opsConfig = null; opsQuality = null; opsHistory = []; opsQualityPage = 1; opsHistoryPage = 1;
       opsDirty = false; opsUncertain = false; opsIntent = null;
       for (const id of ["opsIdentity","opsHealth","opsConfigState","opsQualitySummary","opsQualityRows","opsHistoryRows"]) $(id).replaceChildren();
-      for (const id of ["opsInterval","opsReplay","opsConfigReason"]) $(id).value = "";
+      for (const id of ["opsInterval","opsReplay","opsHealthInterval","opsConfigReason"]) $(id).value = "";
       for (const id of ["opsStatus","opsConfigStatus","opsQualityStatus","opsHistoryStatus","opsQualityPage","opsHistoryPage"]) $(id).textContent = "";
       for (const id of ["opsQualityPrev","opsQualityNext","opsHistoryPrev","opsHistoryNext"]) $(id).disabled = true;
       opsControls();
+    }
+    function renderAnalysisRows(panel,response,stillCurrent) {
+      panel.replaceChildren();
+      for (const request of response.requests || []) panel.appendChild(facts([["파형 요청",request.id],["상태",request.status],["사유",request.reason]]));
+      if (!response.items?.length) panel.appendChild(facts([["분석 기록","미수신 또는 보관기간 만료"]]));
+      for (const row of response.items || []) {
+        const card=document.createElement("section"); card.className="history-card";
+        card.appendChild(facts([["측정 시각",formatLocalTime(row.timestamp)],["특징 버전",row.featureVersion],["원시 파형",row.hasWaveform?"보존됨":"요약 특징만 보존"]]));
+        card.appendChild(rawDetails("신호별 특징",row.channels));
+        if (row.hasWaveform) {
+          const button=document.createElement("button"); button.textContent="파형 보기 · 분석 파일";
+          const preview=document.createElement("section");
+          button.addEventListener("click",async()=>{
+            button.disabled=true;
+            try {
+              const result=await api(`/api/analysis/${encodeURIComponent(row.id)}`);
+              if (!stillCurrent()) return;
+              if (result.frame.deviceId!==row.deviceId || result.frame.siteId!==row.siteId || result.frame.assetId!==row.assetId) throw new Error("파형 대상 불일치");
+              preview.replaceChildren();
+              for (const [name,channel] of Object.entries(result.frame.channels)) {
+                if (!channel.samplesFloat32LE) continue;
+                const bytes=Uint8Array.from(atob(channel.samplesFloat32LE),c=>c.charCodeAt(0));
+                if (bytes.length!==channel.sampleCount*4 || channel.sampleCount>16384) throw new Error("파형 길이 오류");
+                const view=new DataView(bytes.buffer), values=Array.from({length:channel.sampleCount},(_,i)=>view.getFloat32(i*4,true));
+                if (!values.every(Number.isFinite)) throw new Error("유효하지 않은 파형");
+                preview.appendChild(facts([["채널",name],["단위",channel.unit],["샘플링",`${channel.sampleRateHz}Hz / ${channel.sampleCount}개`]]));
+                const canvas=document.createElement("canvas"); canvas.width=640; canvas.height=120; canvas.style.width="100%";
+                const ctx=canvas.getContext("2d"), lo=Math.min(...values), hi=Math.max(...values), span=hi-lo||1;
+                ctx.strokeStyle="#205b9f"; ctx.beginPath();
+                for(let x=0;x<640;x++) {
+                  const bucket=values.slice(Math.floor(x*values.length/640),Math.max(Math.floor((x+1)*values.length/640),Math.floor(x*values.length/640)+1));
+                  ctx.moveTo(x,110-(Math.min(...bucket)-lo)/span*100); ctx.lineTo(x,110-(Math.max(...bucket)-lo)/span*100);
+                }
+                ctx.stroke(); preview.appendChild(canvas);
+              }
+              const download=document.createElement("button"); download.textContent="분석 JSON 저장 (전체 샘플 · 미라벨)";
+              download.addEventListener("click",()=>{
+                const url=URL.createObjectURL(new Blob([JSON.stringify(result)],{type:"application/json"}));
+                const link=document.createElement("a"); link.href=url; link.download=`analysis-${row.id}.json`; link.click(); URL.revokeObjectURL(url);
+              });
+              preview.appendChild(download);
+            } catch(error) {if(stillCurrent()) preview.textContent=`파형 조회 실패: ${error.message}`;}
+            finally {if(stillCurrent()) button.disabled=false;}
+          });
+          card.append(button,preview);
+        }
+        panel.appendChild(card);
+      }
+    }
+    async function loadOpsAnalysis(prefix="",cursor=null) {
+      if(!opsDevice || !can("telemetry:read")) return;
+      const key=opsKey(), generation=++analysisGeneration;
+      $("opsAnalysisRows").replaceChildren();
+      try {
+        const result=await api(`/api/devices/${encodeURIComponent(opsDevice.id)}/analysis${cursor?`?cursor=${encodeURIComponent(cursor)}`:""}`);
+        if(key!==opsKey() || generation!==analysisGeneration) return;
+        if(result.deviceId!==opsDevice.id || !opsScopeMatches(result)) {rejectOpsScope();return;}
+        renderAnalysisRows($("opsAnalysisRows"),result,()=>key===opsKey() && generation===analysisGeneration);
+        if(result.nextCursor) {
+          const next=document.createElement("button"); next.textContent="이전 분석 기록 100건";
+          next.addEventListener("click",()=>{if(key===opsKey() && generation===analysisGeneration) loadOpsAnalysis("",result.nextCursor);});
+          $("opsAnalysisRows").appendChild(next);
+        }
+        $("opsAnalysisStatus").textContent=prefix || "분석 기록 페이지당 100건 · 기본 7일 보관 (용량 상한 별도)";
+      } catch(error) {if(key===opsKey() && generation===analysisGeneration) $("opsAnalysisStatus").textContent=`${prefix} 목록 조회 실패: ${error.message}`;}
+    }
+    async function requestOpsWaveform() {
+      if(!opsDevice || analysisBusy || !can("device:write") || !can("telemetry:read")) return;
+      const reason=$("opsAnalysisReason").value.trim(), key=opsKey();
+      if(!reason || reason.length>1000) {$("opsAnalysisStatus").textContent="요청 사유를 입력하세요.";return;}
+      if(!analysisIntent) {
+        if(!confirm("이 장치의 다음 0.64초 원시 음향·진동 구간을 서버에 보존할까요?")) return;
+        analysisIntent={siteId:opsDevice.siteId,assetId:opsDevice.assetId,reason,requestId:crypto.randomUUID().replaceAll("-","")};
+      } else if(analysisIntent.reason!==reason) {$("opsAnalysisStatus").textContent="이전 요청의 결과가 불확실합니다. 같은 사유로 재시도하세요.";return;}
+      analysisBusy=true; opsControls();
+      try {
+        const result=await api(`/api/devices/${encodeURIComponent(opsDevice.id)}/analysis/requests`,jsonOptions("POST",analysisIntent));
+        if(key!==opsKey()) return;
+        if(!opsScopeMatches(result) || result.requestId!==analysisIntent.requestId) throw new Error("요청 결과 대상 불일치");
+        analysisIntent=null; $("opsAnalysisReason").value="";
+        await loadOpsAnalysis(`요청 저장 완료 (${result.status}). 실제 파형 수신 여부를 확인하세요.`);
+      } catch(error) {if(key===opsKey()) $("opsAnalysisStatus").textContent=`요청 결과 미확인: ${error.message}. 같은 사유로 재시도하면 기존 요청 ID를 재사용합니다.`;}
+      finally {if(key===opsKey()) {analysisBusy=false;opsControls();}}
     }
     function invalidateDeviceOperations() {
       opsDevices = []; clearOpsDevice(); $("opsDevice").replaceChildren();
     }
     function rejectOpsScope() {
-      const dirty = opsDirty, fields = ["opsInterval","opsReplay","opsConfigReason"];
+      const dirty = opsDirty, fields = ["opsInterval","opsReplay","opsHealthInterval","opsConfigReason"];
       const draft = fields.map(id => $(id).value);
       // Drop the cached device list and every in-flight generation. Only a fresh
       // list plus target selection may re-enable writes; a late GET cannot.
@@ -1331,11 +1441,11 @@ def render_page() -> str:
       } catch (error) {if (key === opsKey() && generation === opsQualityGeneration) $("opsQualityStatus").textContent = `통신 품질 조회 실패: ${error.message}`;}
     }
     function opsSettingsValid(settings) {
-      return settings && Object.keys(settings).length === 2 && Number.isInteger(settings.measurementIntervalMs) && settings.measurementIntervalMs >= 3000 && settings.measurementIntervalMs <= 60000 && Number.isInteger(settings.replayBatchSize) && settings.replayBatchSize >= 1 && settings.replayBatchSize <= 4;
+      return settings && Object.keys(settings).every(key=>["measurementIntervalMs","replayBatchSize","healthReportIntervalMs"].includes(key)) && Number.isInteger(settings.measurementIntervalMs) && settings.measurementIntervalMs >= 3000 && settings.measurementIntervalMs <= 60000 && Number.isInteger(settings.replayBatchSize) && settings.replayBatchSize >= 1 && settings.replayBatchSize <= 4 && (!Object.hasOwn(settings,"healthReportIntervalMs") || Number.isInteger(settings.healthReportIntervalMs) && settings.healthReportIntervalMs >= 10000 && settings.healthReportIntervalMs <= 300000);
     }
-    function opsSameSettings(left, right) {return opsSettingsValid(left) && opsSettingsValid(right) && left.measurementIntervalMs === right.measurementIntervalMs && left.replayBatchSize === right.replayBatchSize;}
+    function opsSameSettings(left, right) {return opsSettingsValid(left) && opsSettingsValid(right) && left.measurementIntervalMs === right.measurementIntervalMs && left.replayBatchSize === right.replayBatchSize && left.healthReportIntervalMs === right.healthReportIntervalMs;}
     function opsCommandLabel(state) {return ({pending:"적용 보고 대기",applied:"적용 성공 보고",failed:"실패 보고",rejected:"거부 보고"})[state] || (state ? "알 수 없는 보고 상태" : "발행 없음");}
-    function opsSettingsText(settings) {return opsSettingsValid(settings) ? `대기 ${settings.measurementIntervalMs}ms / 재전송 ${settings.replayBatchSize}건` : "보고 없음";}
+    function opsSettingsText(settings) {return opsSettingsValid(settings) ? `대기 ${settings.measurementIntervalMs}ms / 재전송 ${settings.replayBatchSize}건 / 정기 상태 ${settings.healthReportIntervalMs == null ? "미지정" : settings.healthReportIntervalMs + "ms"}` : "보고 없음";}
     function renderOpsConfig() {
       $("opsConfigState").replaceChildren();
       if (!opsConfig) {opsControls(); return;}
@@ -1348,6 +1458,7 @@ def render_page() -> str:
       if (!opsConfig) return;
       const value = opsConfig.desired?.settings || opsConfig.lastApplied?.settings || opsConfig.defaults;
       $("opsInterval").value = String(value.measurementIntervalMs); $("opsReplay").value = String(value.replayBatchSize); $("opsConfigReason").value = "";
+      $("opsHealthInterval").value = String(value.healthReportIntervalMs ?? 30000);
       opsDirty = false; opsControls();
     }
     async function loadOpsConfig() {
@@ -1386,7 +1497,7 @@ def render_page() -> str:
     }
     async function publishOpsConfig() {
       if (!opsCanEdit() || opsSaving || opsUncertain) return;
-      const settings = {measurementIntervalMs:Number($("opsInterval").value),replayBatchSize:Number($("opsReplay").value)}, reason = $("opsConfigReason").value.trim();
+      const settings = {measurementIntervalMs:Number($("opsInterval").value),replayBatchSize:Number($("opsReplay").value),healthReportIntervalMs:Number($("opsHealthInterval").value)}, reason = $("opsConfigReason").value.trim();
       if (!opsSettingsValid(settings) || !reason || reason.length > 1000) {$("opsConfigStatus").textContent = "허용 범위의 정수 두 값과 변경 사유(1–1000자)를 입력하세요."; return;}
       if (opsConfig.desired && ["pending","applied"].includes(opsConfig.desired.state) && opsSameSettings(settings,opsConfig.desired.settings)) {$("opsConfigStatus").textContent = "같은 설정이 이미 요청돼 있습니다. 중복 발행하지 않고 적용 보고를 확인해 주세요."; return;}
       const intent = {expectedVersion:opsConfig.version,settings,reason}, key = opsKey(), id = opsDevice.id;
@@ -1459,7 +1570,9 @@ def render_page() -> str:
     $("opsConfigLoad").addEventListener("click", () => act(loadOpsConfig));
     $("opsHistoryLoad").addEventListener("click", () => act(loadOpsHistory));
     $("opsConfigPublish").addEventListener("click", () => act(publishOpsConfig));
-    for (const id of ["opsInterval","opsReplay","opsConfigReason"]) $(id).addEventListener("input", () => {opsDirty = true; opsControls();});
+    for (const id of ["opsInterval","opsReplay","opsHealthInterval","opsConfigReason"]) $(id).addEventListener("input", () => {opsDirty = true; opsControls();});
+    $("opsAnalysisLoad").addEventListener("click",()=>loadOpsAnalysis());
+    $("opsAnalysisRequest").addEventListener("click",()=>requestOpsWaveform());
     $("opsConfigCancel").addEventListener("click", () => {if (!opsSaving && !opsUncertain) {fillOpsConfig(); opsIntent = null;}});
     for (const [id,step] of [["opsQualityPrev",-1],["opsQualityNext",1]]) $(id).addEventListener("click", () => {if (opsQuality) {opsQualityPage = Math.min(Math.max(1,Math.ceil(opsQuality.items.length / PAGE_SIZE)),Math.max(1,opsQualityPage + step)); renderOpsQuality();}});
     for (const [id,step] of [["opsHistoryPrev",-1],["opsHistoryNext",1]]) $(id).addEventListener("click", () => {opsHistoryPage = Math.min(Math.max(1,Math.ceil(opsHistory.length / PAGE_SIZE)),Math.max(1,opsHistoryPage + step)); renderOpsHistory();});

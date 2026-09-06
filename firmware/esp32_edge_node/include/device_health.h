@@ -77,6 +77,11 @@ bool metricsChanged(const Metrics& previous, const Metrics& current);
 
 class ReportSchedule {
 public:
+    bool setInterval(std::uint32_t interval) {
+        if (interval < 10000 || interval > 300000) return false;
+        intervalMs_ = interval;
+        return true;
+    }
     bool due(std::uint32_t now, bool changed, bool pending) const;
     void completed(std::uint32_t now, bool success);
 private:
@@ -85,6 +90,7 @@ private:
     std::uint32_t lastAttempt_ = 0;
     std::uint32_t lastSuccess_ = 0;
     std::uint32_t retryMs_ = 5000;
+    std::uint32_t intervalMs_ = 30000;
 };
 
 // At most three initialization attempts per boot, including runtime recovery.

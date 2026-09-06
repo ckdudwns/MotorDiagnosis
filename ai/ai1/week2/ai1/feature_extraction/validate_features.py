@@ -110,27 +110,14 @@ def _stored_range_tolerance(baseline: dict, sigma_multiplier):
     return tolerance
 
 
-def check_outliers(
-    features: dict,
-    baseline: dict,
-    sigma_multiplier: float = None,
-) -> list:
-    """baseline의 mean/std 기준으로 정상범위를 벗어난 특징값을 플래그 처리.
-
-    baseline은 compute_baseline.py가 생성한 dict(또는 그 "features" 서브dict)를 받는다.
-    baseline에 없는 특징값(신규 특징량 등)은 비교 대상에서 제외한다.
-    NaN/Inf 값은 여기서 다루지 않는다 — check_missing_or_invalid()로 먼저 걸러야 한다.
-
-    signalContext가 있는 신호별 기준선은 저장된 normal_range를 그대로 쓴다.
-    0분산은 명시한 절대 허용오차 정책을 사용하고 deviation_sigma는 None이다.
-    해당 문맥이 없는 기존 기준선만 종전의 sigma(기본 3) 재계산/0분산 제외를 유지한다.
-    """
+def _feature_comparisons(features: dict, baseline: dict, sigma_multiplier=None) -> list:
+    """Validate the range policy and measure features without threshold filtering."""
     baseline_features = baseline.get("features", baseline)
     tolerance = _stored_range_tolerance(baseline, sigma_multiplier)
     legacy_sigma = (
         DEFAULT_SIGMA_MULTIPLIER if sigma_multiplier is None else sigma_multiplier
     )
-    outliers = []
+    comparisons = []
 
     for name, value in features.items():
         if not is_valid_number(value):
@@ -166,20 +153,52 @@ def check_outliers(
                 # Preserve the existing contract for legacy, context-free baselines.
                 continue
             low, high = mean - legacy_sigma * std, mean + legacy_sigma * std
-        if value < low or value > high:
-            deviation_sigma = abs(value - mean) / std if std else None
-            outliers.append(
-                {
-                    "feature": name,
-                    "value": value,
-                    "mean": mean,
-                    "std": std,
-                    "normal_range": [low, high],
-                    "deviation_sigma": deviation_sigma,
-                }
-            )
+        comparisons.append(
+            {
+                "feature": name,
+                "value": value,
+                "mean": mean,
+                "std": std,
+                "normal_range": [low, high],
+                "deviation_sigma": abs(value - mean) / std if std else None,
+            }
+        )
 
-    return outliers
+    return comparisons
+
+
+def feature_deviations(features: dict, baseline: dict) -> list:
+    """Return deviations, including in-range features, without changing thresholds.
+
+    Contextual zero-variance features have deviation_sigma=None, not an invented
+    standard deviation or infinity. Their normal_range remains available for
+    classification. As with check_outliers, validate input quality separately.
+    """
+    return [
+        item
+        for item in _feature_comparisons(features, baseline)
+        if item["deviation_sigma"] is None or not math.isnan(item["deviation_sigma"])
+    ]
+
+
+def check_outliers(
+    features: dict,
+    baseline: dict,
+    sigma_multiplier: float = None,
+) -> list:
+    """baseline의 정상범위를 벗어난 특징값을 플래그 처리.
+
+    signalContext가 있으면 저장된 normal_range/0분산 절대 허용오차를 사용하고
+    다른 sigma로 덮어쓰지 않는다. 문맥 없는 기존 기준선만 종전의 sigma(기본 3)
+    재계산/0분산 제외를 유지한다. 기준선에 없는 특징값과 무효 입력은 제외하므로
+    check_missing_or_invalid()를 먼저 호출해야 한다.
+    """
+    return [
+        item
+        for item in _feature_comparisons(features, baseline, sigma_multiplier)
+        if item["value"] < item["normal_range"][0]
+        or item["value"] > item["normal_range"][1]
+    ]
 
 
 def validate_features(

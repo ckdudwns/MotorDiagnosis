@@ -140,6 +140,16 @@ RPM 초안과 음향 초안은 별도 ID/문맥이며 서로의 단위를 대체
 `signalContext`가 없는 기존 2주차 기준선은 종전 기본 3σ 재계산과 0분산 제외 동작을
 유지한다. 새 초안에서 `features`만 떼어 전달하면 이 기존 계약으로 해석되므로 그렇게 사용하지 않는다.
 
+기존 `evaluate_feature_stream()`에도 전체 생성본/등록·승인·활성화본을 그대로 전달한다.
+편차 조회는 `feature_deviations()`로 분리하여 저장 sigma를 0으로 덮어쓰지 않는다.
+신호별 기준선은 저장 범위 밖에서만 이상에 진입하며, 기본 복귀 sigma는 저장 sigma의
+2/3이다. 명시적 `AnomalyRuleConfig`의 진입 sigma가 저장값과 다르면 오류로 거부한다.
+0분산은 저장된 절대 허용오차로 진입·복귀를 판단하고, 해당 특징이 포함된 윈도우와
+이벤트의 `max_deviation_sigma`는 정의되지 않아 `null`로 표시한다. 다른 특징이 함께
+있으면 그 특징들의 복귀 조건도 모두 만족해야 한다. 연속 윈도우 조건은 그대로 적용한다.
+연결 회귀 테스트는 RPM(기본/사용자 sigma·0분산)과 생성 음향 fixture의
+정상→이상→복귀, 레지스트리 수명주기, 경계값 및 무효 윈도우를 검증한다.
+
 ```powershell
 python -m unittest discover -s ai/ai1/week1/ai1/tests
 python -m unittest discover -s ai/ai1/week2/ai1/tests

@@ -24,7 +24,11 @@ _WEEK2_FEATURE_DIR = os.path.normpath(
 )
 sys.path.insert(0, _WEEK2_FEATURE_DIR)
 
-from validate_features import check_outliers, check_missing_or_invalid  # noqa: E402
+from validate_features import (  # noqa: E402
+    check_outliers,
+    check_missing_or_invalid,
+    feature_deviations,
+)
 
 
 @dataclass
@@ -78,10 +82,14 @@ def _validate_baseline(baseline: dict) -> None:
 
     for name, stats in features.items():
         if not isinstance(stats, dict):
-            raise ValueError(f"baseline['features'][{name!r}]는 dict여야 합니다: {stats!r}")
+            raise ValueError(
+                f"baseline['features'][{name!r}]는 dict여야 합니다: {stats!r}"
+            )
         for key in ("mean", "std"):
             if key not in stats:
-                raise ValueError(f"baseline['features'][{name!r}]에 {key!r}가 없습니다.")
+                raise ValueError(
+                    f"baseline['features'][{name!r}]에 {key!r}가 없습니다."
+                )
             value = stats[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(
@@ -95,6 +103,21 @@ def _validate_baseline(baseline: dict) -> None:
             raise ValueError(
                 f"baseline['features'][{name!r}]['std']는 0 이상이어야 합니다: {stats['std']!r}"
             )
+
+
+def _resolve_config(
+    baseline: dict, config: AnomalyRuleConfig = None
+) -> AnomalyRuleConfig:
+    """Use stored entry sigma; an explicit config must not override its range."""
+    if baseline.get("signalContext") is None:
+        return copy.deepcopy(config) if config is not None else AnomalyRuleConfig()
+    # Validate the stored policy even for empty streams and registry registration.
+    check_outliers({}, baseline, None if config is None else config.sigma_enter)
+    if config is not None:
+        return copy.deepcopy(config)
+    sigma = baseline["signalContext"]["sigmaMultiplier"]
+    # Keep the existing default 3:2 entry/recovery ratio for custom stored sigma.
+    return AnomalyRuleConfig(sigma_enter=sigma, sigma_exit=sigma * (2.0 / 3.0))
 
 
 class AssetBaselineRegistry:
@@ -126,7 +149,7 @@ class AssetBaselineRegistry:
         # 값을 스냅샷으로 고정한다.
         entry = {
             "baseline": copy.deepcopy(baseline),
-            "config": copy.deepcopy(config) if config is not None else AnomalyRuleConfig(),
+            "config": _resolve_config(baseline, config),
         }
         if asset_id:
             self._by_asset_id[asset_id] = entry
@@ -152,20 +175,21 @@ class AssetBaselineRegistry:
         # 항목은 여러 설비가 같은 entry 객체를 공유하므로, 한 설비 조회
         # 결과를 고치면 그 항목을 공유하는 다른 모든 설비에도 전파된다.
         # 그래서 조회 시점에도 다시 deepcopy해 반환한다.
-        return {"baseline": copy.deepcopy(entry["baseline"]), "config": copy.deepcopy(entry["config"])}
+        return {
+            "baseline": copy.deepcopy(entry["baseline"]),
+            "config": copy.deepcopy(entry["config"]),
+        }
 
 
-def _max_deviation_sigma(features: dict, baseline: dict) -> float:
-    """모든 특징값 중 baseline 대비 최대 편차(단위: sigma)를 구한다.
+def _max_deviation_sigma(deviations: list):
+    """0분산이 포함된 윈도우의 sigma 최대값은 정의되지 않으므로 None이다."""
+    values = [item["deviation_sigma"] for item in deviations]
+    return None if any(value is None for value in values) else max(values, default=0.0)
 
-    check_outliers(sigma_multiplier=0.0)를 호출하면 표준편차가 0이 아닌 모든
-    특징값이 "이상치"로 반환되므로(정상범위가 [mean, mean]이 되어 사실상 전부
-    벗어남), 그 deviation_sigma들의 최댓값이 "이 윈도우가 기준선에서 얼마나
-    벗어났는가"의 단일 지표가 된다. 판정 로직을 새로 만들지 않고 기존 함수를
-    재사용하는 방식이다.
-    """
-    outliers = check_outliers(features, baseline, sigma_multiplier=0.0)
-    return max((o["deviation_sigma"] for o in outliers), default=0.0)
+
+def _peak_deviation(previous, current):
+    """Do not turn an undefined zero-variance event severity into a numeric score."""
+    return None if previous is None or current is None else max(previous, current)
 
 
 def evaluate_feature_stream(
@@ -182,7 +206,8 @@ def evaluate_feature_stream(
 
     end_index가 None인 이벤트는 스트림이 끝날 때까지 이상 상태가 지속됐음을 뜻한다.
     """
-    config = config or AnomalyRuleConfig()
+    config = _resolve_config(baseline, config)
+    contextual = baseline.get("signalContext") is not None
     baseline_version = baseline.get("meta", {}).get("generated_at")
 
     window_states = []
@@ -215,24 +240,41 @@ def evaluate_feature_stream(
                     "state": "INVALID",
                     "max_deviation_sigma": None,
                     "outlier_features": [],
-                    "invalid_reasons": sorted({issue["reason"] for issue in invalid_issues}),
+                    "invalid_reasons": sorted(
+                        {issue["reason"] for issue in invalid_issues}
+                    ),
                 }
             )
             continue
 
-        max_dev = _max_deviation_sigma(features, baseline)
-        over_enter = max_dev >= config.sigma_enter
-        under_exit = max_dev < config.sigma_exit
-
+        deviations = feature_deviations(features, baseline)
+        max_dev = _max_deviation_sigma(deviations)
         outlier_features = [
             o["feature"]
-            for o in check_outliers(features, baseline, sigma_multiplier=config.sigma_enter)
+            for o in check_outliers(
+                features,
+                baseline,
+                sigma_multiplier=None if contextual else config.sigma_enter,
+            )
         ]
+        if contextual:
+            # The recorded closed range decides entry, including zero variance.
+            # Recovery also requires every defined sigma to be below sigma_exit;
+            # zero-variance features recover inside their absolute tolerance.
+            over_enter = bool(outlier_features)
+            under_exit = not outlier_features and all(
+                item["deviation_sigma"] is None
+                or item["deviation_sigma"] < config.sigma_exit
+                for item in deviations
+            )
+        else:
+            over_enter = max_dev >= config.sigma_enter
+            under_exit = max_dev < config.sigma_exit
 
         if state == "NORMAL":
             if over_enter:
                 consecutive_over += 1
-                pending_max_dev = max(pending_max_dev, max_dev)
+                pending_max_dev = _peak_deviation(pending_max_dev, max_dev)
             else:
                 consecutive_over = 0
                 pending_max_dev = 0.0
@@ -248,7 +290,7 @@ def evaluate_feature_stream(
                 consecutive_under = 0
                 pending_max_dev = 0.0
         else:  # state == "ANOMALY"
-            current_event["max_deviation_sigma"] = max(
+            current_event["max_deviation_sigma"] = _peak_deviation(
                 current_event["max_deviation_sigma"], max_dev
             )
             consecutive_under = consecutive_under + 1 if under_exit else 0
@@ -287,7 +329,9 @@ def evaluate_asset_stream(
     config_version은 evaluate_feature_stream이 이미 채운다).
     """
     entry = registry.resolve(asset_id=asset_id, asset_type=asset_type)
-    result = evaluate_feature_stream(feature_windows, entry["baseline"], entry["config"])
+    result = evaluate_feature_stream(
+        feature_windows, entry["baseline"], entry["config"]
+    )
     for event in result["events"]:
         event["asset_id"] = asset_id
     return result

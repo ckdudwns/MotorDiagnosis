@@ -16,6 +16,7 @@ from typing import Any, NoReturn
 from ai.ai2.week2.anomaly_score import score_telemetry_point
 from ai.ai2.week3.event_lifecycle import AnomalyEventLifecycle, EventLifecycleConfig
 
+from . import device_lifecycle
 from .demo_signals import (
     DEMO_MODEL_VERSION,
     DEMO_SIGNAL_SOURCE,
@@ -2417,6 +2418,7 @@ def install_point_snapshot(install_point: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@device_lifecycle.serialized
 def create_device(
     user: dict[str, Any], site_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -2425,6 +2427,12 @@ def create_device(
     device_id = required_text(payload, "id").upper()
     asset_id = required_text(payload, "assetId").upper()
 
+    with STORE_LOCK:
+        if any(device["id"] == device_id for device in DEVICES):
+            raise ApiError(400, "DEVICE_DUPLICATED", "Device ID is already registered.")
+    # Also reject orphaned IDs deleted by a previous release. History checks
+    # may wait on a separate DB, so do not hold the master-state lock here.
+    device_lifecycle.check_history(device_id)
     with STORE_LOCK:
         validate_asset_device_mapping(site_id, asset_id)
         mapping_status = str(payload.get("mappingStatus") or "active").strip().lower()
@@ -2519,6 +2527,7 @@ def create_device(
         return copy_payload(device)
 
 
+@device_lifecycle.serialized
 def update_device(
     user: dict[str, Any], device_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -2678,8 +2687,13 @@ def update_device(
         return copy_payload(device)
 
 
+@device_lifecycle.serialized
 def delete_device(user: dict[str, Any], device_id: str) -> dict[str, Any]:
     require_permission(user, "device:write")
+    with STORE_LOCK:
+        device = get_device(device_id)
+        require_site_access(user, device["siteId"])
+    device_lifecycle.check_history(device_id)
     with STORE_LOCK:
         device = get_device(device_id)
         require_site_access(user, device["siteId"])

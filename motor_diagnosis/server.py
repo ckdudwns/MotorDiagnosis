@@ -114,6 +114,7 @@ from .telemetry_bulk import ingest_telemetry_bulk
 from .web import render_page
 from .xlsx_export import dataset_xlsx_bytes
 from . import remote_config
+from .communication_quality import CommunicationQualityStore
 
 
 LOGGER = logging.getLogger("motor_diagnosis")
@@ -222,6 +223,16 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         user = self.require_user()
+
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "communication-quality"
+        ):
+            self.send_json(
+                self.server.communication_quality.query(user, segments[2], query)
+            )
+            return
 
         if (
             len(segments) == 4
@@ -697,6 +708,17 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(
                 remote_config.report_configuration(self.bearer_token(), segments[2], payload)
             )
+            return
+
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "communication-quality"
+        ):
+            response, status = self.server.communication_quality.ingest(
+                self.bearer_token(), segments[2], payload
+            )
+            self.send_json(response, status=status)
             return
 
         user = self.require_user()
@@ -1530,6 +1552,10 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
                 maintain_runtime_retention()
             except Exception:
                 LOGGER.exception("Runtime retention failed; will retry on next tick")
+            try:
+                self.communication_quality.prune()
+            except Exception:
+                LOGGER.exception("Quality retention failed; will retry on next tick")
 
     def _run_alert_worker(self):
         # SQLite can wait on another writer. Never perform this work in
@@ -1557,6 +1583,8 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
             if self._alert_worker.ident is not None:
                 self._alert_worker.join()
         super().server_close()
+        if hasattr(self, "communication_quality"):
+            self.communication_quality.close()
         if hasattr(self, "alerts"):
             self.alerts.close()
         close_runtime_state()
@@ -1571,6 +1599,7 @@ def create_server(
     alert_adapters=None,
     auto_alerts=True,
     state_database=None,
+    communication_database=":memory:",
 ) -> ThreadingHTTPServer:
     if demo_enabled is None:
         demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
@@ -1585,12 +1614,15 @@ def create_server(
     )
     server.auto_alerts = auto_alerts
     try:
+        server.communication_quality = CommunicationQualityStore(
+            communication_database
+        )
         server.alerts = AlertService(
             alert_database,
             adapters=alert_adapters,
         )
         server.start_alert_worker()
-        if state_database:
+        if state_database or communication_database != ":memory:":
             server.start_retention_worker()
     except Exception:
         server.server_close()

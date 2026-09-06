@@ -113,6 +113,7 @@ from .model_registry import create_baseline_version, create_model_version, versi
 from .telemetry_bulk import ingest_telemetry_bulk
 from .web import render_page
 from .xlsx_export import dataset_xlsx_bytes
+from . import remote_config
 
 
 LOGGER = logging.getLogger("motor_diagnosis")
@@ -210,7 +211,32 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "devices"]
+            and segments[3:] == ["configuration", "pending"]
+        ):
+            self.send_json(
+                remote_config.pending_configuration(self.bearer_token(), segments[2])
+            )
+            return
+
         user = self.require_user()
+
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "configuration"
+        ):
+            self.send_json(remote_config.configuration_for(user, segments[2]))
+            return
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "devices"]
+            and segments[3:] == ["configuration", "history"]
+        ):
+            self.send_json(remote_config.configuration_history(user, segments[2]))
+            return
 
         if segments == ["api", "bootstrap"]:
             response: dict[str, Any] = {"sites": visible_sites_for_user(user)}
@@ -663,6 +689,16 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "devices"]
+            and segments[3:] == ["configuration", "result"]
+        ):
+            self.send_json(
+                remote_config.report_configuration(self.bearer_token(), segments[2], payload)
+            )
+            return
+
         user = self.require_user()
 
         if segments == ["api", "sites"]:
@@ -793,6 +829,15 @@ class AppHandler(BaseHTTPRequestHandler):
     def route_put(self, segments: list[str]) -> None:
         payload = self.read_json()
         user = self.require_user()
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "configuration"
+        ):
+            self.send_json(
+                remote_config.request_configuration(user, segments[2], payload)
+            )
+            return
         if (
             len(segments) == 4
             and segments[:2] == ["api", "sites"]

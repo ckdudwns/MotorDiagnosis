@@ -16,6 +16,13 @@
 #define DEVICE_HEALTH_URL_VALUE "https://backend.example.com/api/devices/DEV-01-MOT-02/health"
 #define DEVICE_HEALTH_TOKEN_VALUE "YOUR_DEVICE_HEALTH_TOKEN"
 
+// Optional, separate per-device configuration channel. No admin/ingest token.
+// Backend: DEVICE_CONFIG_TOKENS_JSON maps this device ID to a unique token.
+// Kept disabled by default. Set the base URL ending in /configuration, with
+// no query string or trailing slash, and a provisioned token in secrets.h.
+#define DEVICE_CONFIG_URL_VALUE ""
+#define DEVICE_CONFIG_TOKEN_VALUE ""
+
 // PEM-encoded CA certificate that validates the backend TLS certificate.
 // Keep this empty in the example so CI can compile without distributing
 // environment-specific trust material. Real deployments must configure it.

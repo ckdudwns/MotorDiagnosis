@@ -41,6 +41,7 @@ class IotHealthHttpContractTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.close_server)
+        self.initial_event_ids = {event["id"] for event in data.EVENTS}
         generated = subprocess.run(
             [FIXTURE_EXE, "--emit-fixture"],
             check=True,
@@ -117,6 +118,82 @@ class IotHealthHttpContractTest(unittest.TestCase):
         self.assertEqual(len(self.sensor_events()), 0)
         self.assertEqual(self.post(path, self.active)[0], 200)
         self.assertEqual(len(self.sensor_events()), 1)
+
+    def replay_requests(self, option):
+        generated = subprocess.run(
+            [FIXTURE_EXE, option],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return [
+            (kind, int(batch), json.loads(body))
+            for kind, batch, body in (
+                line.split("\t", 2) for line in generated.stdout.splitlines()
+            )
+        ]
+
+    def run_replay(self, requests):
+        failures = []
+        original = data.process_accepted_telemetry
+
+        def analyze(record, scored):
+            try:
+                return original(record, scored)
+            except Exception as error:
+                failures.append(str(error))
+                raise
+
+        with patch.object(data, "process_accepted_telemetry", side_effect=analyze):
+            for kind, batch, body in requests:
+                if kind == "health":
+                    status, _ = self.post("/api/devices/DEV-01-MOT-02/health", body)
+                    self.assertEqual(status, 200, (batch, body))
+                else:
+                    status, result = self.post(
+                        "/api/telemetry/ingest",
+                        body,
+                        token="demo-telemetry-ingest-token",
+                    )
+                    self.assertEqual(status, 201, result)
+                    self.assertTrue(result["accepted"])
+        return failures
+
+    def motor_events(self):
+        return [
+            event
+            for event in data.EVENTS
+            if event.get("assetId") == "SITE-01-MOT-02"
+            and event.get("thresholdVersion") == "RULE-SITE-01-MOT-02-v1"
+            and event["id"] not in self.initial_event_ids
+        ]
+
+    def test_multiple_replay_batches_preserve_analysis_before_fault_and_after_recovery(
+        self,
+    ):
+        requests = self.replay_requests("--emit-replay-fixture")
+        seen_telemetry = 0
+        earlier_batches = set()
+        for kind, batch, body in requests:
+            if kind == "telemetry":
+                seen_telemetry += 1
+                if seen_telemetry <= 15:
+                    earlier_batches.add(batch)
+            elif body["sensorFaults"]:
+                self.assertGreaterEqual(seen_telemetry, 15)
+        self.assertGreaterEqual(len(earlier_batches), 4)
+        self.assertEqual(seen_telemetry, 30)
+        self.assertEqual(self.run_replay(requests), [])
+        self.assertEqual(len(self.motor_events()), 2)
+        self.assertEqual(len(self.sensor_events()), 1)
+        self.assertEqual(self.sensor_events()[0]["status"], "closed")
+
+    def test_old_health_first_order_is_detected_even_with_successful_ingest_ack(self):
+        failures = self.run_replay(self.replay_requests("--emit-broken-replay-fixture"))
+        self.assertEqual(len(failures), 15)
+        self.assertTrue(all("sensor health boundary" in error for error in failures))
+        self.assertEqual(len(self.motor_events()), 1)
 
 
 if __name__ == "__main__":

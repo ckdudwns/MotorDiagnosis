@@ -146,7 +146,8 @@ std::string utcTimestamp(std::int64_t epochMs) {
     return buffer;
 }
 std::string payload(const Journal& journal, const Metrics& metrics,
-                    std::uint32_t session, std::uint64_t monotonicMs, std::int64_t epochMs) {
+                    std::uint32_t session, std::uint64_t monotonicMs, std::int64_t epochMs,
+                    bool includeFaults) {
     const auto timestamp = utcTimestamp(epochMs);
     if (!validJournal(journal) || !session || timestamp.empty() ||
         metrics.rssiDbm < -120 || metrics.rssiDbm > 0 || metrics.rebootCount > 2147483647U ||
@@ -160,10 +161,10 @@ std::string payload(const Journal& journal, const Metrics& metrics,
     document["bufferUsagePct"] = usage(metrics);
     document["firmwareVersion"] = metrics.firmwareVersion;
     JsonArray faults = document["sensorFaults"].to<JsonArray>();
-    if (journal.count) {
+    if (includeFaults && journal.count) {
         addFault(faults, journal.pending[0], session, monotonicMs, epochMs,
                  journal.acknowledgedTime[journal.pending[0].code]);
-    } else {
+    } else if (includeFaults) {
         for (std::size_t i = 0; i < FAULT_COUNT; ++i)
             if (journal.known & (1U << i)) addFault(faults, journal.latest[i], session, monotonicMs, epochMs, journal.acknowledgedTime[i]);
     }
@@ -171,6 +172,44 @@ std::string payload(const Journal& journal, const Metrics& metrics,
     std::string result;
     serializeJson(document, result);
     return result;
+}
+std::int64_t acknowledgedBoundary(const Journal& journal) {
+    std::int64_t boundary = 0;
+    // Journal is packed for NVS; do not bind aligned int64 references to it.
+    for (std::size_t i = 0; i < FAULT_COUNT; ++i) {
+        std::int64_t value = 0;
+        std::memcpy(&value, reinterpret_cast<const unsigned char*>(&journal) +
+                    offsetof(Journal, acknowledgedTime) + i * sizeof(value), sizeof(value));
+        boundary = std::max(boundary, value);
+    }
+    return boundary;
+}
+DispatchOrder dispatchOrder(const Journal& journal, bool telemetryQueued,
+                            bool headTimeKnown, std::int64_t headEpochMs,
+                            std::uint32_t session, std::uint64_t monotonicMs,
+                            std::int64_t epochMs) {
+    DispatchOrder order;
+    if (!validJournal(journal)) return order;
+    if (!journal.count) {
+        order.telemetry = true;
+        // Repeating a snapshot also advances the backend health boundary.
+        order.snapshot = !telemetryQueued;
+        return order;
+    }
+    if (!session || utcTimestamp(epochMs).empty()) return order;
+    const auto& head = journal.pending[0];
+    auto boundary = observationTime(head, session, monotonicMs, epochMs);
+    if (!boundary || boundary < journal.acknowledgedTime[head.code]) boundary = epochMs;
+    // Different fault codes share one backend lifecycle boundary.
+    boundary = std::max(boundary, acknowledgedBoundary(journal));
+    if (!telemetryQueued) {
+        order.transition = true;
+    } else if (headTimeKnown && headEpochMs >= MIN_EPOCH && headEpochMs < MAX_EPOCH) {
+        // Equality must replay first: backend rejects points <= health boundary.
+        order.telemetry = headEpochMs <= boundary;
+        order.transition = !order.telemetry;
+    }
+    return order;
 }
 bool accepted(int httpStatus, const char* response, const char* deviceId, std::int64_t reportedAtMs) {
     if (httpStatus != 200 || !response || !deviceId) return false;

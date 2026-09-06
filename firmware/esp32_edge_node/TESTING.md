@@ -1,4 +1,4 @@
-# ESP32 firmware regression testing — v1.3-iot-health.1
+# ESP32 firmware regression testing — v1.3-iot-health.2
 
 This revision adds IOT-01/02 device-health reporting and sensor recovery while retaining the PR #13 data-integrity regressions. The native test suite exercises production helper code used directly by `main.cpp`.
 
@@ -11,7 +11,7 @@ $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
 & "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" test -e native
 ```
 
-Expected suite size for this revision: **78 tests** (55 existing + 23 device-health tests).
+Expected suite size for this revision: **83 tests** (55 existing + 28 device-health tests).
 
 The native compiler must support C++11. ArduinoJson and Unity are resolved by PlatformIO.
 Run both suites, or select the health suite with `test -e native -f test_device_health`.
@@ -30,7 +30,7 @@ $env:IOT_HEALTH_FIXTURE_EXE = (Resolve-Path firmware/esp32_edge_node/.pio/build/
 python -m unittest discover -s tests -p test_iot_health_contract.py -v
 ```
 
-These three tests use generated C++ requests and a temporary local HTTP server. They
+These five tests use generated C++ requests and a temporary local HTTP server. They
 exercise health-only authorization, active/recovered retry behavior, metrics and
 firmware validation of the actual server response. They skip when no native executable
 is supplied. No production credentials, persistent production database or board is used.
@@ -38,6 +38,12 @@ is supplied. No production credentials, persistent production database or board 
 Device-health native tests cover CRC/restart, FIFO/full-queue safety, ACK loss/marker
 failure, same-/previous-boot time handling, recovery ordering, bounded report and sensor
 retries, millis wrap, invalid metrics, stuck PCM and exact device/time response matching.
+PR23 regressions additionally cover multiple replay batches, timestamp equality,
+unknown/read-failed heads, metrics-only ACKs, shared fault boundaries and failed
+transition-marker persistence. The C++ replay fixture uses the same production
+dispatcher and payload builders as `main.cpp`. HTTP tests assert zero analysis
+failures for 15 pre-fault and 15 post-recovery measurements, and verify that the
+old health-first ordering fails analysis for all 15 earlier points despite 201 ACKs.
 
 On hardware, additionally test:
 

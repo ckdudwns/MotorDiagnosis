@@ -238,11 +238,112 @@ void testRuntimeRecoveryUsesSameBoundedBudget() {
     TEST_ASSERT_TRUE(retry.due(17000)); retry.attempted(17000, true); retry.failed(18000);
     TEST_ASSERT_FALSE(retry.due(1000000));
 }
+void testMultipleReplayBatchesCannotOvertakeFault() {
+    auto journal = emptyJournal(); observe(journal, Fault::ADXL_CHANNEL, true, 1, 500, EPOCH);
+    for (unsigned batch = 0; batch < 4; ++batch) {
+        const unsigned begin = batch * 4;
+        const unsigned end = static_cast<unsigned>(FirmwareLogic::calculateReplayBatchSize(15 - begin, 4)) + begin;
+        for (unsigned index = begin; index < end; ++index) {
+            auto order = dispatchOrder(journal, true, true, EPOCH - 15000 + index * 1000,
+                                       1, 2000, EPOCH + 20000);
+            TEST_ASSERT_TRUE(order.telemetry); TEST_ASSERT_FALSE(order.transition);
+        }
+        // A storage/HTTP retry or restart leaves the same journal head pending.
+        Journal restarted = journal; TEST_ASSERT_TRUE(validJournal(restarted));
+        TEST_ASSERT_EQUAL(1, restarted.count);
+    }
+    TEST_ASSERT_TRUE(dispatchOrder(journal, false, false, 0, 1, 2000, EPOCH + 20000).transition);
+}
+void testTimestampMergeEqualityRecoveryAndFailedAck() {
+    auto journal = emptyJournal();
+    observe(journal, Fault::ADXL_CHANNEL, true, 1, 500, EPOCH);
+    observe(journal, Fault::ADXL_CHANNEL, false, 1, 1500, EPOCH + 5000);
+    TEST_ASSERT_TRUE(dispatchOrder(journal, true, true, EPOCH, 1, 2000, EPOCH + 20000).telemetry);
+    auto later = dispatchOrder(journal, true, true, EPOCH + 1000, 1, 2000, EPOCH + 20000);
+    TEST_ASSERT_TRUE(later.transition); TEST_ASSERT_FALSE(later.telemetry);
+    auto failedMarker = journal; acknowledgeHead(failedMarker, 1, 2000, EPOCH + 20000);
+    TEST_ASSERT_FALSE(dispatchOrder(journal, true, true, EPOCH + 1000, 1, 2000, EPOCH + 20000).telemetry);
+    journal = failedMarker;
+    TEST_ASSERT_TRUE(dispatchOrder(journal, true, true, EPOCH + 1000, 1, 2000, EPOCH + 20000).telemetry);
+    TEST_ASSERT_FALSE(dispatchOrder(journal, true, true, EPOCH + 6000, 1, 2000, EPOCH + 20000).telemetry);
+    acknowledgeHead(journal, 1, 2000, EPOCH + 20000);
+    TEST_ASSERT_TRUE(dispatchOrder(journal, true, true, EPOCH + 6000, 1, 2000, EPOCH + 20000).telemetry);
+    TEST_ASSERT_EQUAL_INT64(EPOCH + 5000, acknowledgedBoundary(journal));
+}
+void testUnknownHeadAndMissingClockCannotAdvanceFault() {
+    auto journal = emptyJournal(); observe(journal, Fault::ADXL_CHANNEL, true, 1, 500, EPOCH);
+    auto order = dispatchOrder(journal, true, false, 0, 1, 2000, EPOCH);
+    TEST_ASSERT_FALSE(order.transition); TEST_ASSERT_FALSE(order.telemetry);
+    TEST_ASSERT_FALSE(dispatchOrder(journal, false, false, 0, 1, 2000, 0).transition);
+    auto unresolved = emptyJournal(); observe(unresolved, Fault::ADXL_CHANNEL, true, 1, 500, 0);
+    TEST_ASSERT_TRUE(dispatchOrder(unresolved, true, true, EPOCH - 1000, 2, 2000, EPOCH).telemetry);
+    journal.crc ^= 1;
+    TEST_ASSERT_FALSE(dispatchOrder(journal, false, false, 0, 1, 2000, EPOCH).transition);
+}
+void testMetricsOnlyDoesNotSendOrConsumeDeferredFault() {
+    auto journal = emptyJournal(); observe(journal, Fault::ADXL_CHANNEL, true, 1, 500, EPOCH);
+    const auto crc = journal.crc;
+    JsonDocument value;
+    TEST_ASSERT_FALSE(deserializeJson(value, payload(journal, metrics(), 1, 2000, EPOCH, false)));
+    TEST_ASSERT_EQUAL(0, value["sensorFaults"].size());
+    TEST_ASSERT_EQUAL(-61, value["rssiDbm"].as<int>());
+    TEST_ASSERT_EQUAL(crc, journal.crc); TEST_ASSERT_EQUAL(1, journal.count);
+    acknowledgeHead(journal, 1, 2000, EPOCH);
+    auto pendingReplay = dispatchOrder(journal, true, true, EPOCH + 1000, 1, 2000, EPOCH + 2000);
+    TEST_ASSERT_TRUE(pendingReplay.telemetry); TEST_ASSERT_FALSE(pendingReplay.snapshot);
+    TEST_ASSERT_TRUE(dispatchOrder(journal, false, false, 0, 1, 2000, EPOCH + 2000).snapshot);
+}
+void testDifferentFaultCodesKeepSharedBoundary() {
+    auto journal = emptyJournal();
+    observe(journal, Fault::ADXL_CHANNEL, true, 1, 500, EPOCH + 1000);
+    observe(journal, Fault::I2S_CHANNEL, true, 1, 400, EPOCH);
+    acknowledgeHead(journal, 1, 2000, EPOCH + 2000);
+    TEST_ASSERT_TRUE(dispatchOrder(journal, true, true, EPOCH + 500, 1, 2000, EPOCH + 2000).telemetry);
+    TEST_ASSERT_TRUE(dispatchOrder(journal, true, true, EPOCH + 1001, 1, 2000, EPOCH + 2000).transition);
+}
+
+// Deterministic host replay driver uses the SAME production dispatcher and
+// payload builder as main.cpp. Python submits every emitted request to HTTP.
+int emitReplayFixture(bool brokenHealthFirst) {
+    auto journal = emptyJournal();
+    observe(journal, Fault::ADXL_CHANNEL, true, 1, 500, EPOCH);
+    observe(journal, Fault::ADXL_CHANNEL, false, 1, 1500, EPOCH + 5000);
+    unsigned cursor = 0;
+    for (unsigned batch = 0; batch < 40 && (cursor < 30 || journal.count); ++batch) {
+        const auto reportTime = EPOCH + 60000 + batch * 5000;
+        const auto pointTime = cursor < 15 ? EPOCH - 15000 + cursor * 1000 :
+                              EPOCH + 6000 + (cursor - 15) * 1000;
+        auto order = dispatchOrder(journal, cursor < 30, true, pointTime, 1, 2000, reportTime);
+        if (brokenHealthFirst) order.transition = journal.count != 0;
+        const bool includeFaults = order.transition || order.snapshot;
+        std::printf("health\t%u\t%s\n", batch,
+                    payload(journal, metrics(), 1, 2000, reportTime, includeFaults).c_str());
+        if (order.transition) acknowledgeHead(journal, 1, 2000, reportTime);
+        const auto limit = FirmwareLogic::calculateReplayBatchSize(30 - cursor, 4);
+        for (unsigned item = 0; item < limit; ++item) {
+            const auto time = cursor < 15 ? EPOCH - 15000 + cursor * 1000 :
+                             EPOCH + 6000 + (cursor - 15) * 1000;
+            auto replay = dispatchOrder(journal, true, true, time, 1, 2000, reportTime);
+            if (!brokenHealthFirst && !replay.telemetry) break;
+            FirmwareLogic::CanonicalTelemetry telemetry;
+            telemetry.sequence = cursor + 1;
+            telemetry.vibrationRmsRaw = 1.0f; telemetry.vibrationPeakHz = 1037.11f;
+            telemetry.acousticRmsRaw = 0.007019f; telemetry.acousticPeakHz = 216.4f;
+            std::printf("telemetry\t%u\t%s\n", batch,
+                FirmwareLogic::buildCanonicalTelemetryPayload(utcTimestamp(time).c_str(),
+                    "SITE-01", "SITE-01-MOT-02", "DEV-01-MOT-02", telemetry).c_str());
+            ++cursor;
+        }
+    }
+    return cursor == 30 && journal.count == 0 ? 0 : 1;
+}
 } // namespace
 
 void setUp() {}
 void tearDown() {}
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--emit-replay-fixture") == 0) return emitReplayFixture(false);
+    if (argc == 2 && std::strcmp(argv[1], "--emit-broken-replay-fixture") == 0) return emitReplayFixture(true);
     if (argc == 3 && std::strcmp(argv[1], "--validate-backend-ack") == 0)
         return accepted(200, argv[2], "DEV-01-MOT-02", EPOCH) ? 0 : 1;
     if (argc == 2 && std::strcmp(argv[1], "--emit-fixture") == 0) {
@@ -287,5 +388,10 @@ int main(int argc, char** argv) {
     RUN_TEST(testMetricChangesAreDebounced);
     RUN_TEST(testSensorInitRetriesAreBoundedAndSpaced);
     RUN_TEST(testRuntimeRecoveryUsesSameBoundedBudget);
+    RUN_TEST(testMultipleReplayBatchesCannotOvertakeFault);
+    RUN_TEST(testTimestampMergeEqualityRecoveryAndFailedAck);
+    RUN_TEST(testUnknownHeadAndMissingClockCannotAdvanceFault);
+    RUN_TEST(testMetricsOnlyDoesNotSendOrConsumeDeferredFault);
+    RUN_TEST(testDifferentFaultCodesKeepSharedBoundary);
     return UNITY_END();
 }

@@ -121,11 +121,21 @@ def build_acoustic_manifest(
         digest = sha256_of_file(record["source_path"])
         if before.get(name) != digest:
             raise ValueError(f"Source changed during import: {name}")
-        if digest in fingerprints and fingerprints[digest] != record["machine_id"]:
-            raise ValueError(
-                "Duplicate recording content across machines cannot establish independent holdout"
-            )
-        fingerprints[digest] = record["machine_id"]
+        label = record["label"]
+        if label not in LABEL_MAPPING:
+            raise ValueError(f"Unsupported source label: {label}")
+        identity = (record["machine_id"], label, record["source_label"])
+        previous = fingerprints.get(digest)
+        if previous is not None:
+            if previous[1:] != identity[1:]:
+                raise ValueError(
+                    f"Conflicting labels for identical recording content: {name}"
+                )
+            if previous[0] != identity[0]:
+                raise ValueError(
+                    "Duplicate recording content across machines cannot establish independent holdout"
+                )
+        fingerprints[digest] = identity
         signal = np.asarray(record["signal"], dtype=np.float64)
         if (
             signal.ndim != 1
@@ -133,9 +143,6 @@ def build_acoustic_manifest(
             or len(signal) < window_size
         ):
             raise ValueError(f"Invalid or too-short acoustic recording: {name}")
-        label = record["label"]
-        if label not in LABEL_MAPPING:
-            raise ValueError(f"Unsupported source label: {label}")
         files[name] = {"sha256": digest, "label": label}
         for index, start in enumerate(
             range(0, len(signal) - window_size + 1, hop_size)

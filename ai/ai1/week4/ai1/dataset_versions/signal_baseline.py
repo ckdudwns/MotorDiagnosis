@@ -23,10 +23,29 @@ def _required_text(value, name):
     return value.strip()
 
 
-def _conditions(value):
+def _conditions_key(value):
+    """Canonical JSON preserves bool/number and nested value types, not key order."""
     if not isinstance(value, dict) or not value:
         raise ValueError("Explicit operating conditions are required")
-    json.dumps(value, allow_nan=False)
+
+    def validate(item):
+        if type(item) is dict:
+            if any(type(key) is not str for key in item):
+                raise ValueError("Operating condition keys must be JSON strings")
+            for child in item.values():
+                validate(child)
+        elif type(item) is list:
+            for child in item:
+                validate(child)
+        elif type(item) not in (str, int, float, bool, type(None)):
+            raise ValueError("Operating conditions must contain JSON values only")
+
+    validate(value)
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
+
+
+def _conditions(value):
+    _conditions_key(value)
     return copy.deepcopy(value)
 
 
@@ -79,6 +98,11 @@ def _build(values, *, dataset_id, site_id, asset_id, context, sample_refs, sigma
             "sampleCount": len(sample_refs),
             "split": "train",
             "sigmaMultiplier": sigma,
+            "evaluationPolicy": {
+                "rangeSource": "normal_range",
+                "zeroVariance": "absolute_tolerance",
+                "absoluteTolerance": 0.0,
+            },
         },
     }
     fingerprint = hashlib.sha256(
@@ -147,6 +171,7 @@ def build_rpm_baseline(
     are consumed. Missing RPM is excluded; invalid measured values fail explicitly.
     """
     conditions = _conditions(operating_conditions)
+    conditions_key = _conditions_key(conditions)
     values, refs = [], []
     for row in records:
         if not (
@@ -163,7 +188,7 @@ def build_rpm_baseline(
             )
         if (
             row.get("rpm_unit") != "rpm"
-            or row.get("operating_conditions") != conditions
+            or _conditions_key(row.get("operating_conditions")) != conditions_key
         ):
             raise ValueError("RPM units/operating conditions cannot be mixed")
         value = row.get("rpm")

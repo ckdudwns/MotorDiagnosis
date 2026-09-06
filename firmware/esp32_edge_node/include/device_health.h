@@ -57,7 +57,20 @@ std::string utcTimestamp(std::int64_t epochMs);
 // would reopen an already closed backend event after ACK loss.
 std::string payload(const Journal& journal, const Metrics& metrics,
                     std::uint32_t session, std::uint64_t monotonicMs,
-                    std::int64_t epochMs);
+                    std::int64_t epochMs, bool includeFaults = true);
+
+struct DispatchOrder {
+    bool telemetry = false;
+    bool transition = false;
+    bool snapshot = false;
+};
+// Merge the durable telemetry head with the durable fault FIFO. Unknown/read-
+// failed heads block fault transitions, but the caller may still send metrics.
+DispatchOrder dispatchOrder(const Journal& journal, bool telemetryQueued,
+                            bool headTimeKnown, std::int64_t headEpochMs,
+                            std::uint32_t session, std::uint64_t monotonicMs,
+                            std::int64_t epochMs);
+std::int64_t acknowledgedBoundary(const Journal& journal);
 bool accepted(int httpStatus, const char* response, const char* deviceId,
               std::int64_t reportedAtMs);
 bool metricsChanged(const Metrics& previous, const Metrics& current);

@@ -1,7 +1,7 @@
 /*
  * MotorDiagnosis Edge Node
  *
- * Firmware Version : v1.3-iot-health.1
+ * Firmware Version : v1.3-iot-health.2
  * Revision Summary :
  *   P1 Atomic Queue Recovery
  *   P2 Unlabeled Real Telemetry Contract
@@ -75,7 +75,7 @@
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.3-iot-health.1";
+    "v1.3-iot-health.2";
 
 // =====================================================
 // Test Config
@@ -669,6 +669,7 @@ bool syncTime();
 bool syncTimeFromBackend();
 
 uint64_t healthUptimeMs();
+int64_t currentHealthEpochMs();
 bool observeSensorFault(DeviceHealth::Fault fault, bool active, uint64_t observedMs);
 void serviceDeviceHealth();
 void serviceSensors();
@@ -5857,6 +5858,18 @@ void replayQueueBatch()
             continue;
         }
 
+        const auto order = DeviceHealth::dispatchOrder(
+            healthJournal, true, packet.timestampResolved,
+            static_cast<int64_t>(packet.epochSeconds) * 1000LL,
+            bootSessionId, healthUptimeMs(), currentHealthEpochMs());
+        if (!order.telemetry)
+        {
+            // The next health transition must commit before this later point.
+            // Re-evaluate for EVERY head, not just once per replay batch.
+            commitConsumedWatermark();
+            return;
+        }
+
         const uint32_t sequence =
             packet.sequence;
 
@@ -6344,7 +6357,22 @@ void serviceDeviceHealth()
                             healthJournal.count != 0)) return;
     const int64_t epochMs = currentHealthEpochMs();
     const uint64_t reportMonotonic = healthUptimeMs();
-    const std::string body = DeviceHealth::payload(healthJournal, metrics, bootSessionId, reportMonotonic, epochMs);
+    TelemetryPacket oldest;
+    BinaryTelemetryRecord raw;
+    uint64_t ordinal = 0;
+    bool queued = !queueIsEmpty();
+    const bool headKnown = queued &&
+        readOldestPersistent(oldest, ordinal, raw) == QueueReadResult::READY;
+    queued = !queueIsEmpty(); // Reading may safely skip proven corruption.
+    const auto order = DeviceHealth::dispatchOrder(
+        healthJournal, queued, headKnown,
+        static_cast<int64_t>(oldest.epochSeconds) * 1000LL,
+        bootSessionId, reportMonotonic, epochMs);
+    const bool includesFaults = order.transition || order.snapshot;
+    // Current metrics need not wait for an old backlog, but they must not
+    // advance analysis boundaries or acknowledge a deferred fault transition.
+    const std::string body = DeviceHealth::payload(
+        healthJournal, metrics, bootSessionId, reportMonotonic, epochMs, includesFaults);
     bool accepted = false;
     if (!body.empty())
     {
@@ -6366,7 +6394,7 @@ void serviceDeviceHealth()
             http.end();
         }
     }
-    if (accepted && healthJournal.count)
+    if (accepted && order.transition && healthJournal.count)
     {
         DeviceHealth::Journal candidate = healthJournal;
         DeviceHealth::acknowledgeHead(candidate, bootSessionId, reportMonotonic, epochMs);
@@ -6674,7 +6702,7 @@ void loop()
     }
 
     serviceSensors();
-    serviceDeviceHealth();
+    serviceDeviceHealth(); // Metrics only while an older telemetry head exists.
 
     // Replay only a bounded slice of old data before each fresh
     // measurement. This prevents a full 24-hour backlog from starving
@@ -6700,6 +6728,16 @@ void loop()
         healthJournalDirty || healthObservationBlocked)
     {
         delay(200); // Wi-Fi, health reporting and bounded replay remain alive.
+        return;
+    }
+
+    // Telemetry UTC has whole-second precision, health has milliseconds.
+    // Start a new window only after the acknowledged boundary's second, rather
+    // than creating a fresh point that the backend would reject as <= boundary.
+    if (timeReady && currentHealthEpochMs() / 1000LL * 1000LL <=
+        DeviceHealth::acknowledgedBoundary(healthJournal))
+    {
+        delay(200);
         return;
     }
 
@@ -6838,7 +6876,8 @@ void loop()
         return;
     }
 
-    // Existing backlog always wins FIFO.
+    // Existing backlog and pending health transitions always win the ordered
+    // dispatcher. Do not bypass a deferred health boundary via direct POST.
     //
     // replayQueueBatch() consumed only a bounded number of oldest
     // records at the start of this loop. If backlog remains, this fresh
@@ -6846,7 +6885,7 @@ void loop()
     // telemetry. Therefore catch-up and acquisition are interleaved
     // without reordering packets.
     if (
-        !queueIsEmpty()
+        !queueIsEmpty() || healthJournal.count != 0
     )
     {
         if (

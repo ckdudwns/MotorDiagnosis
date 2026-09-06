@@ -729,8 +729,8 @@ const opsRow = id => ({id,siteId:'S1',assetId:'A1',mappingStatus:'active',certif
 function opsCommand(version=1, changes={}) {
   return {version,commandId:'a'.repeat(32),settings:{measurementIntervalMs:6000,replayBatchSize:2},state:'pending',result:null,siteId:'S1',assetId:'A1',reason:'fixture reason',requestedBy:'tester',requestedAt:'2026-09-06T00:00:00Z',...changes};
 }
-function opsConfigResult(id='D1', command=null) {
-  return {deviceId:id,version:command?.version || 0,desired:command,lastApplied:null,scopeChanged:false,defaults:opsDefaults,limits:{}};
+function opsConfigResult(id='D1', command=null, scope={}) {
+  return {deviceId:id,siteId:'S1',assetId:'A1',version:command?.version || 0,desired:command,lastApplied:null,scopeChanged:false,defaults:opsDefaults,limits:{},...scope};
 }
 function opsQualityResult(id='D1', hasData=true) {
   const summary = {hasData,windowCount:hasData?1:0,attempts:0,failures:0,retries:0,acknowledged:0,replayAttempts:0,failureRatePct:null,ackLatencyMeanMs:null,ackLatencyMaxMs:null,bufferDepthSampleMean:hasData?0:null,bufferDepthLast:hasData?0:null,bufferDepthMax:hasData?0:null,bufferCapacity:hasData?100:null,bufferDropped:0,observedDurationMs:hasData?60000:0};
@@ -900,7 +900,7 @@ await check('operations remap recovery requires a fresh device list and the new 
   h.context.respond=()=>[ {...opsRow('D1'),assetId:'A2'} ]; await h.run('loadDeviceOperations()');
   assert.equal(h.run('opsDevice'),null); assert.equal(h.get('opsConfigPublish').disabled,true);
   h.get('assetSelect').value='A2';
-  h.context.respond=path=>path.endsWith('/devices') ? [{...opsRow('D1'),assetId:'A2'}] : path.endsWith('/configuration') ? opsConfigResult('D1',opsCommand(2,{assetId:'A2'})) : path.endsWith('/history') ? {items:[],retainedLimit:100} : path.endsWith('/health') ? {deviceId:'D1',siteId:'S1',assetId:'A2'} : {...opsQualityResult(),assetId:'A2'};
+  h.context.respond=path=>path.endsWith('/devices') ? [{...opsRow('D1'),assetId:'A2'}] : path.endsWith('/configuration') ? opsConfigResult('D1',opsCommand(2,{assetId:'A2'}),{assetId:'A2'}) : path.endsWith('/history') ? {items:[],retainedLimit:100} : path.endsWith('/health') ? {deviceId:'D1',siteId:'S1',assetId:'A2'} : {...opsQualityResult(),assetId:'A2'};
   await h.run('loadDeviceOperations()'); assert.equal(h.get('opsConfigPublish').disabled,false);
   opsDraft(h); h.get('opsInterval').value='12000';
   h.context.respond=()=>opsCommand(3,{assetId:'A2',settings:{measurementIntervalMs:12000,replayBatchSize:2}});
@@ -935,6 +935,31 @@ await check('operations foreign quality or history also prevents reuse of the pr
     await h.run(route==='quality' ? 'loadOpsQuality()' : 'loadOpsHistory()');
     assert.equal(h.run('opsConfig'),null); assert.equal(h.get('opsConfigPublish').disabled,true);
     await h.run('publishOpsConfig()'); assert.equal(h.requests.filter(row=>row.options.method==='PUT').length,0);
+  }
+});
+
+await check('operations empty commands require authoritative current mapping regardless of scopeChanged', async () => {
+  for (const scopeChanged of [true,false]) for (const scope of [{assetId:'A2'},{siteId:'S2'},{assetId:null},{siteId:undefined},{siteId:undefined,assetId:undefined}]) {
+    const h=opsHarness(); await h.run('loadDeviceOperations()'); opsDraft(h);
+    h.context.respond=()=>({...opsConfigResult('D1',null,scope),scopeChanged});
+    await h.run('loadOpsConfig()');
+    assert.equal(h.run('opsConfig'),null); assert.equal(h.run('opsDevice'),null);
+    assert.equal(h.get('opsConfigPublish').disabled,true); assert.equal(h.get('opsInterval').disabled,true);
+    assert.equal(h.get('opsConfigReason').value,'fixture reason');
+    assert.match(h.get('opsConfigStatus').textContent,/장치 목록.*다시 선택/);
+    await h.run('selectOpsDevice("D1")'); await h.run('publishOpsConfig()');
+    assert.equal(h.requests.filter(row=>row.options.method==='PUT').length,0);
+  }
+});
+await check('operations publication stays disabled until empty configuration mapping is verified', async () => {
+  for (const matches of [true,false]) {
+    const h=opsHarness(), pending=deferred(); await h.run('loadDeviceOperations()'); opsDraft(h);
+    h.context.respond=()=>pending.promise; const loading=h.run('loadOpsConfig()');
+    assert.equal(h.get('opsConfigPublish').disabled,true); assert.equal(h.run('opsConfig'),null);
+    await h.run('publishOpsConfig()'); assert.equal(h.requests.filter(row=>row.options.method==='PUT').length,0);
+    pending.resolve(opsConfigResult('D1',null,{assetId:matches?'A1':'A2'})); await loading;
+    assert.equal(h.get('opsConfigPublish').disabled,!matches);
+    assert.equal(h.get('opsConfigReason').value,'fixture reason');
   }
 });
 

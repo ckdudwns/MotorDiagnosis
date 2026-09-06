@@ -189,6 +189,8 @@ class CoreOperationsHttpTest(unittest.TestCase):
         self.assertEqual(health["assetId"], device["assetId"])
         status, config = self.request(ROOT + "/configuration")
         self.assertEqual(status, 200, config)
+        self.assertEqual(config["siteId"], device["siteId"])
+        self.assertEqual(config["assetId"], device["assetId"])
         self.assertEqual(config["version"], 0)
         self.assertEqual(config["defaults"], remote_config.DEFAULT_SETTINGS)
         self.assertIsNone(config["desired"])
@@ -270,6 +272,17 @@ class CoreOperationsHttpTest(unittest.TestCase):
     def test_shipped_ui_rejects_real_http_remap_before_put_and_recovers_on_new_asset(
         self,
     ):
+        self._run_ui_remap_probe(initial_command=True, new_mapping_command=True)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for the shipped UI")
+    def test_shipped_ui_rejects_remap_with_no_new_asset_configuration(self):
+        self._run_ui_remap_probe(initial_command=True, new_mapping_command=False)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for the shipped UI")
+    def test_shipped_ui_rejects_remap_with_no_configuration_history(self):
+        self._run_ui_remap_probe(initial_command=False, new_mapping_command=False)
+
+    def _run_ui_remap_probe(self, *, initial_command, new_mapping_command):
         result = subprocess.run(
             [shutil.which("node"), "tests/test_core_operations_http_ui.mjs"],
             cwd=Path(__file__).resolve().parents[1],
@@ -277,6 +290,8 @@ class CoreOperationsHttpTest(unittest.TestCase):
                 {
                     "baseUrl": f"http://127.0.0.1:{self.server.server_address[1]}/",
                     "token": self.tokens["admin"],
+                    "initialCommand": initial_command,
+                    "newMappingCommand": new_mapping_command,
                 }
             ),
             capture_output=True,

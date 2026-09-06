@@ -1211,7 +1211,7 @@ def render_page() -> str:
         row.siteId === $("siteSelect").value && row.assetId === $("assetSelect").value;
     }
     function opsConfigScopeMatches(config) {
-      return !!config && config.deviceId === opsDevice?.id && opsScopeMatches(opsDevice) &&
+      return !!config && config.deviceId === opsDevice?.id && opsScopeMatches(config) &&
         [config.desired,config.lastApplied].every(command => command == null || opsScopeMatches(command));
     }
     function opsCanEdit() {

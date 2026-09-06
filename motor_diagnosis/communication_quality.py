@@ -16,10 +16,11 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import data
+from . import data, device_lifecycle
 from .device_credentials import device_for_token, supported_identifier
 
 SCHEMA_VERSION = 1
+STORAGE_SCHEMA_VERSION = 2
 RETENTION_DAYS = 30
 MAX_INTEGER = 2**53 - 1
 MAX_BUCKETS = 1000
@@ -258,6 +259,7 @@ def _aggregate(reports):
 
 
 class CommunicationQualityStore:
+    @device_lifecycle.serialized
     def __init__(self, database=":memory:"):
         if database != ":memory:":
             Path(database).expanduser().resolve().parent.mkdir(
@@ -279,11 +281,11 @@ class CommunicationQualityStore:
                         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
                     )
                 }
-                if tables - {"communication_windows"}:
+                if tables - {"communication_windows", "communication_devices"}:
                     raise ValueError(
                         "Communication quality requires a separate database file."
                     )
-                if version not in (0, SCHEMA_VERSION):
+                if version not in (0, 1, STORAGE_SCHEMA_VERSION):
                     raise ValueError("Unsupported communication quality schema.")
                 self._db.execute("""CREATE TABLE IF NOT EXISTS communication_windows (
                     device_id TEXT NOT NULL, boot_id TEXT NOT NULL, window_id INTEGER NOT NULL,
@@ -297,11 +299,39 @@ class CommunicationQualityStore:
                 self._db.execute(
                     "CREATE INDEX IF NOT EXISTS quality_retention ON communication_windows(end_ms)"
                 )
-                self._db.execute("PRAGMA user_version=1")
+                self._db.execute("""CREATE TABLE IF NOT EXISTS communication_devices (
+                    device_id TEXT PRIMARY KEY NOT NULL)""")
+                if version < STORAGE_SCHEMA_VERSION:
+                    # Backfill before pruning: even expired v1 windows reserve
+                    # their device identity. Raw-data retention is independent.
+                    self._db.execute("""INSERT OR IGNORE INTO communication_devices
+                        SELECT DISTINCT device_id FROM communication_windows""")
+                self._db.execute(f"PRAGMA user_version={STORAGE_SCHEMA_VERSION}")
             self.prune()
         except BaseException:
             self._db.close()
             raise
+        device_lifecycle.register_history(self)
+
+    def check_device_deletion(self, device_id):
+        try:
+            with self._lock:
+                exists = self._db.execute(
+                    "SELECT 1 FROM communication_devices WHERE device_id=?",
+                    (device_id,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise data.ApiError(
+                503,
+                "COMMUNICATION_QUALITY_STORAGE_UNAVAILABLE",
+                "Device history could not be checked; retry without deleting the device.",
+            ) from error
+        if exists:
+            raise data.ApiError(
+                409,
+                "DEVICE_HAS_COMMUNICATION_QUALITY_HISTORY",
+                "A device with communication quality history cannot be deleted or reused; deactivate it instead.",
+            )
 
     @staticmethod
     def now_ms():
@@ -316,6 +346,7 @@ class CommunicationQualityStore:
                 "DELETE FROM communication_windows WHERE end_ms<=?", (cutoff,)
             ).rowcount
 
+    @device_lifecycle.serialized
     def ingest(self, token, device_id, payload):
         device_for_token(
             token,
@@ -399,6 +430,10 @@ class CommunicationQualityStore:
                         now,
                     ),
                 )
+                self._db.execute(
+                    "INSERT OR IGNORE INTO communication_devices(device_id) VALUES (?)",
+                    (device_id,),
+                )
             return {**response, "duplicate": False, "disposition": "stored"}, 201
         except sqlite3.Error as error:
             raise data.ApiError(
@@ -479,8 +514,10 @@ class CommunicationQualityStore:
             "items": items,
         }
 
+    @device_lifecycle.serialized
     def close(self):
         with self._lock:
             if self._db is not None:
                 self._db.close()
                 self._db = None
+            device_lifecycle.unregister_history(self)

@@ -11,11 +11,12 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import urlencode
 
-from motor_diagnosis import data
+from motor_diagnosis import communication_quality, data
 from motor_diagnosis.communication_quality import (
     CommunicationQualityStore,
     COUNTERS,
@@ -64,6 +65,30 @@ def report(window=1, start=BASE, duration=60_000, boot="0" * 31 + "1", **metrics
         "startedAt": _iso(start),
         "endedAt": _iso(start + duration),
         "metrics": counts,
+    }
+
+
+def idle_report():
+    return report(
+        attempts=0,
+        acknowledged=0,
+        transportFailures=0,
+        retries=0,
+        replayAttempts=0,
+        ackLatencyTotalMs=0,
+        ackLatencyMaxMs=0,
+    )
+
+
+def registration(device_id=DEVICE):
+    return {
+        "id": device_id,
+        "siteId": "SITE-01",
+        "assetId": "SITE-01-MOT-02",
+        "certificateId": "CERT-REPLACEMENT",
+        "certificateFingerprint": "replacement-fingerprint",
+        "certificateIssuedAt": "2026-01-01T00:00:00Z",
+        "certificateExpiresAt": "2099-01-01T00:00:00Z",
     }
 
 
@@ -391,6 +416,105 @@ class QualityStoreTest(QualitySetup):
         self.assertEqual(self.view(), before)
         self.assertEqual(self.store.ingest(TOKEN, DEVICE, report())[1], 200)
 
+    def test_direct_delete_is_blocked_after_restart_and_raw_retention(self):
+        self.store.ingest(TOKEN, DEVICE, idle_report())
+        self.store.close()
+        with patch.object(
+            CommunicationQualityStore, "now_ms", return_value=BASE + 31 * 86_400_000
+        ):
+            self.store = CommunicationQualityStore(self.database)
+        self.addCleanup(self.store.close)
+        self.assertFalse(self.view()["summary"]["hasData"])
+        before = data._runtime_state_payload()
+        error = self.assert_error(
+            "DEVICE_HAS_COMMUNICATION_QUALITY_HISTORY",
+            data.delete_device,
+            self.admin,
+            DEVICE,
+        )
+        self.assertEqual(error.status, 409)
+        self.assertEqual(data._runtime_state_payload(), before)
+
+    def test_v1_history_is_migrated_before_startup_pruning(self):
+        self.store.ingest(TOKEN, DEVICE, idle_report())
+        self.store.close()
+        # Reconstruct the previous release's schema in this disposable fixture.
+        with closing(sqlite3.connect(self.database)) as database, database:
+            database.execute("DROP TABLE communication_devices")
+            database.execute("PRAGMA user_version=1")
+        with patch.object(
+            CommunicationQualityStore, "now_ms", return_value=BASE + 31 * 86_400_000
+        ):
+            self.store = CommunicationQualityStore(self.database)
+        self.addCleanup(self.store.close)
+        self.assertEqual(self.store._db.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertFalse(self.view()["summary"]["hasData"])
+        self.assert_error(
+            "DEVICE_HAS_COMMUNICATION_QUALITY_HISTORY",
+            data.delete_device,
+            self.admin,
+            DEVICE,
+        )
+
+    def test_history_marker_and_report_commit_atomically(self):
+        with self.store._db:
+            self.store._db.execute("""CREATE TRIGGER fail_history_marker
+                BEFORE INSERT ON communication_devices
+                BEGIN SELECT RAISE(ABORT, 'simulated history marker failure'); END""")
+        self.assert_error(
+            "COMMUNICATION_QUALITY_STORAGE_UNAVAILABLE",
+            self.store.ingest,
+            TOKEN,
+            DEVICE,
+            idle_report(),
+        )
+        self.assertFalse(self.view()["summary"]["hasData"])
+        self.assertEqual(
+            self.store._db.execute(
+                "SELECT count(*) FROM communication_devices"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertTrue(data.delete_device(self.admin, DEVICE)["deleted"])
+
+    def test_history_check_failure_is_closed_and_does_not_hold_master_lock(self):
+        before = data._runtime_state_payload()
+
+        def unavailable(*args):
+            self.assertFalse(data.STORE_LOCK._is_owned())
+            raise sqlite3.OperationalError("history unavailable")
+
+        failing = Mock(wraps=self.store._db)
+        failing.execute.side_effect = unavailable
+        with patch.object(self.store, "_db", failing):
+            error = self.assert_error(
+                "COMMUNICATION_QUALITY_STORAGE_UNAVAILABLE",
+                data.delete_device,
+                self.admin,
+                DEVICE,
+            )
+            self.assertEqual(error.status, 503)
+            self.assert_error(
+                "COMMUNICATION_QUALITY_STORAGE_UNAVAILABLE",
+                data.create_device,
+                self.admin,
+                "SITE-01",
+                registration("DEV-NEW-QUALITY"),
+            )
+        self.assertEqual(data._runtime_state_payload(), before)
+
+    def test_delete_checks_history_across_store_connections(self):
+        other = CommunicationQualityStore(self.database)
+        self.addCleanup(other.close)
+        other.ingest(TOKEN, DEVICE, idle_report())
+        other.close()
+        self.assert_error(
+            "DEVICE_HAS_COMMUNICATION_QUALITY_HISTORY",
+            data.delete_device,
+            self.admin,
+            DEVICE,
+        )
+
     def test_retention_queries_hide_expired_without_a_new_write(self):
         self.store.ingest(TOKEN, DEVICE, report())
         with patch.object(
@@ -498,9 +622,9 @@ class QualityHttpTest(QualitySetup):
         self.server.server_close()
         self.thread.join(5)
 
-    def request(self, method="GET", body=None, token=None, query=None):
+    def request(self, method="GET", body=None, token=None, query=None, path=None):
         connection = http.client.HTTPConnection(*self.server.server_address, timeout=5)
-        path = f"/api/devices/{DEVICE}/communication-quality"
+        path = path or f"/api/devices/{DEVICE}/communication-quality"
         if query is not None:
             path += "?" + urlencode(query, doseq=True)
         try:
@@ -527,6 +651,119 @@ class QualityHttpTest(QualitySetup):
         status, response = self.request(query=self.query_args())
         self.assertEqual(status, 200)
         self.assertEqual(response["summary"]["attempts"], 2)
+
+    def test_quality_only_device_cannot_be_deleted_or_replaced_via_http(self):
+        original = copy.deepcopy(data.get_device(DEVICE))
+        self.assertNotIn(DEVICE, data.DEVICE_CONFIGS)
+        self.assertFalse(
+            any(row.get("deviceId") == DEVICE for row in data.TELEMETRY_RECORDS)
+        )
+        self.assertEqual(self.request("POST", idle_report(), TOKEN)[0], 201)
+        before = data._runtime_state_payload()
+        status, response = self.request("DELETE", path=f"/api/devices/{DEVICE}")
+        self.assertEqual(status, 409, response)
+        self.assertEqual(
+            response["error"]["code"], "DEVICE_HAS_COMMUNICATION_QUALITY_HISTORY"
+        )
+        self.assertEqual(data._runtime_state_payload(), before)
+        self.assertEqual(
+            self.request("POST", registration(), path="/api/devices")[0], 400
+        )
+        self.assertEqual(data.get_device(DEVICE), original)
+        self.assertEqual(self.request("POST", idle_report(), TOKEN)[0], 200)
+        self.assertEqual(
+            self.request(query=self.query_args())[1]["summary"]["windowCount"], 1
+        )
+        # Deactivation remains the supported operation for an old device.
+        self.assertEqual(
+            self.request(
+                "PATCH", {"mappingStatus": "inactive"}, path=f"/api/devices/{DEVICE}"
+            )[0],
+            200,
+        )
+
+    def test_device_without_quality_or_other_history_can_still_be_deleted(self):
+        self.assertEqual(self.request("DELETE", path=f"/api/devices/{DEVICE}")[0], 200)
+        self.assertEqual(
+            self.request("POST", registration(), path="/api/devices")[0], 201
+        )
+        self.assertEqual(self.request("POST", idle_report(), TOKEN)[0], 201)
+
+    def test_orphaned_historical_id_cannot_be_registered_via_http(self):
+        self.assertEqual(self.request("POST", idle_report(), TOKEN)[0], 201)
+        # Simulate an ID removed by the prior unguarded release.
+        with data.STORE_LOCK:
+            data.DEVICES[:] = [item for item in data.DEVICES if item["id"] != DEVICE]
+        before = data._runtime_state_payload()
+        status, response = self.request("POST", registration(), path="/api/devices")
+        self.assertEqual(status, 409, response)
+        self.assertEqual(
+            response["error"]["code"], "DEVICE_HAS_COMMUNICATION_QUALITY_HISTORY"
+        )
+        self.assertEqual(data._runtime_state_payload(), before)
+
+    def test_quality_ingest_wins_race_with_device_delete(self):
+        entered, release = threading.Event(), threading.Event()
+        normalize = communication_quality.normalize_report
+
+        def paused(*args):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("Quality fixture was not released")
+            return normalize(*args)
+
+        with patch.object(communication_quality, "normalize_report", paused):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                ingest = executor.submit(self.request, "POST", idle_report(), TOKEN)
+                try:
+                    self.assertTrue(entered.wait(2))
+                    # A blocked quality transaction must not lock normal state reads.
+                    with data.STORE_LOCK:
+                        self.assertEqual(data.get_device(DEVICE)["id"], DEVICE)
+                    deletion = executor.submit(
+                        self.request, "DELETE", path=f"/api/devices/{DEVICE}"
+                    )
+                    with self.assertRaises(TimeoutError):
+                        deletion.result(timeout=0.1)
+                finally:
+                    release.set()
+                self.assertEqual(ingest.result(timeout=5)[0], 201)
+                self.assertEqual(deletion.result(timeout=5)[0], 409)
+        self.assertEqual(
+            self.request(query=self.query_args())[1]["summary"]["windowCount"], 1
+        )
+
+    def test_device_delete_wins_race_without_accepting_an_orphaned_report(self):
+        entered, release = threading.Event(), threading.Event()
+        store = self.server.communication_quality
+        check = store.check_device_deletion
+
+        def paused(device_id):
+            check(device_id)
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("Deletion fixture was not released")
+
+        with patch.object(store, "check_device_deletion", paused):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                deletion = executor.submit(
+                    self.request, "DELETE", path=f"/api/devices/{DEVICE}"
+                )
+                try:
+                    self.assertTrue(entered.wait(2))
+                    ingest = executor.submit(self.request, "POST", idle_report(), TOKEN)
+                    with self.assertRaises(TimeoutError):
+                        ingest.result(timeout=0.1)
+                finally:
+                    release.set()
+                self.assertEqual(deletion.result(timeout=5)[0], 200)
+                self.assertEqual(ingest.result(timeout=5)[0], 404)
+        self.assertEqual(
+            store._db.execute("SELECT count(*) FROM communication_windows").fetchone()[
+                0
+            ],
+            0,
+        )
 
     def test_shutdown_drains_successful_report_before_closing_quality_database(self):
         entered, release, closed = (

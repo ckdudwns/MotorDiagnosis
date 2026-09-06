@@ -1206,8 +1206,16 @@ def render_page() -> str:
     }
 
     function opsKey() {return JSON.stringify([token,$("siteSelect").value,$("assetSelect").value,opsDevice?.id]);}
+    function opsScopeMatches(row) {
+      return !!row && !!opsDevice && row.siteId === opsDevice.siteId && row.assetId === opsDevice.assetId &&
+        row.siteId === $("siteSelect").value && row.assetId === $("assetSelect").value;
+    }
+    function opsConfigScopeMatches(config) {
+      return !!config && config.deviceId === opsDevice?.id && opsScopeMatches(opsDevice) &&
+        [config.desired,config.lastApplied].every(command => command == null || opsScopeMatches(command));
+    }
     function opsCanEdit() {
-      return !!opsConfig && !!opsDevice && can("device:read") && can("parameter:write") &&
+      return opsConfigScopeMatches(opsConfig) && can("device:read") && can("parameter:write") &&
         opsDevice.mappingStatus === "active" && opsDevice.certificateStatus === "registered" &&
         [opsDevice.id,opsDevice.siteId,opsDevice.assetId].every(id => /^[A-Z0-9][A-Z0-9_.-]{0,62}$/.test(id));
     }
@@ -1234,6 +1242,16 @@ def render_page() -> str:
     }
     function invalidateDeviceOperations() {
       opsDevices = []; clearOpsDevice(); $("opsDevice").replaceChildren();
+    }
+    function rejectOpsScope() {
+      const dirty = opsDirty, fields = ["opsInterval","opsReplay","opsConfigReason"];
+      const draft = fields.map(id => $(id).value);
+      // Drop the cached device list and every in-flight generation. Only a fresh
+      // list plus target selection may re-enable writes; a late GET cannot.
+      invalidateDeviceOperations();
+      if (dirty) {fields.forEach((id,index) => {$(id).value = draft[index];}); opsDirty = true;}
+      $("opsStatus").textContent = "장치의 사이트·설비가 현재 화면과 다릅니다. 장치 목록을 새로고친 뒤 올바른 사이트·설비·장치를 다시 선택하세요.";
+      $("opsConfigStatus").textContent = $("opsStatus").textContent;
     }
     function allowOpsChange() {
       return !opsSaving && (!opsDirty || confirm("작성 중인 장치 설정을 버리고 대상을 변경할까요?"));
@@ -1275,7 +1293,7 @@ def render_page() -> str:
       try {
         const row = await api(`/api/devices/${encodeURIComponent(id)}/health`);
         if (key !== opsKey() || generation !== opsHealthGeneration) return;
-        if (row.deviceId !== id) throw new Error("장치 상태 응답의 대상이 다릅니다.");
+        if (row.deviceId !== id || !opsScopeMatches(row)) {rejectOpsScope(); return;}
         $("opsHealth").replaceChildren(facts([["연결 상태",statusLabel(row.health || row.status)],["최근 수신",formatLocalTime(row.lastReceivedAt)],["RSSI",measuredValue(row.rssiDbm," dBm")],["재부팅",measuredValue(row.rebootCount,"회")],["버퍼 사용률",measuredValue(row.bufferUsagePct,"%")],["센서 상태",statusLabel(row.sensorHealth)]]), rawDetails("센서 고장·원본 상태",row));
       } catch (error) {if (key === opsKey() && generation === opsHealthGeneration) $("opsHealth").textContent = `장치 상태 조회 실패: ${error.message}`;}
     }
@@ -1304,7 +1322,8 @@ def render_page() -> str:
         const query = new URLSearchParams({from:new Date(from).toISOString(),to:new Date(to).toISOString(),bucketSeconds:bucket});
         const q = await api(`/api/devices/${encodeURIComponent(id)}/communication-quality?${query}`);
         if (key !== opsKey() || generation !== opsQualityGeneration) return;
-        if (q.deviceId !== id || q.siteId !== opsDevice.siteId || q.assetId !== opsDevice.assetId || q.transport !== "http" || q.attribution !== "whole_window_at_end" || !q.summary || !Array.isArray(q.items)) throw new Error("통신 품질 응답의 대상 또는 집계 계약이 다릅니다.");
+        if (q.deviceId !== id || !opsScopeMatches(q)) {rejectOpsScope(); return;}
+        if (q.transport !== "http" || q.attribution !== "whole_window_at_end" || !q.summary || !Array.isArray(q.items)) throw new Error("통신 품질 응답의 집계 계약이 다릅니다.");
         opsQuality = q; const s = q.summary;
         $("opsQualityStatus").textContent = `${formatLocalTime(q.from)} ~ ${formatLocalTime(q.to)} · ${q.bucketSeconds}초 집계 · 조회 완료 ${formatLocalTime(new Date().toISOString())}${s.hasData ? "" : " · 수신된 관측 창이 없습니다. 정상 여부를 판단할 수 없습니다."}`;
         $("opsQualitySummary").append(facts([["전송 시도",opsMetric(s,"attempts","회")],["실패율",opsMetric(s,"failureRatePct","%")],["재시도",opsMetric(s,"retries","회")],["버퍼 재전송",opsMetric(s,"replayAttempts","회")],["성공 ACK",opsMetric(s,"acknowledged","회")],["ACK 가중 평균",opsMetric(s,"ackLatencyMeanMs"," ms")],["ACK 최대",opsMetric(s,"ackLatencyMaxMs"," ms")],["최신 버퍼 깊이 / 용량",`${opsMetric(s,"bufferDepthLast")} / ${opsMetric(s,"bufferCapacity")}`],["버퍼 삭제",opsMetric(s,"bufferDropped","건")],["관측 지속시간 합",s.hasData ? measuredValue(s.observedDurationMs / 1000,"초") : "관측 없음"],["최초 관측 시작",formatLocalTime(s.firstWindowStartedAt)],["마지막 창 종료",formatLocalTime(s.lastWindowEndedAt)]]),rawDetails("실패 분류·표본 카운터 원문",s));
@@ -1339,6 +1358,7 @@ def render_page() -> str:
         const c = await api(`/api/devices/${encodeURIComponent(id)}/configuration`);
         if (key !== opsKey() || generation !== opsConfigGeneration) return;
         if (c.deviceId !== id || !Number.isInteger(c.version) || c.version < 0 || !opsSettingsValid(c.defaults) || (c.desired && !opsSettingsValid(c.desired.settings)) || (c.lastApplied && !opsSettingsValid(c.lastApplied.settings))) throw new Error("설정 응답의 대상 또는 형식이 다릅니다.");
+        if (!opsConfigScopeMatches(c)) {rejectOpsScope(); return;}
         opsConfig = c; opsUncertain = false;
         const found = intent && c.version === intent.expectedVersion + 1 && c.desired?.version === c.version && opsSameSettings(c.desired.settings,intent.settings) && c.desired.reason === intent.reason;
         if (!preserve || found) fillOpsConfig();
@@ -1359,7 +1379,8 @@ def render_page() -> str:
       try {
         const result = await api(`/api/devices/${encodeURIComponent(id)}/configuration/history`);
         if (key !== opsKey() || generation !== opsHistoryGeneration) return;
-        if (!Array.isArray(result.items) || result.items.some(row => row.siteId !== opsDevice.siteId || row.assetId !== opsDevice.assetId)) throw new Error("설정 이력의 대상이 다릅니다.");
+        if (!Array.isArray(result.items)) throw new Error("설정 이력의 형식이 다릅니다.");
+        if (result.items.some(row => !opsScopeMatches(row))) {rejectOpsScope(); return;}
         opsHistory = result.items; renderOpsHistory(); $("opsHistoryStatus").textContent = `현재 매핑의 최근 ${result.retainedLimit}개 요청·최종 결과를 보관합니다.`;
       } catch (error) {if (key === opsKey() && generation === opsHistoryGeneration) {$("opsHistoryRows").replaceChildren(); $("opsHistoryStatus").textContent = `설정 이력 조회 실패: ${error.message}`;}}
     }

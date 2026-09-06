@@ -3,6 +3,8 @@
 import http.client
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -263,6 +265,26 @@ class CoreOperationsHttpTest(unittest.TestCase):
         self.assertEqual(
             len(self.request(ROOT + "/configuration/history")[1]["items"]), 1
         )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for the shipped UI")
+    def test_shipped_ui_rejects_real_http_remap_before_put_and_recovers_on_new_asset(
+        self,
+    ):
+        result = subprocess.run(
+            [shutil.which("node"), "tests/test_core_operations_http_ui.mjs"],
+            cwd=Path(__file__).resolve().parents[1],
+            input=json.dumps(
+                {
+                    "baseUrl": f"http://127.0.0.1:{self.server.server_address[1]}/",
+                    "token": self.tokens["admin"],
+                }
+            ),
+            capture_output=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("stale asset A issued zero PUTs", result.stdout)
 
     def test_operator_can_read_but_cannot_publish_or_use_device_result_route(self):
         token = self.tokens["operator"]

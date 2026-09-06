@@ -1027,6 +1027,7 @@ DATASET_SNAPSHOTS: dict[str, dict[str, list[dict[str, Any]]]] = {}
 EVENT_NOTES: list[dict[str, Any]] = []
 EVENT_NOTE_HISTORY: list[dict[str, Any]] = []
 LIFECYCLE_CHECKPOINTS: dict[str, dict[str, Any]] = {}
+DEVICE_CONFIGS: dict[str, dict[str, Any]] = {}
 _LIFECYCLE_RUNTIMES: dict[str, AnomalyEventLifecycle] = {}
 _RUNTIME_STATE_STORE: RuntimeStateStore | None = None
 ACOUSTIC_TAXONOMY_VERSIONS: list[dict[str, Any]] = [
@@ -1079,6 +1080,7 @@ def _runtime_state_payload() -> dict[str, Any]:
         "datasetSnapshots": copy_payload(DATASET_SNAPSHOTS),
         "acousticTaxonomies": copy_payload(ACOUSTIC_TAXONOMY_VERSIONS),
         "lifecycleCheckpoints": copy_payload(LIFECYCLE_CHECKPOINTS),
+        "deviceConfigs": copy_payload(DEVICE_CONFIGS),
     }
 
 
@@ -1113,6 +1115,8 @@ def _restore_runtime_state(payload: dict[str, Any]) -> None:
             if not isinstance(payload[key], list):
                 raise ValueError(f"Persisted {key} must be a list.")
             target[:] = copy_payload(payload[key])
+    # Older databases predate this optional configuration channel.
+    DEVICE_CONFIGS.clear()
     dict_fields = {
         "parameters": PARAMETERS,
         "mqttQuarantineIdempotency": MQTT_QUARANTINE_IDEMPOTENCY,
@@ -1120,6 +1124,7 @@ def _restore_runtime_state(payload: dict[str, Any]) -> None:
         "eventEvidenceSnapshots": EVENT_EVIDENCE_SNAPSHOTS,
         "datasetSnapshots": DATASET_SNAPSHOTS,
         "lifecycleCheckpoints": LIFECYCLE_CHECKPOINTS,
+        "deviceConfigs": DEVICE_CONFIGS,
     }
     for key, target in dict_fields.items():
         if key in payload:
@@ -1349,6 +1354,7 @@ def reset_runtime_state() -> None:
         BASELINE_VERSIONS.clear()
         DATASET_SNAPSHOTS.clear()
         LIFECYCLE_CHECKPOINTS.clear()
+        DEVICE_CONFIGS.clear()
         _LIFECYCLE_RUNTIMES.clear()
         ACOUSTIC_TAXONOMY_VERSIONS[:] = [
             {
@@ -2677,6 +2683,12 @@ def delete_device(user: dict[str, Any], device_id: str) -> dict[str, Any]:
     with STORE_LOCK:
         device = get_device(device_id)
         require_site_access(user, device["siteId"])
+        if device_id in DEVICE_CONFIGS:
+            raise ApiError(
+                409,
+                "DEVICE_HAS_CONFIG_HISTORY",
+                "A device with configuration history cannot be deleted; deactivate it instead.",
+            )
         has_telemetry_history = any(
             record.get("deviceId") == device_id for record in TELEMETRY_RECORDS
         )

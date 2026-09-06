@@ -18,20 +18,23 @@ from typing import Any, Callable
 class RuntimeStateStore:
     """Versioned, atomic JSON checkpoints stored in SQLite."""
 
-    SCHEMA_VERSION = 1
+    # v2 owns deviceConfigs, including monotonically increasing device versions.
+    # The wire protocol and firmware NVS schema remain at v1.
+    SCHEMA_VERSION = 2
 
     def __init__(self, database: str) -> None:
         self.database = database
         if database != ":memory:":
-            Path(database).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+            Path(database).expanduser().resolve().parent.mkdir(
+                parents=True, exist_ok=True
+            )
         self._lock = threading.RLock()
         self._db = sqlite3.connect(database, timeout=5.0, check_same_thread=False)
         self._db.execute("PRAGMA busy_timeout=5000")
         if database != ":memory:":
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute(
-            """
+        self._db.execute("""
             CREATE TABLE IF NOT EXISTS runtime_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 schema_version INTEGER NOT NULL,
@@ -39,9 +42,72 @@ class RuntimeStateStore:
                 payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
-            """
-        )
+            """)
         self._db.commit()
+        try:
+            self._migrate()
+        except BaseException:
+            self._db.close()
+            raise
+
+    @staticmethod
+    def _decode(payload: str, schema: int) -> dict[str, Any]:
+        if schema not in (1, RuntimeStateStore.SCHEMA_VERSION):
+            raise ValueError(
+                f"Unsupported runtime state schema {schema}; expected {RuntimeStateStore.SCHEMA_VERSION}."
+            )
+        decoded = json.loads(payload)
+        if not isinstance(decoded, dict):
+            raise ValueError("Runtime state payload must be an object.")
+        if schema == 1:
+            # Also preserve the first PR25 release's configs stored under v1.
+            decoded.setdefault("deviceConfigs", {})
+        if not isinstance(decoded.get("deviceConfigs"), dict):
+            raise ValueError("Persisted deviceConfigs must be an object.")
+        return decoded
+
+    def _migrate(self) -> None:
+        # Take the writer lock before examining the version: simultaneous starts
+        # migrate once, and the version update and old-writer guards are atomic.
+        with self._lock, self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            row = self._db.execute(
+                "SELECT schema_version, payload FROM runtime_state WHERE id=1"
+            ).fetchone()
+            if row is not None:
+                schema = int(row[0])
+                payload = self._decode(row[1], schema)
+                if schema == 1:
+                    self._db.execute(
+                        """UPDATE runtime_state SET schema_version=?,
+                            revision=revision+1, payload=? WHERE id=1""",
+                        (
+                            self.SCHEMA_VERSION,
+                            json.dumps(
+                                payload,
+                                ensure_ascii=True,
+                                allow_nan=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        ),
+                    )
+            # Old releases already reject schema 2 at load. These DB-enforced
+            # guards also reject their UPSERTs if they loaded a v1 snapshot before
+            # migration (and INSERT OR REPLACE attempts), even across connections.
+            self._db.execute(
+                """CREATE TRIGGER IF NOT EXISTS runtime_state_v2_insert_guard
+                BEFORE INSERT ON runtime_state
+                WHEN NEW.schema_version < 2 OR NEW.schema_version <
+                    COALESCE((SELECT schema_version FROM runtime_state WHERE id=1), 2)
+                BEGIN SELECT RAISE(ABORT, 'Runtime state schema downgrade refused'); END"""
+            )
+            self._db.execute(
+                """CREATE TRIGGER IF NOT EXISTS runtime_state_v2_update_guard
+                BEFORE UPDATE ON runtime_state
+                WHEN NEW.schema_version < 2 OR NEW.schema_version < OLD.schema_version
+                BEGIN SELECT RAISE(ABORT, 'Runtime state schema downgrade refused'); END"""
+            )
 
     def load(self) -> dict[str, Any] | None:
         with self._lock:
@@ -54,12 +120,13 @@ class RuntimeStateStore:
             raise ValueError(
                 f"Unsupported runtime state schema {row[0]}; expected {self.SCHEMA_VERSION}."
             )
-        payload = json.loads(row[1])
-        if not isinstance(payload, dict):
-            raise ValueError("Runtime state payload must be an object.")
-        return payload
+        return self._decode(row[1], int(row[0]))
 
     def save(self, payload: dict[str, Any], updated_at: str) -> int:
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("deviceConfigs"), dict
+        ):
+            raise ValueError("Runtime state v2 requires a deviceConfigs object.")
         encoded = json.dumps(
             payload,
             ensure_ascii=True,

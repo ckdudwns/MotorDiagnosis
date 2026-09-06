@@ -63,6 +63,7 @@
 
 #include "firmware_logic.h"
 #include "device_health.h"
+#include "remote_config.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -75,7 +76,7 @@
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.3-iot-health.2";
+    "v1.3-remote-config.1";
 
 // =====================================================
 // Test Config
@@ -139,6 +140,15 @@ const char* INGEST_TOKEN =
 #endif
 const char* DEVICE_HEALTH_URL = DEVICE_HEALTH_URL_VALUE;
 const char* DEVICE_HEALTH_TOKEN = DEVICE_HEALTH_TOKEN_VALUE;
+
+#ifndef DEVICE_CONFIG_URL_VALUE
+#define DEVICE_CONFIG_URL_VALUE ""
+#endif
+#ifndef DEVICE_CONFIG_TOKEN_VALUE
+#define DEVICE_CONFIG_TOKEN_VALUE ""
+#endif
+const char* DEVICE_CONFIG_URL = DEVICE_CONFIG_URL_VALUE;
+const char* DEVICE_CONFIG_TOKEN = DEVICE_CONFIG_TOKEN_VALUE;
 
 #ifndef BACKEND_CA_CERT_VALUE
 #define BACKEND_CA_CERT_VALUE ""
@@ -361,12 +371,11 @@ constexpr uint8_t LITTLEFS_MOUNT_ATTEMPTS =
 constexpr size_t ACK_WATERMARK_BATCH_SIZE =
     32;
 
-// Replay at most four old records per loop, then return to fresh sensing.
-constexpr size_t REPLAY_MAX_RECORDS_PER_LOOP =
-    4;
+// Only the main task changes these after verified configuration persistence.
+// Bounds preserve the existing queue capacity and maximum replay starvation.
+size_t REPLAY_MAX_RECORDS_PER_LOOP = RemoteConfig::DEFAULT_REPLAY_BATCH;
 
-constexpr uint32_t MEASUREMENT_INTERVAL_MS =
-    3000;
+uint32_t MEASUREMENT_INTERVAL_MS = RemoteConfig::DEFAULT_INTERVAL_MS;
 
 constexpr uint32_t NETWORK_RETRY_MS =
     5000;
@@ -6250,6 +6259,119 @@ bool persistHealthJournal(const DeviceHealth::Journal& candidate)
            DeviceHealth::validJournal(readback) && memcmp(&candidate, &readback, sizeof(candidate)) == 0;
 }
 
+RemoteConfig::Controller remoteConfiguration;
+RemoteConfig::Schedule remoteConfigSchedule;
+RemoteConfig::Result pendingConfigResult;
+const RemoteConfig::Identity remoteConfigIdentity{DEVICE_ID, SITE_ID, ASSET_ID};
+bool remoteConfigStorageUsable = true;
+
+void activateRemoteConfiguration()
+{
+    // The main loop is the sole reader/writer; no sensor window is in progress
+    // here. Sampling frequency, packet format and queued records never change.
+    MEASUREMENT_INTERVAL_MS = remoteConfiguration.active().measurementIntervalMs;
+    REPLAY_MAX_RECORDS_PER_LOOP = remoteConfiguration.active().replayBatchSize;
+}
+
+bool persistRemoteConfiguration(const RemoteConfig::Blob& candidate, void*)
+{
+    if (!remoteConfigStorageUsable || !RemoteConfig::validBlob(candidate, remoteConfigIdentity)) return false;
+    RemoteConfig::Blob readback;
+    return preferences.putBytes("remoteConfig", &candidate, sizeof(candidate)) == sizeof(candidate) &&
+        preferences.getBytesLength("remoteConfig") == sizeof(readback) &&
+        preferences.getBytes("remoteConfig", &readback, sizeof(readback)) == sizeof(readback) &&
+        RemoteConfig::validBlob(readback, remoteConfigIdentity) &&
+        memcmp(&candidate, &readback, sizeof(candidate)) == 0;
+}
+
+void initializeRemoteConfiguration()
+{
+    if (preferences.isKey("remoteConfig"))
+    {
+        RemoteConfig::Blob stored;
+        if (preferences.getBytesLength("remoteConfig") != sizeof(stored) ||
+            preferences.getBytes("remoteConfig", &stored, sizeof(stored)) != sizeof(stored) ||
+            !remoteConfiguration.restore(stored, remoteConfigIdentity))
+        {
+            // Preserve the blob and sequence/telemetry state. Never lower the
+            // version floor and accept an older command after corrupt storage.
+            remoteConfigStorageUsable = false;
+            Serial.println("[CONFIG] Invalid/mismatched stored configuration; channel disabled, safe defaults retained. Local repair required.");
+            return;
+        }
+        activateRemoteConfiguration();
+        pendingConfigResult = remoteConfiguration.appliedResult();
+        Serial.printf("[CONFIG] Restored version %lu.\n", static_cast<unsigned long>(remoteConfiguration.active().version));
+    }
+}
+
+bool remoteConfigurationProvisioned()
+{
+    const size_t length = strlen(DEVICE_CONFIG_TOKEN);
+    if (length < 32 || length > 128) return false;
+    for (const char* p = DEVICE_CONFIG_TOKEN; *p; ++p)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-')) return false;
+    // The base URL is local provisioning, never supplied by a remote response.
+    const String suffix = String("/api/devices/") + DEVICE_ID + "/configuration";
+    return *DEVICE_CONFIG_URL && String(DEVICE_CONFIG_URL).endsWith(suffix);
+}
+
+void serviceRemoteConfiguration()
+{
+    if (!remoteConfigStorageUsable || !remoteConfigurationProvisioned() ||
+        WiFi.status() != WL_CONNECTED || !timeReady || !remoteConfigSchedule.due(millis())) return;
+    const bool reporting = pendingConfigResult.status != RemoteConfig::Status::NONE;
+    const String endpoint = String(DEVICE_CONFIG_URL) + (reporting ? "/result" : "/pending");
+    HTTPClient http;
+    WiFiClientSecure secureClient;
+    secureClient.setHandshakeTimeout(3);
+    http.setConnectTimeout(1500);
+    http.setTimeout(1500);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    bool success = false;
+    int status = 0;
+    if (beginBackendHttp(http, secureClient, endpoint.c_str()))
+    {
+        http.addHeader("Authorization", String("Bearer ") + DEVICE_CONFIG_TOKEN);
+        if (reporting)
+        {
+            http.addHeader("Content-Type", "application/json");
+            const std::string body = RemoteConfig::resultPayload(pendingConfigResult);
+            status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
+        }
+        else status = http.GET();
+        // The backend sends Content-Length. Refuse unbounded/chunked responses.
+        String response;
+        const int length = http.getSize();
+        if (status == 200 && length >= 0 && length <= static_cast<int>(RemoteConfig::MAX_RESPONSE_BYTES))
+            response = http.getString();
+        if (reporting)
+        {
+            success = length == static_cast<int>(response.length()) &&
+                RemoteConfig::resultAccepted(status, response.c_str(), DEVICE_ID, pendingConfigResult);
+            if (success || status == 409)
+            {
+                // A superseded result must not block fetching the newer command.
+                pendingConfigResult = RemoteConfig::Result{};
+                success = true;
+            }
+        }
+        else if (status == 200 && !response.isEmpty() && length == static_cast<int>(response.length()))
+        {
+            pendingConfigResult = remoteConfiguration.receive(response.c_str(), remoteConfigIdentity, persistRemoteConfiguration);
+            activateRemoteConfiguration(); // Changed only after verified persistence.
+            success = true;
+        }
+        http.end();
+    }
+    // At most one bounded request per service call. No redirects, arbitrary
+    // commands, network changes, queue clearing, or busy retry loop.
+    remoteConfigSchedule.completed(millis(), success, pendingConfigResult.status != RemoteConfig::Status::NONE);
+    Serial.printf("[CONFIG] %s HTTP %d; active version %lu.\n", reporting ? "result" : "poll", status,
+                  static_cast<unsigned long>(remoteConfiguration.active().version));
+}
+
 bool initializeDeviceHealth()
 {
     if (preferences.isKey("healthJournal"))
@@ -6456,6 +6578,8 @@ void setup()
             delay(1000);
         }
     }
+
+    initializeRemoteConfiguration();
 
     telemetrySequence =
         preferences.getUInt(
@@ -6701,6 +6825,7 @@ void loop()
         persistCurrentSessionTimeAnchor();
     }
 
+    serviceRemoteConfiguration();
     serviceSensors();
     serviceDeviceHealth(); // Metrics only while an older telemetry head exists.
 

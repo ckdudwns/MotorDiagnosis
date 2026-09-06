@@ -15,7 +15,9 @@ alert outbox discovers newly started events through its existing worker.
 
 The global anomaly parameters update all asset rules atomically. Transmission
 interval and edge-buffer parameters are reported as firmware-managed and reject
-runtime writes until a device configuration channel exists.
+runtime writes. Per-device delay/replay configuration uses the separate,
+allowlisted [remote configuration channel](limited-remote-config.md); it does
+not turn global parameters or destructive buffer resizing into remote controls.
 
 ## Added API contracts
 

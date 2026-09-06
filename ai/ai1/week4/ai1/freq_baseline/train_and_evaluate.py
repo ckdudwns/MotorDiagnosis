@@ -263,6 +263,11 @@ def prepare_lstm_chunks(frozen_manifest: dict, names: list):
         if split not in samples_by_split:
             continue  # train 전용 등 3-way가 아닌 매니페스트는 해당 split만 사용
 
+        if len(file_rows) < SEQ_LEN:
+            raise ValueError(
+                f"{source_file}: LSTM requires at least {SEQ_LEN} windows per recording "
+                f"({len(file_rows)} in {split}); no recording may be silently excluded"
+            )
         file_rows = sorted(file_rows, key=lambda r: _window_index(r["sample_id"]))
         vectors = [
             np.array([row[n] for n in names], dtype=np.float64) for row in file_rows

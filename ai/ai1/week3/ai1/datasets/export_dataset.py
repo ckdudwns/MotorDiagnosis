@@ -13,6 +13,7 @@ export_dataset()의 docstring 참고). week1 `build_ai1_handoff_dataset.py`처�
 """
 
 import os
+import copy
 import re
 import csv
 import json
@@ -25,6 +26,7 @@ import argparse
 from openpyxl import Workbook, load_workbook
 
 from register_dataset import (  # noqa: E402
+    _import_module_from_path,
     build_manifest,
     dataset_export_label_fields,
     summarize_dataset_labels,
@@ -299,6 +301,25 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
     새 버전 id로 원자적으로 교체하는 것까지가 마지막 단계다 — 실패하면
     output_dir(과 CURRENT가 가리키는 버전)은 이전 상태 그대로 남는다.
     """
+    # Validate and export the same detached snapshot, before any filesystem write.
+    manifest = copy.deepcopy(manifest)
+    if manifest.get("status") in ("frozen", "approved") or "snapshotDigest" in manifest:
+        versions = _import_module_from_path(
+            "ai1_dataset_export.dataset_version",
+            os.path.normpath(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "..",
+                    "..",
+                    "..",
+                    "week4",
+                    "ai1",
+                    "dataset_versions",
+                    "dataset_version.py",
+                )
+            ),
+        )
+        versions.verify_frozen_integrity(manifest)
     os.makedirs(output_dir, exist_ok=True)
     versions_dir = os.path.join(output_dir, "versions")
     os.makedirs(versions_dir, exist_ok=True)

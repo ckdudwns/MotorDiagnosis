@@ -28,7 +28,6 @@ extract_all_features()가 반환한 특징값 dict의 품질을 점검한다.
 import math
 import json
 
-
 DEFAULT_SIGMA_MULTIPLIER = 3.0
 
 
@@ -75,18 +74,62 @@ def check_missing_or_invalid(features: dict, baseline: dict = None) -> list:
     return invalid
 
 
+def _stored_range_tolerance(baseline: dict, sigma_multiplier):
+    """Contextual drafts use their recorded policy; legacy baselines keep 3-sigma."""
+    context = baseline.get("signalContext")
+    if context is None:
+        return None
+    if not isinstance(context, dict):
+        raise ValueError("signalContext must be an object")
+    policy = context.get("evaluationPolicy")
+    if not isinstance(policy, dict) or (
+        policy.get("rangeSource") != "normal_range"
+        or policy.get("zeroVariance") != "absolute_tolerance"
+    ):
+        raise ValueError(
+            "Contextual baseline requires an explicit stored-range evaluation policy"
+        )
+    tolerance = policy.get("absoluteTolerance")
+    stored_sigma = context.get("sigmaMultiplier")
+    if not is_valid_number(tolerance) or not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("absoluteTolerance must be a finite nonnegative number")
+    if (
+        not is_valid_number(stored_sigma)
+        or not math.isfinite(stored_sigma)
+        or stored_sigma <= 0
+    ):
+        raise ValueError("Stored sigmaMultiplier must be a finite positive number")
+    if sigma_multiplier is not None and (
+        not is_valid_number(sigma_multiplier)
+        or not math.isfinite(sigma_multiplier)
+        or sigma_multiplier != stored_sigma
+    ):
+        raise ValueError(
+            "Cannot override the stored baseline range; build a new baseline instead"
+        )
+    return tolerance
+
+
 def check_outliers(
     features: dict,
     baseline: dict,
-    sigma_multiplier: float = DEFAULT_SIGMA_MULTIPLIER,
+    sigma_multiplier: float = None,
 ) -> list:
     """baseline의 mean/std 기준으로 정상범위를 벗어난 특징값을 플래그 처리.
 
     baseline은 compute_baseline.py가 생성한 dict(또는 그 "features" 서브dict)를 받는다.
     baseline에 없는 특징값(신규 특징량 등)은 비교 대상에서 제외한다.
     NaN/Inf 값은 여기서 다루지 않는다 — check_missing_or_invalid()로 먼저 걸러야 한다.
+
+    signalContext가 있는 신호별 기준선은 저장된 normal_range를 그대로 쓴다.
+    0분산은 명시한 절대 허용오차 정책을 사용하고 deviation_sigma는 None이다.
+    해당 문맥이 없는 기존 기준선만 종전의 sigma(기본 3) 재계산/0분산 제외를 유지한다.
     """
     baseline_features = baseline.get("features", baseline)
+    tolerance = _stored_range_tolerance(baseline, sigma_multiplier)
+    legacy_sigma = (
+        DEFAULT_SIGMA_MULTIPLIER if sigma_multiplier is None else sigma_multiplier
+    )
     outliers = []
 
     for name, value in features.items():
@@ -100,13 +143,31 @@ def check_outliers(
             continue  # 기준선에 없는 특징값은 판단 불가 → 건너뜀
 
         mean, std = stats["mean"], stats["std"]
-        if std <= 1e-12:
-            # 표준편차가 0에 가까우면(예: 단일 프레임 윈도우) 범위 비교가 무의미하므로 건너뜀
-            continue
-
-        low, high = mean - sigma_multiplier * std, mean + sigma_multiplier * std
+        if tolerance is not None:
+            stored_range = stats.get("normal_range")
+            if (
+                not all(is_valid_number(v) and math.isfinite(v) for v in (mean, std))
+                or std < 0
+                or not isinstance(stored_range, (list, tuple))
+                or len(stored_range) != 2
+                or not all(
+                    is_valid_number(v) and math.isfinite(v) for v in stored_range
+                )
+                or stored_range[0] > stored_range[1]
+            ):
+                raise ValueError(f"Invalid stored normal_range/statistics: {name}")
+            low, high = stored_range
+            if std == 0 and (low != mean - tolerance or high != mean + tolerance):
+                raise ValueError(
+                    f"Stored zero-variance range disagrees with tolerance: {name}"
+                )
+        else:
+            if std <= 1e-12:
+                # Preserve the existing contract for legacy, context-free baselines.
+                continue
+            low, high = mean - legacy_sigma * std, mean + legacy_sigma * std
         if value < low or value > high:
-            deviation_sigma = abs(value - mean) / std
+            deviation_sigma = abs(value - mean) / std if std else None
             outliers.append(
                 {
                     "feature": name,
@@ -124,7 +185,7 @@ def check_outliers(
 def validate_features(
     features: dict,
     baseline: dict = None,
-    sigma_multiplier: float = DEFAULT_SIGMA_MULTIPLIER,
+    sigma_multiplier: float = None,
 ) -> dict:
     """특징값 dict 하나를 종합 검증해 결과 리포트를 반환한다.
 

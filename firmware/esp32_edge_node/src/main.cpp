@@ -1,7 +1,7 @@
 /*
  * MotorDiagnosis Edge Node
  *
- * Firmware Version : v1.3-iot-health.2
+ * Firmware Version : v1.3-communication-quality.1
  * Revision Summary :
  *   P1 Atomic Queue Recovery
  *   P2 Unlabeled Real Telemetry Contract
@@ -64,6 +64,7 @@
 #include "firmware_logic.h"
 #include "device_health.h"
 #include "remote_config.h"
+#include "communication_quality.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -76,7 +77,7 @@
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.3-remote-config.1";
+    "v1.3-communication-quality.1";
 
 // =====================================================
 // Test Config
@@ -149,6 +150,15 @@ const char* DEVICE_HEALTH_TOKEN = DEVICE_HEALTH_TOKEN_VALUE;
 #endif
 const char* DEVICE_CONFIG_URL = DEVICE_CONFIG_URL_VALUE;
 const char* DEVICE_CONFIG_TOKEN = DEVICE_CONFIG_TOKEN_VALUE;
+
+#ifndef DEVICE_QUALITY_URL_VALUE
+#define DEVICE_QUALITY_URL_VALUE ""
+#endif
+#ifndef DEVICE_QUALITY_TOKEN_VALUE
+#define DEVICE_QUALITY_TOKEN_VALUE ""
+#endif
+const char* DEVICE_QUALITY_URL = DEVICE_QUALITY_URL_VALUE;
+const char* DEVICE_QUALITY_TOKEN = DEVICE_QUALITY_TOKEN_VALUE;
 
 #ifndef BACKEND_CA_CERT_VALUE
 #define BACKEND_CA_CERT_VALUE ""
@@ -566,6 +576,12 @@ uint64_t ringNextOrdinal =
 
 uint64_t droppedOldestCount =
     0;
+
+CommunicationQuality::Collector qualityCollector;
+CommunicationQuality::Schedule qualitySchedule;
+CommunicationQuality::Outbox qualityOutbox;
+const CommunicationQuality::Identity qualityIdentity{DEVICE_ID, SITE_ID, ASSET_ID};
+bool qualityStorageUsable = true;
 
 // Highest ring ordinal durably known to be consumed.
 // Stored in Preferences key "ringConsumed".
@@ -3870,6 +3886,7 @@ bool consumeHeadOrdinal(
         );
 
     queueCount--;
+    qualityCollector.sampleBuffer(queueCount, droppedOldestCount);
 
     if (
         unresolvedTimestamp &&
@@ -4193,6 +4210,7 @@ bool enqueuePersistent(
         );
 
     queueCount++;
+    qualityCollector.sampleBuffer(queueCount, droppedOldestCount);
 
     Serial.printf(
         "[BUFFER] Queue : %u / %u | physical slots=%u | dropped=%llu\n",
@@ -5558,7 +5576,8 @@ bool moveQueuedPacketToRejected(
 // =====================================================
 
 PostOutcome postPacket(
-    const TelemetryPacket& packet
+    const TelemetryPacket& packet,
+    bool replay = false
 )
 {
     PostOutcome outcome;
@@ -5608,6 +5627,8 @@ PostOutcome postPacket(
         outcome.response =
             "backend-transport-policy-rejected";
 
+        qualityCollector.attempt(packet.sequence, replay,
+            CommunicationQuality::Outcome::CONFIGURATION_FAILURE, 0);
         return outcome;
     }
 
@@ -5644,6 +5665,7 @@ PostOutcome postPacket(
         )
     );
 
+    const uint64_t qualityStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
     const int statusCode =
         http.POST(
             packet.payload
@@ -5667,6 +5689,15 @@ PostOutcome postPacket(
             );
     }
 
+    outcome.result = classifyHttpOutcome(packet, statusCode, outcome.response);
+    using QualityOutcome = CommunicationQuality::Outcome;
+    const QualityOutcome qualityOutcome = outcome.result == PostResult::SUCCESS ? QualityOutcome::ACK :
+        outcome.result == PostResult::PERMANENT_PACKET_REJECT ? QualityOutcome::PACKET_REJECT :
+        outcome.result == PostResult::CONFIGURATION_ERROR ? QualityOutcome::CONFIGURATION_FAILURE :
+        statusCode <= 0 ? QualityOutcome::TRANSPORT_FAILURE : QualityOutcome::RETRYABLE_RESPONSE;
+    qualityCollector.attempt(packet.sequence, replay, qualityOutcome,
+        static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - qualityStartedMs);
+
     Serial.printf(
         "HTTP     : %d\n",
         statusCode
@@ -5682,13 +5713,6 @@ PostOutcome postPacket(
     }
 
     http.end();
-
-    outcome.result =
-        classifyHttpOutcome(
-            packet,
-            statusCode,
-            outcome.response
-        );
 
     return outcome;
 }
@@ -5894,7 +5918,8 @@ void replayQueueBatch()
 
         const PostOutcome outcome =
             postPacket(
-                packet
+                packet,
+                true
             );
 
         if (
@@ -6372,6 +6397,114 @@ void serviceRemoteConfiguration()
                   static_cast<unsigned long>(remoteConfiguration.active().version));
 }
 
+bool qualityProvisioned()
+{
+    const size_t length = strlen(DEVICE_QUALITY_TOKEN);
+    if (length < 32 || length > 128) return false;
+    for (const char* p = DEVICE_QUALITY_TOKEN; *p; ++p)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-')) return false;
+    const String suffix = String("/api/devices/") + DEVICE_ID + "/communication-quality";
+    return *DEVICE_QUALITY_URL && String(DEVICE_QUALITY_URL).endsWith(suffix);
+}
+
+void initializeCommunicationQuality()
+{
+    if (preferences.isKey("qualityPending"))
+    {
+        CommunicationQuality::Window pendingQuality;
+        if (preferences.getBytesLength("qualityPending") != sizeof(pendingQuality) ||
+            preferences.getBytes("qualityPending", &pendingQuality, sizeof(pendingQuality)) != sizeof(pendingQuality) ||
+            !qualityOutbox.restore(pendingQuality, qualityIdentity))
+        {
+            qualityStorageUsable = false;
+            Serial.println("[QUALITY] Invalid/mismatched pending report preserved; quality reporting disabled. Telemetry continues.");
+            return;
+        }
+    }
+    if (!qualityProvisioned()) Serial.println("[QUALITY] Not provisioned; automatic quality reporting disabled.");
+}
+
+bool persistQualityWindow(const CommunicationQuality::Window& window, void*)
+{
+    CommunicationQuality::Window verified;
+    return preferences.putBytes("qualityPending", &window, sizeof(window)) == sizeof(window) &&
+        preferences.getBytesLength("qualityPending") == sizeof(verified) &&
+        preferences.getBytes("qualityPending", &verified, sizeof(verified)) == sizeof(verified) &&
+        CommunicationQuality::validWindow(verified, qualityIdentity) &&
+        memcmp(&window, &verified, sizeof(verified)) == 0;
+}
+
+bool eraseQualityWindow(void*)
+{
+    // A prior ambiguous remove may already have committed. Absence is success
+    // here only because Outbox first validates the server ACK for this report.
+    return (!preferences.isKey("qualityPending") || preferences.remove("qualityPending")) &&
+        !preferences.isKey("qualityPending");
+}
+
+void serviceCommunicationQuality()
+{
+    if (!qualityStorageUsable || !qualityProvisioned()) return;
+    const uint64_t now = healthUptimeMs();
+    if (!qualityCollector.started() && timeReady)
+    {
+        char bootId[33];
+        // Existing durable boot generation refuses overflow. A device ID must
+        // not be reused after erasing its NVS boot/sequence history.
+        snprintf(bootId, sizeof(bootId), "%032lx", static_cast<unsigned long>(bootSessionId));
+        if (!qualityCollector.begin(qualityIdentity, bootId, now, currentHealthEpochMs(), QUEUE_CAPACITY, droppedOldestCount))
+        {
+            qualityStorageUsable = false;
+            Serial.println("[QUALITY] Cannot initialize observation scope/clock; telemetry continues.");
+            return;
+        }
+    }
+    qualityCollector.sampleBuffer(queueCount, droppedOldestCount);
+    qualityCollector.sampleWifi(WiFi.status() == WL_CONNECTED);
+    if (!qualitySchedule.due(millis())) return;
+    if (!qualityOutbox.pending() && qualityCollector.ready(now))
+    {
+        if (!qualityOutbox.capture(qualityCollector, now)) return;
+    }
+    if (!qualityOutbox.pending()) return;
+    if (!qualityOutbox.checkpoint(persistQualityWindow))
+    {
+        qualitySchedule.completed(millis(), false);
+        Serial.println("[QUALITY] Report checkpoint failed; RAM report retained, telemetry continues.");
+        return;
+    }
+    if (WiFi.status() != WL_CONNECTED || !timeReady)
+    {
+        qualitySchedule.completed(millis(), false);
+        return;
+    }
+    HTTPClient http;
+    WiFiClientSecure secureClient;
+    secureClient.setHandshakeTimeout(3);
+    http.setConnectTimeout(1500);
+    http.setTimeout(1500);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    bool success = false;
+    int status = 0;
+    if (beginBackendHttp(http, secureClient, DEVICE_QUALITY_URL))
+    {
+        http.addHeader("Authorization", String("Bearer ") + DEVICE_QUALITY_TOKEN);
+        http.addHeader("Content-Type", "application/json");
+        const std::string body = CommunicationQuality::payload(qualityOutbox.window());
+        status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
+        String response;
+        const int length = http.getSize();
+        if ((status == 200 || status == 201) && length >= 0 && length <= 1024) response = http.getString();
+        success = length == static_cast<int>(response.length()) &&
+            qualityOutbox.acknowledge(status, response.c_str(), eraseQualityWindow);
+        http.end();
+    }
+    qualitySchedule.completed(millis(), success);
+    Serial.printf("[QUALITY] HTTP %d; pending=%s, counter overflow=%s.\n", status,
+        qualityOutbox.pending() ? "yes" : "no", qualityCollector.overflowed() ? "yes" : "no");
+}
+
 bool initializeDeviceHealth()
 {
     if (preferences.isKey("healthJournal"))
@@ -6635,6 +6768,7 @@ void setup()
     }
 
     initializeDeviceHealth();
+    initializeCommunicationQuality();
 
     pinMode(
         ADXL_CS,
@@ -6825,6 +6959,7 @@ void loop()
         persistCurrentSessionTimeAnchor();
     }
 
+    serviceCommunicationQuality();
     serviceRemoteConfiguration();
     serviceSensors();
     serviceDeviceHealth(); // Metrics only while an older telemetry head exists.

@@ -23,6 +23,12 @@
 #define DEVICE_CONFIG_URL_VALUE ""
 #define DEVICE_CONFIG_TOKEN_VALUE ""
 
+// Optional per-device observation channel. Provision a separate quality-only
+// token through backend DEVICE_QUALITY_TOKENS_JSON. URL must end in
+// /api/devices/{deviceId}/communication-quality. Disabled by default.
+#define DEVICE_QUALITY_URL_VALUE ""
+#define DEVICE_QUALITY_TOKEN_VALUE ""
+
 // PEM-encoded CA certificate that validates the backend TLS certificate.
 // Keep this empty in the example so CI can compile without distributing
 // environment-specific trust material. Real deployments must configure it.

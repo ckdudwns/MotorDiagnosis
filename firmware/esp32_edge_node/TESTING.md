@@ -1,6 +1,6 @@
-# ESP32 firmware regression testing — v1.2-beta.11.8.5
+# ESP32 firmware regression testing — v1.3-iot-health.1
 
-This revision addresses the second PR #13 data-integrity review round. The native test suite exercises production helper code used directly by `main.cpp`.
+This revision adds IOT-01/02 device-health reporting and sensor recovery while retaining the PR #13 data-integrity regressions. The native test suite exercises production helper code used directly by `main.cpp`.
 
 ## Native regression suite
 
@@ -8,11 +8,48 @@ Run from `firmware/esp32_edge_node`:
 
 ```powershell
 $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
-Remove-Item -Recurse -Force .pio\build\native -ErrorAction SilentlyContinue
 & "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" test -e native
 ```
 
-Expected suite size for this revision: **55 tests**.
+Expected suite size for this revision: **78 tests** (55 existing + 23 device-health tests).
+
+The native compiler must support C++11. ArduinoJson and Unity are resolved by PlatformIO.
+Run both suites, or select the health suite with `test -e native -f test_device_health`.
+
+## Device-health integration
+
+See [device-health setup and behavior](../../docs/iot-device-health.md) for separate credentials,
+fault codes, NVS journal boundaries, bounded retries and timestamp fallback.
+
+After building/running `test_device_health`, run the optional backend HTTP contract tests
+from the repository root. Point the environment variable at that native executable (not
+the ESP32 firmware binary):
+
+```powershell
+$env:IOT_HEALTH_FIXTURE_EXE = (Resolve-Path firmware/esp32_edge_node/.pio/build/native/program.exe).Path
+python -m unittest discover -s tests -p test_iot_health_contract.py -v
+```
+
+These three tests use generated C++ requests and a temporary local HTTP server. They
+exercise health-only authorization, active/recovered retry behavior, metrics and
+firmware validation of the actual server response. They skip when no native executable
+is supplied. No production credentials, persistent production database or board is used.
+
+Device-health native tests cover CRC/restart, FIFO/full-queue safety, ACK loss/marker
+failure, same-/previous-boot time handling, recovery ordering, bounded report and sensor
+retries, millis wrap, invalid metrics, stuck PCM and exact device/time response matching.
+
+On hardware, additionally test:
+
+- absent ADXL345 / failed I2S initialization: health servicing remains available;
+- I2S read timeout, missing/constant digital channel and successful recovery window;
+- initialization retry exhaustion: no infinite reinitialization, network remains alive;
+- delayed vibration worker: no overlapping measurement requests or concurrent SPI reset;
+- health 401/403/5xx, ACK loss and NVS write failure: no silent transition consumption;
+- power cut with active/recovered pending and cold boot before UTC;
+- unchanged telemetry sequence/ring/replay and no new verified ground-truth labels.
+
+## Existing telemetry integrity regressions
 
 Coverage includes:
 

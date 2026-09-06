@@ -92,6 +92,7 @@ def render_page() -> str:
         <button id="navOverview" aria-pressed="true" aria-controls="siteKpis sitesPanel notificationsPanel modelPanel healthPanel">운영 현황</button>
         <button id="navEvents" aria-pressed="false" aria-controls="exportPanel chartPanel eventListPanel eventReviewPanel">이벤트 검수</button>
         <button id="navManagement" aria-pressed="false" aria-controls="managementPanel">운영 관리</button>
+        <button id="navModels" aria-pressed="false" aria-controls="modelReviewPanel">AI 결과 검토</button>
       </nav>
       <h2 id="viewHeading" class="workspace-title">운영 현황</h2>
       <section class="toolbar panel">
@@ -154,6 +155,19 @@ def render_page() -> str:
           <h2>AI 기준선·모델 정보</h2>
           <div id="modelResult" role="status" aria-live="polite">Loading model metadata.</div>
         </article>
+        <article class="panel wide" id="modelReviewPanel" hidden>
+          <h2>AI1 결과 등록·사람 검토</h2>
+          <p class="notice">자동 인계 결과는 검토 대기로 등록됩니다. 승인은 근거 검토의 기록이며, 모델 파일 검증·현장 성능 보장·운영 배포를 의미하지 않습니다.</p>
+          <div class="actions"><label>검토 상태<select id="modelStatusFilter"><option value="draft">검토 대기</option><option value="approved">승인</option><option value="rejected">반려</option><option value="">전체</option></select></label><button id="modelQueueLoad" class="secondary">목록 새로고침</button></div>
+          <div id="modelQueue" class="history" role="status" aria-live="polite">목록을 조회하세요.</div>
+          <div class="actions"><button id="modelQueuePrev" class="secondary">이전</button><span id="modelQueuePage"></span><button id="modelQueueNext" class="secondary">다음</button></div>
+          <h3>선택 결과의 등록 근거</h3>
+          <div id="modelReviewSummary">검토할 결과를 선택하세요.</div>
+          <details><summary>데이터셋·기준선·지표·산출물 체크섬·검토 이력</summary><pre id="modelReviewEvidence"></pre></details>
+          <label>승인·반려 사유<textarea id="modelReviewReason" maxlength="1000" placeholder="검토한 근거와 판단 사유를 작성하세요."></textarea></label>
+          <div class="actions"><button id="modelApprove" disabled>승인 기록</button><button id="modelReject" class="secondary" disabled>반려 기록</button></div>
+          <div id="modelReviewStatus" role="status" aria-live="polite"></div>
+        </article>
         <article class="panel detail" id="eventReviewPanel" hidden>
           <h2>이벤트 상세·검수</h2>
           <div id="eventDetail">목록에서 이벤트를 선택하세요.</div>
@@ -203,6 +217,8 @@ def render_page() -> str:
     const PAGE_SIZE = 12;
     let managementGeneration = 0, managementRows = [], managementRow = null, managementInputs = [], managementCreating = false, managementDirty = false, managementScope = null;
     let auditPageNumber = 1, auditGeneration = 0;
+    let modelQueueGeneration = 0, modelReviewGeneration = 0, modelQueueRows = [], modelReviewRow = null;
+    let modelQueuePage = 1, modelQueueTotal = 0, modelReviewBusy = false, pendingModelReview = null;
     let reviewSaving = false, noteSaving = false, managementSaving = false, noteHistoryGeneration = 0;
     let noteListGeneration = 0;
     let currentView = "overview";
@@ -254,18 +270,23 @@ def render_page() -> str:
       overview:{button:"navOverview",title:"운영 현황",panels:["siteKpis","sitesPanel","notificationsPanel","modelPanel","healthPanel"]},
       events:{button:"navEvents",title:"이벤트 검수",panels:["exportPanel","chartPanel","eventListPanel","eventReviewPanel"]},
       management:{button:"navManagement",title:"운영 관리",panels:["managementPanel"]},
+      models:{button:"navModels",title:"AI 결과 검토",panels:["modelReviewPanel"]},
     };
     function hasManagementAccess() {return can("audit-log:read") || Object.values(MANAGEMENT).some(config => can(config.permission + ":read"));}
     function setView(view) {
       if (!Object.hasOwn(WORKSPACE_VIEWS, view) || (view === "management" && !hasManagementAccess())) return;
+      if (view === "models" && !can("model:read")) return;
+      const enteringModels = view === "models" && currentView !== "models";
       currentView = view;
       for (const [name,config] of Object.entries(WORKSPACE_VIEWS)) {
         $(config.button).setAttribute("aria-pressed", String(name === view));
         for (const id of config.panels) $(id).hidden = name !== view;
       }
       $("navManagement").hidden = !hasManagementAccess();
+      $("navModels").hidden = !can("model:read");
       $("viewHeading").textContent = WORKSPACE_VIEWS[view].title;
       if (view === "events") redrawChart();
+      if (enteringModels && !modelReviewRow) act(() => loadModelQueue(true));
     }
     function statusMessage(message, error = false) {
       $("appStatus").hidden = !message;
@@ -319,6 +340,7 @@ def render_page() -> str:
     }
 
     async function render() {
+      if (currentView === "models") return loadModelQueue(true);
       const requestGeneration = ++renderGeneration;
       const query = selectionQuery();
       if (!query) { statusMessage("조회 가능한 사이트 또는 설비가 없습니다."); return; }
@@ -330,7 +352,7 @@ def render_page() -> str:
         api("/api/dashboard/sites-summary"),
         api(`/api/events?siteId=${site.id}&assetId=${assetId}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&${eventFilterParams()}`),
         api(`/api/alerts?siteId=${site.id}&channel=web&status=sent&size=10`),
-        api(`/api/model-versions?siteId=${site.id}&assetId=${assetId}&status=draft&size=1`),
+        api(`/api/model-versions?siteId=${site.id}&assetId=${assetId}&size=1`),
         can("anomaly-rule:read") ? api(`/api/anomaly/rules/${encodeURIComponent(assetId)}`) : null,
         can("device:read") ? api(`/api/sites/${encodeURIComponent(site.id)}/devices`).then(rows => Promise.all(rows.map(device => api(`/api/devices/${encodeURIComponent(device.id)}/health`)))) : [],
         can("service-health:read") ? api("/api/health/dependencies").catch(error => ({error:error.message})) : null,
@@ -1037,11 +1059,112 @@ def render_page() -> str:
       renderPager("audit", result.page, result.total);
     }
 
+    function modelScope() {return JSON.stringify([token, $("siteSelect").value, $("assetSelect").value]);}
+    function modelReviewButtons() {
+      const disabled = modelReviewBusy || !can("model:review") || !modelReviewRow?.submission || modelReviewRow.approvalStatus !== "pending";
+      $("modelApprove").disabled = disabled; $("modelReject").disabled = disabled;
+      $("modelReviewReason").disabled = disabled;
+      $("modelStatusFilter").disabled = modelReviewBusy; $("modelQueueLoad").disabled = modelReviewBusy;
+    }
+    function clearModelReview() {
+      modelReviewGeneration++; modelReviewRow = null; pendingModelReview = null;
+      $("modelReviewSummary").textContent = "검토할 결과를 선택하세요.";
+      $("modelReviewEvidence").textContent = ""; $("modelReviewReason").value = "";
+      $("modelReviewStatus").textContent = ""; modelReviewButtons();
+    }
+    function renderModelQueue() {
+      $("modelQueue").replaceChildren();
+      if (!modelQueueRows.length) $("modelQueue").textContent = "해당 조건의 등록 결과가 없습니다.";
+      for (const row of modelQueueRows) {
+        const button = document.createElement("button"); button.className = "secondary";
+        button.textContent = `${row.version} · ${row.approvalStatus || "pending"} · ${row.submission?.jobId || "수동 메타데이터"}`;
+        button.addEventListener("click", () => act(() => selectModelReview(row.version)));
+        $("modelQueue").append(button);
+      }
+      $("modelQueuePage").textContent = `${modelQueuePage} / ${Math.max(1,Math.ceil(modelQueueTotal / PAGE_SIZE))} · ${modelQueueTotal}건`;
+      $("modelQueuePrev").disabled = modelQueuePage <= 1;
+      $("modelQueueNext").disabled = modelQueuePage * PAGE_SIZE >= modelQueueTotal;
+    }
+    let modelQueueFilter = "draft";
+    async function loadModelQueue(reset = false, requestedPage = null) {
+      if (modelReviewBusy || !can("model:read")) return;
+      if ($("modelReviewReason").value.trim() && !confirm("작성 중인 AI 검토 사유를 버리고 목록을 다시 조회할까요?")) {$("modelStatusFilter").value = modelQueueFilter; return;}
+      if (reset) modelQueuePage = 1;
+      else if (requestedPage !== null) modelQueuePage = requestedPage;
+      modelQueueFilter = $("modelStatusFilter").value;
+      const generation = ++modelQueueGeneration, scope = modelScope();
+      clearModelReview(); modelQueueRows = []; modelQueueTotal = 0; renderModelQueue();
+      $("modelQueue").textContent = "등록 결과를 불러오는 중입니다.";
+      const query = new URLSearchParams({siteId:$("siteSelect").value,assetId:$("assetSelect").value,status:$("modelStatusFilter").value,page:modelQueuePage,size:PAGE_SIZE});
+      if (!query.get("siteId") || !query.get("assetId")) {$("modelQueue").textContent = "사이트와 설비를 선택하세요."; return;}
+      try {
+        const page = await api(`/api/model-versions?${query}`);
+        if (generation !== modelQueueGeneration || scope !== modelScope()) return;
+        const last = Math.max(1, Math.ceil(page.total / PAGE_SIZE));
+        if (modelQueuePage > last) {modelQueuePage = last; return loadModelQueue();}
+        modelQueueRows = page.items; modelQueueTotal = page.total; renderModelQueue();
+      } catch (error) {
+        if (generation !== modelQueueGeneration || scope !== modelScope()) return;
+        $("modelQueue").textContent = `목록 조회 실패: ${error.message}`;
+        $("modelQueuePage").textContent = "조회 실패";
+      }
+    }
+    function renderModelReview() {
+      const row = modelReviewRow;
+      if (!row) return;
+      $("modelReviewSummary").textContent = `${row.version} · ${row.approvalStatus} · ${row.deploymentStatus} / ${row.artifactVerified ? "파일 검증됨" : "산출물 참조·제출자 체크섬 (서버 파일 검증 아님)"}`;
+      $("modelReviewEvidence").textContent = JSON.stringify({submission:row.submission, artifactUri:row.artifactUri, artifactChecksum:row.artifactChecksum, registrationDigest:row.registrationDigest, dataset:row.datasetSnapshot, baseline:row.baselineSnapshot, metrics:row.metrics, domainGap:row.domainGap, fieldCalibrationPlan:row.fieldCalibrationPlan, errorCases:row.errorCases, limitations:row.limitations, reviewHistory:row.reviewHistory || []}, null, 2);
+      modelReviewButtons();
+    }
+    async function selectModelReview(version) {
+      if (modelReviewBusy) return;
+      if (modelReviewRow?.version === version) return;
+      if ($("modelReviewReason").value.trim() && !confirm("작성 중인 AI 검토 사유를 버리고 다른 결과를 선택할까요?")) return;
+      clearModelReview();
+      const generation = modelReviewGeneration, scope = modelScope();
+      $("modelReviewStatus").textContent = "등록 근거를 불러오는 중입니다.";
+      try {
+        const row = await api(`/api/model-versions/${encodeURIComponent(version)}`);
+        if (generation !== modelReviewGeneration || scope !== modelScope()) return;
+        if (row.version !== version) throw new Error("선택 결과와 응답 버전이 다릅니다.");
+        modelReviewRow = row; renderModelReview();
+        $("modelReviewStatus").textContent = row.submission ? (can("model:review") ? "사유를 작성하고 승인 또는 반려를 기록하세요." : "읽기 전용입니다. 승인·반려 권한이 필요합니다.") : "기존 수동 메타데이터입니다. 체크섬과 AI1 인계 근거를 갖춘 새 버전을 등록해야 검토할 수 있습니다.";
+      } catch (error) {
+        if (generation === modelReviewGeneration && scope === modelScope()) $("modelReviewStatus").textContent = `상세 조회 실패: ${error.message}`;
+      }
+    }
+    async function submitModelReview(decision) {
+      const row = modelReviewRow, reason = $("modelReviewReason").value.trim();
+      if (modelReviewBusy || !row?.submission || !can("model:review") || row.approvalStatus !== "pending") return;
+      if (!reason) {$("modelReviewStatus").textContent = "승인·반려 사유를 입력하세요."; return;}
+      if (!pendingModelReview || pendingModelReview.version !== row.version || pendingModelReview.payload.reason !== reason || pendingModelReview.payload.decision !== decision) {
+        pendingModelReview = {version:row.version, payload:{decision,reason,requestId:crypto.randomUUID(),expectedRevision:row.approvalRevision,registrationDigest:row.registrationDigest}};
+      }
+      const intent = pendingModelReview, generation = modelReviewGeneration, scope = modelScope();
+      modelReviewBusy = true; modelReviewButtons(); $("modelReviewStatus").textContent = "검토 결과를 저장하는 중입니다.";
+      try {
+        const result = await api(`/api/model-versions/${encodeURIComponent(row.version)}/reviews`, jsonOptions("POST", intent.payload));
+        if (generation !== modelReviewGeneration || scope !== modelScope()) return;
+        if (result.version !== row.version || result.registrationDigest !== row.registrationDigest) throw new Error("검토 응답의 등록 근거가 일치하지 않습니다.");
+        // Confirm the write first; do not turn a subsequent list failure into a duplicate review.
+        modelReviewRow = result; pendingModelReview = null; $("modelReviewReason").value = "";
+        modelQueueGeneration++;
+        modelQueueRows = modelQueueRows.map(item => item.version === result.version ? result : item);
+        if ($("modelStatusFilter").value && $("modelStatusFilter").value !== result.status) {
+          modelQueueRows = modelQueueRows.filter(item => item.version !== result.version); modelQueueTotal = Math.max(0,modelQueueTotal - 1);
+        }
+        renderModelQueue(); renderModelReview();
+        $("modelReviewStatus").textContent = `${result.approvalStatus === "approved" ? "승인이" : "반려가"} 기록됐습니다. 운영 배포는 수행하지 않았습니다.`;
+      } catch (error) {
+        if (generation === modelReviewGeneration && scope === modelScope()) $("modelReviewStatus").textContent = `저장 결과 확인 실패: ${error.message}. 같은 내용으로 재시도하거나 목록을 다시 조회해 상태를 확인하세요.`;
+      } finally {modelReviewBusy = false; modelReviewButtons();}
+    }
+
     let acceptedSelection = {};
     const SELECTION_CONTROLS = ["siteSelect","assetSelect","periodSelect","severityFilter","eventLabelFilter","reviewedFilter","eventSort"];
     function rememberSelection() { acceptedSelection = Object.fromEntries(SELECTION_CONTROLS.map(id => [id,$(id).value])); }
     function allowSelectionChange() {
-      if (!(reviewDirty || memoDirty || managementDirty) || confirm("저장하지 않은 편집을 버리고 조회 조건을 변경할까요?")) return true;
+      if (!modelReviewBusy && (!(reviewDirty || memoDirty || managementDirty || $("modelReviewReason").value.trim()) || confirm("저장하지 않은 편집을 버리고 조회 조건을 변경할까요?"))) return true;
       for (const [id,value] of Object.entries(acceptedSelection)) $(id).value = value;
       return false;
     }
@@ -1061,6 +1184,7 @@ def render_page() -> str:
       }
     }
     function invalidateScope(resetWindow = false) {
+      modelQueueGeneration++; modelQueueRows = []; modelQueueTotal = 0; modelQueuePage = 1; clearModelReview(); renderModelQueue();
       clearEventSelection();
       renderGeneration += 1;
       lastQuery = null; $("exportBtn").disabled = true;
@@ -1081,6 +1205,11 @@ def render_page() -> str:
       if (row) act(() => selectEvent(row.dataset.id));
     });
     $("loginBtn").addEventListener("click", () => login().then(rememberSelection).catch(error => alert(error.message)));
+    $("modelStatusFilter").addEventListener("change", () => act(() => loadModelQueue(true)));
+    $("modelQueueLoad").addEventListener("click", () => act(() => loadModelQueue(true)));
+    for (const [id,step] of [["modelQueuePrev",-1],["modelQueueNext",1]]) $(id).addEventListener("click", () => act(() => loadModelQueue(false, Math.max(1,modelQueuePage + step))));
+    $("modelApprove").addEventListener("click", () => act(() => submitModelReview("approve")));
+    $("modelReject").addEventListener("click", () => act(() => submitModelReview("reject")));
     for (const [view,config] of Object.entries(WORKSPACE_VIEWS)) $(config.button).addEventListener("click", () => setView(view));
     $("siteSelect").addEventListener("change", async () => {
       if (!allowSelectionChange()) return;
@@ -1236,7 +1365,8 @@ def render_page() -> str:
       $("chartHint").textContent = `${point.timestamp} · ${vibrationLabel}: ${vibration ?? "-"} · ${acousticLabel}: ${acoustic ?? "-"} · ${rpmDescription(point)} · score: ${score ?? "unavailable"} (${point.anomalyStatus ?? "-"})`;
     });
     setInterval(() => {
-      if (!token || !selectedSite() || !$("assetSelect").value) return;
+      // Evidence and an unsaved decision must not be replaced by telemetry polling.
+      if (currentView === "models" || !token || !selectedSite() || !$("assetSelect").value) return;
       if (!$("fromInput").value && !chartViewport) activeWindow = null;
       act(render);
     }, 5000);

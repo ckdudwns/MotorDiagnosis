@@ -318,11 +318,11 @@ def versions_for(
     data.require_permission(user, f"{kind}:read")
     if site_id:
         data.require_site_access(user, site_id)
-    if status and status != "draft":
+    if status and status not in {"draft", "approved", "rejected"}:
         raise data.ApiError(
             400,
             "INVALID_VERSION_STATUS",
-            "Only draft versions are supported in this MVP.",
+            "Use draft, approved or rejected.",
         )
     with data.STORE_LOCK:
         records = data.MODEL_VERSIONS if kind == "model" else data.BASELINE_VERSIONS
@@ -338,6 +338,7 @@ def versions_for(
             data.copy_payload(row)
             for row in records
             if _visible(user, row)
+            and (not status or row.get("status") == status)
             and (
                 not site_id
                 or row.get("siteId", row.get("baselineSnapshot", {}).get("siteId"))

@@ -110,6 +110,7 @@ from .data import (
 from .json_validation import loads_strict_json
 from .alerts import AlertService
 from .model_registry import create_baseline_version, create_model_version, versions_for
+from .ai_results import submit_result, review_model
 from .telemetry_bulk import ingest_telemetry_bulk
 from .web import render_page
 from .xlsx_export import dataset_xlsx_bytes
@@ -663,6 +664,10 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             self.send_json(result, status=status)
             return
+        if segments == ["api", "ai1", "results"]:
+            result, status = submit_result(self.bearer_token(), payload)
+            self.send_json(result, status=status)
+            return
         if segments == ["api", "telemetry", "bulk"]:
             result = ingest_telemetry_bulk(
                 telemetry_principal_for_token(self.bearer_token()), payload
@@ -824,6 +829,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if segments == ["api", "baseline-versions"]:
             self.send_json(create_baseline_version(user, payload), status=201)
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "model-versions"] and segments[3] == "reviews":
+            self.send_json(review_model(user, segments[2], payload))
             return
         if segments == ["api", "model-versions"]:
             self.send_json(create_model_version(user, payload), status=201)

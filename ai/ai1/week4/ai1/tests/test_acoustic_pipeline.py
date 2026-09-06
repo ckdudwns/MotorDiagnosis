@@ -351,6 +351,102 @@ class AcousticPipelineTest(unittest.TestCase):
             json.loads(baseline_path.read_text(encoding="utf-8"))["status"], "draft"
         )
 
+    def test_training_cli_auto_registers_real_fixture_artifact_for_human_review(self):
+        from tests.test_ai_results import AIResultTest
+        from motor_diagnosis import data, model_registry
+
+        backend = AIResultTest()
+        backend.setUp()
+        self.addCleanup(backend.doCleanups)
+        frozen = freeze_dataset_version(self.build())
+        dataset = data.create_dataset_version(
+            backend.users["system"],
+            {
+                "name": "Generated acoustic fixture",
+                "source": {
+                    "type": "external",
+                    "uri": "https://example.org/generated-fixture",
+                    "license": "test-only",
+                    "checksum": frozen["source"]["checksum"],
+                },
+                "compatibility": {
+                    "signalType": ["acoustic"],
+                    "samplingRateHz": 8000,
+                    "units": {"acoustic": "normalized_pcm"},
+                    "operatingConditions": {"acquisition": "fixture"},
+                },
+                "sourceFilters": {"siteId": "SITE-01"},
+                "labelTaxonomyVersion": "ACOUSTIC-V1",
+                "labelMapping": {"normal": "NORMAL"},
+                "split": {"train": 0.7, "validation": 0.2, "test": 0.1},
+                "reason": "Generated fixtures, not field performance evidence",
+            },
+        )
+        baseline = model_registry.create_baseline_version(
+            backend.users["system"],
+            {
+                "datasetId": dataset["id"],
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+                "features": {"rms_mean": 0.05},
+            },
+        )
+        target = {
+            "producerId": "AI1-TEST",
+            "datasetId": dataset["id"],
+            "datasetFingerprint": dataset["versionFingerprint"],
+            "baselineVersion": baseline["version"],
+        }
+        manifest_path, target_path = (
+            self.root / "frozen.json",
+            self.root / "target.json",
+        )
+        manifest_path.write_text(json.dumps(frozen), encoding="utf-8")
+        target_path.write_text(json.dumps(target), encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "week4/ai1/freq_baseline/train_and_evaluate.py"),
+                "--manifest",
+                str(manifest_path),
+                "--handoff-target",
+                str(target_path),
+                "--dense-epochs",
+                "1",
+                "--lstm-epochs",
+                "1",
+                "--artifact-dir",
+                str(self.root / "models"),
+                "--output",
+                str(self.root / "report.json"),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads((self.root / "report.json").read_text(encoding="utf-8"))
+        pending = self.root / "models" / report["id"] / "result-handoff.json"
+        self.assertTrue(Path(str(pending) + ".receipt.json").is_file())
+        self.assertTrue((pending.parent / "frozen-manifest.json").is_file())
+        self.assertTrue((pending.parent / "training-report.json").is_file())
+        self.assertEqual(len(data.MODEL_VERSIONS), 1)
+        model = data.MODEL_VERSIONS[0]
+        self.assertEqual(model["submission"]["jobId"], report["id"])
+        self.assertEqual(
+            model["submission"]["candidate"], report["metrics"]["bestCandidate"]
+        )
+        self.assertEqual(
+            model["datasetSnapshot"]["versionFingerprint"],
+            dataset["versionFingerprint"],
+        )
+        self.assertEqual(model["approvalStatus"], "pending")
+        self.assertEqual(model["deploymentStatus"], "not_deployed")
+        self.assertFalse(model["artifactVerified"])
+        self.assertEqual(model["reviewHistory"], [])
+
     def test_acoustic_baseline_uses_only_normal_train_and_registers_context(self):
         frozen = freeze_dataset_version(self.build())
         baseline = build_acoustic_baseline(frozen, site_id="S1", asset_id="A1")

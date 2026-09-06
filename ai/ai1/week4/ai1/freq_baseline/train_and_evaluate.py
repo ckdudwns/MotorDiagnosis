@@ -941,6 +941,10 @@ if __name__ == "__main__":
     parser.add_argument("--dense-epochs", type=int, default=150)
     parser.add_argument("--lstm-epochs", type=int, default=150)
     parser.add_argument(
+        "--handoff-target",
+        help="Opt-in JSON target binding for automatic backend registration after successful training (never approval)",
+    )
+    parser.add_argument(
         "--split-strategy",
         choices=("specimen_group", "operating_condition_holdout"),
         default="operating_condition_holdout",
@@ -974,6 +978,19 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2, allow_nan=False)
+
+    if args.handoff_target:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
+        from ai.ai1.result_handoff import prepare_handoff, send_pending, store_immutable
+
+        with open(args.handoff_target, encoding="utf-8") as handle:
+            handoff_target = json.load(handle)
+        pending = Path(args.artifact_dir) / report["id"] / "result-handoff.json"
+        store_immutable(pending.parent / "frozen-manifest.json", frozen)
+        store_immutable(pending.parent / "training-report.json", report)
+        prepare_handoff(report, frozen, handoff_target, pending)
+        print(f"AI1 result outbox: {pending}")
+        send_pending(pending)
 
     m = report["metrics"]
     test_label = "독립 holdout" if m["independentHoldout"] else "비독립"

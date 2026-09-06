@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
+import {randomUUID} from 'node:crypto';
 
 const source = readFileSync(new URL('../motor_diagnosis/web.py', import.meta.url), 'utf8');
 const script = source.match(/<script>([\s\S]*?)<\/script>/)[1];
@@ -31,7 +32,7 @@ function harness() {
   const get = id => {if (!elements.has(id)) elements.set(id,new Element(selectIds.has(id) ? 'select' : 'div')); return elements.get(id);};
   const context = vm.createContext({
     document:{body:new Element(),getElementById:get,createElement:tag => new Element(tag),addEventListener() {}},
-    URL, URLSearchParams, setTimeout, console, setInterval:fn => intervals.push(fn), confirm:() => true, alert:message => {throw new Error(message);},
+    URL, URLSearchParams, crypto:{randomUUID}, setTimeout, console, setInterval:fn => intervals.push(fn), confirm:() => true, alert:message => {throw new Error(message);},
     fetch:async (path,options = {}) => {
       requests.push({path,options});
       const body = await context.respond(path,options);
@@ -614,6 +615,113 @@ await check('shipped chart uses RPM quality rather than a leftover numeric value
   h.run(`draw([{timestamp:'2026-09-06T00:00:00Z',rpm:0,rpmStatus:'valid'},{timestamp:'2026-09-06T00:00:01Z',rpm:777,rpmStatus:'invalid'}], {});`);
   assert.ok(h.calls.some(call => call[0]==='fillText' && String(call[1]).includes('RPM (보고값)')));
   assert.equal(h.calls.filter(call => call[0]==='arc').length,1);
+});
+
+function modelResult(version = 'M1') {
+  return {version,status:'draft',approvalStatus:'pending',approvalRevision:0,registrationDigest:'sha256:abc',deploymentStatus:'not_deployed',artifactVerified:false,artifactChecksum:'sha256:def',submission:{jobId:`job-${version}`},metrics:{f1:0.5},reviewHistory:[]};
+}
+function modelHarness() {
+  const h = harness(); h.context.fixture = modelResult(); h.get('modelStatusFilter').value='draft';
+  h.context.respond = async () => clone(h.context.fixture);
+  return h;
+}
+await check('AI result queue filters pages and safely displays submitted identifiers', async () => {
+  const h = modelHarness(), row = modelResult('<img onerror=attack()>');
+  h.context.respond = async () => ({items:[row],total:15});
+  await h.run('loadModelQueue(true)');
+  assert.match(h.requests[0].path,/siteId=S1&assetId=A1&status=draft&page=1&size=12/);
+  assert.match(textOf(h.get('modelQueue')),/<img onerror=attack/);
+  assert.equal(h.get('modelQueue').children[0].children.length,0);
+  assert.equal(h.get('modelQueueNext').disabled,false);
+});
+await check('AI failed filter lookup clears old selectable results and approval controls', async () => {
+  const h = modelHarness(); await h.run('selectModelReview("M1")');
+  h.context.respond = async () => {throw new Error('offline');}; h.get('modelStatusFilter').value='approved';
+  await h.run('loadModelQueue(true)');
+  assert.equal(h.run('modelQueueRows.length'),0); assert.equal(h.run('modelReviewRow'),null);
+  assert.match(h.get('modelQueue').textContent,/조회 실패/); assert.equal(h.get('modelApprove').disabled,true);
+});
+await check('AI late queue and detail replies cannot overwrite newer selection or scope', async () => {
+  const h = modelHarness(), late = deferred();
+  h.context.respond = path => path.endsWith('/M1') ? late.promise : Promise.resolve(modelResult('M2'));
+  const older = h.run('selectModelReview("M1")'); await h.run('selectModelReview("M2")');
+  late.resolve(modelResult('M1')); await older; assert.equal(h.run('modelReviewRow.version'),'M2');
+  const list = deferred(); h.context.respond = () => list.promise;
+  const pending = h.run('loadModelQueue()'); h.get('assetSelect').value='A2'; h.run('invalidateScope()');
+  list.resolve({items:[modelResult()],total:1}); await pending; assert.equal(h.run('modelQueueRows.length'),0);
+});
+await check('AI approval needs permission and reason and explicitly remains not deployed', async () => {
+  const h = modelHarness(); await h.run('selectModelReview("M1")');
+  await h.run('submitModelReview("approve")'); assert.equal(h.requests.length,1);
+  assert.match(h.get('modelReviewStatus').textContent,/사유/);
+  h.run('permissions=["model:read"]; renderModelReview();');
+  assert.equal(h.get('modelApprove').disabled,true); h.get('modelReviewReason').value='reviewed';
+  await h.run('submitModelReview("approve")'); assert.equal(h.requests.length,1);
+  assert.match(h.get('modelReviewSummary').textContent,/not_deployed/);
+});
+await check('AI uncertain approval retry reuses its identity and never duplicates after success', async () => {
+  const h = modelHarness(); await h.run('selectModelReview("M1")');
+  h.get('modelReviewReason').value='evidence checked'; let first=true;
+  h.context.respond = async () => {if (first) {first=false;throw new Error('lost response');} return {...modelResult(),status:'approved',approvalStatus:'approved',approvalRevision:1};};
+  await h.run('submitModelReview("approve")'); assert.equal(h.get('modelReviewReason').value,'evidence checked');
+  await h.run('submitModelReview("approve")');
+  const bodies = h.requests.filter(row => row.options.method==='POST').map(row => JSON.parse(row.options.body));
+  assert.equal(bodies.length,2); assert.deepEqual(bodies[0],bodies[1]);
+  assert.equal(h.run('modelReviewRow.approvalStatus'),'approved'); assert.equal(h.get('modelReviewReason').value,'');
+  assert.equal(h.get('modelApprove').disabled,true); assert.match(h.get('modelReviewStatus').textContent,/배포는 수행하지 않았/);
+  await h.run('submitModelReview("approve")'); assert.equal(h.requests.length,3);
+});
+await check('AI write success is not reversed by a failed subsequent list refresh', async () => {
+  const h = modelHarness(); await h.run('selectModelReview("M1")'); h.get('modelReviewReason').value='confirmed';
+  h.context.respond = async () => ({...modelResult(),status:'rejected',approvalStatus:'rejected',approvalRevision:1});
+  await h.run('submitModelReview("reject")'); assert.equal(h.run('pendingModelReview'),null);
+  assert.match(h.get('modelReviewStatus').textContent,/반려가 기록/);
+  h.context.respond = async () => {throw new Error('list failed');}; await h.run('loadModelQueue()');
+  assert.equal(h.get('modelReviewReason').value,''); assert.equal(h.get('modelReject').disabled,true);
+});
+await check('AI stale review error keeps evidence and request for explicit reload', async () => {
+  const h = modelHarness(); await h.run('selectModelReview("M1")'); h.get('modelReviewReason').value='confirmed';
+  h.context.respond = async () => {throw new Error('Reload current revision');};
+  await h.run('submitModelReview("reject")');
+  assert.equal(h.run('modelReviewRow.approvalStatus'),'pending'); assert.equal(h.get('modelReviewReason').value,'confirmed');
+  assert.match(h.get('modelReviewStatus').textContent,/Reload/);
+});
+await check('AI registration evidence and review history are inert text, not executable HTML', async () => {
+  const h = modelHarness(); h.context.fixture.reviewHistory=[{reason:'<script>attack()</script>'}];
+  await h.run('selectModelReview("M1")');
+  assert.match(h.get('modelReviewEvidence').textContent,/<script>attack/); assert.equal(h.get('modelReviewEvidence').children.length,0);
+});
+await check('AI double-click is coalesced and scope changes are blocked during review', async () => {
+  const h = modelHarness(), waiting=deferred(); await h.run('selectModelReview("M1")'); h.run('rememberSelection()');
+  h.get('modelReviewReason').value='reviewed'; h.context.respond=()=>waiting.promise;
+  const saving=h.run('submitModelReview("approve")'); await h.run('submitModelReview("approve")');
+  assert.equal(h.requests.length,2); assert.equal(h.get('modelStatusFilter').disabled,true);
+  h.get('assetSelect').value='A2'; assert.equal(h.run('allowSelectionChange()'),false); assert.equal(h.get('assetSelect').value,'A1');
+  waiting.resolve({...modelResult(),status:'approved',approvalStatus:'approved',approvalRevision:1}); await saving;
+});
+
+await check('AI evidence and draft survive telemetry timers and workspace navigation', async () => {
+  const h = modelHarness(); await h.run('selectModelReview("M1")');
+  h.get('modelReviewReason').value='still inspecting evidence';
+  h.run('currentView="models"; modelQueuePage=2');
+  const calls=h.requests.length, generation=h.run('modelReviewGeneration');
+  for (const interval of h.intervals) interval();
+  h.run('setView("overview"); setView("models"); setView("models")');
+  assert.equal(h.requests.length,calls); assert.equal(h.run('modelReviewGeneration'),generation);
+  assert.equal(h.run('modelReviewRow.version'),'M1'); assert.equal(h.run('modelQueuePage'),2);
+  assert.equal(h.get('modelReviewReason').value,'still inspecting evidence');
+  assert.equal(h.get('modelReviewPanel').hidden,false);
+});
+
+await check('AI cancelled refresh, page, filter and selection preserve the unsaved reason', async () => {
+  const h = modelHarness(); await h.run('selectModelReview("M1")');
+  h.get('modelReviewReason').value='unsaved evidence'; h.context.confirm=()=>false;
+  h.get('modelStatusFilter').value='approved'; const calls=h.requests.length;
+  await h.run('loadModelQueue(true)'); await h.run('loadModelQueue(false,2)');
+  await h.run('selectModelReview("M2")'); await h.run('selectModelReview("M1")');
+  assert.equal(h.requests.length,calls); assert.equal(h.run('modelReviewRow.version'),'M1');
+  assert.equal(h.get('modelReviewReason').value,'unsaved evidence');
+  assert.equal(h.get('modelStatusFilter').value,'draft'); assert.equal(h.run('modelQueuePage'),1);
 });
 
 assert.deepEqual(failures,[],`${failures.length} behavior checks failed`);

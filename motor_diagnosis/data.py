@@ -375,6 +375,7 @@ ROLE_POLICIES = [
             "alert:read",
             "alert:send",
             "model:read",
+            "model:review",
             "baseline:read",
             "parameter:read",
             "parameter:write",
@@ -395,6 +396,12 @@ ROLE_POLICIES = [
         "name": "System administrator",
         "description": "Full system configuration and operational access.",
         "permissions": ["*"],
+    },
+    {
+        "role": "AI1",
+        "name": "AI1 result producer (service only)",
+        "description": "Dedicated handoff principal; no user login, approval or deployment permission.",
+        "permissions": ["model:write", "baseline:read", "dataset:read"],
     },
 ]
 

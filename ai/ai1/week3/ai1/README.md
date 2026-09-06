@@ -2,6 +2,10 @@
 
 Bind Edge AI 프로젝트 3주차, AI-1 담당 영역.
 
+추가 AI1-01/02: `datasets/register_acoustic_dataset.py`에서 MIMII 음향 manifest를
+생성하고 기존 CSV/XLSX 내보내기·4주차 동결/후보 학습에 연결한다.
+실행 방법과 신호별 기준선 입력 계약은 [음향/RPM 안내](../../../../docs/ai1-acoustic-baselines.md)를 참고한다.
+
 3주차 기능정의서(W3.2, 2026-08-24)와 API 명세서(v1.3)를 기준으로 작업했다. 원래
 초안(W3.1)과 달리 **DATA_EXPORT_01의 범위가 "기존 공개·보유 데이터셋 선정·정규화"로
 확장**되었고, AI-1의 착수 순서도 재조정되었다. 이 폴더의 4개 기능은 "선행일정" 시트에

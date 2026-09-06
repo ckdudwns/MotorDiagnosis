@@ -47,7 +47,6 @@ import math
 import re
 from datetime import datetime, timezone
 
-
 # [리뷰 P2] "not-a-sha256" 같은 임의 문자열도 artifactChecksum으로 등록됐다 —
 # 실제 sha256 hexdigest 형식(`sha256:` 뒤에 64자리 16진수)인지 등록 시점에
 # 검증한다.
@@ -69,7 +68,9 @@ def _normalize_sha256_checksum(value, *, field: str) -> str:
     전에 소문자로 정규화해 다시는 대소문자 차이로 정상 아티팩트가 거부되지 않게 한다.
     """
     if not isinstance(value, str) or not _SHA256_CHECKSUM_RE.fullmatch(value):
-        raise ValueError(f"{field}은 'sha256:' 뒤에 64자리 16진수여야 합니다: {value!r}")
+        raise ValueError(
+            f"{field}은 'sha256:' 뒤에 64자리 16진수여야 합니다: {value!r}"
+        )
     return value.lower()
 
 
@@ -90,7 +91,9 @@ def _parse_utc(timestamp: str, *, context: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError as exc:
-        raise ValueError(f"{context}: approvedAt을 파싱할 수 없습니다: {timestamp!r}") from exc
+        raise ValueError(
+            f"{context}: approvedAt을 파싱할 수 없습니다: {timestamp!r}"
+        ) from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
@@ -137,7 +140,9 @@ def compute_registration_digest(model_version: dict) -> str:
     "등록 증명"의 유일한 근거는 아니다 — 등록 증명은 이제 "레지스트리 인스턴스의
     `register()`를 실제로 거쳤는가"라는 구조적 사실에서 나온다.
     """
-    stable = {k: v for k, v in model_version.items() if k not in _VOLATILE_MODEL_VERSION_KEYS}
+    stable = {
+        k: v for k, v in model_version.items() if k not in _VOLATILE_MODEL_VERSION_KEYS
+    }
     payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -153,7 +158,9 @@ def compute_approval_digest(approved_model_version: dict) -> str:
     이후 상태 전이 사이의 내부 손상을 잡기 위한 정합성 점검 용도로는 유지한다.
     """
     stable = {
-        k: v for k, v in approved_model_version.items() if k not in ("status", "approvalDigest")
+        k: v
+        for k, v in approved_model_version.items()
+        if k not in ("status", "approvalDigest")
     }
     payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -315,7 +322,9 @@ class ModelVersionRegistry:
         끊긴다.
         """
         if not isinstance(version, str) or not version.strip():
-            raise ValueError(f"version은 비어있지 않은 문자열이어야 합니다: {version!r}")
+            raise ValueError(
+                f"version은 비어있지 않은 문자열이어야 합니다: {version!r}"
+            )
         if version in self.__entries:
             raise ValueError(
                 f"버전 {version!r}은 이미 이 저장소에 등록되어 있습니다 — 새 버전 "
@@ -348,7 +357,10 @@ class ModelVersionRegistry:
                 "먼저 호출하세요."
             )
         approved = _build_approved_model_version(
-            entry, approved_by=approved_by, reason=reason, metric_snapshot=metric_snapshot
+            entry,
+            approved_by=approved_by,
+            reason=reason,
+            metric_snapshot=metric_snapshot,
         )
         self.__entries[version] = approved
         return copy.deepcopy(approved)
@@ -410,7 +422,10 @@ class ModelVersionRegistry:
                     "않습니다 — 저장소 내부 상태가 손상된 것으로 보입니다."
                 )
             approval_digest = entry.get("approvalDigest")
-            if approval_digest is None or compute_approval_digest(entry) != approval_digest:
+            if (
+                approval_digest is None
+                or compute_approval_digest(entry) != approval_digest
+            ):
                 raise ValueError(
                     f"{label} 버전 {version!r}의 approvalDigest가 내용과 일치하지 "
                     "않습니다 — 저장소 내부 상태가 손상된 것으로 보입니다."
@@ -487,8 +502,14 @@ def _validate_baseline_features(features) -> None:
             raise ValueError(f"features[{name!r}]는 dict여야 합니다: {spec!r}")
         for label in ("mean", "std"):
             value = spec.get(label)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-                raise ValueError(f"features[{name!r}].{label}은 유한한 실수여야 합니다: {value!r}")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(
+                    f"features[{name!r}].{label}은 유한한 실수여야 합니다: {value!r}"
+                )
         # [리뷰 P1] 저장소의 실제 week2 baseline.json은 rms_std/kurtosis_std/
         # spectral_rolloff처럼 구조적으로 std=0.0인 특징을 포함한다(모든 윈도우에서
         # 값이 상수라 표본표준편차가 정확히 0) — 기존 판정 로직(week2 ANOMALY_RULE_01)도
@@ -503,7 +524,9 @@ def _validate_baseline_features(features) -> None:
             not isinstance(normal_range, (list, tuple))
             or len(normal_range) != 2
             or any(
-                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                isinstance(v, bool)
+                or not isinstance(v, (int, float))
+                or not math.isfinite(v)
                 for v in normal_range
             )
         ):
@@ -524,7 +547,9 @@ def compute_baseline_registration_digest(baseline_version: dict) -> str:
     대한 canonical sha256 — 등록 시점 이후 저장소 내부 상태가 손상되지 않았는지
     확인하는 정합성 점검에 쓴다(핵심 신뢰 경계는 `BaselineVersionRegistry`
     자신의 소유 저장소가 제공한다)."""
-    stable = {k: v for k, v in baseline_version.items() if k not in _VOLATILE_BASELINE_KEYS}
+    stable = {
+        k: v for k, v in baseline_version.items() if k not in _VOLATILE_BASELINE_KEYS
+    }
     payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -550,6 +575,7 @@ def _build_registered_baseline_version(
     asset_id: str,
     features: dict,
     time_segment: str = None,
+    signal_context: dict = None,
 ) -> dict:
     """week2 baseline.json과 같은 구조(mean/std/normal_range)를 설비 단위 버전으로
     등록한다. status="draft"로 시작 — 승인 전에는 배포할 수 없다 (FUT-011).
@@ -580,11 +606,32 @@ def _build_registered_baseline_version(
         "status": "draft",
         "createdAt": _now_iso(),
     }
+    if signal_context is not None:
+        if not isinstance(signal_context, dict) or signal_context.get(
+            "modality"
+        ) not in {"acoustic", "rpm", "vibration"}:
+            raise ValueError("signal_context requires a supported modality")
+        for key in ("units", "operatingConditions"):
+            if not isinstance(signal_context.get(key), dict) or not signal_context[key]:
+                raise ValueError(f"signal_context.{key} must be a nonempty object")
+        units = signal_context["units"]
+        if signal_context["modality"] not in units or any(
+            not isinstance(value, str) or not value.strip()
+            for pair in units.items()
+            for value in pair
+        ):
+            raise ValueError(
+                "signal_context.units must name the modality and nonblank units"
+            )
+        json.dumps(signal_context, allow_nan=False)
+        record["signalContext"] = copy.deepcopy(signal_context)
     record["registrationDigest"] = compute_baseline_registration_digest(record)
     return record
 
 
-def _build_approved_baseline_version(entry: dict, *, approved_by: str, reason: str) -> dict:
+def _build_approved_baseline_version(
+    entry: dict, *, approved_by: str, reason: str
+) -> dict:
     """[리뷰 P1] `approved_by`도 `reason`과 마찬가지로 필수로 검증한다."""
     if entry.get("status") != "draft":
         raise ValueError(
@@ -596,7 +643,10 @@ def _build_approved_baseline_version(entry: dict, *, approved_by: str, reason: s
         raise ValueError("reason은 필수입니다.")
 
     stored_digest = entry.get("registrationDigest")
-    if stored_digest is None or compute_baseline_registration_digest(entry) != stored_digest:
+    if (
+        stored_digest is None
+        or compute_baseline_registration_digest(entry) != stored_digest
+    ):
         raise ValueError(
             "등록 레코드의 registrationDigest가 내용과 일치하지 않습니다 — 저장소 "
             "내부 상태가 손상된 것으로 보입니다."
@@ -622,7 +672,10 @@ def _build_active_baseline_version(entry: dict) -> dict:
             f"(현재 status={entry.get('status')!r})."
         )
     approval_digest = entry.get("approvalDigest")
-    if approval_digest is None or compute_baseline_approval_digest(entry) != approval_digest:
+    if (
+        approval_digest is None
+        or compute_baseline_approval_digest(entry) != approval_digest
+    ):
         raise ValueError(
             "승인 레코드의 approvalDigest가 내용과 일치하지 않습니다 — 저장소 내부 "
             "상태가 손상된 것으로 보입니다."
@@ -655,10 +708,13 @@ class BaselineVersionRegistry:
         asset_id: str,
         features: dict,
         time_segment: str = None,
+        signal_context: dict = None,
     ) -> dict:
         """새 기준선을 이 저장소에 status="draft"로 기록한다 (FUT-011)."""
         if not isinstance(baseline_id, str) or not baseline_id.strip():
-            raise ValueError(f"baseline_id는 비어있지 않은 문자열이어야 합니다: {baseline_id!r}")
+            raise ValueError(
+                f"baseline_id는 비어있지 않은 문자열이어야 합니다: {baseline_id!r}"
+            )
         if baseline_id in self.__entries:
             raise ValueError(
                 f"기준선 {baseline_id!r}은 이미 이 저장소에 등록되어 있습니다 — 새 "
@@ -671,6 +727,7 @@ class BaselineVersionRegistry:
             asset_id=asset_id,
             features=features,
             time_segment=time_segment,
+            signal_context=signal_context,
         )
         self.__entries[baseline_id] = record
         return copy.deepcopy(record)
@@ -683,7 +740,9 @@ class BaselineVersionRegistry:
                 f"기준선 {baseline_id!r}이 이 저장소에 등록되어 있지 않습니다 — "
                 "register()를 먼저 호출하세요."
             )
-        approved = _build_approved_baseline_version(entry, approved_by=approved_by, reason=reason)
+        approved = _build_approved_baseline_version(
+            entry, approved_by=approved_by, reason=reason
+        )
         self.__entries[baseline_id] = approved
         return copy.deepcopy(approved)
 
@@ -691,7 +750,9 @@ class BaselineVersionRegistry:
         """이 저장소에서 승인된(approved) 기준선만 배포(active)한다."""
         entry = self.__entries.get(baseline_id)
         if entry is None:
-            raise ValueError(f"기준선 {baseline_id!r}이 이 저장소에 등록되어 있지 않습니다.")
+            raise ValueError(
+                f"기준선 {baseline_id!r}이 이 저장소에 등록되어 있지 않습니다."
+            )
         active = _build_active_baseline_version(entry)
         self.__entries[baseline_id] = active
         return copy.deepcopy(active)

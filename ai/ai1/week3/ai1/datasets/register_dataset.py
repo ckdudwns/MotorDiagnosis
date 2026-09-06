@@ -211,13 +211,17 @@ def validate_split_ratios(ratios: dict) -> None:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"split_ratios[{key!r}]는 숫자여야 합니다: {value!r}")
         if not math.isfinite(value):
-            raise ValueError(f"split_ratios[{key!r}]는 유한한 값이어야 합니다: {value!r}")
+            raise ValueError(
+                f"split_ratios[{key!r}]는 유한한 값이어야 합니다: {value!r}"
+            )
         if not (0 <= value <= 1):
             raise ValueError(f"split_ratios[{key!r}]는 0~1 범위여야 합니다: {value!r}")
 
     total = sum(ratios[key] for key in _REQUIRED_SPLIT_KEYS)
     if not math.isclose(total, 1.0, rel_tol=0, abs_tol=1e-6):
-        raise ValueError(f"split_ratios 합계는 1.0이어야 합니다 (현재 {total}): {ratios!r}")
+        raise ValueError(
+            f"split_ratios 합계는 1.0이어야 합니다 (현재 {total}): {ratios!r}"
+        )
 
 
 def _validate_finite_features(features: dict, sample_id: str) -> None:
@@ -342,9 +346,7 @@ def group_split(
         if pair_index == len(coverage_pairs):
             return True
         label, name = coverage_pairs[pair_index]
-        if any(
-            coverage_assignment.get(gid) == name for gid in label_group_ids[label]
-        ):
+        if any(coverage_assignment.get(gid) == name for gid in label_group_ids[label]):
             return _backtrack(pair_index + 1, coverage_assignment)
         for gid in _candidate_order(label):
             if gid in coverage_assignment:
@@ -377,6 +379,7 @@ def group_split(
     remaining.sort(key=lambda gid: -len(groups[gid]))
 
     for group_id in remaining:
+
         def deficit(split_name: str, group_id: str = group_id) -> float:
             return sum(
                 targets[label][split_name] - assigned_counts[label][split_name]
@@ -411,9 +414,7 @@ def operating_condition_split(records: list, ratios: dict = None) -> list:
     `ratios`는 시그니처 호환을 위해 받지만 무시한다(부하 tier가 배정을 결정).
     """
     del ratios  # 부하 tier 배정이 우선. 시그니처 호환용으로만 받는다.
-    missing = [
-        rec.get("sample_id") for rec in records if rec.get("load_hp") is None
-    ]
+    missing = [rec.get("sample_id") for rec in records if rec.get("load_hp") is None]
     if missing:
         raise ValueError(
             "operating_condition_split에는 레코드마다 load_hp(0~3)가 필요합니다. "
@@ -430,16 +431,12 @@ def operating_condition_split(records: list, ratios: dict = None) -> list:
 def compute_feature_output_fingerprint(rows: list) -> str:
     """실제로 계산된 특징값 산출물 자체의 canonical hash.
 
-    week2 `extract_all_features()`의 MFCC는 librosa가 없으면 조용히 0벡터로
-    대체된다(`compute_mfcc()` fallback). 이 차이는 소스 코드/설정 어디에도
-    드러나지 않으므로, feature_pipeline_version이나 FeatureConfig만으로는
-    같은 원본에서 실제 MFCC 값과 0벡터가 나온 두 실행을 구분할 수 없다.
-    그래서 메타데이터가 아니라 **최종 산출된 특징값 자체**를 해시해, 실행
-    환경 차이로 산출물이 달라지면 반드시 체크섬도 달라지게 한다.
+    과거 MFCC 0벡터 대체 문제를 막기 위해 도입했다. 현재는 의존성이 없으면
+    명시적으로 실패하지만, 라이브러리 버전 등 실행 환경에 따른 수치 차이는
+    남을 수 있다. 메타데이터뿐 아니라 **최종 산출된 특징값 자체**를 해시해
+    산출물이 달라지면 반드시 체크섬도 달라지게 한다.
     """
-    payload = [
-        {name: row[name] for name in sorted(row)} for row in rows
-    ]
+    payload = [{name: row[name] for name in sorted(row)} for row in rows]
     encoded = json.dumps(
         payload, sort_keys=True, ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
@@ -550,6 +547,8 @@ def dataset_export_label_fields(
     }
     if known_label is None:
         return fields
+    if row.get("modality") == "acoustic":
+        fields["known_acoustic_label"] = known_label
     if known_label in label_mapping:
         fields["target_label"] = label_mapping[known_label]
         fields["target_label_taxonomy_version"] = taxonomy_version
@@ -634,7 +633,9 @@ def build_manifest(
 
     records = load_cwru_dataset(data_dir, window_size=window_size, hop_size=hop_size)
     if not records:
-        raise FileNotFoundError(f"{data_dir}에서 CWRU 레코드를 하나도 로드하지 못했습니다.")
+        raise FileNotFoundError(
+            f"{data_dir}에서 CWRU 레코드를 하나도 로드하지 못했습니다."
+        )
 
     source = build_source_block(data_dir)
     config = FeatureConfig(sample_rate=records[0]["sample_rate"])
@@ -806,7 +807,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output",
         default=os.path.normpath(
-            os.path.join(_THIS_DIR, "..", "data", "handoff", "dataset_manifest_full.json")
+            os.path.join(
+                _THIS_DIR, "..", "data", "handoff", "dataset_manifest_full.json"
+            )
         ),
     )
     args = parser.parse_args()
@@ -833,6 +836,8 @@ if __name__ == "__main__":
         json.dump(manifest, f, ensure_ascii=False, indent=2, allow_nan=False)
 
     print(f"데이터셋 {manifest['id']} 매니페스트 생성 완료: {manifest['rowCount']}행")
-    print(f"  분할 전략: {args.split_strategy} (independentHoldout={manifest['independentHoldout']})")
+    print(
+        f"  분할 전략: {args.split_strategy} (independentHoldout={manifest['independentHoldout']})"
+    )
     print(f"  분할 건수: {manifest['splitCounts']}")
     print(f"  저장 위치: {args.output}")

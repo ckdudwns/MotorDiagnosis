@@ -25,7 +25,9 @@ import numpy as np
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATASETS_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", "datasets"))
 _CWRU_DATA_DIR = os.path.normpath(
-    os.path.join(_THIS_DIR, "..", "..", "..", "week1", "ai1", "data", "external", "cwru")
+    os.path.join(
+        _THIS_DIR, "..", "..", "..", "week1", "ai1", "data", "external", "cwru"
+    )
 )
 
 sys.path.insert(0, _DATASETS_DIR)
@@ -101,22 +103,22 @@ class TestGroupSplitSynthetic(unittest.TestCase):
                 memberships, 1, f"그룹 {group!r}이 두 개 이상의 split에 걸쳐 있습니다."
             )
 
-    def test_every_required_split_gets_at_least_one_group_when_enough_groups_exist(self):
-        records = _grouped_records(
-            "NORMAL", {"a.mat": 20, "b.mat": 15, "c.mat": 10}
-        )
+    def test_every_required_split_gets_at_least_one_group_when_enough_groups_exist(
+        self,
+    ):
+        records = _grouped_records("NORMAL", {"a.mat": 20, "b.mat": 15, "c.mat": 10})
         splits = group_split(records, seed=1)
         by_split = self._groups_used_per_split(records, splits)
         for split_name in ("train", "validation", "test"):
             self.assertGreater(
-                len(by_split[split_name]), 0, f"{split_name} split에 그룹이 배정되지 않았습니다."
+                len(by_split[split_name]),
+                0,
+                f"{split_name} split에 그룹이 배정되지 않았습니다.",
             )
 
     def test_split_is_deterministic_given_seed(self):
         records = _grouped_records("NORMAL", {"a.mat": 10, "b.mat": 6, "c.mat": 4})
-        self.assertEqual(
-            group_split(records, seed=7), group_split(records, seed=7)
-        )
+        self.assertEqual(group_split(records, seed=7), group_split(records, seed=7))
 
     def test_insufficient_groups_raises_instead_of_shuffling_windows(self):
         """CWRU처럼 라벨당 그룹(자산)이 1개뿐이면, 윈도우를 섞는 대신
@@ -289,25 +291,33 @@ class TestComputeVersionChecksum(unittest.TestCase):
         """같은 sha256이라도 파일에 배정된 source label(known_label)이 바뀌면
         정규화 산출물(known_label/common_label)이 달라지므로 체크섬도 달라져야
         한다 — 이전에는 payload에서 label이 빠져 sha256만 같으면 동일했다."""
-        relabeled_files = {"97.mat": {"sha256": "sha256:aaa", "label": "BEARING_FAULT_INNER"}}
+        relabeled_files = {
+            "97.mat": {"sha256": "sha256:aaa", "label": "BEARING_FAULT_INNER"}
+        }
         changed = self._checksum(source_files=relabeled_files)
         self.assertNotEqual(self._checksum(), changed)
 
     def test_changes_when_feature_config_changes(self):
         """frame_length/hop_length/n_mfcc/band_edges 중 하나라도 바뀌면 특징값
         산출물이 달라지므로 체크섬도 달라져야 한다."""
-        changed = self._checksum(feature_config=FeatureConfig(sample_rate=12000, n_mfcc=20))
+        changed = self._checksum(
+            feature_config=FeatureConfig(sample_rate=12000, n_mfcc=20)
+        )
         self.assertNotEqual(self._checksum(), changed)
 
     def test_changes_when_feature_pipeline_version_changes(self):
-        changed = self._checksum(feature_pipeline_version="week2.extract_all_features.v2")
+        changed = self._checksum(
+            feature_pipeline_version="week2.extract_all_features.v2"
+        )
         self.assertNotEqual(self._checksum(), changed)
 
     def test_changes_when_feature_output_fingerprint_changes(self):
         """librosa 유무처럼 소스 코드/설정 어디에도 드러나지 않는 실행 환경
         차이(MFCC 0벡터 폴백 등)로 실제 산출된 특징값이 달라지면, 다른 입력이
         전부 같아도 fingerprint를 통해 체크섬이 달라져야 한다."""
-        changed = self._checksum(feature_output_fingerprint="sha256:different-fingerprint")
+        changed = self._checksum(
+            feature_output_fingerprint="sha256:different-fingerprint"
+        )
         self.assertNotEqual(self._checksum(), changed)
 
     def test_changes_when_label_policy_version_changes(self):
@@ -353,21 +363,15 @@ class TestComputeFeatureOutputFingerprint(unittest.TestCase):
         )
 
 
-class TestMfccFallbackWarningIsEncodingSafe(unittest.TestCase):
-    """안내된 설치 방법(루트 requirements.txt + week3 requirements.txt)만으로는
-    librosa가 설치되지 않는다. 이 상태로 register_dataset.py를 실행하면
-    extract_all_features() -> compute_mfcc()의 librosa 미설치 폴백 경고가
-    출력되는데, 이 메시지의 em dash(—)는 Windows 기본 콘솔 코드페이지인
-    cp949로 표현할 수 없어 print()가 UnicodeEncodeError를 내며 rows 생성과
-    fingerprint 계산 전에 실행이 통째로 중단됐다. cp949로 강제 인코딩되는
-    스트림에 실제로 출력해 이 크래시가 재발하지 않는지 확인한다."""
+class TestMissingMfccDependency(unittest.TestCase):
+    """Missing MFCC dependencies cannot silently become valid zero features."""
 
-    def test_fallback_warning_does_not_crash_on_cp949_console(self):
+    def test_missing_dependency_fails_without_emitting_fake_features(self):
         cp949_stream = codecs.getwriter("cp949")(io.BytesIO())
         with mock.patch.object(_extract_features_module, "_HAS_LIBROSA", False):
             with contextlib.redirect_stdout(cp949_stream):
-                mfcc = compute_mfcc(np.zeros(4096), FeatureConfig())
-        self.assertTrue(np.all(mfcc == 0.0))
+                with self.assertRaises(ImportError):
+                    compute_mfcc(np.zeros(4096), FeatureConfig())
 
 
 class TestWeek2ExtractFeaturesModuleIsolation(unittest.TestCase):
@@ -471,7 +475,9 @@ class TestValidateSplitRatios(unittest.TestCase):
 
     def test_nan_ratio_rejected(self):
         with self.assertRaises(ValueError):
-            validate_split_ratios({"train": float("nan"), "validation": 0.2, "test": 0.1})
+            validate_split_ratios(
+                {"train": float("nan"), "validation": 0.2, "test": 0.1}
+            )
 
     def test_group_split_rejects_invalid_ratios_before_max_call(self):
         """전부 0인 비율은 InsufficientAssetGroupsError(그룹 부족)가 아니라,
@@ -610,7 +616,9 @@ class TestOperatingConditionSplit(unittest.TestCase):
         self.assertEqual(a, b)
         # 0HP->test, 1HP->validation, 2·3HP->train
         for rec, split in zip(recs, a):
-            expected = {0: "test", 1: "validation", 2: "train", 3: "train"}[rec["load_hp"]]
+            expected = {0: "test", 1: "validation", 2: "train", 3: "train"}[
+                rec["load_hp"]
+            ]
             self.assertEqual(split, expected)
 
     def test_same_specimen_spans_multiple_splits(self):
@@ -662,20 +670,29 @@ class TestOperatingConditionHoldoutSeedIndependenceSynthetic(unittest.TestCase):
             "type": "external",
             "uri": "https://example.invalid/cwru",
             "license": "synthetic-test",
-            "files": {"synthetic.mat": {"sha256": "sha256:" + "a" * 64, "label": "NORMAL"}},
+            "files": {
+                "synthetic.mat": {"sha256": "sha256:" + "a" * 64, "label": "NORMAL"}
+            },
         }
 
     def test_operating_condition_holdout_checksum_id_unaffected_by_unused_seed(self):
-        with mock.patch(
-            "register_dataset.load_cwru_dataset", return_value=self._synthetic_records()
-        ), mock.patch(
-            "register_dataset.build_source_block", return_value=self._synthetic_source()
+        with (
+            mock.patch(
+                "register_dataset.load_cwru_dataset",
+                return_value=self._synthetic_records(),
+            ),
+            mock.patch(
+                "register_dataset.build_source_block",
+                return_value=self._synthetic_source(),
+            ),
         ):
             m1 = build_manifest(
                 data_dir="unused", split_strategy="operating_condition_holdout", seed=1
             )
             m2 = build_manifest(
-                data_dir="unused", split_strategy="operating_condition_holdout", seed=999
+                data_dir="unused",
+                split_strategy="operating_condition_holdout",
+                seed=999,
             )
         self.assertEqual(m1["split"], m2["split"])
         self.assertEqual(m1["source"]["checksum"], m2["source"]["checksum"])
@@ -692,7 +709,8 @@ class TestDatasetExportLabelFields(unittest.TestCase):
     def test_mapped_known_label_is_verified_and_trainable(self):
         info = dataset_export_label_fields(
             {"known_label": "BEARING_FAULT_INNER", "common_label": "ANOMALY"},
-            DATASET_LABEL_MAPPING, self._TAX,
+            DATASET_LABEL_MAPPING,
+            self._TAX,
         )
         self.assertEqual(info["label_status"], "verified")
         self.assertTrue(info["training_eligible"])
@@ -922,12 +940,18 @@ class TestExportDatasetSynthetic(unittest.TestCase):
                     export_dataset(manifest_v2, tmp_dir)
 
             with open(result_v1["csv_path"], "rb") as f:
-                self.assertEqual(f.read(), csv_before, "실패한 내보내기가 CSV를 건드렸습니다")
+                self.assertEqual(
+                    f.read(), csv_before, "실패한 내보내기가 CSV를 건드렸습니다"
+                )
             with open(result_v1["xlsx_path"], "rb") as f:
-                self.assertEqual(f.read(), xlsx_before, "실패한 내보내기가 XLSX를 건드렸습니다")
+                self.assertEqual(
+                    f.read(), xlsx_before, "실패한 내보내기가 XLSX를 건드렸습니다"
+                )
             with open(result_v1["manifest_path"], "rb") as f:
                 self.assertEqual(
-                    f.read(), manifest_before, "실패한 내보내기가 manifest를 건드렸습니다"
+                    f.read(),
+                    manifest_before,
+                    "실패한 내보내기가 manifest를 건드렸습니다",
                 )
             with open(current_before, encoding="utf-8") as f:
                 self.assertEqual(
@@ -962,7 +986,9 @@ class TestExportDatasetSynthetic(unittest.TestCase):
         try:
             result = export_dataset(manifest, tmp_dir)
             self.assertEqual(result["version_id"], manifest["id"])
-            self.assertEqual(result["version_dir"], resolve_current_version_dir(tmp_dir))
+            self.assertEqual(
+                result["version_dir"], resolve_current_version_dir(tmp_dir)
+            )
             self.assertTrue(result["csv_path"].startswith(result["version_dir"]))
             self.assertTrue(os.path.exists(os.path.join(tmp_dir, "CURRENT")))
         finally:
@@ -995,7 +1021,9 @@ class TestExportDatasetSynthetic(unittest.TestCase):
 
         manifest_a = self._synthetic_manifest()
         manifest_b = self._synthetic_manifest()
-        manifest_b["createdAt"] = "2026-09-04T00:00:00+00:00"  # 내용은 동일, 생성 시각만 다름
+        manifest_b["createdAt"] = (
+            "2026-09-04T00:00:00+00:00"  # 내용은 동일, 생성 시각만 다름
+        )
         self.assertEqual(manifest_a["id"], manifest_b["id"])
 
         tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_createdat_")
@@ -1024,7 +1052,9 @@ class TestExportDatasetSynthetic(unittest.TestCase):
         manifest_a = self._synthetic_manifest()
         manifest_b = self._synthetic_manifest()
         # 같은 키-값 쌍을 반대 순서로 삽입한 dict — 내용은 동일하다.
-        manifest_b["labelMapping"] = dict(reversed(list(manifest_a["labelMapping"].items())))
+        manifest_b["labelMapping"] = dict(
+            reversed(list(manifest_a["labelMapping"].items()))
+        )
         self.assertEqual(manifest_a["labelMapping"], manifest_b["labelMapping"])
         self.assertNotEqual(
             list(manifest_a["labelMapping"].items()),
@@ -1157,7 +1187,9 @@ class TestExportDatasetSynthetic(unittest.TestCase):
 
             # 거부됐으므로 변조된 셀 값이 그대로 남아 있어야 한다(추가 손상 없음).
             wb_after = load_workbook(result_1["xlsx_path"])
-            values = {row[0].value: row[1].value for row in wb_after["manifest"].iter_rows()}
+            values = {
+                row[0].value: row[1].value for row in wb_after["manifest"].iter_rows()
+            }
             self.assertEqual(values["source.license"], "TAMPERED-LICENSE")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1171,7 +1203,9 @@ class TestExportDatasetSynthetic(unittest.TestCase):
         from export_dataset import VersionContentConflictError
 
         manifest = self._synthetic_manifest()
-        tmp_dir = tempfile.mkdtemp(prefix="ai1_week3_dataset_export_xlsx_header_tamper_")
+        tmp_dir = tempfile.mkdtemp(
+            prefix="ai1_week3_dataset_export_xlsx_header_tamper_"
+        )
         try:
             result_1 = export_dataset(manifest, tmp_dir)
 
@@ -1339,9 +1373,13 @@ class TestVersionIdPathTraversal(unittest.TestCase):
     def _manifest_with_id(self, version_id: str) -> dict:
         rows = [
             {
-                "sample_id": "97_0000", "source_file": "97.mat",
-                "known_label": "NORMAL", "common_label": "NORMAL",
-                "split": "train", "sample_rate_hz": 12000, "rpm": 1797,
+                "sample_id": "97_0000",
+                "source_file": "97.mat",
+                "known_label": "NORMAL",
+                "common_label": "NORMAL",
+                "split": "train",
+                "sample_rate_hz": 12000,
+                "rpm": 1797,
                 "rms_mean": 0.05,
             }
         ]
@@ -1349,12 +1387,15 @@ class TestVersionIdPathTraversal(unittest.TestCase):
             "id": version_id,
             "name": "cwru-bearing-vibration-v1",
             "source": {
-                "type": "external", "uri": "https://example.invalid/cwru",
-                "license": "test", "checksum": "sha256:deadbeef",
+                "type": "external",
+                "uri": "https://example.invalid/cwru",
+                "license": "test",
+                "checksum": "sha256:deadbeef",
                 "files": {"97.mat": {"sha256": "sha256:aaa", "label": "NORMAL"}},
             },
             "compatibility": {
-                "signalType": ["vibration"], "samplingRateHz": 12000,
+                "signalType": ["vibration"],
+                "samplingRateHz": 12000,
                 "units": {"vibration": "g"},
                 "operatingConditions": {"rpmRange": [1797, 1797], "load": "test"},
             },
@@ -1381,7 +1422,9 @@ class TestVersionIdPathTraversal(unittest.TestCase):
                 export_dataset(manifest, tmp_dir)
             # versions_dir 밖(tmp_dir의 부모 등)에 디렉터리가 실제로 생기지
             # 않았는지 확인한다.
-            escaped_dir = os.path.normpath(os.path.join(tmp_dir, "..", "escaped-version"))
+            escaped_dir = os.path.normpath(
+                os.path.join(tmp_dir, "..", "escaped-version")
+            )
             self.assertFalse(os.path.exists(escaped_dir))
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1447,7 +1490,9 @@ class TestSpecimenGroupingForCwru(unittest.TestCase):
 
     def test_specimen_group_3way_fails_because_normal_has_one_specimen(self):
         with self.assertRaises(InsufficientAssetGroupsError):
-            build_manifest(data_dir=_CWRU_DATA_DIR, seed=42)  # 기본 specimen_group 3-way
+            build_manifest(
+                data_dir=_CWRU_DATA_DIR, seed=42
+            )  # 기본 specimen_group 3-way
 
     def test_fault_only_records_do_support_specimen_independent_3way(self):
         # NORMAL을 뺀 결함 3클래스는 각 specimen 3개(0.007/0.014/0.021")라 진짜
@@ -1455,9 +1500,7 @@ class TestSpecimenGroupingForCwru(unittest.TestCase):
         # (register_dataset import 시 load_cwru_vibration 경로가 sys.path에 추가됨)
         from load_cwru_vibration import load_cwru_dataset as _load
 
-        records = [
-            r for r in _load(_CWRU_DATA_DIR) if r["label"] != "NORMAL"
-        ]
+        records = [r for r in _load(_CWRU_DATA_DIR) if r["label"] != "NORMAL"]
         splits = group_split(records, seed=42, group_key="specimen_id")
         by_specimen = {}
         for rec, split in zip(records, splits):
@@ -1554,7 +1597,9 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
             seed=999,
             split_strategy="operating_condition_holdout",
         )
-        self.assertEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])
+        self.assertEqual(
+            self.manifest["source"]["checksum"], other["source"]["checksum"]
+        )
         self.assertEqual(self.manifest["id"], other["id"])
 
     def test_id_and_source_checksum_change_with_real_config_change(self):
@@ -1568,9 +1613,14 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
             split_strategy="operating_condition_holdout",
         )
         self.assertIn("checksum", self.manifest["source"])
-        self.assertNotEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])
+        self.assertNotEqual(
+            self.manifest["source"]["checksum"], other["source"]["checksum"]
+        )
         self.assertNotEqual(self.manifest["id"], other["id"])
-        self.assertIn(self.manifest["source"]["checksum"].split(":", 1)[1][:12], self.manifest["id"])
+        self.assertIn(
+            self.manifest["source"]["checksum"].split(":", 1)[1][:12],
+            self.manifest["id"],
+        )
 
     def test_id_and_checksum_ignore_requested_split_ratios(self):
         """[리뷰 P1] operating_condition_split은 요청 split_ratios를 완전히
@@ -1583,7 +1633,9 @@ class TestRegisterAndExportRealCwruData(unittest.TestCase):
             seed=42,
             split_strategy="operating_condition_holdout",
         )
-        self.assertEqual(self.manifest["source"]["checksum"], other["source"]["checksum"])
+        self.assertEqual(
+            self.manifest["source"]["checksum"], other["source"]["checksum"]
+        )
         self.assertEqual(self.manifest["id"], other["id"])
         self.assertEqual(self.manifest["split"], other["split"])
 

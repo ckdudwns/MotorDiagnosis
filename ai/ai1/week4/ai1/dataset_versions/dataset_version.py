@@ -83,7 +83,9 @@ def compute_snapshot_digest(manifest: dict) -> str:
 # recomputed(draft)에는 없는 파생 필드(snapshotChecksum — source.checksum과 같은
 # 값의 사본)와, 같은 날 두 번 빌드해도 date 컴포넌트 경계에서 달라질 수 있는 id를
 # 뺀다(id 재현성은 freeze 시점에 이미 checksum suffix로 검증됨).
-_REPRODUCIBILITY_IGNORED_KEYS = _VOLATILE_MANIFEST_KEYS | frozenset({"snapshotChecksum", "id"})
+_REPRODUCIBILITY_IGNORED_KEYS = _VOLATILE_MANIFEST_KEYS | frozenset(
+    {"snapshotChecksum", "id"}
+)
 
 # id의 마지막 "-" 뒤 세그먼트(예: "DS-CWRU-VIBRATION-20260824-abcdef123456"의
 # "abcdef123456")는 source.checksum sha256 hexdigest의 앞 12자다. id 앞부분(이름·
@@ -121,7 +123,9 @@ def _canonical_comparable_snapshot(manifest: dict) -> str:
     `False`를 `true`/`false`로, `12000.0`을 `"12000.0"`으로 직렬화해 타입을 구분한다)로
     비교해 이 문제를 없앤다.
     """
-    filtered = {k: v for k, v in manifest.items() if k not in _REPRODUCIBILITY_IGNORED_KEYS}
+    filtered = {
+        k: v for k, v in manifest.items() if k not in _REPRODUCIBILITY_IGNORED_KEYS
+    }
     return json.dumps(filtered, sort_keys=True, ensure_ascii=False, allow_nan=False)
 
 
@@ -170,6 +174,25 @@ def compute_source_checksum(manifest: dict) -> str:
         "snapshot_schema_version": manifest.get("snapshotSchemaVersion"),
         "split_strategy": checksum_inputs.get("splitStrategyKey"),
     }
+    # New signal manifests bind physical context and label criteria to identity;
+    # existing CWRU versions keep their original canonical checksum contract.
+    if "manifestContextVersion" in checksum_inputs:
+        if (
+            type(checksum_inputs["manifestContextVersion"]) is not int
+            or checksum_inputs["manifestContextVersion"] != 1
+        ):
+            raise ValueError("Unsupported manifestContextVersion")
+        payload["manifest_context"] = {
+            "version": 1,
+            "compatibility": manifest.get("compatibility"),
+            "featureNames": manifest.get("featureNames"),
+            "labelCriteria": manifest.get("labelCriteria"),
+            "source": {
+                key: value
+                for key, value in manifest.get("source", {}).items()
+                if key not in {"files", "checksum"}
+            },
+        }
     encoded = json.dumps(
         payload, sort_keys=True, ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
@@ -317,7 +340,11 @@ def freeze_dataset_version(manifest: dict) -> dict:
 
 
 def _build_approved_dataset_version(
-    frozen_manifest: dict, *, approved_by: str, reason: str, trusted_legacy: bool = False
+    frozen_manifest: dict,
+    *,
+    approved_by: str,
+    reason: str,
+    trusted_legacy: bool = False,
 ) -> dict:
     """status가 frozen인 데이터셋 버전만 승인할 수 있다 (`DatasetVersionRegistry.approve()`의
     내부 로직).
@@ -439,7 +466,9 @@ class DatasetVersionRegistry:
         verify_frozen_integrity(frozen_manifest, trusted_legacy=True)
         dataset_id = frozen_manifest.get("id")
         if not isinstance(dataset_id, str) or not dataset_id.strip():
-            raise ValueError(f"frozen_manifest의 id가 비어있지 않은 문자열이어야 합니다: {dataset_id!r}")
+            raise ValueError(
+                f"frozen_manifest의 id가 비어있지 않은 문자열이어야 합니다: {dataset_id!r}"
+            )
         if dataset_id in self.__entries:
             raise ValueError(
                 f"데이터셋 {dataset_id!r}은 이미 이 저장소에 등록되어 있습니다."
@@ -448,7 +477,12 @@ class DatasetVersionRegistry:
         return copy.deepcopy(self.__entries[dataset_id])
 
     def approve(
-        self, dataset_id: str, *, approved_by: str, reason: str, trusted_legacy: bool = False
+        self,
+        dataset_id: str,
+        *,
+        approved_by: str,
+        reason: str,
+        trusted_legacy: bool = False,
     ) -> dict:
         """이 저장소에 동결된(frozen) 데이터셋만 승인한다.
 
@@ -475,7 +509,9 @@ class DatasetVersionRegistry:
         return copy.deepcopy(entry) if entry is not None else None
 
 
-def verify_frozen_integrity(frozen_manifest: dict, *, trusted_legacy: bool = False) -> None:
+def verify_frozen_integrity(
+    frozen_manifest: dict, *, trusted_legacy: bool = False
+) -> None:
     """동결본이 동결 시점 이후 변조되지 않았는지 검증한다. 불일치면 ValueError.
 
     학습·배포처럼 동결본을 입력으로 쓰는 쪽이 status=="frozen"만 확인하지 말고 이걸
@@ -495,7 +531,9 @@ def verify_frozen_integrity(frozen_manifest: dict, *, trusted_legacy: bool = Fal
     if trusted_legacy is True:
         stored_checksum = frozen_manifest.get("datasetChecksum")
         if stored_checksum is None:
-            raise ValueError("동결본에 무결성 검증값(snapshotDigest/datasetChecksum)이 없습니다.")
+            raise ValueError(
+                "동결본에 무결성 검증값(snapshotDigest/datasetChecksum)이 없습니다."
+            )
         current = compute_dataset_checksum(frozen_manifest)
         if current != stored_checksum:
             raise ValueError(
@@ -561,7 +599,9 @@ def verify_reproducibility(
     _require_bool_trusted_legacy(trusted_legacy)
     verify_frozen_integrity(frozen_manifest, trusted_legacy=trusted_legacy)
 
-    if frozen_manifest["datasetChecksum"] != compute_dataset_checksum(recomputed_manifest):
+    if frozen_manifest["datasetChecksum"] != compute_dataset_checksum(
+        recomputed_manifest
+    ):
         return False
     if trusted_legacy is True:
         return True
@@ -601,9 +641,9 @@ def verify_reproducibility(
     if frozen_id_suffix != expected_suffix or recomputed_id_suffix != expected_suffix:
         return False
 
-    if _canonical_comparable_snapshot(frozen_manifest) != _canonical_comparable_snapshot(
-        recomputed_manifest
-    ):
+    if _canonical_comparable_snapshot(
+        frozen_manifest
+    ) != _canonical_comparable_snapshot(recomputed_manifest):
         return False
     return True
 

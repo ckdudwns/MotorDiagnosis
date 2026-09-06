@@ -57,10 +57,10 @@ spectral_centroid/bandwidth/rolloff, band_energy 5구간, mfcc 13개)의 기준�
   프레임이 1개면 std가 항상 0).
 - `mfcc_1~13`은 librosa로 정상 계산된 실제 값이다 (예: `mfcc_1` mean=-151.41,
   std=3.87 / `mfcc_2` mean=124.63, std=4.00 — 전체 값은 `dataset/baseline.json`
-  참고). **librosa가 설치되지 않은 환경에서 `compute_baseline.py`를 실행하면
-  MFCC가 0벡터로 대체되므로**(`extract_features.py`의 `compute_mfcc()` fallback),
-  `feature_extraction/requirements.txt`의 librosa가 실제로 설치돼 있는지 먼저
-  확인한 뒤 재실행해야 한다.
+  참고). **현재는 librosa가 없으면 명시적으로 ImportError가 발생하며 0벡터로
+  대체하지 않는다.** `feature_extraction/requirements.txt`를 설치한 뒤 실행한다.
+  MFCC를 제외하려면 `FeatureConfig(n_mfcc=0)`을 명시해야 하며 해당 열 자체가 사라진다.
+  음향 등록 CLI는 `--without-mfcc`로 별도의 특징 스키마·데이터셋 ID를 생성한다.
 
 ## 3. 특징값 품질 검증 (`validate_features.py`)
 

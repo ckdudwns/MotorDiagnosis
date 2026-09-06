@@ -21,7 +21,9 @@ import numpy as np
 import torch
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_DATASET_VERSIONS_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", "dataset_versions"))
+_DATASET_VERSIONS_DIR = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "dataset_versions")
+)
 # __main__ 배선에서 register_dataset.build_manifest / dataset_version.freeze를
 # 쓸 때만 필요하다. 학습 파이프라인 자체(run_training_job)는 동결 매니페스트
 # dict만 받아 원본 CWRU를 다시 읽지 않는다.
@@ -49,6 +51,7 @@ def _sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
             digest.update(chunk)
     return f"sha256:{digest.hexdigest()}"
 
+
 SEQ_LEN = 5
 
 # 3주차 매니페스트 row에서 특징이 아닌 컬럼.
@@ -62,6 +65,12 @@ _NON_FEATURE_ROW_KEYS = frozenset(
         "split",
         "sample_rate_hz",
         "rpm",
+        "modality",
+        "signal_unit",
+        "source_ref",
+        "window_index",
+        "window_start_sample",
+        "window_end_sample",
     }
 )
 
@@ -77,11 +86,14 @@ _NON_FEATURE_ROW_KEYS = frozenset(
 # 모델 입력만 26개로 좁힌다.
 _OPERATING_POINT_FEATURES = frozenset({"vibration_peak_hz"})
 
+
 def _independence_note(independent_holdout: bool) -> str:
     return "specimen 독립" if independent_holdout else "specimen 독립 아님"
 
 
-def _dense_split_strategy_description(frozen_manifest: dict, independent_holdout: bool) -> str:
+def _dense_split_strategy_description(
+    frozen_manifest: dict, independent_holdout: bool
+) -> str:
     """[리뷰 P2] 예전에는 이 설명이 `operating_condition_holdout — 부하조건 기준,
     specimen 독립 아님`으로 고정돼 있었다 — specimen-independent 매니페스트
     (`splitStrategy="specimen_group: ..."`, `independentHoldout=True`)로 학습해도
@@ -92,13 +104,15 @@ def _dense_split_strategy_description(frozen_manifest: dict, independent_holdout
     declared = frozen_manifest.get("splitStrategy") or "(미상)"
     return (
         f"동결 매니페스트의 split 배정({declared} — {_independence_note(independent_holdout)})을 "
-        "그대로 재사용하고, inline 특징 컬럼(27개 중 운전 조건 결합 특징을 뺀 26개)을 직접 "
+        "그대로 재사용하고, manifest에 동결된 inline 특징 컬럼을 직접 "
         "입력으로 사용 (재윈도우/재계산 없음 — 학습 입력이 datasetId가 가리키는 데이터와 "
         "정확히 일치)"
     )
 
 
-def _lstm_split_strategy_description(frozen_manifest: dict, independent_holdout: bool) -> str:
+def _lstm_split_strategy_description(
+    frozen_manifest: dict, independent_holdout: bool
+) -> str:
     """[리뷰 P2] dense와 같은 이유로 실제 splitStrategy/독립성을 반영해 동적으로
     생성한다(예전 고정 문구도 operating_condition_holdout·비독립을 가정했다)."""
     declared = frozen_manifest.get("splitStrategy") or "(미상)"
@@ -131,7 +145,20 @@ def feature_names_from_manifest(frozen_manifest: dict) -> list:
     rows = frozen_manifest.get("rows") or []
     if not rows:
         raise ValueError("frozen_manifest에 rows가 없습니다.")
-    all_names = [k for k in rows[0] if k not in _NON_FEATURE_ROW_KEYS]
+    all_names = frozen_manifest.get("featureNames")
+    if all_names is None:
+        all_names = [k for k in rows[0] if k not in _NON_FEATURE_ROW_KEYS]
+    if (
+        not isinstance(all_names, list)
+        or any(
+            not isinstance(name, str) or not name or name in _NON_FEATURE_ROW_KEYS
+            for name in all_names
+        )
+        or len(set(all_names)) != len(all_names)
+    ):
+        raise ValueError(
+            "featureNames must contain unique feature columns, not metadata"
+        )
     names = model_feature_names(all_names)
     if not names:
         raise ValueError("매니페스트 row에서 특징 컬럼을 찾지 못했습니다.")
@@ -139,6 +166,16 @@ def feature_names_from_manifest(frozen_manifest: dict) -> list:
         missing = [n for n in names if n not in row]
         if missing:
             raise ValueError(f"{row.get('sample_id')!r} row에 특징이 누락됨: {missing}")
+        for name in names:
+            value = row[name]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(
+                    f"{row.get('sample_id')!r}: nonfinite/nonnumeric feature {name}"
+                )
     return names
 
 
@@ -226,6 +263,11 @@ def prepare_lstm_chunks(frozen_manifest: dict, names: list):
         if split not in samples_by_split:
             continue  # train 전용 등 3-way가 아닌 매니페스트는 해당 split만 사용
 
+        if len(file_rows) < SEQ_LEN:
+            raise ValueError(
+                f"{source_file}: LSTM requires at least {SEQ_LEN} windows per recording "
+                f"({len(file_rows)} in {split}); no recording may be silently excluded"
+            )
         file_rows = sorted(file_rows, key=lambda r: _window_index(r["sample_id"]))
         vectors = [
             np.array([row[n] for n in names], dtype=np.float64) for row in file_rows
@@ -252,7 +294,11 @@ def compute_metrics(y_true: list, y_pred: list) -> dict:
 
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
     accuracy = (tp + tn) / len(y_true) if y_true else 0.0
 
     return {
@@ -267,7 +313,9 @@ def compute_metrics(y_true: list, y_pred: list) -> dict:
     }
 
 
-def collect_error_cases(samples: list, y_true: list, y_pred: list, errors, threshold: float, limit: int = 10) -> dict:
+def collect_error_cases(
+    samples: list, y_true: list, y_pred: list, errors, threshold: float, limit: int = 10
+) -> dict:
     false_positives, false_negatives = [], []
     for sample, true_label, pred_label, error in zip(samples, y_true, y_pred, errors):
         case = {
@@ -312,7 +360,9 @@ def _train_and_validate_candidate(
     """
     model_builder = _MODEL_BUILDERS[name]
 
-    train_normal = [s for s in samples_by_split["train"] if s["common_label"] == "NORMAL"]
+    train_normal = [
+        s for s in samples_by_split["train"] if s["common_label"] == "NORMAL"
+    ]
     if not train_normal:
         raise ValueError(f"{name}: train split에 NORMAL 샘플이 없습니다.")
     empty_splits = [
@@ -348,9 +398,7 @@ def _train_and_validate_candidate(
     threshold = float(val_normal_errors.mean() + SIGMA * val_normal_errors.std())
 
     # 후보 선택용: 검증셋 전체에 대한 지표 (테스트셋은 선택에 쓰지 않는다).
-    validation_metrics = compute_metrics(
-        val_labels, (val_errors > threshold).tolist()
-    )
+    validation_metrics = compute_metrics(val_labels, (val_errors > threshold).tolist())
 
     scaler_mean = scaler.mean_.tolist()
     scaler_std = scaler.std_.tolist()
@@ -396,7 +444,9 @@ def _train_and_validate_candidate(
         # file://C:\... 같은 비표준 URI는 백엔드 모델 등록에서 400
         # INVALID_ARTIFACT_URI로 거부된다. 표준 파일 URI로 변환한다
         # (Windows: file:///C:/..., POSIX: file:///...).
-        "artifactUri": Path(artifact_path).resolve().as_uri() if artifact_path else None,
+        "artifactUri": (
+            Path(artifact_path).resolve().as_uri() if artifact_path else None
+        ),
         "artifactChecksum": artifact_checksum,
         "normalization": {
             "featureOrder": list(feature_names),
@@ -413,7 +463,9 @@ def _train_and_validate_candidate(
 def _finalize_test_evaluation(name: str, state: dict, samples_by_split: dict) -> tuple:
     """후보 선택이 끝난 뒤, 선택된 후보 하나에 대해서만 test holdout을 한 번 연다."""
     test_matrix, test_labels = _matrix_and_labels(samples_by_split["test"])
-    test_tensor = torch.tensor(state["scaler"].transform(test_matrix), dtype=torch.float32)
+    test_tensor = torch.tensor(
+        state["scaler"].transform(test_matrix), dtype=torch.float32
+    )
     test_errors = reconstruction_error(state["model"], test_tensor)
     y_pred = (test_errors > state["threshold"]).tolist()
 
@@ -439,11 +491,15 @@ def _validate_artifact_payload(payload: dict) -> None:
 
     feature_names = payload.get("feature_names")
     if not isinstance(feature_names, list) or not feature_names:
-        raise ValueError(f"feature_names는 비어있지 않은 리스트여야 합니다: {feature_names!r}")
+        raise ValueError(
+            f"feature_names는 비어있지 않은 리스트여야 합니다: {feature_names!r}"
+        )
     # [리뷰 P2] 리스트이고 중복이 없는지만 확인하면 공백 문자열("")도 "고유한
     # 이름"으로 통과한다 — 각 원소가 실제로 비어있지 않은 문자열인지도 검증한다.
     if any(not isinstance(n, str) or not n.strip() for n in feature_names):
-        raise ValueError(f"feature_names에 비어있지 않은 문자열이 아닌 항목이 있습니다: {feature_names!r}")
+        raise ValueError(
+            f"feature_names에 비어있지 않은 문자열이 아닌 항목이 있습니다: {feature_names!r}"
+        )
     if len(feature_names) != len(set(feature_names)):
         raise ValueError(f"artifact feature_names에 중복이 있습니다: {feature_names}")
 
@@ -458,9 +514,13 @@ def _validate_artifact_payload(payload: dict) -> None:
     for label in ("scaler_mean", "scaler_std"):
         values = payload.get(label)
         if not isinstance(values, list) or len(values) != input_dim:
-            raise ValueError(f"{label}은 길이 {input_dim}인 리스트여야 합니다: {values!r}")
+            raise ValueError(
+                f"{label}은 길이 {input_dim}인 리스트여야 합니다: {values!r}"
+            )
         if any(
-            isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+            isinstance(v, bool)
+            or not isinstance(v, (int, float))
+            or not math.isfinite(v)
             for v in values
         ):
             raise ValueError(f"{label}에 유한하지 않은 값이 있습니다: {values!r}")
@@ -470,7 +530,11 @@ def _validate_artifact_payload(payload: dict) -> None:
 
     for label in ("threshold", "sigma"):
         value = payload.get(label)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
             raise ValueError(f"{label}은 유한한 실수여야 합니다: {value!r}")
     # [리뷰 P2] 유한값 여부만 확인하면 threshold<0이나 sigma<=0도 통과한다.
     # reconstruction_error는 항상 0 이상이므로 threshold도 0 이상이어야 하고,
@@ -485,9 +549,13 @@ def _validate_artifact_payload(payload: dict) -> None:
     seq_len = payload.get("seq_len")
     if model_type == "lstm_autoencoder":
         if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len <= 0:
-            raise ValueError(f"lstm_autoencoder는 양의 정수 seq_len이 필요합니다: {seq_len!r}")
+            raise ValueError(
+                f"lstm_autoencoder는 양의 정수 seq_len이 필요합니다: {seq_len!r}"
+            )
     elif seq_len is not None:
-        raise ValueError(f"{model_type!r}에는 seq_len이 없어야 합니다(None): {seq_len!r}")
+        raise ValueError(
+            f"{model_type!r}에는 seq_len이 없어야 합니다(None): {seq_len!r}"
+        )
 
 
 def score_from_artifact(
@@ -548,7 +616,9 @@ def score_from_artifact(
         )
 
     # checksum을 검증한 바로 그 바이트를 역직렬화한다(파일을 다시 열지 않음).
-    payload = torch.load(io.BytesIO(artifact_bytes), weights_only=True, map_location="cpu")
+    payload = torch.load(
+        io.BytesIO(artifact_bytes), weights_only=True, map_location="cpu"
+    )
     _validate_artifact_payload(payload)
     artifact_names = list(payload["feature_names"])
 
@@ -619,10 +689,32 @@ def score_from_artifact(
     }
 
 
-def build_domain_gap() -> dict:
+def build_domain_gap(frozen_manifest=None) -> dict:
     """MVP 기획서(v1.2) "AI 보장 범위"·"8. AI 및 데이터 기획" 문구를 정적으로 반영."""
+    if frozen_manifest and frozen_manifest.get("compatibility", {}).get(
+        "signalType"
+    ) == ["acoustic"]:
+        return {
+            "source": frozen_manifest.get("source", {}).get("uri"),
+            "signalType": "acoustic",
+            "samplingRateHz": frozen_manifest["compatibility"].get("samplingRateHz"),
+            "units": frozen_manifest["compatibility"].get("units"),
+            "operatingConditions": frozen_manifest["compatibility"].get(
+                "operatingConditions"
+            ),
+            "limitations": [
+                "Microphone, placement, channel and background noise differ from field equipment.",
+                "Normalized PCM is not calibrated sound pressure or dB.",
+                "Public binary normal/abnormal labels do not identify detailed failure types.",
+            ],
+            "guaranteeScope": "Acoustic candidate evaluation only; no field accuracy, RUL or deployment guarantee.",
+        }
     return {
-        "samplingRateHz": {"source": 12000, "target": None, "note": "대상 설비 샘플링률 미확정"},
+        "samplingRateHz": {
+            "source": 12000,
+            "target": None,
+            "note": "대상 설비 샘플링률 미확정",
+        },
         "installPoint": {
             "source": "Drive-End 베어링 하우징 고정식 가속도계",
             "target": None,
@@ -642,7 +734,12 @@ def build_domain_gap() -> dict:
             ),
         },
         "labelTaxonomy": {
-            "source": ["NORMAL", "BEARING_FAULT_INNER", "BEARING_FAULT_BALL", "BEARING_FAULT_OUTER"],
+            "source": [
+                "NORMAL",
+                "BEARING_FAULT_INNER",
+                "BEARING_FAULT_BALL",
+                "BEARING_FAULT_OUTER",
+            ],
             "target": "미확정 — 도서발전소 환경 특유의 염분·혼합 소음원으로 인한 신규 이상 유형 가능성",
         },
         "guaranteeScope": (
@@ -676,7 +773,9 @@ def _actual_independent_holdout(frozen_manifest: dict) -> bool:
     """
     splits_by_specimen: dict = {}
     for row in frozen_manifest.get("rows") or []:
-        splits_by_specimen.setdefault(row.get("specimen_id"), set()).add(row.get("split"))
+        splits_by_specimen.setdefault(row.get("specimen_id"), set()).add(
+            row.get("split")
+        )
     return all(len(splits) <= 1 for splits in splits_by_specimen.values())
 
 
@@ -736,16 +835,23 @@ def run_training_job(
     # (원본 CWRU 재로드·재계산 없음). 같은 feature_names로 두 경로를 묶는다.
     # train/validation만으로 두 후보를 학습·평가한다 — test holdout은 아직 열지 않는다.
     feature_names, dense_splits = prepare_dense_splits(frozen_manifest)
+    lstm_splits = prepare_lstm_chunks(frozen_manifest, feature_names)
+    # Fail on short recordings before training/saving the first candidate.
+    if any(not lstm_splits[name] for name in ("train", "validation", "test")):
+        raise ValueError(
+            f"LSTM requires at least {SEQ_LEN} consecutive windows per recording in each split"
+        )
     dense_candidate, dense_state = _train_and_validate_candidate(
         "dense_autoencoder",
         _dense_split_strategy_description(frozen_manifest, independent_holdout),
         dense_splits,
         feature_names=feature_names,
         epochs=dense_epochs,
-        artifact_path=os.path.join(job_dir, "dense_autoencoder.pt") if job_dir else None,
+        artifact_path=(
+            os.path.join(job_dir, "dense_autoencoder.pt") if job_dir else None
+        ),
     )
 
-    lstm_splits = prepare_lstm_chunks(frozen_manifest, feature_names)
     lstm_candidate, lstm_state = _train_and_validate_candidate(
         "lstm_autoencoder",
         _lstm_split_strategy_description(frozen_manifest, independent_holdout),
@@ -760,7 +866,10 @@ def run_training_job(
 
     # [리뷰 P1] 선택된 후보 하나에 대해서만, 선택이 끝난 뒤 test holdout을 연다.
     states_by_name = {"dense_autoencoder": dense_state, "lstm_autoencoder": lstm_state}
-    splits_by_name = {"dense_autoencoder": dense_splits, "lstm_autoencoder": lstm_splits}
+    splits_by_name = {
+        "dense_autoencoder": dense_splits,
+        "lstm_autoencoder": lstm_splits,
+    }
     best_metrics, best_error_cases = _finalize_test_evaluation(
         best["name"], states_by_name[best["name"]], splits_by_name[best["name"]]
     )
@@ -786,12 +895,15 @@ def run_training_job(
             "holdoutType": holdout_type,
             "evaluation": evaluation_note,
             "validation": best["validationMetrics"],
-            **best["metrics"],  # 선택된 모델의 test 지표 (독립 검증 아님 — 위 플래그 참고)
+            **best[
+                "metrics"
+            ],  # 선택된 모델의 test 지표 (독립 검증 아님 — 위 플래그 참고)
         },
         # test holdout은 선택된 후보에 대해서만 평가했으므로, error case도 그
         # 후보 하나만 담긴다 — 낙선한 후보는 test holdout을 아예 열지 않았다.
         "errorCases": {best["name"]: best_error_cases},
-        "domainGap": build_domain_gap(),
+        "domainGap": build_domain_gap(frozen_manifest),
+        "inputCompatibility": frozen_manifest.get("compatibility"),
         "fieldCalibrationPlan": build_field_calibration_plan(),
         "createdAt": datetime.now(timezone.utc).isoformat(),
     }
@@ -801,16 +913,26 @@ if __name__ == "__main__":
     import argparse
     import json
 
-    parser = argparse.ArgumentParser(description="AI_FREQ_MODEL_01 베이스라인 학습·평가")
+    parser = argparse.ArgumentParser(
+        description="AI_FREQ_MODEL_01 베이스라인 학습·평가"
+    )
+    parser.add_argument(
+        "--manifest",
+        help="Frozen inline-feature manifest (acoustic or vibration); skips CWRU loading",
+    )
     parser.add_argument(
         "--cwru-dir",
         default=os.path.normpath(
-            os.path.join(_THIS_DIR, "..", "..", "..", "week1", "ai1", "data", "external", "cwru")
+            os.path.join(
+                _THIS_DIR, "..", "..", "..", "week1", "ai1", "data", "external", "cwru"
+            )
         ),
     )
     parser.add_argument(
         "--output",
-        default=os.path.normpath(os.path.join(_THIS_DIR, "..", "data", "training_job_report.json")),
+        default=os.path.normpath(
+            os.path.join(_THIS_DIR, "..", "data", "training_job_report.json")
+        ),
     )
     parser.add_argument(
         "--artifact-dir",
@@ -833,10 +955,14 @@ if __name__ == "__main__":
     from register_dataset import build_manifest
     from dataset_version import freeze_dataset_version  # noqa: E402
 
-    manifest = build_manifest(
-        data_dir=args.cwru_dir, split_strategy=args.split_strategy
-    )
-    frozen = freeze_dataset_version(manifest)
+    if args.manifest:
+        with open(args.manifest, encoding="utf-8") as handle:
+            frozen = json.load(handle)
+    else:
+        manifest = build_manifest(
+            data_dir=args.cwru_dir, split_strategy=args.split_strategy
+        )
+        frozen = freeze_dataset_version(manifest)
 
     report = run_training_job(
         frozen,
@@ -845,11 +971,12 @@ if __name__ == "__main__":
         artifact_dir=args.artifact_dir,
     )
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2, allow_nan=False)
 
     m = report["metrics"]
+    test_label = "독립 holdout" if m["independentHoldout"] else "비독립"
     print(f"학습 완료: {report['id']}  (datasetId={report['datasetId']})")
     if not m["independentHoldout"]:
         print(
@@ -864,13 +991,13 @@ if __name__ == "__main__":
         tm = candidate.get("metrics")
         if tm is not None:
             line += (
-                f" / (비독립) 테스트 f1={tm['f1']:.3f}, precision={tm['precision']:.3f}, "
+                f" / ({test_label}) 테스트 f1={tm['f1']:.3f}, precision={tm['precision']:.3f}, "
                 f"recall={tm['recall']:.3f}"
             )
         line += f"  artifact={candidate['artifactChecksum']}"
         print(line)
     print(
         f"  선택 기준: {m['selectionCriterion']} → 최적 후보: {m['bestCandidate']} "
-        f"(검증 f1={m['validation']['f1']:.3f}, 비독립 테스트 f1={m['f1']:.3f})"
+        f"(검증 f1={m['validation']['f1']:.3f}, {test_label} 테스트 f1={m['f1']:.3f})"
     )
     print(f"저장 위치: {args.output}")

@@ -192,7 +192,9 @@ CWRU 실데이터가 없는 환경에서도 합성(fixture) 데이터 기반 테
 - `vibration_peak_hz`(RPM 프록시)는 `operating_condition_holdout`이 부하 기준 분할이라
   train/validation에서 값 범위가 겹치지 않아 모델 입력에서 제외했다 (매니페스트에는 유지)
 - LSTM 후보는 시퀀스 청크 수가 Dense보다 적다 — 실측 데이터로 늘어나면 재검증 필요
-- 음향(acoustic) 모달리티는 아직 없음 — MIMII 데이터 확보 후 같은 구조로 별도 후보 추가
+- 음향(acoustic) manifest를 `--manifest`로 받아 같은 Dense/LSTM 후보 학습 경로를 사용한다.
+  음향/RPM 기준선 builder도 추가됐다. [등록·학습·기준선 안내](../../../../docs/ai1-acoustic-baselines.md)를 참고한다.
+  실제 MIMII 전체 데이터 재학습과 현장 성능·음압 보정은 별도 작업이다.
 - `artifactUri`는 로컬 파일을 가리키는 표준 `file://` URI(`Path(...).resolve().as_uri()`)
   — 운영 전 오브젝트 스토리지 URI로 교체
 - 대상 모터·센서 확정 후 전이학습, 임계값 재보정, 드리프트 모니터링 진행

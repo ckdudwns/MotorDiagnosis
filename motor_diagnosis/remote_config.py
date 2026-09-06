@@ -17,6 +17,14 @@ HISTORY_LIMIT = 100
 SETTING_LIMITS = {"measurementIntervalMs": (3000, 60000), "replayBatchSize": (1, 4)}
 DEFAULT_SETTINGS = {"measurementIntervalMs": 3000, "replayBatchSize": 4}
 ERROR_CODES = {"storage_failure", "invalid_config", "stale_version", "version_conflict"}
+IDENTIFIER_PATTERN = r"[A-Z0-9][A-Z0-9_.-]{0,62}"
+
+
+def _supported_identifier(value: Any) -> bool:
+    # Match the firmware's 64-byte NVS fields (63 ASCII bytes plus terminator).
+    return (
+        isinstance(value, str) and re.fullmatch(IDENTIFIER_PATTERN, value) is not None
+    )
 
 
 def _error(status: int, code: str, message: str):
@@ -65,8 +73,7 @@ def _credentials() -> dict[str, str]:
         seen = set()
         for device_id, token in values.items():
             if (
-                not isinstance(device_id, str)
-                or re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{0,62}", device_id) is None
+                not _supported_identifier(device_id)
                 or not isinstance(token, str)
                 or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token) is None
                 or token in seen
@@ -122,6 +129,18 @@ def _active_device(device_id: str) -> dict[str, Any]:
         )
     data.get_site(device["siteId"])
     data.get_asset(device["siteId"], device["assetId"])
+    for field, value in (
+        ("deviceId", device["id"]),
+        ("siteId", device["siteId"]),
+        ("assetId", device["assetId"]),
+    ):
+        if not _supported_identifier(value):
+            _error(
+                409,
+                "DEVICE_CONFIG_UNSUPPORTED_ID",
+                f"{field} is unsupported for remote configuration; use 1-63 ASCII characters, "
+                "starting with A-Z or 0-9, followed by A-Z, 0-9, dot, underscore or hyphen.",
+            )
     return device
 
 

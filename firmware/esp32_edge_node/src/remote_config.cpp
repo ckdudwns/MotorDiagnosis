@@ -12,9 +12,10 @@ bool settingsValid(std::uint32_t interval, std::uint32_t batch) {
 }
 bool identifier(const char* value) {
     if (!value || !*value || std::strlen(value) > 63) return false;
+    if (!(*value >= 'A' && *value <= 'Z') && !(*value >= '0' && *value <= '9')) return false;
     for (const char* p = value; *p; ++p)
         if (!(*p >= 'A' && *p <= 'Z') && !(*p >= '0' && *p <= '9') &&
-            *p != '-' && *p != '_') return false;
+            *p != '-' && *p != '_' && *p != '.') return false;
     return true;
 }
 bool commandIdValid(const char* value) {
@@ -49,6 +50,7 @@ const char* statusText(Status status) {
 }
 bool equalText(JsonVariantConst value, const char* expected) {
     return value.is<const char*>() && expected &&
+        value.as<JsonString>().size() == std::strlen(expected) &&
         std::strcmp(value.as<const char*>(), expected) == 0;
 }
 bool unsignedInteger(JsonVariantConst value) {

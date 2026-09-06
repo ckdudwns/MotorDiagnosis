@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import runpy
 import sqlite3
 import subprocess
 import tempfile
@@ -78,6 +79,52 @@ class ConfigSetup(unittest.TestCase):
         with self.assertRaises(data.ApiError) as error:
             function(*args)
         self.assertEqual(error.exception.code, code)
+
+    def register_target(self, device_id, site_id, asset_id):
+        """Use the public registration path, not direct edits of model globals."""
+        data.create_site(self.admin, {"id": site_id, "name": "ID contract site"})
+        data.create_asset(
+            self.admin,
+            site_id,
+            {
+                "id": asset_id,
+                "assetCode": "MOT.01",
+                "name": "ID contract motor",
+                "ratedRpm": 1500,
+                "installLocation": "Contract test bay",
+                "baseline": {
+                    "status": "ready",
+                    "capturedAt": "2026-09-06T00:00:00Z",
+                    "vibrationRmsMmS": 1.0,
+                    "acousticDb": 50.0,
+                    "sampleCount": 10,
+                },
+            },
+        )
+        data.update_rollout_plan(
+            self.admin,
+            site_id,
+            {
+                "networkProfileId": "A",
+                "targetAssetIds": [asset_id],
+                "installPriority": "high",
+                "configurationType": "direct",
+                "gatewayRequired": False,
+                "note": "ID contract fixture",
+            },
+        )
+        return data.create_device(
+            self.admin,
+            site_id,
+            {
+                "id": device_id,
+                "assetId": asset_id,
+                "certificateId": "CERT-CONTRACT",
+                "certificateFingerprint": "fingerprint-contract",
+                "certificateIssuedAt": "2026-09-06T00:00:00Z",
+                "certificateExpiresAt": "2099-09-06T00:00:00Z",
+            },
+        )
 
 
 class RemoteConfigTest(ConfigSetup):
@@ -388,6 +435,71 @@ class RemoteConfigTest(ConfigSetup):
         data._restore_runtime_state(snapshot)
         self.assertEqual(data.DEVICE_CONFIGS, {})
 
+    def test_schema_upgrade_blocks_rollback_and_redeployment_keeps_generation(self):
+        legacy_type = runpy.run_path(
+            str(Path(__file__).parent / "fixtures" / "runtime_store_v1.py")
+        )["RuntimeStateStore"]
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "runtime.sqlite3")
+            command = self.issue()
+            config.report_configuration(TOKEN, DEVICE, self.result(command))
+            legacy = legacy_type(database)
+            try:
+                # PR25 originally wrote the new field with the old schema number.
+                legacy.save(data._runtime_state_payload(), data.now_iso())
+                data.reset_runtime_state()
+                data.configure_runtime_state(database)
+                before = config.configuration_for(self.admin, DEVICE)
+                data.close_runtime_state()
+                with self.assertRaisesRegex(
+                    ValueError, "Unsupported runtime state schema 2"
+                ):
+                    legacy.load()
+                # Even an already-running old writer cannot drop the field.
+                old_checkpoint = data._runtime_state_payload()
+                old_checkpoint.pop("deviceConfigs")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    legacy.save(old_checkpoint, data.now_iso())
+                data.reset_runtime_state()
+                data.configure_runtime_state(database)
+                self.assertEqual(config.configuration_for(self.admin, DEVICE), before)
+                self.assertEqual(before["desired"]["commandId"], command["commandId"])
+                self.assertEqual(before["lastApplied"]["version"], 1)
+                self.assertEqual(self.issue(1)["version"], 2)
+            finally:
+                data.close_runtime_state()
+                legacy.close()
+
+    def test_unsupported_registered_ids_fail_before_configuration_publication(self):
+        for field in ("deviceId", "siteId", "assetId"):
+            for invalid in (
+                "X" * 64,
+                "BAD/ID",
+                "BAD ID",
+                "한글ID",
+                "-LEADING",
+                "BAD\x00ID",
+            ):
+                with self.subTest(field=field, value=invalid):
+                    data.reset_runtime_state()
+                    ids = {
+                        "deviceId": "DEV-CONTRACT",
+                        "siteId": "SITE.CONTRACT",
+                        "assetId": "MOT.CONTRACT",
+                    }
+                    ids[field] = invalid
+                    self.register_target(ids["deviceId"], ids["siteId"], ids["assetId"])
+                    audit = data.copy_payload(data.AUDIT_LOGS)
+                    self.assertApiError(
+                        "DEVICE_CONFIG_UNSUPPORTED_ID",
+                        config.request_configuration,
+                        self.admin,
+                        ids["deviceId"],
+                        self.request_payload(),
+                    )
+                    self.assertEqual(data.DEVICE_CONFIGS, {})
+                    self.assertEqual(data.AUDIT_LOGS, audit)
+
 
 class RemoteConfigHttpTest(ConfigSetup):
     def setUp(self):
@@ -404,12 +516,12 @@ class RemoteConfigHttpTest(ConfigSetup):
         self.thread.join(5)
         super().tearDown()
 
-    def http(self, suffix="", *, method="GET", body=None, token=None):
+    def http(self, suffix="", *, method="GET", body=None, token=None, device_id=DEVICE):
         connection = http.client.HTTPConnection(*self.server.server_address, timeout=5)
         try:
             connection.request(
                 method,
-                f"/api/devices/{DEVICE}/configuration{suffix}",
+                f"/api/devices/{device_id}/configuration{suffix}",
                 json.dumps(body) if body is not None else None,
                 {
                     "Authorization": "Bearer "
@@ -481,6 +593,52 @@ class RemoteConfigHttpTest(ConfigSetup):
             self.http()[1]["lastApplied"]["settings"],
             {"measurementIntervalMs": 7000, "replayBatchSize": 2},
         )
+
+    @unittest.skipUnless(
+        FIXTURE and Path(FIXTURE).is_file(),
+        "Build native remote-config fixture and set IOT_CONFIG_FIXTURE_EXE",
+    )
+    def test_registered_id_boundaries_roundtrip_through_native_cpp_and_reboot(self):
+        for device_id, site_id, asset_id in (
+            ("DEV.DOT_01", "SITE.DOT", "SITE.DOT-MOT.01"),
+            ("D", "S", "A"),
+            ("D" + "._-9" * 15 + "ZZ", "S" + "." * 62, "A" + "_" * 62),
+        ):
+            with self.subTest(ids=(device_id, site_id, asset_id)):
+                self.register_target(device_id, site_id, asset_id)
+                with patch.dict(
+                    os.environ,
+                    {"DEVICE_CONFIG_TOKENS_JSON": json.dumps({device_id: TOKEN})},
+                ):
+                    status, command = self.http(
+                        method="PUT", body=self.request_payload(), device_id=device_id
+                    )
+                    self.assertEqual(status, 200, command)
+                    status, pending = self.http(
+                        "/pending", token=TOKEN, device_id=device_id
+                    )
+                    self.assertEqual(status, 200, pending)
+                    completed = subprocess.run(
+                        [FIXTURE, "--roundtrip-json", device_id, site_id, asset_id],
+                        input=json.dumps(pending),
+                        text=True,
+                        capture_output=True,
+                        check=True,
+                        timeout=10,
+                    )
+                    applied, rebooted = map(json.loads, completed.stdout.splitlines())
+                    self.assertEqual(applied, rebooted)
+                    status, result = self.http(
+                        "/result",
+                        method="POST",
+                        body=rebooted,
+                        token=TOKEN,
+                        device_id=device_id,
+                    )
+                    self.assertEqual(status, 200, result)
+                    self.assertEqual(
+                        self.http(device_id=device_id)[1]["lastApplied"]["version"], 1
+                    )
 
 
 if __name__ == "__main__":

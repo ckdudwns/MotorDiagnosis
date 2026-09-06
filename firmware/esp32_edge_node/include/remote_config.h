@@ -10,6 +10,8 @@ constexpr std::uint32_t DEFAULT_REPLAY_BATCH = 4;
 constexpr std::size_t MAX_RESPONSE_BYTES = 2048;
 
 struct Identity {
+    // Same contract as backend remote_config.IDENTIFIER_PATTERN:
+    // [A-Z0-9][A-Z0-9_.-]{0,62}; ASCII only, case-sensitive, no normalization.
     const char* deviceId;
     const char* siteId;
     const char* assetId;

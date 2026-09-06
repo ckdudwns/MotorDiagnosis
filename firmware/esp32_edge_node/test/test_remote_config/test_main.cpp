@@ -11,6 +11,7 @@ namespace {
 const Identity ID{"DEV-01-MOT-02", "SITE-01", "SITE-01-MOT-02"};
 const char* COMMAND = "0123456789abcdef0123456789abcdef";
 struct Storage {
+    Identity identity = ID;
     Blob durable;
     unsigned writes = 0;
     bool verifySuccess = true;
@@ -19,14 +20,14 @@ bool persist(const Blob& value, void* context) {
     auto& storage = *static_cast<Storage*>(context);
     storage.writes++;
     storage.durable = value;
-    return storage.verifySuccess && validBlob(storage.durable, ID);
+    return storage.verifySuccess && validBlob(storage.durable, storage.identity);
 }
-JsonDocument command(unsigned version = 1, unsigned interval = 6000, unsigned batch = 2) {
+JsonDocument command(unsigned version = 1, unsigned interval = 6000, unsigned batch = 2, const Identity& identity = ID) {
     JsonDocument doc;
     doc["schemaVersion"] = 1;
-    doc["deviceId"] = ID.deviceId;
-    doc["siteId"] = ID.siteId;
-    doc["assetId"] = ID.assetId;
+    doc["deviceId"] = identity.deviceId;
+    doc["siteId"] = identity.siteId;
+    doc["assetId"] = identity.assetId;
     doc["desired"]["version"] = version;
     doc["desired"]["commandId"] = COMMAND;
     doc["desired"]["settings"]["measurementIntervalMs"] = interval;
@@ -123,6 +124,46 @@ void testStoredScopeAndIncomingScopeMustMatchLocalIdentity() {
         TEST_ASSERT_EQUAL(static_cast<int>(Status::NONE), static_cast<int>(receive(controller, storage, doc).status));
     }
     TEST_ASSERT_EQUAL(1, storage.writes);
+}
+void testIdentifierDotsAndLengthBoundariesApplyAndRestore() {
+    for (const std::string& value : {std::string("A"), std::string("SITE.DOT-MOT_01"), std::string("9") + std::string(62, '.')}) {
+        Controller controller, rebooted; Storage storage;
+        storage.identity = {value.c_str(), value.c_str(), value.c_str()};
+        const auto doc = command(1, 6000, 2, storage.identity);
+        const auto result = controller.receive(text(doc).c_str(), storage.identity, persist, &storage);
+        TEST_ASSERT_EQUAL(static_cast<int>(Status::APPLIED), static_cast<int>(result.status));
+        TEST_ASSERT_EQUAL(1, storage.writes);
+        TEST_ASSERT_TRUE(rebooted.restore(storage.durable, storage.identity));
+        TEST_ASSERT_EQUAL_STRING(resultPayload(result).c_str(), resultPayload(rebooted.appliedResult()).c_str());
+    }
+}
+void testUnsupportedLocalIdentifiersNeverPersist() {
+    for (const std::string& value : {std::string(""), std::string(64, 'X'), std::string("-LEADING"), std::string("_LEADING"),
+            std::string(".LEADING"), std::string("lower"), std::string("BAD/ID"), std::string("BAD ID"), std::string("BAD\nID"), std::string("BAD\xc3\x89")}) {
+        for (unsigned field = 0; field < 3; ++field) {
+            Controller controller; Storage storage;
+            if (field == 0) storage.identity.deviceId = value.c_str();
+            if (field == 1) storage.identity.siteId = value.c_str();
+            if (field == 2) storage.identity.assetId = value.c_str();
+            const auto doc = command(1, 6000, 2, storage.identity);
+            const auto result = controller.receive(text(doc).c_str(), storage.identity, persist, &storage);
+            TEST_ASSERT_EQUAL(static_cast<int>(Status::NONE), static_cast<int>(result.status));
+            TEST_ASSERT_EQUAL(0, storage.writes);
+            TEST_ASSERT_EQUAL(0, controller.active().version);
+        }
+    }
+}
+void testEmbeddedNullInWireIdentityCannotMatchLocalPrefix() {
+    Controller controller; Storage storage;
+    for (const char* field : {"deviceId", "siteId", "assetId"}) {
+        auto doc = command();
+        const std::string original = doc[field].as<const char*>();
+        doc[field] = "PLACEHOLDER";
+        std::string raw = text(doc);
+        raw.replace(raw.find("\"PLACEHOLDER\""), std::strlen("\"PLACEHOLDER\""), "\"" + original + "\\u0000OTHER\"");
+        TEST_ASSERT_EQUAL(static_cast<int>(Status::NONE), static_cast<int>(controller.receive(raw.c_str(), ID, persist, &storage).status));
+    }
+    TEST_ASSERT_EQUAL(0, storage.writes);
 }
 void testOlderVersionAndConflictingEqualVersionNeverApply() {
     Controller controller; Storage storage;
@@ -239,11 +280,12 @@ void testScheduleSurvivesMonotonicWrap() {
 void setUp() {}
 void tearDown() {}
 int main(int argc, char** argv) {
-    if (argc == 2 && std::strcmp(argv[1], "--roundtrip-json") == 0) {
+    if ((argc == 2 || argc == 5) && std::strcmp(argv[1], "--roundtrip-json") == 0) {
         const std::string input{std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>()};
         Controller controller, rebooted; Storage storage;
-        const auto result = controller.receive(input.c_str(), ID, persist, &storage);
-        if (result.status != Status::APPLIED || !rebooted.restore(storage.durable, ID)) return 2;
+        if (argc == 5) storage.identity = {argv[2], argv[3], argv[4]};
+        const auto result = controller.receive(input.c_str(), storage.identity, persist, &storage);
+        if (result.status != Status::APPLIED || !rebooted.restore(storage.durable, storage.identity)) return 2;
         std::cout << resultPayload(result) << '\n' << resultPayload(rebooted.appliedResult()) << '\n';
         return 0;
     }
@@ -257,6 +299,9 @@ int main(int argc, char** argv) {
     RUN_TEST(testStorageRecoveryRetriesExactVersion);
     RUN_TEST(testEveryCorruptBlobByteIsRejectedWithoutChangingActiveState);
     RUN_TEST(testStoredScopeAndIncomingScopeMustMatchLocalIdentity);
+    RUN_TEST(testIdentifierDotsAndLengthBoundariesApplyAndRestore);
+    RUN_TEST(testUnsupportedLocalIdentifiersNeverPersist);
+    RUN_TEST(testEmbeddedNullInWireIdentityCannotMatchLocalPrefix);
     RUN_TEST(testOlderVersionAndConflictingEqualVersionNeverApply);
     RUN_TEST(testBoundsAndUnsupportedFieldsAreRejected);
     RUN_TEST(testSettingsRequireJsonIntegersNotBooleanOrStrings);

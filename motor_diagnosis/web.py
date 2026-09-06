@@ -93,12 +93,13 @@ def render_page() -> str:
         <button id="navEvents" aria-pressed="false" aria-controls="exportPanel chartPanel eventListPanel eventReviewPanel">이벤트 검수</button>
         <button id="navManagement" aria-pressed="false" aria-controls="managementPanel">운영 관리</button>
         <button id="navModels" aria-pressed="false" aria-controls="modelReviewPanel">AI 결과 검토</button>
+        <button id="navDeviceOps" aria-pressed="false" aria-controls="deviceOpsPanel">장치 운영</button>
       </nav>
       <h2 id="viewHeading" class="workspace-title">운영 현황</h2>
       <section class="toolbar panel">
         <label>사이트<select id="siteSelect"></select></label>
         <label>설비<select id="assetSelect"></select></label>
-        <label>조회 기간<select id="periodSelect">
+        <label id="telemetryPeriodField">조회 기간<select id="periodSelect">
           <option value="1">최근 1시간</option>
           <option value="6">최근 6시간</option>
           <option value="24" selected>최근 24시간</option>
@@ -205,6 +206,39 @@ def render_page() -> str:
           <details><summary>현재 등록 정보·이력</summary><pre id="managementDetail"></pre></details>
           <section id="auditPanel" hidden><h2>감사 기록</h2><div class="subgrid"><label>작업 종류<input id="auditAction"></label><label>대상 종류<input id="auditTarget"></label><label>작성자 ID<input id="auditActor"></label></div><div class="actions"><button id="auditLoad" class="secondary">조회</button><button id="auditPrev" class="secondary">이전</button><span id="auditPage"></span><button id="auditNext" class="secondary">다음</button></div><div id="auditRows" class="history table-scroll"></div></section>
         </article>
+        <article class="panel wide" id="deviceOpsPanel" hidden>
+          <h2>장치 운영 · 통신 품질 · 제한된 설정</h2>
+          <p class="notice">선택 설비에 연결된 장치만 표시합니다. 통신 품질은 장치가 보고한 HTTP 전송 관측값이며, 보고가 없는 구간은 정상으로 간주하지 않습니다.</p>
+          <div class="actions"><label>운영 장치<select id="opsDevice"></select></label><button id="opsReload" class="secondary">장치 목록 새로고침</button></div>
+          <div id="opsStatus" role="status" aria-live="polite"></div>
+          <div id="opsIdentity"></div><div id="opsHealth" class="table-scroll"></div>
+          <h3>통신 품질</h3>
+          <div class="subgrid">
+            <label>품질 조회 기간<select id="opsQualityRange"><option value="1">최근 1시간</option><option value="6">최근 6시간</option><option value="24" selected>최근 24시간</option><option value="168">최근 7일</option><option value="720">최근 30일</option></select></label>
+            <label>집계 간격<select id="opsQualityBucket"><option value="60">1분</option><option value="300">5분</option><option value="3600" selected>1시간</option><option value="86400">1일</option></select></label>
+          </div>
+          <div class="actions"><button id="opsQualityLoad" class="secondary">상태·품질 조회</button></div>
+          <div id="opsQualityStatus" role="status" aria-live="polite"></div><div id="opsQualitySummary"></div>
+          <p><small>관측 창 전체를 종료 시각의 구간에 배정합니다. 긴 창은 구간 밖 관측을 포함할 수 있습니다. ACK 지연은 HTTP 응답 검증까지의 왕복 시간이며, 버퍼 평균은 표본 평균입니다. 화면은 자동 갱신하지 않으며 조회 시각을 확인해 주세요.</small></p>
+          <div id="opsQualityRows" class="table-scroll"></div>
+          <div class="actions"><button id="opsQualityPrev" class="secondary" disabled>이전 구간</button><span id="opsQualityPage"></span><button id="opsQualityNext" class="secondary" disabled>다음 구간</button></div>
+          <h3>제한된 원격 설정</h3>
+          <p class="notice">발행은 서버에 요청을 저장하는 단계입니다. 장치의 적용 성공 보고 전에는 적용 완료가 아닙니다. 센서·인증·네트워크·모터 속도·OTA 설정은 변경하지 않습니다.</p>
+          <div id="opsConfigState"></div>
+          <div class="actions"><button id="opsConfigLoad" class="secondary">서버 설정 다시 확인</button></div>
+          <div class="subgrid">
+            <label>측정 후 대기 시간 (ms)<input id="opsInterval" type="number" min="3000" max="60000" step="1" disabled></label>
+            <label>루프당 버퍼 재전송 상한 (건)<input id="opsReplay" type="number" min="1" max="4" step="1" disabled></label>
+          </div>
+          <small>대기 시간 3,000–60,000ms, 재전송 1–4건. 정확한 측정 시작 간격은 취득·전송 처리 시간 때문에 달라질 수 있습니다.</small>
+          <label>설정 변경 사유<textarea id="opsConfigReason" maxlength="1000" disabled></textarea></label>
+          <div class="actions"><button id="opsConfigPublish" disabled>설정 요청 발행</button><button id="opsConfigCancel" class="secondary" disabled>편집 취소</button></div>
+          <div id="opsConfigStatus" role="status" aria-live="polite"></div>
+          <h3>설정 요청·결과 이력</h3>
+          <button id="opsHistoryLoad" class="secondary">이력 새로고침</button>
+          <div id="opsHistoryStatus" role="status"></div><div id="opsHistoryRows" class="table-scroll"></div>
+          <div class="actions"><button id="opsHistoryPrev" class="secondary" disabled>이전 이력</button><span id="opsHistoryPage"></span><button id="opsHistoryNext" class="secondary" disabled>다음 이력</button></div>
+        </article>
       </section>
     </section>
   </main>
@@ -222,6 +256,10 @@ def render_page() -> str:
     let reviewSaving = false, noteSaving = false, managementSaving = false, noteHistoryGeneration = 0;
     let noteListGeneration = 0;
     let currentView = "overview";
+    let opsGeneration = 0, opsDevices = [], opsDevice = null, opsConfig = null;
+    let opsConfigGeneration = 0, opsQualityGeneration = 0, opsHealthGeneration = 0, opsHistoryGeneration = 0;
+    let opsSaving = false, opsDirty = false, opsUncertain = false, opsIntent = null;
+    let opsQuality = null, opsQualityPage = 1, opsHistory = [], opsHistoryPage = 1;
     const CHART_PAD = 34;
     const $ = (id) => document.getElementById(id);
 
@@ -271,12 +309,15 @@ def render_page() -> str:
       events:{button:"navEvents",title:"이벤트 검수",panels:["exportPanel","chartPanel","eventListPanel","eventReviewPanel"]},
       management:{button:"navManagement",title:"운영 관리",panels:["managementPanel"]},
       models:{button:"navModels",title:"AI 결과 검토",panels:["modelReviewPanel"]},
+      deviceOps:{button:"navDeviceOps",title:"장치 운영",panels:["deviceOpsPanel"]},
     };
     function hasManagementAccess() {return can("audit-log:read") || Object.values(MANAGEMENT).some(config => can(config.permission + ":read"));}
     function setView(view) {
       if (!Object.hasOwn(WORKSPACE_VIEWS, view) || (view === "management" && !hasManagementAccess())) return;
       if (view === "models" && !can("model:read")) return;
+      if (view === "deviceOps" && !can("device:read")) return;
       const enteringModels = view === "models" && currentView !== "models";
+      const enteringDevices = view === "deviceOps" && currentView !== "deviceOps";
       currentView = view;
       for (const [name,config] of Object.entries(WORKSPACE_VIEWS)) {
         $(config.button).setAttribute("aria-pressed", String(name === view));
@@ -284,9 +325,12 @@ def render_page() -> str:
       }
       $("navManagement").hidden = !hasManagementAccess();
       $("navModels").hidden = !can("model:read");
+      $("navDeviceOps").hidden = !can("device:read");
+      $("telemetryPeriodField").hidden = view === "deviceOps";
       $("viewHeading").textContent = WORKSPACE_VIEWS[view].title;
       if (view === "events") redrawChart();
       if (enteringModels && !modelReviewRow) act(() => loadModelQueue(true));
+      if (enteringDevices && !opsDirty && !opsSaving) act(loadDeviceOperations);
     }
     function statusMessage(message, error = false) {
       $("appStatus").hidden = !message;
@@ -341,6 +385,7 @@ def render_page() -> str:
 
     async function render() {
       if (currentView === "models") return loadModelQueue(true);
+      if (currentView === "deviceOps") return loadDeviceOperations();
       const requestGeneration = ++renderGeneration;
       const query = selectionQuery();
       if (!query) { statusMessage("조회 가능한 사이트 또는 설비가 없습니다."); return; }
@@ -1160,11 +1205,212 @@ def render_page() -> str:
       } finally {modelReviewBusy = false; modelReviewButtons();}
     }
 
+    function opsKey() {return JSON.stringify([token,$("siteSelect").value,$("assetSelect").value,opsDevice?.id]);}
+    function opsScopeMatches(row) {
+      return !!row && !!opsDevice && row.siteId === opsDevice.siteId && row.assetId === opsDevice.assetId &&
+        row.siteId === $("siteSelect").value && row.assetId === $("assetSelect").value;
+    }
+    function opsConfigScopeMatches(config) {
+      return !!config && config.deviceId === opsDevice?.id && opsScopeMatches(config) &&
+        [config.desired,config.lastApplied].every(command => command == null || opsScopeMatches(command));
+    }
+    function opsCanEdit() {
+      return opsConfigScopeMatches(opsConfig) && can("device:read") && can("parameter:write") &&
+        opsDevice.mappingStatus === "active" && opsDevice.certificateStatus === "registered" &&
+        [opsDevice.id,opsDevice.siteId,opsDevice.assetId].every(id => /^[A-Z0-9][A-Z0-9_.-]{0,62}$/.test(id));
+    }
+    function opsControls() {
+      const edit = opsCanEdit() && !opsSaving && !opsUncertain;
+      for (const id of ["opsInterval","opsReplay","opsConfigReason"]) $(id).disabled = !edit;
+      $("opsConfigPublish").disabled = !edit;
+      $("opsConfigCancel").disabled = !edit || !opsDirty;
+      $("opsConfigLoad").disabled = !opsDevice || opsSaving;
+      $("opsDevice").disabled = opsSaving || !opsDevices.length;
+      $("opsReload").disabled = opsSaving;
+      $("opsQualityLoad").disabled = !opsDevice;
+      $("opsHistoryLoad").disabled = !opsDevice;
+    }
+    function clearOpsDevice() {
+      opsGeneration++; opsConfigGeneration++; opsQualityGeneration++; opsHealthGeneration++; opsHistoryGeneration++;
+      opsDevice = null; opsConfig = null; opsQuality = null; opsHistory = []; opsQualityPage = 1; opsHistoryPage = 1;
+      opsDirty = false; opsUncertain = false; opsIntent = null;
+      for (const id of ["opsIdentity","opsHealth","opsConfigState","opsQualitySummary","opsQualityRows","opsHistoryRows"]) $(id).replaceChildren();
+      for (const id of ["opsInterval","opsReplay","opsConfigReason"]) $(id).value = "";
+      for (const id of ["opsStatus","opsConfigStatus","opsQualityStatus","opsHistoryStatus","opsQualityPage","opsHistoryPage"]) $(id).textContent = "";
+      for (const id of ["opsQualityPrev","opsQualityNext","opsHistoryPrev","opsHistoryNext"]) $(id).disabled = true;
+      opsControls();
+    }
+    function invalidateDeviceOperations() {
+      opsDevices = []; clearOpsDevice(); $("opsDevice").replaceChildren();
+    }
+    function rejectOpsScope() {
+      const dirty = opsDirty, fields = ["opsInterval","opsReplay","opsConfigReason"];
+      const draft = fields.map(id => $(id).value);
+      // Drop the cached device list and every in-flight generation. Only a fresh
+      // list plus target selection may re-enable writes; a late GET cannot.
+      invalidateDeviceOperations();
+      if (dirty) {fields.forEach((id,index) => {$(id).value = draft[index];}); opsDirty = true;}
+      $("opsStatus").textContent = "장치의 사이트·설비가 현재 화면과 다릅니다. 장치 목록을 새로고친 뒤 올바른 사이트·설비·장치를 다시 선택하세요.";
+      $("opsConfigStatus").textContent = $("opsStatus").textContent;
+    }
+    function allowOpsChange() {
+      return !opsSaving && (!opsDirty || confirm("작성 중인 장치 설정을 버리고 대상을 변경할까요?"));
+    }
+    async function loadDeviceOperations() {
+      if (!can("device:read") || !allowOpsChange()) return;
+      const previous = opsDevice?.id, scope = JSON.stringify([token,$("siteSelect").value,$("assetSelect").value]);
+      invalidateDeviceOperations(); const generation = opsGeneration;
+      const siteId = $("siteSelect").value, assetId = $("assetSelect").value;
+      if (!siteId || !assetId) {$("opsStatus").textContent = "사이트와 설비를 선택하세요."; return;}
+      $("opsStatus").textContent = "설비에 연결된 장치를 조회하는 중입니다.";
+      try {
+        const rows = await api(`/api/sites/${encodeURIComponent(siteId)}/devices`);
+        if (generation !== opsGeneration || scope !== JSON.stringify([token,$("siteSelect").value,$("assetSelect").value])) return;
+        if (!Array.isArray(rows)) throw new Error("장치 목록 형식이 올바르지 않습니다.");
+        opsDevices = rows.filter(row => row.siteId === siteId && row.assetId === assetId);
+        setOptions($("opsDevice"), opsDevices, row => row.id, row => `${row.id} · ${row.mappingStatus === "active" ? "활성" : "비활성"}`);
+        const selected = opsDevices.find(row => row.id === previous) || opsDevices.find(row => row.mappingStatus === "active") || opsDevices[0];
+        opsControls();
+        if (!selected) {$("opsStatus").textContent = "이 설비에 연결된 장치가 없습니다. 운영 관리에서 장치를 등록하세요."; return;}
+        $("opsDevice").value = selected.id; await selectOpsDevice(selected.id);
+      } catch (error) {if (generation === opsGeneration) $("opsStatus").textContent = `장치 목록 조회 실패: ${error.message}`;}
+    }
+    async function selectOpsDevice(deviceId) {
+      if (!allowOpsChange()) {$("opsDevice").value = opsDevice?.id || ""; return;}
+      const row = opsDevices.find(item => item.id === deviceId);
+      clearOpsDevice();
+      if (!row) return;
+      opsDevice = {...row}; $("opsDevice").value = row.id;
+      $("opsIdentity").append(facts([["장치",row.id],["연결 설비",row.assetId],["매핑",row.mappingStatus === "active" ? "활성" : "비활성"],["인증서 상태",row.certificateStatus],["등록 펌웨어",row.firmwareVersion]]));
+      $("opsStatus").textContent = "조회 시점의 보고값입니다. 설정 편집 중에도 상태·품질은 별도로 조회할 수 있습니다.";
+      opsControls();
+      await Promise.all([loadOpsHealth(),loadOpsQuality(),loadOpsConfig(),loadOpsHistory()]);
+    }
+    async function loadOpsHealth() {
+      if (!opsDevice || !can("device:read")) return;
+      const key = opsKey(), generation = ++opsHealthGeneration, id = opsDevice.id;
+      $("opsHealth").replaceChildren(); $("opsHealth").textContent = "장치 상태 조회 중";
+      try {
+        const row = await api(`/api/devices/${encodeURIComponent(id)}/health`);
+        if (key !== opsKey() || generation !== opsHealthGeneration) return;
+        if (row.deviceId !== id || !opsScopeMatches(row)) {rejectOpsScope(); return;}
+        $("opsHealth").replaceChildren(facts([["연결 상태",statusLabel(row.health || row.status)],["최근 수신",formatLocalTime(row.lastReceivedAt)],["RSSI",measuredValue(row.rssiDbm," dBm")],["재부팅",measuredValue(row.rebootCount,"회")],["버퍼 사용률",measuredValue(row.bufferUsagePct,"%")],["센서 상태",statusLabel(row.sensorHealth)]]), rawDetails("센서 고장·원본 상태",row));
+      } catch (error) {if (key === opsKey() && generation === opsHealthGeneration) $("opsHealth").textContent = `장치 상태 조회 실패: ${error.message}`;}
+    }
+    function opsMetric(row, field, unit = "") {return row?.hasData ? measuredValue(row[field],unit) : "관측 없음";}
+    function renderOpsQuality() {
+      const q = opsQuality; $("opsQualityRows").replaceChildren();
+      if (!q) return;
+      $("opsQualityRows").append(statusTable("종료 시각 기준 통신 품질",["구간 (현지 시각)","관측 창","시도 / 실패 / 재시도","ACK 평균 / 최대","버퍼 표본 평균 / 최대","삭제","경계 초과 창"],q.items.slice((opsQualityPage - 1) * PAGE_SIZE,opsQualityPage * PAGE_SIZE).map(row => [
+        `${formatLocalTime(row.from)} ~ ${formatLocalTime(row.to)}`,row.hasData ? `${row.windowCount}건` : "관측 없음",
+        ["attempts","failures","retries"].map(field => opsMetric(row,field)).join(" / "),
+        `${opsMetric(row,"ackLatencyMeanMs"," ms")} / ${opsMetric(row,"ackLatencyMaxMs"," ms")}`,
+        `${opsMetric(row,"bufferDepthSampleMean")} / ${opsMetric(row,"bufferDepthMax")}`,opsMetric(row,"bufferDropped"),row.crossBoundaryWindows || 0,
+      ])));
+      renderPager("opsQuality",opsQualityPage,q.items.length);
+    }
+    async function loadOpsQuality() {
+      if (!opsDevice || !can("device:read")) return;
+      const key = opsKey(), generation = ++opsQualityGeneration, id = opsDevice.id;
+      opsQuality = null; opsQualityPage = 1; $("opsQualitySummary").replaceChildren(); $("opsQualityRows").replaceChildren();
+      $("opsQualityPage").textContent = ""; $("opsQualityPrev").disabled = true; $("opsQualityNext").disabled = true;
+      $("opsQualityStatus").textContent = "통신 품질 조회 중";
+      try {
+        const hours = Number($("opsQualityRange").value), bucket = Number($("opsQualityBucket").value);
+        const to = Date.now(), from = to - hours * 3600000, width = bucket * 1000;
+        if (![1,6,24,168,720].includes(hours) || ![60,300,3600,86400].includes(bucket) || Math.floor((to - 1 - Math.floor(from / width) * width) / width) + 1 > 1000) throw new Error("최대 1,000개 구간까지 조회할 수 있습니다. 집계 간격을 늘려 주세요.");
+        const query = new URLSearchParams({from:new Date(from).toISOString(),to:new Date(to).toISOString(),bucketSeconds:bucket});
+        const q = await api(`/api/devices/${encodeURIComponent(id)}/communication-quality?${query}`);
+        if (key !== opsKey() || generation !== opsQualityGeneration) return;
+        if (q.deviceId !== id || !opsScopeMatches(q)) {rejectOpsScope(); return;}
+        if (q.transport !== "http" || q.attribution !== "whole_window_at_end" || !q.summary || !Array.isArray(q.items)) throw new Error("통신 품질 응답의 집계 계약이 다릅니다.");
+        opsQuality = q; const s = q.summary;
+        $("opsQualityStatus").textContent = `${formatLocalTime(q.from)} ~ ${formatLocalTime(q.to)} · ${q.bucketSeconds}초 집계 · 조회 완료 ${formatLocalTime(new Date().toISOString())}${s.hasData ? "" : " · 수신된 관측 창이 없습니다. 정상 여부를 판단할 수 없습니다."}`;
+        $("opsQualitySummary").append(facts([["전송 시도",opsMetric(s,"attempts","회")],["실패율",opsMetric(s,"failureRatePct","%")],["재시도",opsMetric(s,"retries","회")],["버퍼 재전송",opsMetric(s,"replayAttempts","회")],["성공 ACK",opsMetric(s,"acknowledged","회")],["ACK 가중 평균",opsMetric(s,"ackLatencyMeanMs"," ms")],["ACK 최대",opsMetric(s,"ackLatencyMaxMs"," ms")],["최신 버퍼 깊이 / 용량",`${opsMetric(s,"bufferDepthLast")} / ${opsMetric(s,"bufferCapacity")}`],["버퍼 삭제",opsMetric(s,"bufferDropped","건")],["관측 지속시간 합",s.hasData ? measuredValue(s.observedDurationMs / 1000,"초") : "관측 없음"],["최초 관측 시작",formatLocalTime(s.firstWindowStartedAt)],["마지막 창 종료",formatLocalTime(s.lastWindowEndedAt)]]),rawDetails("실패 분류·표본 카운터 원문",s));
+        renderOpsQuality();
+      } catch (error) {if (key === opsKey() && generation === opsQualityGeneration) $("opsQualityStatus").textContent = `통신 품질 조회 실패: ${error.message}`;}
+    }
+    function opsSettingsValid(settings) {
+      return settings && Object.keys(settings).length === 2 && Number.isInteger(settings.measurementIntervalMs) && settings.measurementIntervalMs >= 3000 && settings.measurementIntervalMs <= 60000 && Number.isInteger(settings.replayBatchSize) && settings.replayBatchSize >= 1 && settings.replayBatchSize <= 4;
+    }
+    function opsSameSettings(left, right) {return opsSettingsValid(left) && opsSettingsValid(right) && left.measurementIntervalMs === right.measurementIntervalMs && left.replayBatchSize === right.replayBatchSize;}
+    function opsCommandLabel(state) {return ({pending:"적용 보고 대기",applied:"적용 성공 보고",failed:"실패 보고",rejected:"거부 보고"})[state] || (state ? "알 수 없는 보고 상태" : "발행 없음");}
+    function opsSettingsText(settings) {return opsSettingsValid(settings) ? `대기 ${settings.measurementIntervalMs}ms / 재전송 ${settings.replayBatchSize}건` : "보고 없음";}
+    function renderOpsConfig() {
+      $("opsConfigState").replaceChildren();
+      if (!opsConfig) {opsControls(); return;}
+      const c = opsConfig, desired = c.desired, applied = c.lastApplied;
+      $("opsConfigState").append(facts([["서버 요청 버전",c.version],["최신 요청 상태",opsCommandLabel(desired?.state)],["요청한 값",opsSettingsText(desired?.settings)],["요청 시각",formatLocalTime(desired?.requestedAt)],["장치의 마지막 적용 보고",applied ? `v${applied.version} · ${opsSettingsText(applied.settings)}` : "아직 적용 성공 보고가 없습니다."],["적용 보고 수신",formatLocalTime(applied?.result?.receivedAt)],["최신 결과 오류",desired?.result?.errorCode || "없음 / 미보고"]]),rawDetails("서버 요청·장치 적용 보고 원문",c));
+      if (c.scopeChanged) $("opsConfigState").append(facts([["매핑 변경","이전 매핑의 설정은 현재 장치 적용값으로 표시하지 않습니다."]]));
+      opsControls();
+    }
+    function fillOpsConfig() {
+      if (!opsConfig) return;
+      const value = opsConfig.desired?.settings || opsConfig.lastApplied?.settings || opsConfig.defaults;
+      $("opsInterval").value = String(value.measurementIntervalMs); $("opsReplay").value = String(value.replayBatchSize); $("opsConfigReason").value = "";
+      opsDirty = false; opsControls();
+    }
+    async function loadOpsConfig() {
+      if (!opsDevice || opsSaving || !can("device:read")) return;
+      const key = opsKey(), generation = ++opsConfigGeneration, id = opsDevice.id, preserve = opsDirty, intent = opsIntent;
+      opsConfig = null; renderOpsConfig(); $("opsConfigStatus").textContent = "서버 설정 조회 중";
+      try {
+        const c = await api(`/api/devices/${encodeURIComponent(id)}/configuration`);
+        if (key !== opsKey() || generation !== opsConfigGeneration) return;
+        if (c.deviceId !== id || !Number.isInteger(c.version) || c.version < 0 || !opsSettingsValid(c.defaults) || (c.desired && !opsSettingsValid(c.desired.settings)) || (c.lastApplied && !opsSettingsValid(c.lastApplied.settings))) throw new Error("설정 응답의 대상 또는 형식이 다릅니다.");
+        if (!opsConfigScopeMatches(c)) {rejectOpsScope(); return;}
+        opsConfig = c; opsUncertain = false;
+        const found = intent && c.version === intent.expectedVersion + 1 && c.desired?.version === c.version && opsSameSettings(c.desired.settings,intent.settings) && c.desired.reason === intent.reason;
+        if (!preserve || found) fillOpsConfig();
+        opsIntent = null; renderOpsConfig();
+        $("opsConfigStatus").textContent = found ? "요청과 같은 버전·설정·사유가 서버에 있습니다. 중복 발행하지 않았습니다. 장치 적용 보고는 별도로 확인하세요." : !opsCanEdit() ? "읽기 전용입니다. 설정 발행에는 권한과 활성·등록된 장치 매핑이 필요합니다." : preserve ? "최신 버전을 조회했습니다. 보존된 편집 내용과 서버 요청을 비교한 뒤 발행하세요." : c.desired ? "최신 요청을 불러왔습니다. 발행과 장치 적용 성공 보고는 별개입니다." : "발행 이력이 없어 기본값을 편집기에 표시합니다. 장치의 실제 적용값을 의미하지 않습니다.";
+      } catch (error) {if (key === opsKey() && generation === opsConfigGeneration) {$("opsConfigStatus").textContent = `설정 조회 실패: ${error.message}. 다시 확인하기 전에는 발행할 수 없습니다.`; opsControls();}}
+    }
+    function renderOpsHistory() {
+      $("opsHistoryRows").replaceChildren();
+      if (!opsHistory.length) $("opsHistoryRows").textContent = "현재 매핑에 보관된 설정 이력이 없습니다.";
+      else $("opsHistoryRows").append(statusTable("설정 발행·장치 결과",["버전","상태","요청 설정","요청 시각 / 작성자","변경 사유","결과 시각 / 오류"],opsHistory.slice((opsHistoryPage - 1) * PAGE_SIZE,opsHistoryPage * PAGE_SIZE).map(row => [row.version,opsCommandLabel(row.state),opsSettingsText(row.settings),`${formatLocalTime(row.requestedAt)} / ${displayValue(row.requestedBy)}`,row.reason,`${formatLocalTime(row.result?.receivedAt)} / ${displayValue(row.result?.errorCode)}`])));
+      renderPager("opsHistory",opsHistoryPage,opsHistory.length);
+    }
+    async function loadOpsHistory() {
+      if (!opsDevice || !can("device:read")) return;
+      const key = opsKey(), generation = ++opsHistoryGeneration, id = opsDevice.id;
+      opsHistory = []; opsHistoryPage = 1; renderOpsHistory(); $("opsHistoryStatus").textContent = "설정 이력 조회 중";
+      try {
+        const result = await api(`/api/devices/${encodeURIComponent(id)}/configuration/history`);
+        if (key !== opsKey() || generation !== opsHistoryGeneration) return;
+        if (!Array.isArray(result.items)) throw new Error("설정 이력의 형식이 다릅니다.");
+        if (result.items.some(row => !opsScopeMatches(row))) {rejectOpsScope(); return;}
+        opsHistory = result.items; renderOpsHistory(); $("opsHistoryStatus").textContent = `현재 매핑의 최근 ${result.retainedLimit}개 요청·최종 결과를 보관합니다.`;
+      } catch (error) {if (key === opsKey() && generation === opsHistoryGeneration) {$("opsHistoryRows").replaceChildren(); $("opsHistoryStatus").textContent = `설정 이력 조회 실패: ${error.message}`;}}
+    }
+    async function publishOpsConfig() {
+      if (!opsCanEdit() || opsSaving || opsUncertain) return;
+      const settings = {measurementIntervalMs:Number($("opsInterval").value),replayBatchSize:Number($("opsReplay").value)}, reason = $("opsConfigReason").value.trim();
+      if (!opsSettingsValid(settings) || !reason || reason.length > 1000) {$("opsConfigStatus").textContent = "허용 범위의 정수 두 값과 변경 사유(1–1000자)를 입력하세요."; return;}
+      if (opsConfig.desired && ["pending","applied"].includes(opsConfig.desired.state) && opsSameSettings(settings,opsConfig.desired.settings)) {$("opsConfigStatus").textContent = "같은 설정이 이미 요청돼 있습니다. 중복 발행하지 않고 적용 보고를 확인해 주세요."; return;}
+      const intent = {expectedVersion:opsConfig.version,settings,reason}, key = opsKey(), id = opsDevice.id;
+      if (!confirm(`${id}에 v${intent.expectedVersion + 1} 설정을 발행할까요?\n${opsSettingsText(settings)}\n장치의 적용 성공 보고는 별도입니다.`)) return;
+      opsSaving = true; opsIntent = intent; opsDirty = true; opsControls(); $("opsConfigStatus").textContent = "설정 요청을 저장하는 중입니다.";
+      try {
+        const command = await api(`/api/devices/${encodeURIComponent(id)}/configuration`,jsonOptions("PUT",intent));
+        if (key !== opsKey()) return;
+        if (command.version !== intent.expectedVersion + 1 || command.siteId !== opsDevice.siteId || command.assetId !== opsDevice.assetId || command.reason !== reason || command.state !== "pending" || !/^[0-9a-f]{32}$/.test(command.commandId) || !opsSameSettings(command.settings,settings)) throw new Error("서버 발행 확인이 요청 내용과 다릅니다.");
+        opsConfigGeneration++; opsHistoryGeneration++;
+        opsConfig = {...opsConfig,version:command.version,desired:command};
+        opsHistory = [command,...opsHistory.filter(row => row.commandId !== command.commandId)].slice(0,100); opsHistoryPage = 1;
+        opsUncertain = false; opsIntent = null; fillOpsConfig(); renderOpsConfig(); renderOpsHistory();
+        $("opsConfigStatus").textContent = `v${command.version} 요청을 저장했습니다. 장치 적용 성공 보고 대기 중입니다.`;
+        $("opsHistoryStatus").textContent = "이번 발행을 반영했습니다. 이전 이력 전체와 결과는 이력 새로고침으로 확인하세요.";
+      } catch (error) {if (key === opsKey()) {opsUncertain = true; $("opsConfigStatus").textContent = `발행 결과 확인 실패: ${error.message}. 중복 발행 방지를 위해 잠갔습니다. 서버 설정을 다시 확인하세요.`;}}
+      finally {opsSaving = false; opsControls();}
+    }
+
     let acceptedSelection = {};
     const SELECTION_CONTROLS = ["siteSelect","assetSelect","periodSelect","severityFilter","eventLabelFilter","reviewedFilter","eventSort"];
     function rememberSelection() { acceptedSelection = Object.fromEntries(SELECTION_CONTROLS.map(id => [id,$(id).value])); }
     function allowSelectionChange() {
-      if (!modelReviewBusy && (!(reviewDirty || memoDirty || managementDirty || $("modelReviewReason").value.trim()) || confirm("저장하지 않은 편집을 버리고 조회 조건을 변경할까요?"))) return true;
+      if (!modelReviewBusy && !opsSaving && (!(reviewDirty || memoDirty || managementDirty || opsDirty || $("modelReviewReason").value.trim()) || confirm("저장하지 않은 편집을 버리고 조회 조건을 변경할까요?"))) return true;
       for (const [id,value] of Object.entries(acceptedSelection)) $(id).value = value;
       return false;
     }
@@ -1184,6 +1430,7 @@ def render_page() -> str:
       }
     }
     function invalidateScope(resetWindow = false) {
+      invalidateDeviceOperations();
       modelQueueGeneration++; modelQueueRows = []; modelQueueTotal = 0; modelQueuePage = 1; clearModelReview(); renderModelQueue();
       clearEventSelection();
       renderGeneration += 1;
@@ -1205,6 +1452,17 @@ def render_page() -> str:
       if (row) act(() => selectEvent(row.dataset.id));
     });
     $("loginBtn").addEventListener("click", () => login().then(rememberSelection).catch(error => alert(error.message)));
+    $("opsReload").addEventListener("click", () => act(loadDeviceOperations));
+    $("opsDevice").addEventListener("change", () => act(() => selectOpsDevice($("opsDevice").value)));
+    $("opsQualityLoad").addEventListener("click", () => act(() => Promise.all([loadOpsHealth(),loadOpsQuality()])));
+    for (const id of ["opsQualityRange","opsQualityBucket"]) $(id).addEventListener("change", () => act(loadOpsQuality));
+    $("opsConfigLoad").addEventListener("click", () => act(loadOpsConfig));
+    $("opsHistoryLoad").addEventListener("click", () => act(loadOpsHistory));
+    $("opsConfigPublish").addEventListener("click", () => act(publishOpsConfig));
+    for (const id of ["opsInterval","opsReplay","opsConfigReason"]) $(id).addEventListener("input", () => {opsDirty = true; opsControls();});
+    $("opsConfigCancel").addEventListener("click", () => {if (!opsSaving && !opsUncertain) {fillOpsConfig(); opsIntent = null;}});
+    for (const [id,step] of [["opsQualityPrev",-1],["opsQualityNext",1]]) $(id).addEventListener("click", () => {if (opsQuality) {opsQualityPage = Math.min(Math.max(1,Math.ceil(opsQuality.items.length / PAGE_SIZE)),Math.max(1,opsQualityPage + step)); renderOpsQuality();}});
+    for (const [id,step] of [["opsHistoryPrev",-1],["opsHistoryNext",1]]) $(id).addEventListener("click", () => {opsHistoryPage = Math.min(Math.max(1,Math.ceil(opsHistory.length / PAGE_SIZE)),Math.max(1,opsHistoryPage + step)); renderOpsHistory();});
     $("modelStatusFilter").addEventListener("change", () => act(() => loadModelQueue(true)));
     $("modelQueueLoad").addEventListener("click", () => act(() => loadModelQueue(true)));
     for (const [id,step] of [["modelQueuePrev",-1],["modelQueueNext",1]]) $(id).addEventListener("click", () => act(() => loadModelQueue(false, Math.max(1,modelQueuePage + step))));
@@ -1366,7 +1624,7 @@ def render_page() -> str:
     });
     setInterval(() => {
       // Evidence and an unsaved decision must not be replaced by telemetry polling.
-      if (currentView === "models" || !token || !selectedSite() || !$("assetSelect").value) return;
+      if (["models","deviceOps"].includes(currentView) || !token || !selectedSite() || !$("assetSelect").value) return;
       if (!$("fromInput").value && !chartViewport) activeWindow = null;
       act(render);
     }, 5000);

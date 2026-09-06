@@ -130,6 +130,8 @@ class ConfigSetup(unittest.TestCase):
 class RemoteConfigTest(ConfigSetup):
     def test_initial_read_does_not_create_or_claim_applied_configuration(self):
         view = config.configuration_for(self.admin, DEVICE)
+        self.assertEqual(view["siteId"], data.get_device(DEVICE)["siteId"])
+        self.assertEqual(view["assetId"], data.get_device(DEVICE)["assetId"])
         self.assertEqual(view["version"], 0)
         self.assertIsNone(view["desired"])
         self.assertIsNone(view["lastApplied"])
@@ -247,6 +249,7 @@ class RemoteConfigTest(ConfigSetup):
 
     def test_inactive_revoked_and_remapped_devices_cannot_receive_old_commands(self):
         self.issue()
+        original_view = config.configuration_for(self.admin, DEVICE)
         device = data.get_device(DEVICE)
         for field, value in (
             ("mappingStatus", "inactive"),
@@ -262,7 +265,14 @@ class RemoteConfigTest(ConfigSetup):
         self.assertApiError(
             "DEVICE_CONFIG_SCOPE_CHANGED", config.pending_configuration, TOKEN, DEVICE
         )
-        self.assertTrue(config.configuration_for(self.admin, DEVICE)["scopeChanged"])
+        view = config.configuration_for(self.admin, DEVICE)
+        self.assertTrue(view["scopeChanged"])
+        self.assertEqual(view["siteId"], device["siteId"])
+        self.assertEqual(view["assetId"], "SITE-01-GEN-01")
+        self.assertIsNone(view["desired"])
+        self.assertIsNone(view["lastApplied"])
+        self.assertEqual(original_view["assetId"], original_view["desired"]["assetId"])
+        self.assertNotEqual(original_view["assetId"], view["assetId"])
         self.assertEqual(config.configuration_history(self.admin, DEVICE)["items"], [])
         self.issue(1)
         self.assertEqual(

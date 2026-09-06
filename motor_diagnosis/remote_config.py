@@ -168,6 +168,8 @@ def configuration_for(user: dict[str, Any], device_id: str) -> dict[str, Any]:
         return data.copy_payload(
             {
                 "deviceId": device_id,
+                "siteId": device["siteId"],
+                "assetId": device["assetId"],
                 "version": record["version"],
                 "desired": (
                     desired if desired and _same_scope(desired, device) else None

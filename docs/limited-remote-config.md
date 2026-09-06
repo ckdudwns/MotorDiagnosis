@@ -11,7 +11,7 @@ ESP32가 HTTPS로 자신의 설정을 조회하고, 버전과 설정을 NVS에 �
 
 최소 대기 시간을 기존 3초보다 줄이지 않고, 재전송 상한도 기존 4건보다 늘리지 않는다. 기존 링의 물리적 크기·보존 정책·ACK·sequence·레코드 형식은 바꾸지 않는다. 버퍼를 비우거나 저장소를 초기화하는 원격 명령은 없다.
 
-Wi-Fi/인증정보/서버 주소/TLS 신뢰 설정, 센서 핀·샘플링률·단위 보정, 임의 코드·명령 실행, 모터 속도 제어, 펌웨어 OTA는 지원하지 않는다. 이 변경은 IoT와 백엔드 API 범위이며 별도 원격 설정 편집 화면은 포함하지 않는다.
+Wi-Fi/인증정보/서버 주소/TLS 신뢰 설정, 센서 핀·샘플링률·단위 보정, 임의 코드·명령 실행, 모터 속도 제어, 펌웨어 OTA는 지원하지 않는다. 후속 [장치 운영 화면](core-operations-ui.md)에서 아래 장치별 API를 사용해 허용된 설정을 발행하고 적용 보고를 확인한다.
 
 전역 `/api/parameters`의 `TELEMETRY_INTERVAL_SEC`와 버퍼 관련 값은 계속 읽기 전용이다. 이 값들을 장치의 실제 적용 설정으로 간주하지 말고 아래 장치별 API를 사용한다.
 
@@ -66,11 +66,19 @@ Wi-Fi/인증정보/서버 주소/TLS 신뢰 설정, 센서 핀·샘플링률·�
 
 | 메서드·경로 | 인증·권한 | 동작 |
 | --- | --- | --- |
-| `GET /api/devices/{deviceId}/configuration` | 사용자 `device:read` + 사이트 접근 | 버전, 최신 요청, 마지막 적용 보고, 기본값·범위 조회 |
+| `GET /api/devices/{deviceId}/configuration` | 사용자 `device:read` + 사이트 접근 | 현재 `siteId`·`assetId`, 버전, 최신 요청, 마지막 적용 보고, 기본값·범위 조회 |
 | `PUT /api/devices/{deviceId}/configuration` | 사용자 `parameter:write`, `device:read` + 사이트 접근 | 설정 전체와 기대 버전·사유를 검증해 새 요청 발행 |
 | `GET /api/devices/{deviceId}/configuration/history` | 사용자 `device:read` + 사이트 접근 | 현재 매핑 범위의 최근 요청/결과 이력 |
 | `GET /api/devices/{deviceId}/configuration/pending` | 해당 장치의 전용 설정 토큰 | 장치에 전달할 최신 설정. 없으면 `desired: null` |
 | `POST /api/devices/{deviceId}/configuration/result` | 해당 장치의 전용 설정 토큰 | 적용/실패/거부 보고. 정확한 명령을 확인한 후 수락 |
+
+사용자 설정 GET의 최상위 `siteId`·`assetId`는 **현재 장치 매핑**이며, 최신 요청·마지막
+적용 보고가 모두 `null`이거나 설정 이력이 없어도 항상 반환한다. 현재 매핑과 명령·버전은
+같은 저장소 잠금 안에서 읽고 복사한다. 이전 매핑의 명령은 기존처럼 숨기지만 현재
+매핑 필드는 숨기지 않는다. UI는 이 필드와 선택 대상을 확인한 후 발행을 활성화한다.
+`scopeChanged`만으로 현재 선택이 맞는지 판단하지 않는다. 새 UI는 현재 매핑 필드가
+없는 응답도 차단하므로, 백엔드를 먼저 또는 UI와 함께 배포한다. 이번 추가는 사용자 GET에
+한정되며 PUT 본문과 장치용 pending/result 계약은 변경하지 않는다.
 
 첫 발행 본문 예시:
 

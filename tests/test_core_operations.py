@@ -16,6 +16,7 @@ from urllib.parse import urlencode
 from motor_diagnosis import data, remote_config
 from motor_diagnosis.communication_quality import COUNTERS, _iso
 from motor_diagnosis.server import create_server
+from tests.auth_fixtures import credentials, install_production_auth
 
 DEVICE = "DEV-01-MOT-02"
 CONFIG_TOKEN = "operations-config-fixture-" + "A" * 32
@@ -25,6 +26,7 @@ ROOT = f"/api/devices/{DEVICE}"
 
 class CoreOperationsHttpTest(unittest.TestCase):
     def setUp(self):
+        install_production_auth(self)
         data.close_runtime_state()
         data.reset_runtime_state()
         self.addCleanup(data.reset_runtime_state)
@@ -56,7 +58,7 @@ class CoreOperationsHttpTest(unittest.TestCase):
             status, login = self.request(
                 "/api/auth/login",
                 "POST",
-                {"username": name, "password": name + "123"},
+                credentials(name),
                 token="",
             )
             self.assertEqual(status, 200, login)

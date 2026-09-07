@@ -136,8 +136,10 @@ class Pr19RegressionTest(unittest.TestCase):
                 ))
         return initial, initial + timedelta(days=2)
 
-    def assert_empty_http_telemetry_and_exports(self, server):
-        login = data.authenticate({"username": "admin", "password": "admin123"})
+    def assert_empty_http_telemetry_and_exports(self, server, login_payload=None):
+        login = data.authenticate(
+            login_payload or {"username": "admin", "password": "admin123"}
+        )
         headers = {"Authorization": f"Bearer {login['session']['token']}"}
         scope = "siteId=SITE-01&assetId=SITE-01-GEN-01"
 
@@ -178,6 +180,9 @@ class Pr19RegressionTest(unittest.TestCase):
         self.assertEqual(manifest_values["recordCount"], "0")
 
     def test_all_expired_restart_returns_empty_http_telemetry_and_exports(self):
+        from tests.auth_fixtures import credentials, install_production_auth
+
+        install_production_auth(self)
         _, future = self.seed_retention_window(ages=(29,))
         data.close_runtime_state()
         data.reset_runtime_state()
@@ -195,7 +200,7 @@ class Pr19RegressionTest(unittest.TestCase):
                 self.assertFalse(server.demo_enabled)
                 self.assertEqual(data.TELEMETRY_RECORDS, [])
                 self.assertEqual(data.TELEMETRY_IDEMPOTENCY, {})
-                self.assert_empty_http_telemetry_and_exports(server)
+                self.assert_empty_http_telemetry_and_exports(server, credentials("admin"))
             finally:
                 server.shutdown()
                 server.server_close()

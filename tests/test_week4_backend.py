@@ -777,6 +777,9 @@ class Week4HttpTest(unittest.TestCase):
         )
 
     def test_production_demo_guard_and_restricted_admin_site_authorization(self):
+        from tests.auth_fixtures import install_production_auth
+
+        install_production_auth(self)
         with patch.dict(
             "os.environ", {"APP_ENV": "production", "DEMO_ENABLED": "true"}
         ):
@@ -786,7 +789,7 @@ class Week4HttpTest(unittest.TestCase):
             finally:
                 server.server_close()
         self.server.demo_enabled = True
-        restricted = user("admin")
+        restricted = data.public_user(data.USERS[1])
         restricted["allowedSiteIds"] = ["SITE-01"]
         before = len(data.EVENTS)
         with patch(

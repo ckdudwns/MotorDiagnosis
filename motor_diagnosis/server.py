@@ -26,6 +26,7 @@ from .data import (
     ROLE_POLICIES,
     TELEMETRY_RECORDS,
     ApiError,
+    authentication_users,
     acoustic_taxonomies_for,
     alert_policies_for,
     anomaly_rule_for,
@@ -1756,6 +1757,8 @@ def create_server(
     model_database=":memory:",
     model_preprocessing_profile=None,
 ) -> ThreadingHTTPServer:
+    # Fail closed before opening sockets or persistent databases in production.
+    authentication_users()
     if demo_enabled is None:
         demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
     configure_runtime_state(state_database)

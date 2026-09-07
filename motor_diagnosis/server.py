@@ -111,6 +111,7 @@ from .json_validation import loads_strict_json
 from .alerts import AlertService
 from .edge_analysis import AnalysisStore
 from .model_inference import ModelInferenceStore
+from .model_history import ModelHistoryGuard
 from .model_registry import create_baseline_version, create_model_version, versions_for
 from .ai_results import submit_result, review_model
 from .telemetry_bulk import ingest_telemetry_bulk
@@ -1727,6 +1728,8 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
         super().server_close()
         if getattr(self, "model_inference", None) is not None:
             self.model_inference.close()
+        if getattr(self, "model_history", None) is not None:
+            self.model_history.close()
         if hasattr(self, "communication_quality"):
             self.communication_quality.close()
         if hasattr(self, "alerts"):
@@ -1766,7 +1769,10 @@ def create_server(
     )
     server.auto_alerts = auto_alerts
     server.model_inference = None
+    server.model_history = None
     try:
+        # Identity protection must survive disabling/replacing the ML runtime.
+        server.model_history = ModelHistoryGuard(model_database)
         if model_preprocessing_profile and not model_artifact:
             raise ValueError("Raw preprocessing requires an explicit checkpoint")
         if model_artifact:

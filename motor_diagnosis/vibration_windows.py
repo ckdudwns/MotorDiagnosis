@@ -222,6 +222,24 @@ class VibrationWindowStore:
                 LOGGER.exception("Window processing failed; accepted work retained")
             self.stop.wait(0.25)
 
+    def result_context(self):
+        return {"mode": "shadow", "affectsAlerts": False, "domainValidated": False,
+                "verdict": None, "variant": self.variant, "modelVersion": None}
+
+    def infer_window(self, values):
+        if self.checkpoint is None:
+            return {"status": "waiting_model", "reason": "MODEL_NOT_CONFIGURED"}
+        prediction = self.checkpoint.predict([values], self.input_names())
+        if len(prediction["verdict"]) != 1 or len(prediction["errors"]) != 1:
+            raise ValueError("Expected exactly one prediction per window")
+        if (type(prediction["verdict"][0]) is not bool
+                or not math.isfinite(prediction["errors"][0])
+                or not math.isfinite(prediction["threshold"])):
+            raise ValueError("Invalid prediction values")
+        return {"status": "completed", "modelVersion": self.checkpoint.checksum,
+                "verdict": prediction["verdict"][0], "error": prediction["errors"][0],
+                "threshold": prediction["threshold"]}
+
     def tick(self):
         with self.processing:
             with self.lock:
@@ -229,27 +247,14 @@ class VibrationWindowStore:
             if row is None:
                 return False
             window = json.loads(row["body"])
-            result = {"mode": "shadow", "affectsAlerts": False, "domainValidated": False,
-                      "verdict": None, "variant": self.variant, "modelVersion": None}
+            result = self.result_context()
             if window["quality"] != "valid":
                 result.update(status="unavailable", reason=window["quality"])
             else:
                 try:
                     values = self.input_values(window)
                     result["modelInput"] = values
-                    if self.checkpoint is None:
-                        result.update(status="waiting_model", reason="MODEL_NOT_CONFIGURED")
-                    else:
-                        prediction = self.checkpoint.predict([values], self.input_names())
-                        if len(prediction["verdict"]) != 1 or len(prediction["errors"]) != 1:
-                            raise ValueError("Expected exactly one prediction per window")
-                        if (type(prediction["verdict"][0]) is not bool
-                                or not math.isfinite(prediction["errors"][0])
-                                or not math.isfinite(prediction["threshold"])):
-                            raise ValueError("Invalid prediction values")
-                        result.update(status="completed", modelVersion=self.checkpoint.checksum,
-                                      verdict=prediction["verdict"][0], error=prediction["errors"][0],
-                                      threshold=prediction["threshold"])
+                    result.update(self.infer_window(values))
                 except Exception:
                     LOGGER.exception("Window unavailable; not classified as normal")
                     result.update(status="unavailable", reason="MODEL_INPUT_OR_INFERENCE_FAILED")

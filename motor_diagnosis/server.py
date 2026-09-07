@@ -1784,6 +1784,8 @@ def create_server(
     window_database=":memory:",
     raw_window_database=":memory:",
     window_model_variant=None,
+    rf66_artifact=None,
+    rf66_checksum=None,
 ) -> ThreadingHTTPServer:
     # Fail closed before opening sockets or persistent databases in production.
     authentication_users()
@@ -1835,7 +1837,14 @@ def create_server(
             checkpoint=checkpoint if window_model_variant else None,
             variant=window_model_variant or "base21",
         )
-        server.raw_vibration = RawVibrationStore(raw_window_database)
+        rf66_model = None
+        if rf66_checksum and not rf66_artifact:
+            raise ValueError("RF66 checksum requires an explicit RF66 artifact")
+        if rf66_artifact:
+            from .rf66 import RF66Model
+
+            rf66_model = RF66Model.load(rf66_artifact, expected_checksum=rf66_checksum)
+        server.raw_vibration = RawVibrationStore(raw_window_database, model=rf66_model)
         server.analysis = AnalysisStore(analysis_database)
         server.communication_quality = CommunicationQualityStore(communication_database)
         server.alerts = AlertService(

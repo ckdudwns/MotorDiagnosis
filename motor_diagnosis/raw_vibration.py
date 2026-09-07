@@ -146,7 +146,8 @@ class RawVibrationStore(VibrationWindowStore):
     max_batch = 4
     list_limit = 20
 
-    def __init__(self, database=":memory:"):
+    def __init__(self, database=":memory:", *, model=None):
+        self.model = model
         super().__init__(database)
         self.variant = "spectral66"
         self.db.execute("CREATE TABLE IF NOT EXISTS raw_clock_anchors(device TEXT, boot TEXT, uptime INTEGER, captured REAL, PRIMARY KEY(device,boot))")
@@ -157,6 +158,27 @@ class RawVibrationStore(VibrationWindowStore):
 
     def input_values(self, window):
         return extract66(decode_samples(window))
+
+    def result_context(self):
+        result = super().result_context()
+        result.update(score=None, modelType="random_forest", featureProfileId=FEATURE_PROFILE,
+                      fieldValidated=False, confirmationApplied=False)
+        if self.model is not None:
+            result.update(self.model.metadata())
+        return result
+
+    def infer_window(self, values):
+        if self.model is None:
+            return {"status": "waiting_model", "reason": "MODEL_NOT_CONFIGURED"}
+        prediction = self.model.predict_window(values)
+        score, threshold, verdict = (prediction[k] for k in ("score", "threshold", "verdict"))
+        if (type(score) not in (int, float) or type(threshold) not in (int, float)
+                or not math.isfinite(score) or not math.isfinite(threshold)
+                or not 0 <= score <= 1 or not 0 <= threshold <= 1
+                or type(verdict) is not bool or verdict != (score > threshold)
+                or threshold != self.model.threshold):
+            raise ValueError("Invalid RF66 window prediction")
+        return {"status": "completed", "score": score, "threshold": threshold, "verdict": verdict}
 
     def validate_stream_clock(self, window, captured):
         key = (window["deviceId"], window["bootId"])
@@ -171,4 +193,5 @@ class RawVibrationStore(VibrationWindowStore):
         result["featureProfileId"] = FEATURE_PROFILE
         result["numericPolicy"] = "base21 float32 promoted to float64; extra45 float64"
         result["maxRows"] = self.max_rows
+        result["configuredModel"] = self.model.metadata() if self.model is not None else None
         return result

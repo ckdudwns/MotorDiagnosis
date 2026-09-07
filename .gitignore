@@ -62,4 +62,7 @@ ai/ai1/week1/ai1/data/prototype/
 ai/ai1/week1/ai1/synthetic_data/
 
 # Internal planning documents
+ingest-tokens*.json
+ingest-tokens*.json.lock
+*.ingest-token.json
 참고/

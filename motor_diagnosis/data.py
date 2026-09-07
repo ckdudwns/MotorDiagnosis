@@ -17,6 +17,7 @@ from ai.ai2.week2.anomaly_score import score_telemetry_point
 from ai.ai2.week3.event_lifecycle import AnomalyEventLifecycle, EventLifecycleConfig
 
 from . import device_lifecycle
+from . import ingest_auth
 from .auth_config import AuthConfigurationError, configured_users, user_fingerprint
 from .demo_signals import (
     DEMO_MODEL_VERSION,
@@ -2809,17 +2810,51 @@ def format_rfc3339(value: datetime) -> str:
     )
 
 
+def validate_ingest_auth() -> None:
+    try:
+        ingest_auth.configured_credentials()
+    except ingest_auth.IngestAuthError:
+        raise ApiError(
+            503,
+            "INGEST_AUTH_UNAVAILABLE",
+            "Machine ingestion credentials are not configured safely.",
+        ) from None
+
+
 def telemetry_principal_for_token(token: str) -> dict[str, Any]:
     if not token:
         raise ApiError(
             401, "AUTH_REQUIRED", "A bearer device or service token is required."
         )
     service = TELEMETRY_SERVICE_TOKENS.get(token)
+    production = os.environ.get("APP_ENV", "").strip().lower() == "production"
+    # Check before every configured fallback, including DEVICE_HEALTH_TOKEN.
+    if production and (service is not None or token.startswith("demo-")):
+        raise ApiError(
+            401, "AUTH_REQUIRED", "Demo service tokens are disabled in production."
+        )
+    if service is not None:
+        return copy_payload(service)
+    try:
+        service = ingest_auth.principal_for_token(token)
+    except ingest_auth.IngestAuthError:
+        raise ApiError(
+            503,
+            "INGEST_AUTH_UNAVAILABLE",
+            "Machine ingestion credentials are not configured safely.",
+        ) from None
+    if service is None and token.startswith("ingest-"):
+        # Revoked machine tokens must not regain rights through legacy secrets.
+        raise ApiError(
+            401, "AUTH_REQUIRED", "The machine credential is invalid or revoked."
+        )
     configured_health_token = os.environ.get("DEVICE_HEALTH_TOKEN", "")
     if (
         service is None
         and configured_health_token
-        and hmac.compare_digest(token, configured_health_token)
+        and hmac.compare_digest(
+            token.encode("utf-8"), configured_health_token.encode("utf-8")
+        )
     ):
         service = {
             "id": "service-device-health",
@@ -2828,14 +2863,6 @@ def telemetry_principal_for_token(token: str) -> dict[str, Any]:
             "allowedDeviceIds": ["*"],
         }
     if service:
-        if service.get("demoOnly") and os.environ.get(
-            "APP_ENV", ""
-        ).strip().lower() == ("production"):
-            raise ApiError(
-                401,
-                "AUTH_REQUIRED",
-                "Demo telemetry validation tokens are disabled in production.",
-            )
         return copy_payload(service)
     user = current_user_for_token(token)
     if not has_permission(user, "telemetry:ingest"):
@@ -3271,6 +3298,16 @@ def quarantine_mqtt_message(
     ):
         device_id = topic_parts[1].strip().upper() or None
 
+    allowed_device_ids = principal.get("allowedDeviceIds", ["*"])
+    if "*" not in allowed_device_ids and (
+        topic != f"devices/{device_id}/telemetry" or device_id not in allowed_device_ids
+    ):
+        raise ApiError(
+            403,
+            "TELEMETRY_QUARANTINE_FORBIDDEN",
+            "The token cannot quarantine messages for this topic.",
+        )
+
     with STORE_LOCK:
         request_fingerprint = hashlib.sha256(
             json.dumps(
@@ -3543,6 +3580,11 @@ def process_accepted_telemetry(
 def ingest_telemetry(
     principal: dict[str, Any], payload: dict[str, Any]
 ) -> tuple[dict[str, Any], int]:
+    # Reject foreign-device submissions before even writing rejection diagnostics.
+    device_id = payload.get("deviceId")
+    principal_can_ingest(
+        principal, device_id.strip().upper() if isinstance(device_id, str) else ""
+    )
     started = time.monotonic()
     try:
         return _accept_telemetry(principal, payload)

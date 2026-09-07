@@ -11,8 +11,10 @@
 #define HEALTH_URL_VALUE "https://backend.example.com/api/health"
 #define INGEST_TOKEN_VALUE "YOUR_TELEMETRY_TOKEN"
 
-// Separate limited-scope credential: device-health:write, never an admin token.
-// Backend production provisioning currently uses DEVICE_HEALTH_TOKEN.
+// Provision a device-scoped machine credential using docs/production-ingest-auth.md.
+// Its secret can fill INGEST_TOKEN_VALUE and DEVICE_HEALTH_TOKEN_VALUE for this
+// same device only. Never use a factory-demo token or an operator session.
+// A separately provisioned legacy health-only credential is also supported.
 #define DEVICE_HEALTH_URL_VALUE "https://backend.example.com/api/devices/DEV-01-MOT-02/health"
 #define DEVICE_HEALTH_TOKEN_VALUE "YOUR_DEVICE_HEALTH_TOKEN"
 

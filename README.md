@@ -251,6 +251,7 @@ pio run -d firmware/esp32_edge_node -e esp32-s3-devkitc-1
 
 - [백엔드 영구 저장·실시간 이벤트 연결](https://github.com/ckdudwns/MotorDiagnosis/blob/main/docs/backend-production-integrations.md)
 - [운영 계정 설정·데모 로그인 차단 및 EC2 적용](docs/production-auth.md)
+- [운영 장치·MQTT 수집 토큰 발급·교체·폐기](docs/production-ingest-auth.md)
 - [AI2 운영 대시보드 연결 및 사용 흐름](https://github.com/ckdudwns/MotorDiagnosis/blob/main/docs/ai2-dashboard-integration.md)
 - [AI1 음향 학습·음향/RPM 기준선](https://github.com/ckdudwns/MotorDiagnosis/blob/main/docs/ai1-acoustic-baselines.md)
 - [AI1 4주차 학습·데이터셋·모델 버전](https://github.com/ckdudwns/MotorDiagnosis/blob/main/ai/ai1/week4/ai1/README.md)

@@ -27,6 +27,7 @@ from .data import (
     TELEMETRY_RECORDS,
     ApiError,
     authentication_users,
+    validate_ingest_auth,
     acoustic_taxonomies_for,
     alert_policies_for,
     anomaly_rule_for,
@@ -1759,6 +1760,7 @@ def create_server(
 ) -> ThreadingHTTPServer:
     # Fail closed before opening sockets or persistent databases in production.
     authentication_users()
+    validate_ingest_auth()
     if demo_enabled is None:
         demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
     configure_runtime_state(state_database)

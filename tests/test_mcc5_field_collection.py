@@ -125,6 +125,109 @@ class FieldCollectionTest(unittest.TestCase):
             self.assertIn("HUMAN_NORMAL_REVIEW_REQUIRED", result["blockingReasons"])
             self.assertIn("TIMING_TOLERANCE_NOT_AGREED", result["blockingReasons"])
 
+    def long_session(self):
+        meta = self.meta()
+        meta["end"] = "2026-09-07T00:05:00.160Z"
+        meta["qualityLimits"]["minimumValidSeconds"] = 300
+        return meta, [self.window(i) for i in range(469)]
+
+    def test_frozen_timestamp_cannot_pass_300_second_collection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            meta, rows = self.long_session()
+            for row in rows:
+                row["timestamp"] = meta["start"]
+            result, _ = f.inspect(meta, self.write_windows(Path(temp), rows))
+            self.assertAlmostEqual(result["validSeconds"], 300.16)
+            self.assertAlmostEqual(result["observedSpanSeconds"], 0.640)
+            self.assertFalse(result["passesCollectionChecks"])
+            self.assertIn("TIMESTAMP_UPTIME_MISMATCH", result["blockingReasons"])
+
+    def test_second_resolution_timestamps_remain_valid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            meta, rows = self.long_session()
+            for row in rows:
+                row["timestamp"] = datetime.fromisoformat(row["timestamp"]).isoformat(
+                    timespec="seconds"
+                )
+            self.assertEqual(rows[0]["timestamp"], rows[1]["timestamp"])
+            result, _ = f.inspect(meta, self.write_windows(Path(temp), rows))
+            self.assertTrue(result["passesCollectionChecks"])
+            self.assertLessEqual(result["maxTimestampUptimeErrorUs"], 1000000)
+
+    def test_cumulative_slow_drift_and_mid_record_freeze_are_blocked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for scenario in ("slow", "freeze_then_recover"):
+                with self.subTest(scenario=scenario):
+                    meta, rows = self.long_session()
+                    start = f.timestamp(meta["start"])
+                    for i, row in enumerate(rows):
+                        seconds = (
+                            i * 0.630
+                            if scenario == "slow"
+                            else min(i, 100) * 0.640 if 100 <= i < 110 else i * 0.640
+                        )
+                        row["timestamp"] = datetime.fromtimestamp(
+                            start + seconds, timezone.utc
+                        ).isoformat()
+                    result, _ = f.inspect(meta, self.write_windows(Path(temp), rows))
+                    self.assertFalse(result["passesCollectionChecks"])
+                    self.assertIn(
+                        "TIMESTAMP_UPTIME_MISMATCH", result["blockingReasons"]
+                    )
+
+    def test_old_passing_audit_is_rechecked_for_frozen_time(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            folder = root / "frozen"
+            folder.mkdir()
+            meta, rows = self.long_session()
+            for row in rows:
+                row["timestamp"] = meta["start"]
+            path = self.write_windows(folder, rows)
+            f.dump(folder / "session.json", meta)
+            f.dump(
+                folder / "audit.json",
+                {
+                    "passesCollectionChecks": True,
+                    "metadataSha256": f.digest(folder / "session.json"),
+                    "windowsSha256": f.digest(path),
+                },
+            )
+            self.assertFalse(f.check_archive(folder)[2]["passesCollectionChecks"])
+            with self.assertRaisesRegex(ValueError, "TIMESTAMP_UPTIME_MISMATCH"):
+                f.build([folder], root / "plan")
+
+    def test_matching_clocks_with_compressed_duration_do_not_prove_coverage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            meta, rows = self.long_session()
+            meta["qualityLimits"]["maxTimingErrorUs"] = 10000
+            for i, row in enumerate(rows):
+                row["startUptimeUs"] = i * 630000
+                row["timestamp"] = datetime.fromtimestamp(
+                    f.timestamp(meta["start"]) + i * .630, timezone.utc
+                ).isoformat()
+            result, _ = f.inspect(meta, self.write_windows(Path(temp), rows))
+            self.assertEqual(result["maxTimestampUptimeErrorUs"], 0)
+            self.assertAlmostEqual(result["observedUptimeSpanSeconds"], 295.48)
+            self.assertFalse(result["passesCollectionChecks"])
+            self.assertIn("INCOMPLETE_REQUESTED_INTERVAL", result["blockingReasons"])
+
+    def test_missing_requested_start_or_end_is_not_hidden_by_row_count(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for edge in ("start", "end"):
+                with self.subTest(edge=edge):
+                    meta, rows = self.long_session()
+                    # Permit the count deficit, but not a five-second edge gap.
+                    meta["qualityLimits"]["minimumValidSeconds"] = 290
+                    meta["qualityLimits"]["maxMissingWindows"] = 10
+                    if edge == "start":
+                        meta["start"] = "2026-09-06T23:59:55Z"
+                    else:
+                        meta["end"] = "2026-09-07T00:05:05.160Z"
+                    result, _ = f.inspect(meta, self.write_windows(Path(temp), rows))
+                    self.assertFalse(result["passesCollectionChecks"])
+                    self.assertIn("INCOMPLETE_REQUESTED_INTERVAL", result["blockingReasons"])
+
     def test_gaps_and_invalid_windows_preserved_and_blocked(self):
         with tempfile.TemporaryDirectory() as temp:
             rows = [self.window(i) for i in (0, 2, 3)]

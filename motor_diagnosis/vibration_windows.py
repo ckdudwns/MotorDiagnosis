@@ -38,7 +38,9 @@ def validate_envelope(payload, keys=KEYS, profile=PROFILE_ID, unit="g"):
     if not isinstance(payload, dict) or set(payload) != keys:
         reject("Use the exact versioned vibration-window envelope")
     for key in ("deviceId", "siteId", "assetId"):
-        if not isinstance(payload[key], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", payload[key]):
+        # Registration uses required_text(...).upper(), not a second ID grammar.
+        # Require the canonical spelling on the wire to preserve stream identity.
+        if payload[key] != data.required_text(payload, key).upper():
             reject("Invalid " + key)
     if not isinstance(payload["bootId"], str) or not re.fullmatch(r"[0-9a-f]{32}", payload["bootId"]):
         reject("bootId must be 32 lowercase hexadecimal characters")

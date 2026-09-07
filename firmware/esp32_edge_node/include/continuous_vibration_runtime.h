@@ -2,6 +2,7 @@
 // Included by main.cpp after sensor helpers: one SPI owner, separate compute
 // and network tasks. No LittleFS, NVS, HTTPS or feature FFT in the FIFO reader.
 #include "vibration_window.h"
+#include "continuous_vibration_health.h"
 #include <mbedtls/base64.h>
 
 #ifndef RAW_VIBRATION_ENABLED
@@ -55,6 +56,18 @@ bool hasLatest = false;
 std::atomic<bool> sensorReady{false};
 std::atomic<std::uint32_t> processingDrops{0};
 char boot[33];
+CaptureHealth captureHealth;
+
+void reportCaptureHealth(CaptureHealth::State state) {
+    captureHealth.record(state, healthUptimeMs(),
+        [](DeviceHealth::Fault fault, bool active, std::uint64_t observedMs) {
+            const SensorObservation observation{fault, active, observedMs};
+            // Transitions only, not every sample/window. Backpressure pauses
+            // acquisition rather than silently losing a fault/recovery. FIFO
+            // overflow after a pause is reported as an invalid window.
+            return xQueueSend(sensorObservations, &observation, portMAX_DELAY) == pdTRUE;
+        });
+}
 
 void resetFifo() {
     adxlWrite(0x38, 0); // Bypass clears stale FIFO; then continuous stream.
@@ -62,6 +75,7 @@ void resetFifo() {
 }
 void finish(Quality quality) {
     capturing.quality = quality;
+    if (quality == Quality::Valid) reportCaptureHealth(CaptureHealth::State::Healthy);
     if (xQueueSend(rawQueue, &capturing, 0) != pdTRUE) ++processingDrops;
     ++capturing.index; // Includes invalid/dropped windows, never renumber.
     capturing.count = 0;
@@ -72,6 +86,7 @@ void captureTask(void*) {
     while (true) {
         if (!sensorReady.load()) {
             if (!initADXL345()) {
+                reportCaptureHealth(CaptureHealth::State::InitFailed);
                 capturing.startUs = esp_timer_get_time();
                 finish(Quality::SensorUnavailable);
                 vTaskDelay(pdMS_TO_TICKS(640));
@@ -83,14 +98,18 @@ void captureTask(void*) {
         }
         const auto now = static_cast<std::uint64_t>(esp_timer_get_time());
         const unsigned entries = adxlRead(0x39) & 0x3f;
-        if (entries >= 32 || adxlRead(REG_DEVID) != 0xE5) {
+        const bool disconnected = adxlRead(REG_DEVID) != 0xE5 || entries > 32;
+        if (entries >= 32 || disconnected) {
+            reportCaptureHealth(disconnected ? CaptureHealth::State::ChannelFailed :
+                                              CaptureHealth::State::TimedOut);
             if (!capturing.count) capturing.startUs = now;
-            finish(entries > 32 ? Quality::SensorUnavailable : Quality::FifoOverrun);
+            finish(disconnected ? Quality::SensorUnavailable : Quality::FifoOverrun);
             sensorReady.store(false);
             continue;
         }
         if (!entries) {
             if (now - lastData > 100000) {
+                reportCaptureHealth(CaptureHealth::State::TimedOut);
                 if (!capturing.count) capturing.startUs = now;
                 finish(Quality::SampleGap);
                 sensorReady.store(false);

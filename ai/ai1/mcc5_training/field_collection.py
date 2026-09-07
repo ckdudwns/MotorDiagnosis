@@ -26,6 +26,9 @@ QUALITY = {
     "processing_overflow",
 }
 MAX_ROWS = 100000
+# Two timestamps quantized to whole seconds can differ from uptime by <1s.
+# This allowance is cumulative, never multiplied by the number of windows.
+TIMESTAMP_UPTIME_TOLERANCE_US = 1000000
 WINDOW_KEYS = set(
     "schemaVersion deviceId siteId assetId bootId windowIndex timestamp startUptimeUs sampleRateHz sampleCount profileId axes unit quality features".split()
 )
@@ -230,6 +233,7 @@ def inspect(meta, path):
     start, end = metadata(meta)
     windows, identities, streams, qualities = 0, set(), {}, collections.Counter()
     missing, max_error, first, last = 0, 0, None, None
+    anchors, max_clock_error = {}, 0
     with Path(path).open(encoding="utf-8") as source:
         for line in source:
             if len(line) > 128000 or not line.strip():
@@ -241,6 +245,17 @@ def inspect(meta, path):
                 raise ValueError("Duplicate window identity")
             identities.add(key)
             previous = streams.get(w["bootId"])
+            captured_us = round(captured * 1000000)
+            anchor_uptime, anchor_timestamp = anchors.setdefault(
+                w["bootId"], (w["startUptimeUs"], captured_us)
+            )
+            max_clock_error = max(
+                max_clock_error,
+                abs(
+                    (captured_us - anchor_timestamp)
+                    - (w["startUptimeUs"] - anchor_uptime)
+                ),
+            )
             if previous is not None:
                 delta = w["windowIndex"] - previous[0]
                 if (
@@ -269,6 +284,8 @@ def inspect(meta, path):
         reasons.append("REQUIRE_ONE_BOOT_PER_SESSION")
     if windows < 2:
         reasons.append("INSUFFICIENT_TIMING_PAIRS")
+    if max_clock_error > TIMESTAMP_UPTIME_TOLERANCE_US:
+        reasons.append("TIMESTAMP_UPTIME_MISMATCH")
     if valid * 0.640 < limits["minimumValidSeconds"]:
         reasons.append("INSUFFICIENT_VALID_DURATION")
     if windows - valid > limits["maxInvalidWindows"]:
@@ -279,8 +296,17 @@ def inspect(meta, path):
         reasons.append("TIMING_TOLERANCE_NOT_AGREED")
     elif max_error > limits["maxTimingErrorUs"]:
         reasons.append("TIMING_TOLERANCE_EXCEEDED")
-    # Account for at most one phase-alignment window at each requested edge.
-    if windows < max(0, math.floor((end - start) / 0.640) - 1):
+    # Counts alone cannot prove coverage. Check UTC edges and the independent
+    # uptime span too; second-precision UTC gets a fixed quantization allowance.
+    uptime_span = max(
+        (streams[boot][1] - anchor[0] + 640000 for boot, anchor in anchors.items()),
+        default=0,
+    ) / 1000000
+    edge_tolerance = 0.640 + TIMESTAMP_UPTIME_TOLERANCE_US / 1000000
+    if (windows < max(0, math.floor((end - start) / 0.640) - 1)
+            or first is None or first - start > edge_tolerance
+            or end - (last + 0.640) > edge_tolerance
+            or uptime_span + 2 * 0.640 < end - start - 0.000001):
         reasons.append("INCOMPLETE_REQUESTED_INTERVAL")
     return {
         "sessionId": meta["sessionId"],
@@ -291,8 +317,12 @@ def inspect(meta, path):
         "validSeconds": valid * 0.640,
         "missingWindowsInsideStream": missing,
         "maxAdjacentTimingErrorUs": max_error,
+        "maxTimestampUptimeErrorUs": max_clock_error,
+        "timestampUptimeToleranceUs": TIMESTAMP_UPTIME_TOLERANCE_US,
+        "validSecondsBasis": "quality-valid window count x 0.640; not verified wall-clock duration",
         "qualityCounts": dict(qualities),
         "observedSpanSeconds": 0 if first is None else last - first + 0.640,
+        "observedUptimeSpanSeconds": uptime_span,
         "requestedIntervalBoundaryUncertaintyWindows": 1,
         "passesCollectionChecks": not reasons,
         "blockingReasons": reasons,

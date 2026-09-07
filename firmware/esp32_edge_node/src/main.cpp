@@ -6721,11 +6721,12 @@ void serviceSensors()
         adxlInitFailed = !initialized;
         adxlRetry.attempted(millis(), initialized);
     }
-    if (adxlRetry.attempts())
+    if (!CONTINUOUS_VIBRATION_ENABLED && adxlRetry.attempts())
         observeSensorFault(DeviceHealth::Fault::ADXL_INIT, adxlInitFailed, healthUptimeMs());
     SensorObservation observation;
     // Peek until the observation is durably recorded. A failed write or full
-    // journal cannot discard a short-lived audio failure between main loops.
+    // journal cannot discard a short-lived audio/vibration failure or recovery
+    // between main loops. The continuous FIFO owner uses this same queue.
     while (xQueuePeek(sensorObservations, &observation, 0) == pdTRUE)
     {
         if (!observeSensorFault(observation.fault, observation.active, observation.observedMs)) break;
@@ -7226,7 +7227,15 @@ void loop()
         return;
     }
     for (size_t code = 0; code < DeviceHealth::FAULT_COUNT; ++code)
-        observeSensorFault(static_cast<DeviceHealth::Fault>(code), false, healthUptimeMs());
+    {
+        const auto fault = static_cast<DeviceHealth::Fault>(code);
+#if CONTINUOUS_VIBRATION_ENABLED
+        // A cached summary must not clear a newer FIFO failure. Recovery is
+        // queued by the capture owner after a complete window, in FIFO order.
+        if (ContinuousVibration::CaptureHealth::owns(fault)) continue;
+#endif
+        observeSensorFault(fault, false, healthUptimeMs());
+    }
     // Send these observations on the next service pass. An HTTP health request
     // here would shift the fresh packet timestamp after the measured window.
     if (healthJournalDirty || healthObservationBlocked)

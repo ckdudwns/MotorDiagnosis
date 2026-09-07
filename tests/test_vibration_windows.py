@@ -114,6 +114,60 @@ class WindowTest(RpmSetup):
         with self.assertRaises(data.ApiError):
             self.store.list_device({"role": "AI1"}, DEVICE)
 
+    def test_registered_dotted_id_accepted_by_both_http_window_endpoints(self):
+        from motor_diagnosis import ingest_auth, raw_vibration
+        from tests.test_raw_vibration import counts, encoded
+
+        # Keep the existing ready asset/rollout and replace its active mapping
+        # through the same registration functions used by the HTTP handlers.
+        data.update_device(self.admin, DEVICE, {"mappingStatus": "inactive"})
+        asset = data.get_asset("SITE-01", "SITE-01-GEN-01")
+        device = data.create_device(self.admin, "SITE-01", {
+            "id": "DEV.REVIEW.01", "assetId": asset["id"],
+            "certificateId": "review-cert", "certificateFingerprint": "a" * 64,
+        })
+        self.assertIsNotNone(ingest_auth.DEVICE.fullmatch(device["id"]))
+        window = self.window(deviceId=device["id"], assetId=asset["id"])
+        raw = {**window, "profileId": raw_vibration.PROFILE_ID, "unit": "count",
+               "encoding": raw_vibration.ENCODING, "gPerCount": .0039,
+               "samples": encoded(counts())}
+        del raw["features"]
+        server = create_server("127.0.0.1", 0, demo_enabled=False, auto_alerts=False)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for endpoint, value in (("vibration-windows", window), ("raw-vibration-windows", raw)):
+                with self.subTest(endpoint=endpoint):
+                    path = f"/api/devices/{device['id']}/{endpoint}"
+                    connection = http.client.HTTPConnection(*server.server_address, timeout=10)
+                    try:
+                        connection.request("POST", path, json.dumps({"windows": [value]}), {
+                            "Authorization": "Bearer demo-telemetry-ingest-token",
+                            "Content-Type": "application/json",
+                        })
+                        response = connection.getresponse()
+                        body = json.load(response)
+                        self.assertEqual(response.status, 202, body)
+                        self.assertEqual(body["deviceId"], device["id"])
+                        connection.request("GET", path, headers={"Authorization": "Bearer " + self.token})
+                        response = connection.getresponse()
+                        body = json.load(response)
+                        self.assertEqual(response.status, 200, body)
+                        self.assertEqual(body["items"][0]["window"], value)
+                    finally:
+                        connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_envelope_ids_require_registration_canonical_spelling(self):
+        from motor_diagnosis.vibration_windows import normalize
+        for key in ("deviceId", "siteId", "assetId"):
+            for value in (None, 123, "", "   ", " dev.review.01", "dev.review.01"):
+                with self.subTest(key=key, value=value), self.assertRaises(data.ApiError):
+                    normalize(self.window(**{key: value}))
+
     def test_capacity_preserves_retryable_batch_and_watermark(self):
         with mock.patch("motor_diagnosis.vibration_windows.MAX_PENDING", 1):
             with self.assertRaises(data.ApiError) as error:

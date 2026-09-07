@@ -279,6 +279,18 @@ class StoreTest(RpmSetup):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(body["items"][0]["analysis"]["score"], .8)
                 self.assertEqual(body["configuredModel"]["modelVersion"], self.model.checksum)
+                self.assertEqual(body["eventPolicy"]["mode"], "shadow")
+                resolve_path = "/api/events/RF66-MISSING/rf66-resolve"
+                connection.request("POST", resolve_path, json.dumps({"reason": "inspected"}),
+                                   {"Content-Type": "application/json"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 401, response.read())
+                connection.request("POST", resolve_path, json.dumps({"reason": "inspected"}),
+                                   {"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+                response = connection.getresponse()
+                body = json.load(response)
+                self.assertEqual(response.status, 404)
+                self.assertEqual(body["error"]["code"], "RF66_EVENT_NOT_FOUND")
                 self.assertIsNone(server.model_inference)
                 self.assertIsNone(server.vibration_windows.checkpoint)
             finally:

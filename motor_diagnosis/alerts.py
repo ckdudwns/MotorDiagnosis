@@ -115,7 +115,8 @@ def configured_adapters():
 class AlertService:
     MAX_ATTEMPTS = 3
 
-    def __init__(self, database=":memory:", *, adapters=None, clock=time.time):
+    def __init__(self, database=":memory:", *, adapters=None, clock=time.time, rf66_guard=None):
+        self._rf66_guard = rf66_guard or (lambda event: False)
         self._owner_file = None
         if database != ":memory:":
             Path(database).parent.mkdir(parents=True, exist_ok=True)
@@ -227,6 +228,9 @@ class AlertService:
         return result
 
     def _queue(self, event, policies, *, is_test=False):
+        if event.get("source") == "rf66" and not self._rf66_guard(event):
+            return {"eventId": event["id"], "deliveries": [],
+                    "suppressed": [{"policyId": p["id"], "reason": "rf66_notifications_disabled_or_stale"} for p in policies]}
         now = self._clock()
         stamp = datetime.fromtimestamp(now, timezone.utc)
         minute = stamp.strftime("%H:%M")
@@ -268,7 +272,7 @@ class AlertService:
                     )
                     for recipient in recipients:
                         key = json.dumps(
-                            [event["id"], policy["id"], channel, recipient, is_test]
+                            [self._observation_key(event), policy["id"], channel, recipient, is_test]
                         )
                         previous = self._db.execute(
                             "SELECT payload FROM alert_deliveries WHERE dedupe_key=?",
@@ -337,6 +341,11 @@ class AlertService:
             "suppressed": suppressed,
         }
 
+    @staticmethod
+    def _observation_key(event):
+        return (event["id"] + ":rf66:" + event["rf66Transition"]
+                if event.get("source") == "rf66" else event["id"])
+
     def observe_events(self):
         with data.STORE_LOCK:
             events = data.copy_payload(data.EVENTS)
@@ -349,9 +358,10 @@ class AlertService:
             )
         )
         for event in events:
+            observation_key = self._observation_key(event)
             with self._lock:
                 if self._db.execute(
-                    "SELECT 1 FROM alert_seen_events WHERE event_id=?", (event["id"],)
+                    "SELECT 1 FROM alert_seen_events WHERE event_id=?", (observation_key,)
                 ).fetchone():
                     continue
                 # _queue commits first; a crash here is safe because delivery keys are unique.
@@ -359,7 +369,7 @@ class AlertService:
                 with self._db:
                     self._db.execute(
                         "INSERT OR IGNORE INTO alert_seen_events VALUES (?)",
-                        (event["id"],),
+                        (observation_key,),
                     )
 
     def _claim(self, *, one_per_channel=False):
@@ -387,6 +397,8 @@ class AlertService:
         started = time.monotonic()
         error, retryable = None, False
         try:
+            if row["event"].get("source") == "rf66" and not self._rf66_guard(row["event"]):
+                raise DeliveryError("RF66_DELIVERY_DISABLED_OR_STALE", False)
             if row["channel"] == "stub":
                 LOGGER.info("alert_stub id=%s event=%s", row["id"], row["eventId"])
             elif row["channel"] != "web":

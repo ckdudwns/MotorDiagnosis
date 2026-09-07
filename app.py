@@ -24,6 +24,7 @@ def main() -> None:
         raw_window_database=os.environ.get("RAW_VIBRATION_WINDOW_DB_PATH", "output/raw-vibration-windows.sqlite3"),
         rf66_artifact=os.environ.get("RF66_MODEL_ARTIFACT") or None,
         rf66_checksum=os.environ.get("RF66_MODEL_CHECKSUM") or None,
+        rf66_event_mode=os.environ.get("RF66_EVENT_MODE", "shadow"),
         window_model_variant=os.environ.get("WINDOW_MODEL_VARIANT") or None,
         model_candidate=os.environ.get("SHADOW_MODEL_CANDIDATE", "lstm_autoencoder"),
         model_checksum=os.environ.get("SHADOW_MODEL_CHECKSUM"),

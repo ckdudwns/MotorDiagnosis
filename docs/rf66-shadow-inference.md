@@ -2,6 +2,10 @@
 
 ## 범위
 
+이벤트·알림 운영 모드는 [RF66 이벤트·알림 수명주기](rf66-event-alert-lifecycle.md)를
+참고하십시오. 아래 비교 추론의 score/verdict 및 현장 미검증 표시는 계속 유지합니다.
+기본은 shadow이며, 명시적 설정 시에만 별도의 이벤트 수명주기를 실행합니다.
+
 ADXL345 800Hz × 512 XYZ 원시 count 구간을 기존
 `POST /api/devices/{deviceId}/raw-vibration-windows`로 받습니다.
 서버는 count × 0.0039g 변환 후 `mcc5-vibration-800hz-spectral66-v1`의

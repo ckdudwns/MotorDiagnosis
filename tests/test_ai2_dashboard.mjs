@@ -1032,6 +1032,45 @@ await check('late original response cannot expose a download on a different sele
   assert.equal(card.children.at(-1).children.length,0);
 });
 
+await check('model comparison keeps warming/failure separate from actual verdicts', () => {
+  const h=harness();
+  h.context.shadow={checkpoint:{modelType:'lstm_autoencoder',modelVersion:'sha256:fixture',featureCount:26,sequenceLength:5},items:[
+    {status:'warming_up',verdict:null,reason:'SEQUENCE_INCOMPLETE'},
+    {status:'not_evaluated',verdict:null,reason:'INFERENCE_FAILED'},
+    {status:'inferred',verdict:false,reconstructionError:0.2,threshold:1},
+    {status:'inferred',verdict:true,reconstructionError:2,threshold:1},
+  ]};
+  h.run('renderAnalysisRows($("opsAnalysisRows"),{shadowInference:shadow,items:[]},()=>true)');
+  const rows=h.get('opsAnalysisRows').children;
+  assert.match(textOf(rows[0]),/26개 특징 \/ 5개 연속 구간/);
+  assert.match(textOf(rows[0]),/전처리 미연결/);
+  assert.match(textOf(rows[1]),/판정 불가/); assert.match(textOf(rows[2]),/판정 불가/);
+  assert.match(textOf(rows[3]),/임계값 이내/); assert.match(textOf(rows[4]),/이상 후보/);
+  assert.match(textOf(rows[0]),/기존 이벤트\/알림 변경 없음/);
+});
+await check('model metadata renders as text and old output keeps its model version', () => {
+  const h=harness(); h.context.shadow={checkpoint:{modelType:'<img onerror=attack()>',modelVersion:'new-model',featureCount:26,sequenceLength:5},items:[{status:'not_evaluated',reason:'MODEL_CHANGED',modelVersion:'old-model',verdict:false}]};
+  h.run('renderAnalysisRows($("opsAnalysisRows"),{shadowInference:shadow,items:[]},()=>true)');
+  const rows=h.get('opsAnalysisRows').children;
+  assert.match(textOf(rows[0]),/<img onerror=attack\(\)>/);
+  assert.match(textOf(rows[1]),/old-model/);
+  assert.match(textOf(rows[1]),/판정 불가/);
+  assert.doesNotMatch(textOf(rows[1]),/임계값 이내/);
+});
+
+await check('raw preprocessing configuration is never displayed as verified field compatibility', () => {
+  const h=harness();
+  h.context.shadow={checkpoint:{modelType:'lstm_autoencoder',modelVersion:'m',featureCount:26,sequenceLength:5},rawInputStatus:'configured_unverified',preprocessing:{preprocessingId:'p',profile:{channel:'vibrationX',unit:'g',sampleRateHz:12000,windowSamples:2048}},items:[{inputKind:'raw',status:'not_evaluated',verdict:null,reason:'PREPROCESSOR_CHANGED',preprocessing:{preprocessingId:'old-p'}}]};
+  h.run('renderAnalysisRows($("opsAnalysisRows"),{shadowInference:shadow,items:[]},()=>true)');
+  const rows=h.get('opsAnalysisRows').children;
+  assert.match(textOf(rows[0]),/학습 호환성 미검증/);
+  assert.match(textOf(rows[1]),/12000Hz/);
+  assert.match(textOf(rows[2]),/원시 파형 변환/);
+  assert.match(textOf(rows[2]),/old-p/);
+  assert.match(textOf(rows[2]),/판정 불가/);
+  assert.doesNotMatch(textOf(rows[2]),/임계값 이내/);
+});
+
 assert.deepEqual(failures,[],`${failures.length} behavior checks failed`);
 console.log(`AI2 dashboard: ${checks} behavior checks passed.`);
 

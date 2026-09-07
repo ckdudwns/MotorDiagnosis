@@ -110,6 +110,8 @@ from .data import (
 from .json_validation import loads_strict_json
 from .alerts import AlertService
 from .edge_analysis import AnalysisStore
+from .model_inference import ModelInferenceStore
+from .model_history import ModelHistoryGuard
 from .model_registry import create_baseline_version, create_model_version, versions_for
 from .ai_results import submit_result, review_model
 from .telemetry_bulk import ingest_telemetry_bulk
@@ -235,6 +237,17 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
         user = self.require_user()
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "model-inference"
+        ):
+            if self.server.model_inference is None:
+                raise ApiError(
+                    409, "MODEL_NOT_CONFIGURED", "No shadow checkpoint is configured"
+                )
+            self.send_json(self.server.model_inference.list_device(user, segments[2]))
+            return
         if len(segments) == 3 and segments[:2] == ["api", "analysis"]:
             self.send_json(self.server.analysis.detail(user, segments[2]))
             return
@@ -243,11 +256,16 @@ class AppHandler(BaseHTTPRequestHandler):
             and segments[:2] == ["api", "devices"]
             and segments[3] == "analysis"
         ):
-            self.send_json(
-                self.server.analysis.list_device(
-                    user, segments[2], cursor=query.get("cursor", [None])[0]
-                )
+            result = self.server.analysis.list_device(
+                user, segments[2], cursor=query.get("cursor", [None])[0]
             )
+            if self.server.model_inference is not None and has_permission(
+                user, "model:read"
+            ):
+                result["shadowInference"] = self.server.model_inference.list_for(
+                    user, result["siteId"], result["assetId"], device_id=segments[2]
+                )
+            self.send_json(result)
             return
 
         if (
@@ -592,6 +610,23 @@ class AppHandler(BaseHTTPRequestHandler):
                     start=parse_rfc3339("from", detail["context"]["from"]).timestamp(),
                     end=parse_rfc3339("to", detail["context"]["to"]).timestamp(),
                 )
+                if self.server.model_inference is not None and has_permission(
+                    user, "model:read"
+                ):
+                    detail["analysis"]["shadowInference"] = (
+                        self.server.model_inference.list_for(
+                            user,
+                            detail["event"]["siteId"],
+                            detail["event"]["assetId"],
+                            device_id=detail["event"].get("deviceId"),
+                            start=parse_rfc3339(
+                                "from", detail["context"]["from"]
+                            ).timestamp(),
+                            end=parse_rfc3339(
+                                "to", detail["context"]["to"]
+                            ).timestamp(),
+                        )
+                    )
             if detail["context"]["source"] == "stored":
                 detail["context"]["points"] = annotate_telemetry_points(
                     detail["context"]["points"]
@@ -683,14 +718,40 @@ class AppHandler(BaseHTTPRequestHandler):
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
     def route_post(self, segments: list[str]) -> None:
+        raw_model_path = (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "model-raw-inputs"
+        )
         analysis_path = (
             len(segments) == 4
             and segments[:2] == ["api", "devices"]
             and segments[3] == "analysis"
         )
         payload = (
-            self.read_json(maximum=1024 * 1024) if analysis_path else self.read_json()
+            self.read_json(maximum=512 * 1024)
+            if raw_model_path
+            else (
+                self.read_json(maximum=1024 * 1024)
+                if analysis_path
+                else self.read_json()
+            )
         )
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] in {"model-inputs", "model-raw-inputs"}
+        ):
+            principal = telemetry_principal_for_token(self.bearer_token())
+            if self.server.model_inference is None:
+                raise ApiError(
+                    409, "MODEL_NOT_CONFIGURED", "No shadow checkpoint is configured"
+                )
+            result, status = self.server.model_inference.ingest(
+                principal, segments[2], payload, raw=raw_model_path
+            )
+            self.send_json(result, status=status)
+            return
         if analysis_path:
             result, status = self.server.analysis.ingest(
                 telemetry_principal_for_token(self.bearer_token()), segments[2], payload
@@ -1633,6 +1694,11 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
                 self.analysis.prune()
             except Exception:
                 LOGGER.exception("Analysis retention failed; will retry on next tick")
+            if self.model_inference is not None:
+                try:
+                    self.model_inference.prune()
+                except Exception:
+                    LOGGER.exception("Shadow retention failed; will retry on next tick")
 
     def _run_alert_worker(self):
         # SQLite can wait on another writer. Never perform this work in
@@ -1660,6 +1726,10 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
             if self._alert_worker.ident is not None:
                 self._alert_worker.join()
         super().server_close()
+        if getattr(self, "model_inference", None) is not None:
+            self.model_inference.close()
+        if getattr(self, "model_history", None) is not None:
+            self.model_history.close()
         if hasattr(self, "communication_quality"):
             self.communication_quality.close()
         if hasattr(self, "alerts"):
@@ -1680,6 +1750,11 @@ def create_server(
     state_database=None,
     communication_database=":memory:",
     analysis_database=":memory:",
+    model_artifact=None,
+    model_candidate="lstm_autoencoder",
+    model_checksum=None,
+    model_database=":memory:",
+    model_preprocessing_profile=None,
 ) -> ThreadingHTTPServer:
     if demo_enabled is None:
         demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
@@ -1693,18 +1768,45 @@ def create_server(
         bool(demo_enabled) and os.environ.get("APP_ENV", "").lower() != "production"
     )
     server.auto_alerts = auto_alerts
+    server.model_inference = None
+    server.model_history = None
     try:
+        # Identity protection must survive disabling/replacing the ML runtime.
+        server.model_history = ModelHistoryGuard(model_database)
+        if model_preprocessing_profile and not model_artifact:
+            raise ValueError("Raw preprocessing requires an explicit checkpoint")
+        if model_artifact:
+            from ai.ai2.model_runtime import Checkpoint
+
+            checkpoint = Checkpoint.load(
+                model_artifact,
+                candidate=model_candidate,
+                expected_checksum=model_checksum,
+            )
+            preprocessor = None
+            if model_preprocessing_profile:
+                from ai.ai2.raw_preprocessing import RawPreprocessor
+
+                preprocessor = RawPreprocessor.load(
+                    checkpoint, model_preprocessing_profile
+                )
+            server.model_inference = ModelInferenceStore(
+                checkpoint, model_database, preprocessor=preprocessor
+            )
         server.analysis = AnalysisStore(analysis_database)
         server.communication_quality = CommunicationQualityStore(communication_database)
         server.alerts = AlertService(
             alert_database,
             adapters=alert_adapters,
         )
+        if server.model_inference is not None:
+            server.model_inference.start()
         server.start_alert_worker()
         if (
             state_database
             or communication_database != ":memory:"
             or analysis_database != ":memory:"
+            or (model_artifact and model_database != ":memory:")
         ):
             server.start_retention_worker()
     except Exception:

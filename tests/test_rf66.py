@@ -40,7 +40,7 @@ class PackageTest(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.rule = {"classes": [False, True], "comparison": ">", "threshold": .7,
-                     "modelSequenceLength": 1}
+                     "modelSequenceLength": 1, "confirmation": dict(rf66.CONFIRMATION_RULE)}
 
     def write_package(self, *, corrupt=False):
         files = {"model/candidate.joblib": self.content,
@@ -75,6 +75,7 @@ class PackageTest(unittest.TestCase):
                      (self.spec, "modelKind", "dense_autoencoder"),
                      (self.spec, "threshold", float("nan")), (self.rule, "comparison", ">="),
                      (self.rule, "classes", [0, 1]), (self.rule, "threshold", .5),
+                     (self.rule, "confirmation", {**rf66.CONFIRMATION_RULE, "requiredHits": 2}),
                      (self.contract, "featureNames", list(reversed(NAMES)))]
         for target, key, value in mutations:
             old = target[key]
@@ -142,7 +143,7 @@ class StoreTest(RpmSetup):
             self.assertEqual(result["score"], .8)
             self.assertTrue(result["verdict"])
             self.assertFalse(result["affectsAlerts"])
-            self.assertFalse(result["confirmationApplied"])
+            self.assertTrue(result["confirmationApplied"])
             self.assertNotIn("error", result)
             self.assertEqual(len(result["modelInput"]), 66)
 

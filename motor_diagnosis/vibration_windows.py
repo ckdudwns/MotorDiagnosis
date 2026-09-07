@@ -240,6 +240,10 @@ class VibrationWindowStore:
                 "verdict": prediction["verdict"][0], "error": prediction["errors"][0],
                 "threshold": prediction["threshold"]}
 
+    def finalize_result(self, row, window, result):
+        """Optional result enrichment inside the result-write transaction."""
+        return result
+
     def tick(self):
         with self.processing:
             with self.lock:
@@ -258,8 +262,10 @@ class VibrationWindowStore:
                 except Exception:
                     LOGGER.exception("Window unavailable; not classified as normal")
                     result.update(status="unavailable", reason="MODEL_INPUT_OR_INFERENCE_FAILED")
-            encoded = json.dumps(result, allow_nan=False)
             with self.lock, self.db:
+                self.db.execute("BEGIN IMMEDIATE")
+                result = self.finalize_result(row, window, result)
+                encoded = json.dumps(result, allow_nan=False)
                 self.db.execute("UPDATE vibration_windows SET status=?,result=? WHERE ordinal=?",
                                 (result["status"], encoded, row["ordinal"]))
             return True

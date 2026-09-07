@@ -82,6 +82,24 @@ void testAckAcceptsNestedNonAckMetadata()
     );
 }
 
+void testAckRejectsMalformedNestedMetadata()
+{
+    const char* malformedResponses[] = {
+        "{\"accepted\":true,\"duplicate\":false,\"deviceId\":\"DEV-01-MOT-02\",\"sequence\":1234,\"lifecycleUpdates\":[not-json]}",
+        "{\"accepted\":true,\"duplicate\":false,\"deviceId\":\"DEV-01-MOT-02\",\"sequence\":1234,\"lifecycleUpdates\":[{\"kind\":}]}",
+        "{\"accepted\":true,\"duplicate\":false,\"deviceId\":\"DEV-01-MOT-02\",\"sequence\":1234,\"lifecycleUpdates\":[\"\\q\"]}"
+    };
+
+    for (const char* response : malformedResponses)
+    {
+        assertAckResult(
+            AckValidationResult::MALFORMED_RESPONSE,
+            201,
+            response
+        );
+    }
+}
+
 void testAckAcceptsDuplicate200()
 {
     assertAckResult(
@@ -931,6 +949,7 @@ int main(
 
     RUN_TEST(testAckAcceptsNew201);
     RUN_TEST(testAckAcceptsNestedNonAckMetadata);
+    RUN_TEST(testAckRejectsMalformedNestedMetadata);
     RUN_TEST(testAckAcceptsDuplicate200);
     RUN_TEST(testAckRejects204EvenThough2xx);
     RUN_TEST(testAckRejectsWrongDevice);

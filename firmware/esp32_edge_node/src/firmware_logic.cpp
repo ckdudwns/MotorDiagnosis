@@ -1,5 +1,6 @@
 #include "firmware_logic.h"
 
+#include <ArduinoJson.h>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -878,6 +879,20 @@ AckValidationResult validateAckJson(
     if (
         responseJson == nullptr ||
         expectedDeviceId == nullptr
+    )
+    {
+        return AckValidationResult::MALFORMED_RESPONSE;
+    }
+
+    // Validate the complete response, including optional nested metadata.
+    // The flat parser below extracts and type-checks the required ACK fields;
+    // ArduinoJson prevents malformed optional values from being accepted.
+    JsonDocument document;
+    if (
+        deserializeJson(
+            document,
+            responseJson
+        )
     )
     {
         return AckValidationResult::MALFORMED_RESPONSE;

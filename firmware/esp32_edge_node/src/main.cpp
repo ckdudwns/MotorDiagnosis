@@ -133,9 +133,6 @@ const char* HEALTH_URL =
 const char* INGEST_TOKEN =
     INGEST_TOKEN_VALUE;
 
-const char* DEVICE_HEALTH_TOKEN =
-    DEVICE_HEALTH_TOKEN_VALUE;
-
 // Existing ignored secrets.h files still compile; reporting stays disabled
 // until a separate limited-scope credential and matching device URL are set.
 #ifndef DEVICE_HEALTH_URL_VALUE

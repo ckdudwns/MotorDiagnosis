@@ -22,6 +22,9 @@ def main() -> None:
         model_artifact=os.environ.get("SHADOW_MODEL_ARTIFACT"),
         model_candidate=os.environ.get("SHADOW_MODEL_CANDIDATE", "lstm_autoencoder"),
         model_checksum=os.environ.get("SHADOW_MODEL_CHECKSUM"),
+        model_preprocessing_profile=os.environ.get(
+            "SHADOW_MODEL_PREPROCESSING_PROFILE"
+        ),
         model_database=os.environ.get(
             "SHADOW_MODEL_DB_PATH", "output/model-inference.sqlite3"
         ),

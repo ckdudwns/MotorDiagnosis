@@ -1276,10 +1276,12 @@ def render_page() -> str:
       if (response.shadowInference) {
         const shadow=response.shadowInference, model=shadow.checkpoint;
         const statuses={queued:"처리 대기",warming_up:"연속 구간 대기",not_evaluated:"판정 불가",inferred:"비교 추론 완료"};
-        panel.appendChild(facts([["모델 비교",`${model.modelType} · ${model.modelVersion}`],["모델 입력",`${model.featureCount}개 특징 / ${model.sequenceLength}개 연속 구간`],["현재 원시 신호","판정 불가 · 모델 전처리 미연결"],["적용 범위","비교용 · 기존 이벤트/알림 변경 없음 · 현장 성능 미검증"]]));
+        const rawState=shadow.rawInputStatus==="configured_unverified" ? "원시 변환 설정됨 · 학습 호환성 미검증" : "판정 불가 · 모델 전처리 미연결";
+        panel.appendChild(facts([["모델 비교",`${model.modelType} · ${model.modelVersion}`],["모델 입력",`${model.featureCount}개 특징 / ${model.sequenceLength}개 연속 구간`],["현재 원시 신호",rawState],["적용 범위","비교용 · 기존 이벤트/알림 변경 없음 · 현장 성능 미검증"]]));
+        if (shadow.preprocessing) panel.appendChild(facts([["전처리 버전",shadow.preprocessing.preprocessingId],["입력 조건",`${shadow.preprocessing.profile.channel} / ${shadow.preprocessing.profile.unit} / ${shadow.preprocessing.profile.sampleRateHz}Hz / ${shadow.preprocessing.profile.windowSamples}개 표본`]]));
         for (const item of shadow.items || []) {
           const verdict=item.status==="inferred" && typeof item.verdict==="boolean" ? (item.verdict?"이상 후보":"임계값 이내") : "판정 불가";
-          panel.appendChild(facts([["입력 시각",formatLocalTime(item.timestamp)],["모델 버전",item.modelVersion],["처리 상태",statuses[item.status] || "판정 불가"],["비교 판정",verdict],["재구성 오차",item.reconstructionError ?? "미산출"],["임계값",item.threshold ?? "미적용"],["상태 사유",item.reason || "—"]]));
+          panel.appendChild(facts([["입력 시각",formatLocalTime(item.timestamp)],["입력 종류",item.inputKind==="raw"?"원시 파형 변환":"준비된 특징"],["모델 버전",item.modelVersion],["전처리 버전",item.preprocessing?.preprocessingId || item.preprocessingId || "—"],["처리 상태",statuses[item.status] || "판정 불가"],["비교 판정",verdict],["재구성 오차",item.reconstructionError ?? "미산출"],["임계값",item.threshold ?? "미적용"],["상태 사유",item.reason || "—"]]));
         }
       }
       for (const request of response.requests || []) panel.appendChild(facts([["파형 요청",request.id],["상태",request.status],["사유",request.reason]]));

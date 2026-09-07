@@ -1058,6 +1058,19 @@ await check('model metadata renders as text and old output keeps its model versi
   assert.doesNotMatch(textOf(rows[1]),/임계값 이내/);
 });
 
+await check('raw preprocessing configuration is never displayed as verified field compatibility', () => {
+  const h=harness();
+  h.context.shadow={checkpoint:{modelType:'lstm_autoencoder',modelVersion:'m',featureCount:26,sequenceLength:5},rawInputStatus:'configured_unverified',preprocessing:{preprocessingId:'p',profile:{channel:'vibrationX',unit:'g',sampleRateHz:12000,windowSamples:2048}},items:[{inputKind:'raw',status:'not_evaluated',verdict:null,reason:'PREPROCESSOR_CHANGED',preprocessing:{preprocessingId:'old-p'}}]};
+  h.run('renderAnalysisRows($("opsAnalysisRows"),{shadowInference:shadow,items:[]},()=>true)');
+  const rows=h.get('opsAnalysisRows').children;
+  assert.match(textOf(rows[0]),/학습 호환성 미검증/);
+  assert.match(textOf(rows[1]),/12000Hz/);
+  assert.match(textOf(rows[2]),/원시 파형 변환/);
+  assert.match(textOf(rows[2]),/old-p/);
+  assert.match(textOf(rows[2]),/판정 불가/);
+  assert.doesNotMatch(textOf(rows[2]),/임계값 이내/);
+});
+
 assert.deepEqual(failures,[],`${failures.length} behavior checks failed`);
 console.log(`AI2 dashboard: ${checks} behavior checks passed.`);
 

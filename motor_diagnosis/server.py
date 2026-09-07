@@ -717,18 +717,29 @@ class AppHandler(BaseHTTPRequestHandler):
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
     def route_post(self, segments: list[str]) -> None:
+        raw_model_path = (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "model-raw-inputs"
+        )
         analysis_path = (
             len(segments) == 4
             and segments[:2] == ["api", "devices"]
             and segments[3] == "analysis"
         )
         payload = (
-            self.read_json(maximum=1024 * 1024) if analysis_path else self.read_json()
+            self.read_json(maximum=512 * 1024)
+            if raw_model_path
+            else (
+                self.read_json(maximum=1024 * 1024)
+                if analysis_path
+                else self.read_json()
+            )
         )
         if (
             len(segments) == 4
             and segments[:2] == ["api", "devices"]
-            and segments[3] == "model-inputs"
+            and segments[3] in {"model-inputs", "model-raw-inputs"}
         ):
             principal = telemetry_principal_for_token(self.bearer_token())
             if self.server.model_inference is None:
@@ -736,7 +747,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     409, "MODEL_NOT_CONFIGURED", "No shadow checkpoint is configured"
                 )
             result, status = self.server.model_inference.ingest(
-                principal, segments[2], payload
+                principal, segments[2], payload, raw=raw_model_path
             )
             self.send_json(result, status=status)
             return
@@ -1740,6 +1751,7 @@ def create_server(
     model_candidate="lstm_autoencoder",
     model_checksum=None,
     model_database=":memory:",
+    model_preprocessing_profile=None,
 ) -> ThreadingHTTPServer:
     if demo_enabled is None:
         demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
@@ -1755,6 +1767,8 @@ def create_server(
     server.auto_alerts = auto_alerts
     server.model_inference = None
     try:
+        if model_preprocessing_profile and not model_artifact:
+            raise ValueError("Raw preprocessing requires an explicit checkpoint")
         if model_artifact:
             from ai.ai2.model_runtime import Checkpoint
 
@@ -1763,7 +1777,16 @@ def create_server(
                 candidate=model_candidate,
                 expected_checksum=model_checksum,
             )
-            server.model_inference = ModelInferenceStore(checkpoint, model_database)
+            preprocessor = None
+            if model_preprocessing_profile:
+                from ai.ai2.raw_preprocessing import RawPreprocessor
+
+                preprocessor = RawPreprocessor.load(
+                    checkpoint, model_preprocessing_profile
+                )
+            server.model_inference = ModelInferenceStore(
+                checkpoint, model_database, preprocessor=preprocessor
+            )
         server.analysis = AnalysisStore(analysis_database)
         server.communication_quality = CommunicationQualityStore(communication_database)
         server.alerts = AlertService(

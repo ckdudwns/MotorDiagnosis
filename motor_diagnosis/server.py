@@ -785,6 +785,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 status=201,
             )
             return
+        if len(segments) == 4 and segments[:2] == ["api", "events"] and segments[3] == "rf66-resolve":
+            self.send_json(self.server.raw_vibration.events.resolve(self.require_user(), segments[2], payload))
+            return
         if segments == ["api", "auth", "login"]:
             self.send_json(authenticate(payload))
             return
@@ -1727,6 +1730,10 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
         # BaseServer.service_actions(), which runs in the HTTP accept loop.
         # One coordinator coalesces polling; ticks never overlap or accumulate.
         while not self._alert_stop.wait(0.5):
+            try:
+                self.raw_vibration.events.dispatch()
+            except Exception:
+                LOGGER.exception("RF66 event projection failed; durable transition retained")
             if not self.auto_alerts:
                 continue
             try:
@@ -1786,6 +1793,7 @@ def create_server(
     window_model_variant=None,
     rf66_artifact=None,
     rf66_checksum=None,
+    rf66_event_mode="shadow",
 ) -> ThreadingHTTPServer:
     # Fail closed before opening sockets or persistent databases in production.
     authentication_users()
@@ -1844,12 +1852,13 @@ def create_server(
             from .rf66 import RF66Model
 
             rf66_model = RF66Model.load(rf66_artifact, expected_checksum=rf66_checksum)
-        server.raw_vibration = RawVibrationStore(raw_window_database, model=rf66_model)
+        server.raw_vibration = RawVibrationStore(raw_window_database, model=rf66_model, event_mode=rf66_event_mode)
         server.analysis = AnalysisStore(analysis_database)
         server.communication_quality = CommunicationQualityStore(communication_database)
         server.alerts = AlertService(
             alert_database,
             adapters=alert_adapters,
+            rf66_guard=server.raw_vibration.events.notification_allowed,
         )
         if server.model_inference is not None:
             server.model_inference.start()

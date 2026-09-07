@@ -17,6 +17,39 @@ function fixture() {
 }
 const load=h=>h.run('loadRF66(devices,query)');
 
+test('event modes are explicit and RF66 event scores are not statistical scores',async()=>{
+  for (const [mode,label] of [['shadow','이벤트/알림 미생성'],['events','알림 꺼짐'],['alerts','알림 활성화']]) {
+    const h=fixture();h.context.respond=()=>({...result(),eventPolicy:{mode}});
+    await load(h);assert.ok(text(h.get('rf66Rows')).includes(label));
+  }
+  const h=fixture();
+  h.context.rows=[{id:'RF66-TEST',title:'RF66 event',source:'rf66',occurredAt:'2026-09-08T00:00:00Z',
+    score:null,rf66Score:.85,status:'open',rf66Observation:'unknown',severity:'critical',label:'needs_review'}];
+  h.run('events=rows;renderEvents()');
+  assert.match(text(h.get('events')),/RF66 0.85/);
+  assert.match(text(h.get('events')),/unknown/);
+  assert.doesNotMatch(text(h.get('events')),/null/);
+});
+
+test('manual RF66 closure requires reason permission and current selection',async()=>{
+  const h=fixture();h.context.event={id:'RF66-TEST',source:'rf66',status:'open'};
+  h.run('var controls=rf66ResolutionControls(event,()=>true)');
+  const controls=h.run('controls'), [reason,button,status]=controls.children;
+  await button.listeners.click();assert.equal(h.requests.length,0);
+  reason.value='checked after model replacement';
+  h.context.respond=()=>({status:'closed'});
+  await button.listeners.click();await button.listeners.click();
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].options.method,'POST');
+  assert.match(h.requests[0].path,/RF66-TEST\/rf66-resolve$/);
+  assert.match(status.textContent,/저장 완료/);
+  h.run('permissions=[]');
+  assert.equal(h.run('rf66ResolutionControls(event,()=>true)').children.length,0);
+  h.run("permissions=['*']");
+  const stale=h.run('rf66ResolutionControls(event,()=>false)');
+  stale.children[0].value='reason';await stale.children[1].listeners.click();
+  assert.equal(h.requests.length,1);
+});
+
 test('three-window confirmation is separate, strict and never a normal guarantee',async()=>{
   const confirmation = verdicts => ({policyId:'rf66-consecutive-3-v1',width:3,requiredHits:3,
     verdicts,validWindows:verdicts.length,anomalyHits:verdicts.filter(Boolean).length,affectsAlerts:false,

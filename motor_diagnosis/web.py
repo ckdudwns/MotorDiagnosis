@@ -127,7 +127,7 @@ def render_page() -> str:
       <section class="grid">
         <article class="panel wide" id="rf66Panel">
           <h2>RF66 진동 모델 · 구간별 비교 판정</h2>
-          <p>800Hz · 512샘플 · XYZ · 66개 특징. 기존 통계 점수와 별개이며 이벤트·알림에 반영하지 않습니다. 현장 성능 미검증 · 연속 3구간 확인은 별도 열에 표시합니다.</p>
+          <p>800Hz · 512샘플 · XYZ · 66개 특징. 기존 통계 점수와 별개입니다. 이벤트·알림은 별도 운영 모드에 따릅니다. 현장 성능 미검증 · 연속 3구간 확인은 별도 열에 표시합니다.</p>
           <p id="rf66Status" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
           <div id="rf66Rows"></div>
         </article>
@@ -516,6 +516,9 @@ def render_page() -> str:
         ? "최근 원시 구간: " + formatLocalTime(items[0].window.timestamp) + " · 저장 이력이며 현재 실시간 수신을 보장하지 않습니다."
         : (model ? "원시 구간 입력 대기 · 모델은 준비됐지만 저장된 원시 구간이 없습니다." : "저장된 원시 구간이 없습니다.");
       card.appendChild(freshness);
+      const eventMode = document.createElement("p");
+      eventMode.textContent = "이벤트 운영 모드: " + ({shadow:"비교만 · 이벤트/알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 활성화 (정책·입력 유효성 적용)"}[result.eventPolicy?.mode] || "미확인 (이전 서버)");
+      card.appendChild(eventMode);
       if (items.length) {
         const rows = items.slice(0, 5).map(item => {
           const a = item.analysis || {}, valid = rf66Completed(item);
@@ -733,7 +736,7 @@ def render_page() -> str:
         const pill = document.createElement("span");
         pill.className = `pill ${["warning", "critical", "device"].includes(event.severity) ? event.severity : ""}`;
         pill.textContent = event.label;
-        meta.append(pill, ` ${formatLocalTime(event.occurredAt)} - ${event.score}`);
+        meta.append(pill, ` ${formatLocalTime(event.occurredAt)} - ` + (event.source === "rf66" ? `RF66 ${event.rf66Score} · ${event.status} · ${event.rf66Observation}` : event.score));
         button.append(title, document.createElement("br"), meta);
         return button;
       }));
@@ -931,6 +934,30 @@ def render_page() -> str:
       }
     }
 
+    function rf66ResolutionControls(event, current) {
+      const section = document.createElement("section");
+      if (event.source !== "rf66" || event.status !== "open" || !can("event:review")) return section;
+      const reason = document.createElement("textarea"), button = document.createElement("button"), status = document.createElement("p");
+      reason.setAttribute("aria-label", "RF66 수동 해제 사유");
+      reason.setAttribute("maxlength", "500");
+      reason.placeholder = "모델 교체·점검 등 수동 해제 사유 (센서 정상 복귀와 별도 기록)";
+      button.textContent = "RF66 이벤트 수동 해제";
+      button.addEventListener("click", async () => {
+        if (button.disabled || !current() || !can("event:review")) return;
+        const value = reason.value.trim();
+        if (!value || value.length > 500) {status.textContent = "해제 사유를 1~500자로 입력하세요."; return;}
+        if (!confirm("이 이벤트를 수동 해제할까요? 정상 복귀 알림은 보내지 않으며 작업자와 사유가 기록됩니다.")) return;
+        button.disabled = true;
+        try {
+          await api(`/api/events/${encodeURIComponent(event.id)}/rf66-resolve`, {method:"POST",body:JSON.stringify({reason:value})});
+          if (current()) status.textContent = "수동 해제 저장 완료 · 목록은 다음 새로고침에 반영됩니다.";
+        } catch (error) {
+          if (current()) {status.textContent = "해제 실패: " + error.message; button.disabled = false;}
+        }
+      });
+      section.append(reason, button, status);
+      return section;
+    }
     async function selectEvent(eventId, force = false) {
       if (!force && (reviewDirty || memoDirty) && !confirm("저장하지 않은 편집을 버리고 이벤트를 변경할까요?")) return;
       clearEventSelection();
@@ -951,8 +978,9 @@ def render_page() -> str:
       detail.replaceChildren();
       const title = document.createElement("b");
       title.textContent = event.title;
-      detail.append(title, document.createElement("br"), `${formatLocalTime(event.occurredAt)} · ${event.duration ?? "-"} · 점수 ${event.maxScore ?? event.score ?? "-"}`, document.createElement("br"), event.note || "");
+      detail.append(title, document.createElement("br"), `${formatLocalTime(event.occurredAt)} · ${event.duration ?? "-"} · ` + (event.source === "rf66" ? `RF66 확률 점수 ${event.rf66Score} (통계 점수 아님) · 상태 ${event.status} · 관측 ${event.rf66Observation}` : `점수 ${event.maxScore ?? event.score ?? "-"}`), document.createElement("br"), event.note || "");
       const missing = document.createElement("p");
+      detail.appendChild(rf66ResolutionControls(event, () => generation === detailGeneration && selectedEventId === eventId));
       missing.className = "notice";
       missing.textContent = response.context.rawDataMissing ? "요약 시계열 없음: 보관기간 만료 또는 미수신. 보존된 특징·버전만 표시합니다." : `전후 요약 시계열 ${response.context.points.length}건 · 출처 ${response.context.source} (원시 파형은 별도 분석 기록에서 확인)`;
       detail.appendChild(missing);
@@ -973,9 +1001,9 @@ def render_page() -> str:
       $("eventEvidence").textContent = JSON.stringify({context:{from:response.context.from, to:response.context.to, source:response.context.source}, featureSnapshot:response.featureSnapshot, appliedRule:response.appliedRule, modelVersion:response.modelVersion, deviceSnapshot:response.deviceSnapshot}, null, 2);
       const rule = response.appliedRule || {};
       $("evidenceSummary").replaceChildren(facts([
-        ["이벤트 ID",event.id], ["모델 버전",response.modelVersion], ["규칙 버전",rule.version],
+        ["이벤트 ID",event.id], ["모델 버전",response.modelVersion], ["규칙 버전",rule.version || rule.policyId],
         ["장치",response.deviceSnapshot?.deviceId || response.deviceSnapshot?.id],
-        ["진입 점수 임계값",rule.scoreThreshold], ["규칙 지속시간",measuredValue(rule.durationSec,"초")],
+        ["진입 점수 임계값",event.source === "rf66" ? event.rf66Threshold : rule.scoreThreshold], ["규칙 지속시간",event.source === "rf66" ? "발생/복귀 각 3구간" : measuredValue(rule.durationSec,"초")],
         ["규칙 활성",rule.active === true ? "활성" : rule.active === false ? "비활성" : "미수신"],
         ["신호 출처",response.context.source],
       ]));

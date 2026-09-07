@@ -146,13 +146,21 @@ class RawVibrationStore(VibrationWindowStore):
     max_batch = 4
     list_limit = 20
 
-    def __init__(self, database=":memory:", *, model=None):
+    def __init__(self, database=":memory:", *, model=None, event_mode="shadow"):
+        from .rf66_events import RF66Events, MODES
+        if event_mode not in MODES:
+            raise ValueError("RF66_EVENT_MODE must be shadow, events, or alerts")
         self.model = model
         super().__init__(database)
         self.variant = "spectral66"
         self.db.execute("CREATE TABLE IF NOT EXISTS raw_clock_anchors(device TEXT, boot TEXT, uptime INTEGER, captured REAL, PRIMARY KEY(device,boot))")
         self.db.execute("CREATE INDEX IF NOT EXISTS raw_device_order ON vibration_windows(device,ordinal)")
         self.db.commit()
+        try:
+            self.events = RF66Events(self, event_mode)
+        except Exception:
+            self.close()
+            raise
 
     def input_names(self):
         return list(NAMES)
@@ -238,6 +246,7 @@ class RawVibrationStore(VibrationWindowStore):
             "verdicts": history, "decision": decision, "status": status,
             "resetReason": reason, "affectsAlerts": False,
         }
+        result["eventLifecycle"] = self.events.apply(row, window, result)
         return result
 
     def list_device(self, user, device_id):
@@ -246,4 +255,5 @@ class RawVibrationStore(VibrationWindowStore):
         result["numericPolicy"] = "base21 float32 promoted to float64; extra45 float64"
         result["maxRows"] = self.max_rows
         result["configuredModel"] = self.model.metadata() if self.model is not None else None
+        result["eventPolicy"] = self.events.metadata()
         return result

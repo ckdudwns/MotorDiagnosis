@@ -89,7 +89,7 @@ def render_page() -> str:
     <section id="appPanel" hidden>
       <div id="appStatus" class="notice" role="status" aria-live="polite" hidden></div>
       <nav class="workspace-nav" aria-label="업무 화면">
-        <button id="navOverview" aria-pressed="true" aria-controls="siteKpis sitesPanel notificationsPanel modelPanel healthPanel">운영 현황</button>
+        <button id="navOverview" aria-pressed="true" aria-controls="siteKpis rf66Panel sitesPanel notificationsPanel modelPanel healthPanel">운영 현황</button>
         <button id="navEvents" aria-pressed="false" aria-controls="exportPanel chartPanel eventListPanel eventReviewPanel">이벤트 검수</button>
         <button id="navManagement" aria-pressed="false" aria-controls="managementPanel">운영 관리</button>
         <button id="navModels" aria-pressed="false" aria-controls="modelReviewPanel">AI 결과 검토</button>
@@ -125,6 +125,12 @@ def render_page() -> str:
         <div class="kpi"><span>위험 설비</span><strong id="criticalAssets">-</strong></div>
       </section>
       <section class="grid">
+        <article class="panel wide" id="rf66Panel">
+          <h2>RF66 진동 모델 · 구간별 비교 판정</h2>
+          <p>800Hz · 512샘플 · XYZ · 66개 특징. 기존 통계 점수와 별개이며 이벤트·알림에 반영하지 않습니다. 현장 성능 미검증 · 연속 3구간 확인 미적용.</p>
+          <p id="rf66Status" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
+          <div id="rf66Rows"></div>
+        </article>
         <article class="panel wide" id="sitesPanel">
           <h2>전체 사이트 현황</h2>
           <div class="table-scroll"><table><thead><tr><th>사이트</th><th>지역</th><th>상태</th><th>정상</th><th>주의</th><th>위험</th><th>미검수</th><th>최근 수신</th><th>장치</th></tr></thead><tbody id="siteRows"></tbody></table></div>
@@ -290,6 +296,7 @@ def render_page() -> str:
     }
 
     async function login() {
+      clearRF66();
       const response = await api("/api/auth/login", {
         method: "POST",
         headers: {"content-type": "application/json"},
@@ -321,7 +328,7 @@ def render_page() -> str:
 
     function can(permission) { return permissions.includes("*") || permissions.includes(permission); }
     const WORKSPACE_VIEWS = {
-      overview:{button:"navOverview",title:"운영 현황",panels:["siteKpis","sitesPanel","notificationsPanel","modelPanel","healthPanel"]},
+      overview:{button:"navOverview",title:"운영 현황",panels:["siteKpis","rf66Panel","sitesPanel","notificationsPanel","modelPanel","healthPanel"]},
       events:{button:"navEvents",title:"이벤트 검수",panels:["exportPanel","chartPanel","eventListPanel","eventReviewPanel"]},
       management:{button:"navManagement",title:"운영 관리",panels:["managementPanel"]},
       models:{button:"navModels",title:"AI 결과 검토",panels:["modelReviewPanel"]},
@@ -400,6 +407,7 @@ def render_page() -> str:
     }
 
     async function render() {
+      clearRF66("새로고침 후 RF66 결과를 확인합니다.");
       if (currentView === "models") return loadModelQueue(true);
       if (currentView === "deviceOps") return loadDeviceOperations();
       const requestGeneration = ++renderGeneration;
@@ -430,6 +438,7 @@ def render_page() -> str:
       renderNotifications(alertPage.items);
       renderModelResult(modelPage.items);
       renderHealth(devices, dependencies);
+      void loadRF66(devices, query);
       $("siteCount").textContent = siteSummaries.length;
       $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
       $("warningAssets").textContent = siteSummaries.reduce((n, s) => n + s.warningAssets, 0);
@@ -450,6 +459,112 @@ def render_page() -> str:
       });
     }
 
+    let rf66Generation = 0;
+    function clearRF66(message = "설비를 선택하고 새로고침하세요.") {
+      rf66Generation++;
+      $("rf66Rows").replaceChildren();
+      $("rf66Status").textContent = message;
+    }
+    function rf66Number(value) {
+      return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+    }
+    function rf66Completed(item) {
+      const a = item.analysis || {};
+      return a.status === "completed" && item.window.quality === "valid"
+        && a.modelType === "random_forest" && a.featureProfileId === "mcc5-vibration-800hz-spectral66-v1"
+        && typeof a.modelVersion === "string" && /^sha256:[0-9a-f]{64}$/.test(a.modelVersion)
+        && rf66Number(a.score) && rf66Number(a.threshold) && typeof a.verdict === "boolean"
+        && a.verdict === (a.score > a.threshold) && a.affectsAlerts === false;
+    }
+    function renderRF66Card(result) {
+      const card = document.createElement("section");
+      const title = document.createElement("h3");
+      title.textContent = result.deviceId + " / " + result.assetId;
+      card.appendChild(title);
+      const model = result.configuredModel;
+      const configured = document.createElement("p");
+      configured.textContent = model
+        ? "현재 적용: RF66 (Random Forest) · " + model.modelVersion + " · 임계값 " + model.threshold + " (초과 시 이상 후보)"
+        : "현재 RF66 모델 미설정 · 아래 기록이 있으면 과거 결과입니다.";
+      configured.style.overflowWrap = "anywhere";
+      card.appendChild(configured);
+      const items = [...result.items].sort((a,b) => Date.parse(b.window.timestamp) - Date.parse(a.window.timestamp));
+      const recent = items.find(rf66Completed);
+      const summary = document.createElement("p");
+      summary.textContent = recent
+        ? "최근 판정 대상 구간: " + formatLocalTime(recent.window.timestamp) + " · " + (recent.analysis.verdict ? "이상 후보" : "정상 후보 (임계값 이내)") + (recent.analysis.modelVersion !== model?.modelVersion ? " · 과거 모델 결과" : "")
+        : "완료된 판정 없음";
+      card.appendChild(summary);
+      const freshness = document.createElement("p");
+      freshness.textContent = items.length
+        ? "최근 원시 구간: " + formatLocalTime(items[0].window.timestamp) + " · 저장 이력이며 현재 실시간 수신을 보장하지 않습니다."
+        : (model ? "원시 구간 입력 대기 · 모델은 준비됐지만 저장된 원시 구간이 없습니다." : "저장된 원시 구간이 없습니다.");
+      card.appendChild(freshness);
+      if (items.length) {
+        const rows = items.slice(0, 5).map(item => {
+          const a = item.analysis || {}, valid = rf66Completed(item);
+          const labels = {queued:"처리 대기",waiting_model:"모델 대기",unavailable:"판정 불가"};
+          const label = valid ? (a.verdict ? "이상 후보" : "정상 후보 (임계값 이내)") : (labels[a.status] || "판정 불가 · 결과 형식 확인 필요");
+          return [formatLocalTime(item.window.timestamp), label, valid ? String(a.score) : "—",
+            valid ? String(a.threshold) : "—", item.window.quality,
+            a.reason || "—", (a.modelVersion || "—") + (a.modelVersion && a.modelVersion !== model?.modelVersion ? " (과거 모델)" : "")];
+        });
+        const scroll = document.createElement("div");
+        scroll.className = "table-scroll";
+        scroll.style.overflowWrap = "anywhere";
+        scroll.appendChild(statusTable("최근 구간 결과 · 점수 0~1 (현장 고장 확률 아님)",
+          ["측정 시각","판정","RF66 점수","임계값","입력 품질","사유","결과의 모델 버전"], rows));
+        card.appendChild(scroll);
+      }
+      return card;
+    }
+    async function loadRF66(devices, query) {
+      clearRF66();
+      if (!["device:read","telemetry:read","model:read"].every(can)) {
+        $("rf66Status").textContent = "RF66 조회 권한이 없습니다.";
+        return;
+      }
+      const generation = rf66Generation, session = token;
+      const current = () => generation === rf66Generation && session === token
+        && selectedSite()?.id === query.siteId && $("assetSelect").value === query.assetId
+        && ["device:read","telemetry:read","model:read"].every(can);
+      const selected = devices.filter(d => d.assetId === query.assetId
+        && (!d.siteId || d.siteId === query.siteId));
+      if (!selected.length) {
+        $("rf66Status").textContent = "선택 설비에 조회 가능한 장치가 없습니다.";
+        return;
+      }
+      $("rf66Status").textContent = "RF66 결과 조회 중 · 조회 기간 필터와 별개인 최근 저장 구간입니다.";
+      const cards = await Promise.all(selected.map(async device => {
+        const id = device.deviceId || device.id;
+        try {
+          const result = await api(`/api/devices/${encodeURIComponent(id)}/raw-vibration-windows`);
+          if (!current()) return null;
+          if (!Object.hasOwn(result, "configuredModel") || result.deviceId !== id || result.siteId !== query.siteId || result.assetId !== query.assetId
+              || !Array.isArray(result.items) || result.items.some(item =>
+                !item?.window || item.window.deviceId !== id || item.window.siteId !== query.siteId
+                || item.window.assetId !== query.assetId || !Number.isFinite(Date.parse(item.window.timestamp)))) {
+            throw new Error("장치·설비 매핑 또는 결과 형식 불일치");
+          }
+          const m = result.configuredModel;
+          if (m && (m.modelType !== "random_forest" || !rf66Number(m.threshold)
+              || !/^sha256:[0-9a-f]{64}$/.test(m.modelVersion || "")
+              || m.featureProfileId !== "mcc5-vibration-800hz-spectral66-v1"
+              || m.comparison !== ">" || m.mode !== "shadow" || m.affectsAlerts !== false)) {
+            throw new Error("RF66 모델 설정 응답 확인 필요");
+          }
+          return renderRF66Card(result);
+        } catch (error) {
+          if (!current()) return null;
+          const card = document.createElement("p");
+          card.textContent = id + " · RF66 조회 실패: " + error.message + " · 로그인·권한·서버 API를 확인하고 새로고침하세요.";
+          return card;
+        }
+      }));
+      if (!current()) return;
+      $("rf66Rows").replaceChildren(...cards.filter(Boolean));
+      $("rf66Status").textContent = "최근 저장 구간 · 정상 후보는 장비 정상 확정이 아닙니다. 장치별 조회 상태를 확인하세요.";
+    }
     function renderPager(prefix, page, total) {
       const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
       $(prefix + "Page").textContent = `${page} / ${pages} · ${total}건`;
@@ -1584,6 +1699,7 @@ def render_page() -> str:
       }
     }
     function invalidateScope(resetWindow = false) {
+      clearRF66();
       invalidateDeviceOperations();
       modelQueueGeneration++; modelQueueRows = []; modelQueueTotal = 0; modelQueuePage = 1; clearModelReview(); renderModelQueue();
       clearEventSelection();

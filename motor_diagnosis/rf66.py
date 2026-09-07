@@ -23,6 +23,12 @@ PACKAGES = {"numpy": "2.5.2", "scipy": "1.18.1", "scikit-learn": "1.9.0",
 CONTRACT_SHA256 = "54d50a8af512c0bbc5f43e4fb485f0a9dc1e1e37538b64926ac3c97cc7d88b19"
 NUMERIC_POLICY = "base21 cast float32 then promoted float64; extra45 float64"
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
+CONFIRMATION_RULE = {
+    "width": 3, "requiredHits": 3, "warmupOrInvalid": -1,
+    "noConfirmedAnomaly": 0, "confirmedAnomaly": 1,
+    "resetOn": ["stream/device/boot/model change", "gap", "invalid quality"],
+    "reject": ["duplicate", "out-of-order"],
+}
 
 
 def _sha(content):
@@ -78,6 +84,11 @@ def _read_package(path, expected_checksum):
             or rule.get("modelSequenceLength") != 1
             or environment.get("packages") != PACKAGES):
         raise ValueError("Unsupported RF66 decision rule or environment")
+    confirmation = rule.get("confirmation")
+    if (not isinstance(confirmation, dict)
+            or any(type(confirmation.get(k)) is not type(v) or confirmation.get(k) != v
+                   for k, v in CONFIRMATION_RULE.items())):
+        raise ValueError("Unsupported RF66 confirmation rule")
     return model_bytes, spec
 
 
@@ -135,4 +146,5 @@ class RF66Model:
                 "featureProfileId": FEATURE_PROFILE, "threshold": self.threshold,
                 "comparison": ">", "scoreType": "anomaly_class_probability",
                 "mode": "shadow", "affectsAlerts": False, "fieldValidated": False,
-                "domainValidated": False, "confirmationApplied": False}
+                "domainValidated": False, "confirmationApplied": True,
+                "confirmationPolicyId": "rf66-consecutive-3-v1"}

@@ -17,6 +17,24 @@ function fixture() {
 }
 const load=h=>h.run('loadRF66(devices,query)');
 
+test('three-window confirmation is separate, strict and never a normal guarantee',async()=>{
+  const confirmation = verdicts => ({policyId:'rf66-consecutive-3-v1',width:3,requiredHits:3,
+    verdicts,validWindows:verdicts.length,anomalyHits:verdicts.filter(Boolean).length,affectsAlerts:false,
+    decision:verdicts.length<3?-1:verdicts.every(Boolean)?1:0,
+    status:verdicts.length<3?'warming_up':verdicts.every(Boolean)?'confirmed_anomaly':'no_confirmed_anomaly'});
+  for (const [verdicts,label] of [[[true],'확인 대기'],[[true,true,true],'3구간 이상 확인'],[[false,false,false],'정상 확정 아님']]) {
+    const h=fixture(), verdict=verdicts.at(-1);
+    h.context.respond=()=>result([item({score: verdict ? .8 : 0,verdict,confirmationApplied:true,confirmation:confirmation(verdicts)})]);
+    await load(h); assert.match(text(h.get('rf66Rows')),new RegExp(label));
+  }
+  for (const patch of [{decision:1},{validWindows:3},{verdicts:[1,1,1]},{affectsAlerts:true},{policyId:'unknown'}]) {
+    const h=fixture();
+    h.context.respond=()=>result([item({confirmationApplied:true,confirmation:{...confirmation([false]),...patch}})]);
+    await load(h); assert.match(text(h.get('rf66Rows')),/결과 형식 확인 필요/);
+    assert.doesNotMatch(text(h.get('rf66Rows')),/3구간 이상 확인/);
+  }
+});
+
 test('RF66 overview markup and source remain safe',()=>{
   assert.match(source,/id="rf66Panel"/);
   assert.ok(!source.includes('.innerHTML'));

@@ -127,7 +127,7 @@ def render_page() -> str:
       <section class="grid">
         <article class="panel wide" id="rf66Panel">
           <h2>RF66 진동 모델 · 구간별 비교 판정</h2>
-          <p>800Hz · 512샘플 · XYZ · 66개 특징. 기존 통계 점수와 별개이며 이벤트·알림에 반영하지 않습니다. 현장 성능 미검증 · 연속 3구간 확인 미적용.</p>
+          <p>800Hz · 512샘플 · XYZ · 66개 특징. 기존 통계 점수와 별개이며 이벤트·알림에 반영하지 않습니다. 현장 성능 미검증 · 연속 3구간 확인은 별도 열에 표시합니다.</p>
           <p id="rf66Status" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
           <div id="rf66Rows"></div>
         </article>
@@ -476,6 +476,22 @@ def render_page() -> str:
         && rf66Number(a.score) && rf66Number(a.threshold) && typeof a.verdict === "boolean"
         && a.verdict === (a.score > a.threshold) && a.affectsAlerts === false;
     }
+    function rf66Confirmation(item) {
+      const a = item.analysis || {}, c = a.confirmation;
+      if (a.confirmationApplied !== true) return "미적용 (기존 결과/모델 대기)";
+      if (!rf66Completed(item)) return "확인 불가 · 연속 초기화";
+      if (!c || c.policyId !== "rf66-consecutive-3-v1" || c.width !== 3 || c.requiredHits !== 3
+          || c.affectsAlerts !== false || !Array.isArray(c.verdicts)
+          || c.verdicts.length < 1 || c.verdicts.length > 3
+          || c.verdicts.some(v => typeof v !== "boolean")
+          || c.validWindows !== c.verdicts.length || c.anomalyHits !== c.verdicts.filter(Boolean).length
+          || c.verdicts.at(-1) !== a.verdict) return "확인 불가 · 결과 형식 확인 필요";
+      const decision = c.validWindows < 3 ? -1 : c.anomalyHits === 3 ? 1 : 0;
+      const status = decision === -1 ? "warming_up" : decision === 1 ? "confirmed_anomaly" : "no_confirmed_anomaly";
+      if (c.decision !== decision || c.status !== status) return "확인 불가 · 결과 형식 확인 필요";
+      const label = decision === -1 ? "확인 대기" : decision === 1 ? "3구간 이상 확인 (비교 판정)" : "3구간 이상 미확인 (정상 확정 아님)";
+      return label + " · 유효 " + c.validWindows + "/3 · 초과 " + c.anomalyHits + "/3" + (c.resetReason ? " · 초기화: " + c.resetReason : "");
+    }
     function renderRF66Card(result) {
       const card = document.createElement("section");
       const title = document.createElement("h3");
@@ -507,13 +523,13 @@ def render_page() -> str:
           const label = valid ? (a.verdict ? "이상 후보" : "정상 후보 (임계값 이내)") : (labels[a.status] || "판정 불가 · 결과 형식 확인 필요");
           return [formatLocalTime(item.window.timestamp), label, valid ? String(a.score) : "—",
             valid ? String(a.threshold) : "—", item.window.quality,
-            a.reason || "—", (a.modelVersion || "—") + (a.modelVersion && a.modelVersion !== model?.modelVersion ? " (과거 모델)" : "")];
+            a.reason || "—", (a.modelVersion || "—") + (a.modelVersion && a.modelVersion !== model?.modelVersion ? " (과거 모델)" : ""), rf66Confirmation(item)];
         });
         const scroll = document.createElement("div");
         scroll.className = "table-scroll";
         scroll.style.overflowWrap = "anywhere";
         scroll.appendChild(statusTable("최근 구간 결과 · 점수 0~1 (현장 고장 확률 아님)",
-          ["측정 시각","판정","RF66 점수","임계값","입력 품질","사유","결과의 모델 버전"], rows));
+          ["측정 시각","단일 구간 판정","RF66 점수","임계값","입력 품질","사유","결과의 모델 버전","연속 3구간 확인"], rows));
         card.appendChild(scroll);
       }
       return card;

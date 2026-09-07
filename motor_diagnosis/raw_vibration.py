@@ -151,6 +151,7 @@ class RawVibrationStore(VibrationWindowStore):
         super().__init__(database)
         self.variant = "spectral66"
         self.db.execute("CREATE TABLE IF NOT EXISTS raw_clock_anchors(device TEXT, boot TEXT, uptime INTEGER, captured REAL, PRIMARY KEY(device,boot))")
+        self.db.execute("CREATE INDEX IF NOT EXISTS raw_device_order ON vibration_windows(device,ordinal)")
         self.db.commit()
 
     def input_names(self):
@@ -187,6 +188,57 @@ class RawVibrationStore(VibrationWindowStore):
             self.db.execute("INSERT INTO raw_clock_anchors VALUES(?,?,?,?)", (*key, window["startUptimeUs"], captured))
         elif abs((captured - anchor[1]) * 1e6 - (window["startUptimeUs"] - anchor[0])) > 1000000:
             reject("Measurement UTC and uptime elapsed disagree", 409, "TIMESTAMP_UPTIME_MISMATCH")
+
+    def finalize_result(self, row, window, result):
+        # Derive state only from committed results. A failed UPDATE rolls back
+        # both the result and its confirmation, so retries never count twice.
+        policy = "rf66-consecutive-3-v1"
+        history = []
+        reason = "STREAM_START"
+        previous = self.db.execute(
+            "SELECT * FROM vibration_windows WHERE device=? AND ordinal<? ORDER BY ordinal DESC LIMIT 1",
+            (row["device"], row["ordinal"])).fetchone()
+        if previous is not None:
+            old_window = json.loads(previous["body"])
+            old_result = json.loads(previous["result"]) if previous["result"] else {}
+            old = old_result.get("confirmation", {})
+            if any(window[k] != old_window[k] for k in
+                   ("deviceId", "siteId", "assetId", "bootId", "profileId")):
+                reason = "STREAM_CHANGED"
+            elif any(result.get(k) != old_result.get(k) for k in
+                     ("modelVersion", "featureProfileId", "threshold")):
+                reason = "MODEL_CHANGED"
+            elif row["gap"] or window["windowIndex"] != old_window["windowIndex"] + 1:
+                reason = "WINDOW_GAP"
+            # Conservative continuity guard, not a field sampling calibration.
+            elif abs(window["startUptimeUs"] - old_window["startUptimeUs"] - 640000) > 10000:
+                reason = "TIME_GAP"
+            elif (old_result.get("status") != "completed" or old_window["quality"] != "valid"
+                  or old.get("policyId") != policy or old_result.get("confirmationApplied") is not True):
+                reason = "PREVIOUS_UNAVAILABLE"
+            else:
+                history = old.get("verdicts", [])
+                if (not isinstance(history, list) or not 1 <= len(history) <= 3
+                        or any(type(v) is not bool for v in history)):
+                    history, reason = [], "PREVIOUS_UNAVAILABLE"
+                else:
+                    reason = None
+        available = (self.model is not None and result["status"] == "completed"
+                     and window["quality"] == "valid" and type(result.get("verdict")) is bool)
+        if available:
+            history = (history + [result["verdict"]])[-3:]
+            decision = int(all(history)) if len(history) == 3 else -1
+            status = "confirmed_anomaly" if decision == 1 else "no_confirmed_anomaly" if decision == 0 else "warming_up"
+        else:
+            history, decision, status, reason = [], -1, "unavailable", result.get("reason", "UNAVAILABLE")
+        result["confirmationApplied"] = self.model is not None
+        result["confirmation"] = {
+            "policyId": policy, "width": 3, "requiredHits": 3,
+            "validWindows": len(history), "anomalyHits": sum(history),
+            "verdicts": history, "decision": decision, "status": status,
+            "resetReason": reason, "affectsAlerts": False,
+        }
+        return result
 
     def list_device(self, user, device_id):
         result = super().list_device(user, device_id)

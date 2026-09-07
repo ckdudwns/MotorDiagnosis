@@ -379,24 +379,27 @@ bool parseJsonValueStrict(
     if (json[cursor] == '{') return parseJsonObjectStrict(json, cursor);
     if (json[cursor] == '[') return parseJsonArrayStrict(json, cursor);
 
-    PrimitiveValue value;
-    if (!parseJsonString(json, cursor, value.text))
+    if (json[cursor] == '"')
     {
-        if (json.compare(cursor, 4, "true") == 0 ||
-            json.compare(cursor, 5, "false") == 0 ||
-            json.compare(cursor, 4, "null") == 0)
-        {
-            if (json.compare(cursor, 4, "true") == 0) cursor += 4;
-            else if (json.compare(cursor, 5, "false") == 0) cursor += 5;
-            else cursor += 4;
-            return true;
-        }
-
-        std::string number;
-        return parseNumberToken(json, cursor, number);
+        PrimitiveValue value;
+        return parseJsonString(json, cursor, value.text);
     }
 
-    return true;
+    PrimitiveValue value;
+    if (
+        json.compare(cursor, 4, "true") == 0 ||
+        json.compare(cursor, 5, "false") == 0 ||
+        json.compare(cursor, 4, "null") == 0
+    )
+    {
+        if (json.compare(cursor, 4, "true") == 0) cursor += 4;
+        else if (json.compare(cursor, 5, "false") == 0) cursor += 5;
+        else cursor += 4;
+        return true;
+    }
+
+    std::string number;
+    return parseNumberToken(json, cursor, number);
 }
 
 bool parsePrimitiveValue(

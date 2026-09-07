@@ -136,7 +136,7 @@ const char* INGEST_TOKEN =
 // Existing ignored secrets.h files still compile; reporting stays disabled
 // until a separate limited-scope credential and matching device URL are set.
 #ifndef DEVICE_HEALTH_URL_VALUE
-#define DEVICE_HEALTH_URL_VALUE ""
+#define DEVICE_HEALTH_URL_VALUE HEALTH_URL_VALUE
 #endif
 #ifndef DEVICE_HEALTH_TOKEN_VALUE
 #define DEVICE_HEALTH_TOKEN_VALUE ""

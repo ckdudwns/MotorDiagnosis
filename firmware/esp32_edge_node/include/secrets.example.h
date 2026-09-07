@@ -10,7 +10,6 @@
 #define INGEST_URL_VALUE "https://backend.example.com/api/telemetry/ingest"
 #define HEALTH_URL_VALUE "https://backend.example.com/api/health"
 #define INGEST_TOKEN_VALUE "YOUR_TELEMETRY_TOKEN"
-#define DEVICE_HEALTH_TOKEN_VALUE "YOUR_DEVICE_HEALTH_TOKEN"
 
 // Provision a device-scoped machine credential using docs/production-ingest-auth.md.
 // Its secret can fill INGEST_TOKEN_VALUE and DEVICE_HEALTH_TOKEN_VALUE for this

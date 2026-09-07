@@ -1,6 +1,5 @@
 #include "firmware_logic.h"
 
-#include <ArduinoJson.h>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -300,6 +299,106 @@ bool parseNumberToken(
     return true;
 }
 
+bool parseJsonValueStrict(
+    const std::string& json,
+    std::size_t& cursor
+);
+
+bool parseJsonObjectStrict(
+    const std::string& json,
+    std::size_t& cursor
+)
+{
+    ++cursor;
+    cursor = skipWhitespace(json, cursor);
+    if (cursor < json.size() && json[cursor] == '}')
+    {
+        ++cursor;
+        return true;
+    }
+
+    while (cursor < json.size())
+    {
+        std::string key;
+        if (!parseJsonString(json, cursor, key)) return false;
+        cursor = skipWhitespace(json, cursor);
+        if (cursor >= json.size() || json[cursor++] != ':') return false;
+        if (!parseJsonValueStrict(json, cursor)) return false;
+        cursor = skipWhitespace(json, cursor);
+        if (cursor >= json.size()) return false;
+        if (json[cursor] == '}')
+        {
+            ++cursor;
+            return true;
+        }
+        if (json[cursor++] != ',') return false;
+        cursor = skipWhitespace(json, cursor);
+    }
+
+    return false;
+}
+
+bool parseJsonArrayStrict(
+    const std::string& json,
+    std::size_t& cursor
+)
+{
+    ++cursor;
+    cursor = skipWhitespace(json, cursor);
+    if (cursor < json.size() && json[cursor] == ']')
+    {
+        ++cursor;
+        return true;
+    }
+
+    while (cursor < json.size())
+    {
+        if (!parseJsonValueStrict(json, cursor)) return false;
+        cursor = skipWhitespace(json, cursor);
+        if (cursor >= json.size()) return false;
+        if (json[cursor] == ']')
+        {
+            ++cursor;
+            return true;
+        }
+        if (json[cursor++] != ',') return false;
+        cursor = skipWhitespace(json, cursor);
+    }
+
+    return false;
+}
+
+bool parseJsonValueStrict(
+    const std::string& json,
+    std::size_t& cursor
+)
+{
+    cursor = skipWhitespace(json, cursor);
+    if (cursor >= json.size()) return false;
+
+    if (json[cursor] == '{') return parseJsonObjectStrict(json, cursor);
+    if (json[cursor] == '[') return parseJsonArrayStrict(json, cursor);
+
+    PrimitiveValue value;
+    if (!parseJsonString(json, cursor, value.text))
+    {
+        if (json.compare(cursor, 4, "true") == 0 ||
+            json.compare(cursor, 5, "false") == 0 ||
+            json.compare(cursor, 4, "null") == 0)
+        {
+            if (json.compare(cursor, 4, "true") == 0) cursor += 4;
+            else if (json.compare(cursor, 5, "false") == 0) cursor += 5;
+            else cursor += 4;
+            return true;
+        }
+
+        std::string number;
+        return parseNumberToken(json, cursor, number);
+    }
+
+    return true;
+}
+
 bool parsePrimitiveValue(
     const std::string& json,
     std::size_t& cursor,
@@ -319,62 +418,9 @@ bool parsePrimitiveValue(
         return false;
     }
 
-    if (
-        json[cursor] == '{' ||
-        json[cursor] == '['
-    )
+    if (json[cursor] == '{' || json[cursor] == '[')
     {
-        std::string nesting;
-        nesting += json[cursor++];
-        bool inString = false;
-        bool escaped = false;
-
-        while (cursor < json.size() && !nesting.empty())
-        {
-            const char c = json[cursor++];
-
-            if (inString)
-            {
-                if (escaped)
-                {
-                    escaped = false;
-                }
-                else if (c == '\\')
-                {
-                    escaped = true;
-                }
-                else if (c == '"')
-                {
-                    inString = false;
-                }
-
-                continue;
-            }
-
-            if (c == '"')
-            {
-                inString = true;
-            }
-            else if (c == '{' || c == '[')
-            {
-                nesting += c;
-            }
-            else if (c == '}' || c == ']')
-            {
-                const char expected = nesting.back() == '{' ? '}' : ']';
-                if (c != expected)
-                {
-                    return false;
-                }
-                nesting.pop_back();
-            }
-        }
-
-        if (!nesting.empty() || inString)
-        {
-            return false;
-        }
-
+        if (!parseJsonValueStrict(json, cursor)) return false;
         value.type = PrimitiveType::NESTED;
         return true;
     }
@@ -879,20 +925,6 @@ AckValidationResult validateAckJson(
     if (
         responseJson == nullptr ||
         expectedDeviceId == nullptr
-    )
-    {
-        return AckValidationResult::MALFORMED_RESPONSE;
-    }
-
-    // Validate the complete response, including optional nested metadata.
-    // The flat parser below extracts and type-checks the required ACK fields;
-    // ArduinoJson prevents malformed optional values from being accepted.
-    JsonDocument document;
-    if (
-        deserializeJson(
-            document,
-            responseJson
-        )
     )
     {
         return AckValidationResult::MALFORMED_RESPONSE;

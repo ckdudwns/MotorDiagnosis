@@ -583,7 +583,11 @@ class RemoteConfigHttpTest(ConfigSetup):
     def test_real_backend_command_native_cpp_apply_reboot_and_result_contract(self):
         self.http(
             method="PUT",
-            body=self.request_payload(measurementIntervalMs=7000, replayBatchSize=2),
+            body=self.request_payload(
+                measurementIntervalMs=7000,
+                replayBatchSize=2,
+                healthReportIntervalMs=120000,
+            ),
         )
         status, pending = self.http("/pending", token=TOKEN)
         self.assertEqual(status, 200)
@@ -601,7 +605,11 @@ class RemoteConfigHttpTest(ConfigSetup):
         self.assertEqual(status, 200, result)
         self.assertEqual(
             self.http()[1]["lastApplied"]["settings"],
-            {"measurementIntervalMs": 7000, "replayBatchSize": 2},
+            {
+                "measurementIntervalMs": 7000,
+                "replayBatchSize": 2,
+                "healthReportIntervalMs": 120000,
+            },
         )
 
     @unittest.skipUnless(
@@ -649,6 +657,50 @@ class RemoteConfigHttpTest(ConfigSetup):
                     self.assertEqual(
                         self.http(device_id=device_id)[1]["lastApplied"]["version"], 1
                     )
+
+
+class HealthIntervalContractTest(ConfigSetup):
+    def test_v2_health_value_survives_application_and_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite3"
+            data.configure_runtime_state(path)
+            command = self.issue(healthReportIntervalMs=120000)
+            self.assertEqual(
+                config.pending_configuration(TOKEN, DEVICE)["schemaVersion"], 2
+            )
+            config.report_configuration(TOKEN, DEVICE, self.result(command))
+            data.close_runtime_state()
+            data.configure_runtime_state(path)
+            restored = config.pending_configuration(TOKEN, DEVICE)
+            self.assertEqual(
+                restored["desired"]["settings"]["healthReportIntervalMs"], 120000
+            )
+            self.assertEqual(restored["desired"]["commandId"], command["commandId"])
+            data.close_runtime_state()
+
+    def test_legacy_command_and_report_do_not_invent_health_interval(self):
+        payload = self.request_payload()
+        del payload["settings"]["healthReportIntervalMs"]
+        command = config.request_configuration(self.admin, DEVICE, payload)
+        self.assertEqual(
+            config.pending_configuration(TOKEN, DEVICE)["schemaVersion"], 1
+        )
+        config.report_configuration(TOKEN, DEVICE, self.result(command))
+        with self.assertRaises(data.ApiError):
+            config.report_configuration(
+                TOKEN,
+                DEVICE,
+                self.result(
+                    command,
+                    settings={**command["settings"], "healthReportIntervalMs": 30000},
+                ),
+            )
+
+    def test_health_bounds_reject_without_advancing_version(self):
+        for value in (9999, 300001, True, None, 30000.5, "30000"):
+            with self.subTest(value=value), self.assertRaises(data.ApiError):
+                self.issue(healthReportIntervalMs=value)
+        self.assertIsNone(config.pending_configuration(TOKEN, DEVICE)["desired"])
 
 
 if __name__ == "__main__":

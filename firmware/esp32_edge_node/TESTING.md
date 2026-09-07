@@ -1,6 +1,6 @@
-# ESP32 firmware regression testing — v1.3-iot-health.2
+# ESP32 firmware regression testing — v1.3-signal-analysis.1
 
-This revision adds IOT-01/02 device-health reporting and sensor recovery while retaining the PR #13 data-integrity regressions. The native test suite exercises production helper code used directly by `main.cpp`.
+This revision includes device health, bounded remote configuration, communication quality and opt-in edge statistics/requested waveforms while retaining the data-integrity regressions. The native test suite exercises production helper code used directly by `main.cpp`. See [analysis operations](../../docs/signal-analysis-operations.md) for the expanded contract and physical-test limitations.
 
 ## Native regression suite
 
@@ -11,10 +11,14 @@ $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
 & "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" test -e native
 ```
 
-Expected suite size for this revision: **83 tests** (55 existing + 28 device-health tests).
+Expected suite size for this revision: **126 tests** (55 firmware logic + 29 device health + 22 remote configuration + 15 communication quality + 5 edge analysis).
 
 The native compiler must support C++11. ArduinoJson and Unity are resolved by PlatformIO.
-Run both suites, or select the health suite with `test -e native -f test_device_health`.
+Run all five suites, or select one with `test -e native -f test_device_health` or `test -e native -f test_edge_analysis`. The native environment enables Unity double assertions for FFT numerical checks.
+
+The analysis fixture also supports `--emit-fixture <RFC3339-UTC>` to emit a deterministic raw frame using production C++ code. Set `IOT_ANALYSIS_FIXTURE_EXE` to this executable when running `tests.test_edge_analysis`; Python checks actual backend acceptance, float32 samples and independently recomputed AI1 features. The four-channel samples are synthetic test vectors, not actual board measurements.
+
+Item 2 (RPM acquisition/estimation) is excluded. Analysis frames remain schema v1 with four-channel statistics and optional requested waveforms. Existing telemetry keeps `rpm:null`; `tests.test_edge_analysis` also checks that the analysis contract rejects unsupported schema versions and speed fields.
 
 ## Device-health integration
 

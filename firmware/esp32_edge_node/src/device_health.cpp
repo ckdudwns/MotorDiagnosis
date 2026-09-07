@@ -229,7 +229,7 @@ bool metricsChanged(const Metrics& previous, const Metrics& current) {
 bool ReportSchedule::due(std::uint32_t now, bool changed, bool pending) const {
     if (!attempted_) return true;
     if (now - lastAttempt_ < retryMs_) return false;
-    return !succeeded_ || changed || pending || now - lastSuccess_ >= 30000U;
+    return !succeeded_ || changed || pending || now - lastSuccess_ >= intervalMs_;
 }
 void ReportSchedule::completed(std::uint32_t now, bool success) {
     attempted_ = true;

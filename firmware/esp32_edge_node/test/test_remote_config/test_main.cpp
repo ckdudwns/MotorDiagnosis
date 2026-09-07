@@ -217,7 +217,7 @@ void testMalformedMissingOrFutureEnvelopeCannotApply() {
         doc.remove(field);
         TEST_ASSERT_EQUAL(static_cast<int>(Status::NONE), static_cast<int>(receive(controller, storage, doc).status));
     }
-    auto newer = command(); newer["schemaVersion"] = 2;
+    auto newer = command(); newer["schemaVersion"] = 3;
     TEST_ASSERT_EQUAL(static_cast<int>(Status::NONE), static_cast<int>(receive(controller, storage, newer).status));
     auto none = command(); none["desired"] = nullptr;
     TEST_ASSERT_EQUAL(static_cast<int>(Status::NONE), static_cast<int>(receive(controller, storage, none).status));
@@ -275,6 +275,46 @@ void testScheduleSurvivesMonotonicWrap() {
     TEST_ASSERT_FALSE(schedule.due(100));
     TEST_ASSERT_TRUE(schedule.due(5000));
 }
+void testHealthIntervalV2PersistsAndLegacyCommandsPreserveIt() {
+    Controller controller, rebooted; Storage storage;
+    auto doc = command(); doc["schemaVersion"] = 2;
+    doc["desired"]["settings"]["healthReportIntervalMs"] = 120000;
+    auto result = receive(controller, storage, doc);
+    TEST_ASSERT_EQUAL(static_cast<int>(Status::APPLIED), static_cast<int>(result.status));
+    TEST_ASSERT_EQUAL(120000, controller.active().healthReportIntervalMs);
+    TEST_ASSERT_TRUE(rebooted.restore(storage.durable, ID));
+    TEST_ASSERT_EQUAL_STRING(resultPayload(result).c_str(), resultPayload(rebooted.appliedResult()).c_str());
+    auto legacy = receive(controller, storage, command(2));
+    TEST_ASSERT_EQUAL(120000, controller.active().healthReportIntervalMs);
+    TEST_ASSERT_TRUE(resultPayload(legacy).find("healthReportIntervalMs") == std::string::npos);
+    for (unsigned bad : {0U, 9999U, 300001U}) {
+        doc["desired"]["version"] = 3;
+        doc["desired"]["settings"]["healthReportIntervalMs"] = bad;
+        TEST_ASSERT_EQUAL(static_cast<int>(Status::REJECTED), static_cast<int>(receive(controller, storage, doc).status));
+    }
+    TEST_ASSERT_EQUAL(2, storage.writes);
+}
+void testLegacyStorageMigrationKeepsVersionAndDoesNotInventAppliedHealth() {
+    Controller controller, migrated; Storage storage;
+    receive(controller, storage, command(9));
+    LegacyBlob old;
+    std::memcpy(&old, &storage.durable, offsetof(LegacyBlob, crc));
+    old.schema = 1;
+    std::uint32_t crc = 0xffffffffU;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&old);
+    for (std::size_t i=0; i<offsetof(LegacyBlob, crc); ++i) {
+        crc ^= bytes[i];
+        for (unsigned bit=0; bit<8; ++bit) crc=(crc>>1)^((crc&1)?0xedb88320U:0);
+    }
+    old.crc = ~crc;
+    TEST_ASSERT_TRUE(migrated.restoreLegacy(old, ID));
+    TEST_ASSERT_EQUAL(9, migrated.active().version);
+    TEST_ASSERT_EQUAL(30000, migrated.active().healthReportIntervalMs);
+    TEST_ASSERT_TRUE(resultPayload(migrated.appliedResult()).find("healthReportIntervalMs") == std::string::npos);
+    old.crc ^= 1;
+    TEST_ASSERT_FALSE(migrated.restoreLegacy(old, ID));
+    TEST_ASSERT_EQUAL(9, migrated.active().version);
+}
 } // namespace
 
 void setUp() {}
@@ -310,5 +350,7 @@ int main(int argc, char** argv) {
     RUN_TEST(testResultAckRequiresExactVersionCommandDeviceAndStatus);
     RUN_TEST(testScheduleHasBoundedFailureBackoffAndNoBusyPolling);
     RUN_TEST(testScheduleSurvivesMonotonicWrap);
+    RUN_TEST(testHealthIntervalV2PersistsAndLegacyCommandsPreserveIt);
+    RUN_TEST(testLegacyStorageMigrationKeepsVersionAndDoesNotInventAppliedHealth);
     return UNITY_END();
 }

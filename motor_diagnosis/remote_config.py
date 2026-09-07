@@ -14,8 +14,16 @@ from . import data
 SCHEMA_VERSION = 1
 MAX_VERSION = 2_147_483_647
 HISTORY_LIMIT = 100
-SETTING_LIMITS = {"measurementIntervalMs": (3000, 60000), "replayBatchSize": (1, 4)}
-DEFAULT_SETTINGS = {"measurementIntervalMs": 3000, "replayBatchSize": 4}
+SETTING_LIMITS = {
+    "measurementIntervalMs": (3000, 60000),
+    "replayBatchSize": (1, 4),
+    "healthReportIntervalMs": (10000, 300000),
+}
+DEFAULT_SETTINGS = {
+    "measurementIntervalMs": 3000,
+    "replayBatchSize": 4,
+    "healthReportIntervalMs": 30000,
+}
 ERROR_CODES = {"storage_failure", "invalid_config", "stale_version", "version_conflict"}
 IDENTIFIER_PATTERN = r"[A-Z0-9][A-Z0-9_.-]{0,62}"
 
@@ -42,15 +50,19 @@ def _integer(value: Any, minimum: int, maximum: int, field: str) -> int:
 
 
 def normalize_settings(settings: Any) -> dict[str, int]:
-    if not isinstance(settings, dict) or set(settings) != set(SETTING_LIMITS):
+    if not isinstance(settings, dict) or set(settings) not in (
+        {"measurementIntervalMs", "replayBatchSize"},
+        set(SETTING_LIMITS),
+    ):
         _error(
             400,
             "INVALID_DEVICE_CONFIG",
-            "Only measurementIntervalMs and replayBatchSize are supported; both are required.",
+            "measurementIntervalMs and replayBatchSize are required; healthReportIntervalMs is the only optional extension.",
         )
     return {
         key: _integer(settings[key], *bounds, key)
         for key, bounds in SETTING_LIMITS.items()
+        if key in settings
     }
 
 
@@ -279,7 +291,11 @@ def pending_configuration(token: str, device_id: str) -> dict[str, Any]:
         # loss can be reconciled without inventing another command or NVS write.
         return data.copy_payload(
             {
-                "schemaVersion": SCHEMA_VERSION,
+                "schemaVersion": (
+                    2
+                    if desired and "healthReportIntervalMs" in desired["settings"]
+                    else SCHEMA_VERSION
+                ),
                 "deviceId": device_id,
                 "siteId": device["siteId"],
                 "assetId": device["assetId"],

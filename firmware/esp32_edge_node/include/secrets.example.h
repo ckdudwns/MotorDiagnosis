@@ -29,6 +29,14 @@
 #define DEVICE_QUALITY_URL_VALUE ""
 #define DEVICE_QUALITY_TOKEN_VALUE ""
 
+// Opt-in analysis channel uses the existing scoped ingest credential and the
+// same HTTPS origin as INGEST_URL_VALUE. Features are separate from telemetry;
+// raw 0.64-second waveform windows require an operator request. Eight durable
+// slots retain unacknowledged captures; no unbounded audio recording occurs.
+#ifndef EDGE_ANALYSIS_ENABLED_VALUE
+#define EDGE_ANALYSIS_ENABLED_VALUE false
+#endif
+
 // PEM-encoded CA certificate that validates the backend TLS certificate.
 // Keep this empty in the example so CI can compile without distributing
 // environment-specific trust material. Real deployments must configure it.

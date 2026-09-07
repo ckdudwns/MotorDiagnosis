@@ -1,7 +1,7 @@
 /*
  * MotorDiagnosis Edge Node
  *
- * Firmware Version : v1.3-communication-quality.1
+ * Firmware Version : v1.3-signal-analysis.1
  * Revision Summary :
  *   P1 Atomic Queue Recovery
  *   P2 Unlabeled Real Telemetry Contract
@@ -48,6 +48,8 @@
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <LittleFS.h>
+#include "edge_analysis.h"
+#include <ArduinoJson.h>
 #include <arduinoFFT.h>
 #include "driver/i2s.h"
 #include "freertos/queue.h"
@@ -77,7 +79,7 @@
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.3-communication-quality.1";
+    "v1.3-signal-analysis.1";
 
 // =====================================================
 // Test Config
@@ -6290,32 +6292,151 @@ RemoteConfig::Result pendingConfigResult;
 const RemoteConfig::Identity remoteConfigIdentity{DEVICE_ID, SITE_ID, ASSET_ID};
 bool remoteConfigStorageUsable = true;
 
+// Separate bounded outbox; never changes the existing 48-byte telemetry ring.
+#ifndef EDGE_ANALYSIS_ENABLED_VALUE
+#define EDGE_ANALYSIS_ENABLED_VALUE false
+#endif
+struct AnalysisHeader { uint32_t magic = 0x45414631, sequence = 0, bytes = 0, crc = 0; };
+constexpr unsigned ANALYSIS_SLOTS = 8;
+EdgeAnalysis::PendingRequest analysisRequest;
+uint32_t analysisLastAttempt = 0;
+uint32_t analysisLastCapture = 0;
+bool analysisCaptured = false;
+bool analysisAttempted = false, analysisStorageUsable = true;
+String analysisPath(unsigned slot) { return String("/analysis-") + slot + ".bin"; }
+
+bool readAnalysis(unsigned slot, AnalysisHeader& header, std::string& body)
+{
+    File file = LittleFS.open(analysisPath(slot), "r");
+    if (!file || file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) != sizeof(header) ||
+        header.magic != 0x45414631 || !header.sequence || !header.bytes || header.bytes > EdgeAnalysis::MAX_FRAME_BYTES ||
+        file.size() != sizeof(header) + header.bytes) return false;
+    body.resize(header.bytes);
+    return file.read(reinterpret_cast<uint8_t*>(&body[0]), header.bytes) == header.bytes &&
+        EdgeAnalysis::checksum(body.data(), body.size()) == header.crc;
+}
+
+void preserveAnalysis(const TelemetryPacket& packet)
+{
+    if (!EDGE_ANALYSIS_ENABLED_VALUE || !analysisStorageUsable || !packet.timestampResolved || !psramFound()) return;
+    timeval now{};
+    gettimeofday(&now, nullptr);
+    const char* request = analysisRequest.forCapture(packet.epochSeconds, static_cast<double>(now.tv_sec) + now.tv_usec / 1000000.0);
+    // Analysis is a sampled 30-second stream, not the realtime summary channel.
+    // A pending operator request captures the next valid window immediately.
+    if (!request && analysisCaptured && millis() - analysisLastCapture < 30000U) return;
+    unsigned slot = 0;
+    while (slot < ANALYSIS_SLOTS && LittleFS.exists(analysisPath(slot))) ++slot;
+    if (slot == ANALYSIS_SLOTS) {
+        Serial.println("[ANALYSIS] Outbox full; existing captures retained, new analysis window not stored.");
+        return;
+    }
+    const std::string body = EdgeAnalysis::frame(packet.payload.c_str(), vibX, vibY, vibZ, commonAudioWindow, request);
+    if (body.empty()) return;
+    AnalysisHeader header;
+    header.sequence = packet.sequence; header.bytes = body.size();
+    header.crc = EdgeAnalysis::checksum(body.data(), body.size());
+    const String pending = analysisPath(slot) + ".tmp";
+    File file = LittleFS.open(pending, "w");
+    if (!file) return;
+    const bool written = file.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) == sizeof(header) &&
+        file.write(reinterpret_cast<const uint8_t*>(body.data()), body.size()) == body.size();
+    file.flush(); file.close();
+    if (!written || !LittleFS.rename(pending, analysisPath(slot))) return;
+    AnalysisHeader verified; std::string restored;
+    if (!readAnalysis(slot, verified, restored) || restored != body) {
+        analysisStorageUsable = false;
+        Serial.println("[ANALYSIS] Verification failed; capture preserved, channel disabled.");
+        return;
+    }
+    analysisRequest.clear(); // The request identity now lives in the durable outbox.
+    analysisCaptured = true; analysisLastCapture = millis();
+}
+
+void serviceEdgeAnalysis()
+{
+    if (!EDGE_ANALYSIS_ENABLED_VALUE || !analysisStorageUsable || !psramFound() || WiFi.status() != WL_CONNECTED || !timeReady ||
+        (analysisAttempted && millis() - analysisLastAttempt < 5000U)) return;
+    const String ingest = INGEST_URL;
+    const String suffix = "/api/telemetry/ingest";
+    if (!ingest.endsWith(suffix)) return;
+    const String endpoint = ingest.substring(0, ingest.length()-suffix.length()) + "/api/devices/" + DEVICE_ID + "/analysis";
+    analysisAttempted = true; analysisLastAttempt = millis();
+    unsigned head = ANALYSIS_SLOTS; AnalysisHeader selected; std::string body;
+    for (unsigned i=0; i<ANALYSIS_SLOTS; ++i) {
+        if (!LittleFS.exists(analysisPath(i))) continue;
+        AnalysisHeader header; std::string candidate;
+        if (!readAnalysis(i,header,candidate)) {
+            analysisStorageUsable = false;
+            Serial.println("[ANALYSIS] Corrupt/read-failed capture retained; channel disabled.");
+            return;
+        }
+        if (head == ANALYSIS_SLOTS || header.sequence < selected.sequence) {head=i; selected=header; body=std::move(candidate);}
+    }
+    HTTPClient http; WiFiClientSecure secure;
+    secure.setHandshakeTimeout(3); http.setConnectTimeout(1500); http.setTimeout(1500);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    // Drain exactly one saved frame before polling a new capture request.
+    if (!beginBackendHttp(http,secure,(endpoint+(head==ANALYSIS_SLOTS?"/pending":"")).c_str())) return;
+    http.addHeader("Authorization", String("Bearer ") + INGEST_TOKEN);
+    int status;
+    if (head == ANALYSIS_SLOTS) status=http.GET();
+    else {
+        http.addHeader("Content-Type","application/json");
+        status=http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())),body.size());
+    }
+    const int length=http.getSize(); String response;
+    if (length>=0 && length<=2048) response=http.getString();
+    if (length==static_cast<int>(response.length())) {
+        if (head != ANALYSIS_SLOTS) {
+            if (EdgeAnalysis::accepted(status,response.c_str(),selected.sequence)) LittleFS.remove(analysisPath(head));
+        } else if (status==200) {
+            analysisRequest.load(response.c_str(), DEVICE_ID, SITE_ID, ASSET_ID);
+        }
+    }
+    http.end();
+}
+
 void activateRemoteConfiguration()
 {
     // The main loop is the sole reader/writer; no sensor window is in progress
     // here. Sampling frequency, packet format and queued records never change.
     MEASUREMENT_INTERVAL_MS = remoteConfiguration.active().measurementIntervalMs;
     REPLAY_MAX_RECORDS_PER_LOOP = remoteConfiguration.active().replayBatchSize;
+    healthSchedule.setInterval(remoteConfiguration.active().healthReportIntervalMs);
 }
 
 bool persistRemoteConfiguration(const RemoteConfig::Blob& candidate, void*)
 {
     if (!remoteConfigStorageUsable || !RemoteConfig::validBlob(candidate, remoteConfigIdentity)) return false;
     RemoteConfig::Blob readback;
-    return preferences.putBytes("remoteConfig", &candidate, sizeof(candidate)) == sizeof(candidate) &&
-        preferences.getBytesLength("remoteConfig") == sizeof(readback) &&
-        preferences.getBytes("remoteConfig", &readback, sizeof(readback)) == sizeof(readback) &&
+    return preferences.putBytes("remoteConfigV2", &candidate, sizeof(candidate)) == sizeof(candidate) &&
+        preferences.getBytesLength("remoteConfigV2") == sizeof(readback) &&
+        preferences.getBytes("remoteConfigV2", &readback, sizeof(readback)) == sizeof(readback) &&
         RemoteConfig::validBlob(readback, remoteConfigIdentity) &&
         memcmp(&candidate, &readback, sizeof(candidate)) == 0;
 }
 
 void initializeRemoteConfiguration()
 {
-    if (preferences.isKey("remoteConfig"))
+    if (!preferences.isKey("remoteConfigV2") && preferences.isKey("remoteConfig"))
+    {
+        RemoteConfig::LegacyBlob legacy;
+        if (preferences.getBytesLength("remoteConfig") != sizeof(legacy) ||
+            preferences.getBytes("remoteConfig", &legacy, sizeof(legacy)) != sizeof(legacy) ||
+            !remoteConfiguration.restoreLegacy(legacy, remoteConfigIdentity) ||
+            !persistRemoteConfiguration(remoteConfiguration.active(), nullptr))
+        {
+            remoteConfigStorageUsable = false;
+            Serial.println("[CONFIG] Legacy migration failed; original value retained, channel disabled.");
+            return;
+        }
+    }
+    if (preferences.isKey("remoteConfigV2"))
     {
         RemoteConfig::Blob stored;
-        if (preferences.getBytesLength("remoteConfig") != sizeof(stored) ||
-            preferences.getBytes("remoteConfig", &stored, sizeof(stored)) != sizeof(stored) ||
+        if (preferences.getBytesLength("remoteConfigV2") != sizeof(stored) ||
+            preferences.getBytes("remoteConfigV2", &stored, sizeof(stored)) != sizeof(stored) ||
             !remoteConfiguration.restore(stored, remoteConfigIdentity))
         {
             // Preserve the blob and sequence/telemetry state. Never lower the
@@ -6961,6 +7082,7 @@ void loop()
 
     serviceCommunicationQuality();
     serviceRemoteConfiguration();
+    serviceEdgeAnalysis();
     serviceSensors();
     serviceDeviceHealth(); // Metrics only while an older telemetry head exists.
 
@@ -7102,6 +7224,7 @@ void loop()
             ? ""
             : " (UTC unresolved)"
     );
+    preserveAnalysis(packet);
 
     // True cold boot without UTC:
     // even if the station is associated with Wi-Fi but NTP/backend time is

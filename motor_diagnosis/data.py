@@ -1202,9 +1202,9 @@ def _persist_runtime_state() -> None:
     previous_status = str(dependency.get("status") or "ready") if dependency else ""
     checked_at = now_iso()
     if dependency is not None:
-        dependency["statusReportCount"] = int(
-            dependency.get("statusReportCount", 0)
-        ) + 1
+        dependency["statusReportCount"] = (
+            int(dependency.get("statusReportCount", 0)) + 1
+        )
         dependency["status"] = "healthy"
         dependency["lastCheckedAt"] = checked_at
         dependency["detail"] = None
@@ -2489,10 +2489,7 @@ def create_device(
                 400, "INVALID_NUMBER", "bufferUsagePct must be between 0 and 100."
             )
         hardware_profile_id = (
-            str(
-                payload.get("hardwareProfileId")
-                or "HW-ESP32S3-ADXL345-INMP441-WIFI"
-            )
+            str(payload.get("hardwareProfileId") or "HW-ESP32S3-ADXL345-INMP441-WIFI")
             .strip()
             .upper()
         )
@@ -3366,7 +3363,7 @@ def recover_device_from_telemetry(device: dict[str, Any], received_at: str) -> N
     device["updatedAt"] = received_at
     if recovery_event:
         EVENTS.insert(0, recovery_event)
-        _freeze_event_evidence(recovery_event)
+        _freeze_event_evidence(recovery_event, creating=True)
 
 
 def _lifecycle_config_for(rule: dict[str, Any]) -> EventLifecycleConfig:
@@ -3441,9 +3438,7 @@ def _lifecycle_event_record(
     record.update(
         {
             "severity": (
-                "critical"
-                if max_score >= float(rule["scoreThreshold"])
-                else "warning"
+                "critical" if max_score >= float(rule["scoreThreshold"]) else "warning"
             ),
             "duration": f"{duration_sec}s",
             "durationSec": duration_sec,
@@ -3466,7 +3461,7 @@ def _lifecycle_event_record(
         EVENTS.insert(0, record)
         site = get_site(record["siteId"])
         site["eventCount"] = int(site["eventCount"]) + 1
-        _freeze_event_evidence(record)
+        _freeze_event_evidence(record, creating=True)
     return record, created
 
 
@@ -3494,9 +3489,7 @@ def process_accepted_telemetry(
         LIFECYCLE_CHECKPOINTS[stored_record["assetId"]] = copy_payload(checkpoint)
         for update in updates:
             if "event" in update:
-                event, created = _lifecycle_event_record(
-                    update, point, rule
-                )
+                event, created = _lifecycle_event_record(update, point, rule)
                 updates_applied.append(
                     {"kind": update["kind"], "eventId": event["id"], "created": created}
                 )
@@ -3561,9 +3554,7 @@ def _accept_telemetry(
                     "SEQUENCE_CONFLICT",
                     "The same deviceId and sequence already exist with a different payload.",
                 )
-            TELEMETRY_METRICS["duplicates"] = (
-                int(TELEMETRY_METRICS["duplicates"]) + 1
-            )
+            TELEMETRY_METRICS["duplicates"] = int(TELEMETRY_METRICS["duplicates"]) + 1
             TELEMETRY_METRICS["requests"] = int(TELEMETRY_METRICS["requests"]) + 1
             latency_ms = (time.monotonic() - started) * 1000
             TELEMETRY_METRICS["lastLatencyMs"] = round(latency_ms, 2)
@@ -3594,7 +3585,15 @@ def _accept_telemetry(
             "receivedAt": received_at,
             "labelProvenance": label_provenance,
         }
-        scored = score_telemetry_point(stored_record)
+        rule = anomaly_rule_for(stored_record["assetId"])
+        if rule.get("signalBaselines"):
+            from ai.ai2.week3.signal_score import score_signals
+
+            scored = score_signals(
+                stored_record, rule["signalBaselines"], rule["version"]
+            )
+        else:
+            scored = score_telemetry_point(stored_record)
         stored_record.update(copy_payload(scored))
         TELEMETRY_RECORDS.append(stored_record)
         TELEMETRY_IDEMPOTENCY[idempotency_key] = {
@@ -3828,7 +3827,7 @@ def device_health_for(device_id: str) -> dict[str, Any]:
                 "note": "No telemetry was received within DEVICE_OFFLINE_SEC.",
             }
             EVENTS.insert(0, event)
-            _freeze_event_evidence(event)
+            _freeze_event_evidence(event, creating=True)
             get_site(device["siteId"])["eventCount"] = (
                 int(get_site(device["siteId"])["eventCount"]) + 1
             )
@@ -3943,9 +3942,7 @@ def _sensor_fault_payload(value: Any, reported_at: str) -> dict[str, Any]:
         )
     detail = str(detail_value or "").strip()
     if len(detail) > 500:
-        raise ApiError(
-            400, "INVALID_DEVICE_HEALTH", "sensorFaults.detail is too long."
-        )
+        raise ApiError(400, "INVALID_DEVICE_HEALTH", "sensorFaults.detail is too long.")
     occurred_at = format_rfc3339(
         parse_rfc3339(
             "sensorFaults.occurredAt",
@@ -3962,7 +3959,9 @@ def _sensor_fault_payload(value: Any, reported_at: str) -> dict[str, Any]:
     }
 
 
-def _apply_sensor_health_boundary(device: dict[str, Any], fault: dict[str, Any]) -> None:
+def _apply_sensor_health_boundary(
+    device: dict[str, Any], fault: dict[str, Any]
+) -> None:
     # update_device_health holds STORE_LOCK while reading this authoritative
     # mapping and applying the boundary, so replacement cannot race this check.
     # Inactive devices still retain their own health/fault history.
@@ -4026,7 +4025,9 @@ def update_device_health(
         )
     reported_at = format_rfc3339(
         parse_rfc3339(
-            "reportedAt", payload.get("reportedAt") or now_iso(), "INVALID_DEVICE_HEALTH"
+            "reportedAt",
+            payload.get("reportedAt") or now_iso(),
+            "INVALID_DEVICE_HEALTH",
         )
     )
     rssi = _device_health_number(payload, "rssiDbm", -120, 0)
@@ -4034,7 +4035,9 @@ def update_device_health(
     buffer_usage = _device_health_number(payload, "bufferUsagePct", 0, 100)
     firmware = payload.get("firmwareVersion")
     if firmware is not None and (
-        not isinstance(firmware, str) or not firmware.strip() or len(firmware.strip()) > 100
+        not isinstance(firmware, str)
+        or not firmware.strip()
+        or len(firmware.strip()) > 100
     ):
         raise ApiError(
             400,
@@ -4048,7 +4051,9 @@ def update_device_health(
             "INVALID_DEVICE_HEALTH",
             "sensorFaults must be a list of at most 32 entries.",
         )
-    faults = [_sensor_fault_payload(value, reported_at) for value in sensor_fault_values]
+    faults = [
+        _sensor_fault_payload(value, reported_at) for value in sensor_fault_values
+    ]
 
     with STORE_LOCK:
         device = get_device(normalized_device_id)
@@ -4121,7 +4126,7 @@ def update_device_health(
                     "assetEventExcluded": True,
                 }
                 EVENTS.insert(0, event)
-                _freeze_event_evidence(event)
+                _freeze_event_evidence(event, creating=True)
                 get_site(device["siteId"])["eventCount"] += 1
             elif fault["status"] == "active" and existing is not None:
                 existing["severity"] = fault["severity"]
@@ -4398,9 +4403,9 @@ def record_runtime_dependency(
             )
         previous_status = str(dependency.get("status") or "ready")
         checked_at = now_iso()
-        dependency["statusReportCount"] = int(
-            dependency.get("statusReportCount", 0)
-        ) + 1
+        dependency["statusReportCount"] = (
+            int(dependency.get("statusReportCount", 0)) + 1
+        )
         if not success:
             dependency["failureCount"] = int(dependency.get("failureCount", 0)) + 1
         dependency["latencyMs"] = round(max(0.0, float(latency_ms)), 2)
@@ -4716,7 +4721,7 @@ def inject_anomaly(payload: dict[str, Any]) -> dict[str, Any]:
             ),
             "scenarioLabel": "combined_anomaly",
         }
-        _freeze_event_evidence(event)
+        _freeze_event_evidence(event, creating=True)
         EVENTS.insert(0, event)
         site["status"] = "critical"
         site["eventCount"] = int(site["eventCount"]) + 1
@@ -4925,8 +4930,7 @@ def event_notes_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
         event = get_event(event_id)
         require_site_access(user, event["siteId"])
         history_order = {
-            item["noteId"]: index
-            for index, item in enumerate(EVENT_NOTE_HISTORY, 1)
+            item["noteId"]: index for index, item in enumerate(EVENT_NOTE_HISTORY, 1)
         }
         rows = sorted(
             (
@@ -4936,7 +4940,8 @@ def event_notes_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
             ),
             key=lambda item: (
                 int(item.get("changeSequence", history_order.get(item["id"], 0))),
-                item["updatedAt"], item["id"],
+                item["updatedAt"],
+                item["id"],
             ),
             reverse=True,
         )
@@ -5201,10 +5206,25 @@ def anomaly_rule_version_for(asset_id: str, version: str) -> dict[str, Any]:
 
 
 def _freeze_event_evidence(
-    event: dict[str, Any], points: list[dict[str, Any]] | None = None
+    event: dict[str, Any],
+    points: list[dict[str, Any]] | None = None,
+    *,
+    creating: bool = False,
 ) -> dict[str, Any]:
     with STORE_LOCK:
         evidence = EVENT_EVIDENCE_SNAPSHOTS.setdefault(event["id"], {})
+        if "installationSnapshot" not in evidence:
+            from .installation_evidence import snapshot_for
+
+            evidence["installationSnapshot"] = (
+                snapshot_for(event)
+                if creating
+                else {
+                    "status": "unavailable",
+                    "source": "not_recorded_at_creation",
+                    "points": [],
+                }
+            )
 
         if "deviceSnapshot" not in evidence:
             device_id = str(event.get("deviceId") or "").strip().upper()
@@ -5309,13 +5329,16 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
         evidence_snapshot = copy_payload(EVENT_EVIDENCE_SNAPSHOTS[event_snapshot["id"]])
     threshold_version = str(event_snapshot.get("thresholdVersion") or "").strip()
     if event_snapshot.get("eventType") == "sensor_fault":
-        applied_rule = copy_payload(event_snapshot.get("ruleSnapshot") or {
-            "version": "sensor-health-v1",
-            "type": "device_sensor_health",
-            "faultCode": event_snapshot.get("faultCode"),
-            "source": "device-self-report",
-            "assetEventExcluded": True,
-        })
+        applied_rule = copy_payload(
+            event_snapshot.get("ruleSnapshot")
+            or {
+                "version": "sensor-health-v1",
+                "type": "device_sensor_health",
+                "faultCode": event_snapshot.get("faultCode"),
+                "source": "device-self-report",
+                "assetEventExcluded": True,
+            }
+        )
     else:
         applied_rule = (
             anomaly_rule_version_for(event_snapshot["assetId"], threshold_version)
@@ -5340,6 +5363,7 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
         "appliedRule": applied_rule,
         "modelVersion": event_snapshot.get("modelVersion"),
         "deviceSnapshot": evidence_snapshot["deviceSnapshot"],
+        "installationSnapshot": evidence_snapshot["installationSnapshot"],
         "latestReview": latest_review,
     }
 
@@ -5424,6 +5448,11 @@ def update_anomaly_rule(
                 "INVALID_HYSTERESIS",
                 "hysteresis must be lower than scoreThreshold.",
             )
+        signal_baselines = rule.get("signalBaselines")
+        if "signalBaselines" in payload:
+            from .signal_rules import bind_baselines
+
+            signal_baselines = bind_baselines(user, asset, payload["signalBaselines"])
         rule["history"].append(before)
         rule.update(
             {
@@ -5433,6 +5462,7 @@ def update_anomaly_rule(
                 "hysteresis": hysteresis,
                 "mergeWindowSec": merge_window_sec,
                 "active": active,
+                "signalBaselines": signal_baselines,
                 "reason": reason,
                 "updatedAt": now_iso(),
             }
@@ -5696,9 +5726,7 @@ def update_parameter(
                 )
                 rule.setdefault("history", []).append(snapshot)
                 rule[rule_field] = value
-                rule["version"] = (
-                    f"RULE-{rule['assetId']}-v{len(rule['history']) + 1}"
-                )
+                rule["version"] = f"RULE-{rule['assetId']}-v{len(rule['history']) + 1}"
                 rule["reason"] = reason
                 rule["updatedAt"] = updated_at
             _LIFECYCLE_RUNTIMES.clear()
@@ -6028,10 +6056,7 @@ def sensor_faults_for_device(
     for event in EVENTS:
         if event.get("eventType") in {"sensor_fault_candidate", "sensor_fault"} and (
             event.get("deviceId") == device["id"]
-            or (
-                not event.get("deviceId")
-                and event["assetId"] == device["assetId"]
-            )
+            or (not event.get("deviceId") and event["assetId"] == device["assetId"])
         ):
             rows.append(
                 {

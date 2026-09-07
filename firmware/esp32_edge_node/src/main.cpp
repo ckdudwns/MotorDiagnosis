@@ -6298,7 +6298,7 @@ bool remoteConfigStorageUsable = true;
 #endif
 struct AnalysisHeader { uint32_t magic = 0x45414631, sequence = 0, bytes = 0, crc = 0; };
 constexpr unsigned ANALYSIS_SLOTS = 8;
-std::string analysisRequest;
+EdgeAnalysis::PendingRequest analysisRequest;
 uint32_t analysisLastAttempt = 0;
 uint32_t analysisLastCapture = 0;
 bool analysisCaptured = false;
@@ -6319,16 +6319,19 @@ bool readAnalysis(unsigned slot, AnalysisHeader& header, std::string& body)
 void preserveAnalysis(const TelemetryPacket& packet)
 {
     if (!EDGE_ANALYSIS_ENABLED_VALUE || !analysisStorageUsable || !packet.timestampResolved || !psramFound()) return;
+    timeval now{};
+    gettimeofday(&now, nullptr);
+    const char* request = analysisRequest.forCapture(packet.epochSeconds, static_cast<double>(now.tv_sec) + now.tv_usec / 1000000.0);
     // Analysis is a sampled 30-second stream, not the realtime summary channel.
     // A pending operator request captures the next valid window immediately.
-    if (analysisRequest.empty() && analysisCaptured && millis() - analysisLastCapture < 30000U) return;
+    if (!request && analysisCaptured && millis() - analysisLastCapture < 30000U) return;
     unsigned slot = 0;
     while (slot < ANALYSIS_SLOTS && LittleFS.exists(analysisPath(slot))) ++slot;
     if (slot == ANALYSIS_SLOTS) {
         Serial.println("[ANALYSIS] Outbox full; existing captures retained, new analysis window not stored.");
         return;
     }
-    const std::string body = EdgeAnalysis::frame(packet.payload.c_str(), vibX, vibY, vibZ, commonAudioWindow, analysisRequest.c_str());
+    const std::string body = EdgeAnalysis::frame(packet.payload.c_str(), vibX, vibY, vibZ, commonAudioWindow, request);
     if (body.empty()) return;
     AnalysisHeader header;
     header.sequence = packet.sequence; header.bytes = body.size();
@@ -6388,11 +6391,7 @@ void serviceEdgeAnalysis()
         if (head != ANALYSIS_SLOTS) {
             if (EdgeAnalysis::accepted(status,response.c_str(),selected.sequence)) LittleFS.remove(analysisPath(head));
         } else if (status==200) {
-            JsonDocument result;
-            if (!deserializeJson(result,response) && result["deviceId"] == DEVICE_ID && result["siteId"] == SITE_ID && result["assetId"] == ASSET_ID) {
-                const char* request=result["requestId"];
-                analysisRequest=request && strlen(request)==32 ? request : "";
-            }
+            analysisRequest.load(response.c_str(), DEVICE_ID, SITE_ID, ASSET_ID);
         }
     }
     http.end();

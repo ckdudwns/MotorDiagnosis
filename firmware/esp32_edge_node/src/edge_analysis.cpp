@@ -66,6 +66,36 @@ bool addChannel(JsonObject channels, const char* name, const std::vector<float>&
 }
 }
 
+void PendingRequest::clear() {
+    id_.clear(); expiresAtEpoch_ = 0;
+}
+
+bool PendingRequest::load(const char* response, const char* device, const char* site, const char* asset) {
+    clear(); // A malformed, empty or remapped response cannot retain old authority.
+    if(!response || !device || !site || !asset) return false;
+    JsonDocument doc;
+    if(deserializeJson(doc,response,DeserializationOption::NestingLimit(3)) ||
+        doc["deviceId"] != device || doc["siteId"] != site || doc["assetId"] != asset ||
+        !doc["requestId"].is<const char*>() || !hexId(doc["requestId"].as<const char*>()) ||
+        doc["expiresAtEpoch"].is<bool>() || !doc["expiresAtEpoch"].is<double>()) return false;
+    const double expires = doc["expiresAtEpoch"].as<double>();
+    if(!std::isfinite(expires) || expires < 1700000000.0 || expires > 4102444800.0) return false;
+    id_ = doc["requestId"].as<const char*>(); expiresAtEpoch_ = expires;
+    return true;
+}
+
+const char* PendingRequest::forCapture(std::uint64_t capturedEpoch, double nowEpoch) {
+    if(id_.empty()) return nullptr;
+    // Unknown/backward time fails closed. Check both the captured timestamp and
+    // the current sub-second UTC time before constructing a new raw file.
+    if(capturedEpoch < 1700000000ULL || !std::isfinite(nowEpoch) ||
+        nowEpoch < static_cast<double>(capturedEpoch) || nowEpoch >= expiresAtEpoch_ ||
+        static_cast<double>(capturedEpoch) >= expiresAtEpoch_) {
+        clear(); return nullptr;
+    }
+    return id_.c_str();
+}
+
 Features summarize(const float* samples, std::size_t count, std::size_t block) {
     Features out;
     if(!samples || count<2 || count>16384 || block<2 || block>2048 || (block&(block-1)) || count%block) return out;

@@ -270,14 +270,18 @@ def render_page() -> str:
     const CHART_PAD = 34;
     const $ = (id) => document.getElementById(id);
 
-    async function api(path, options = {}) {
+    async function api(path, options = {}, preserveJson = false) {
       const headers = {...(options.headers || {})};
       if (token) headers.authorization = `Bearer ${token}`;
       const res = await fetch(path, {...options, headers});
       const type = res.headers.get("content-type") || "";
-      const body = type.includes("json") ? await res.json() : await res.text();
+      const original = preserveJson ? await res.text() : null;
+      let body;
+      if (preserveJson) body = type.includes("json") ? JSON.parse(original) : original;
+      else body = type.includes("json") ? await res.json() : await res.text();
       if (!res.ok) throw new Error(body?.error?.message || `${path} ${res.status}`);
-      return body;
+      if (preserveJson && !type.includes("json")) throw new Error("JSON 응답이 아닙니다.");
+      return preserveJson ? {body, original} : body;
     }
 
     async function login() {
@@ -1281,7 +1285,7 @@ def render_page() -> str:
           button.addEventListener("click",async()=>{
             button.disabled=true;
             try {
-              const result=await api(`/api/analysis/${encodeURIComponent(row.id)}`);
+              const {body:result,original}=await api(`/api/analysis/${encodeURIComponent(row.id)}`,{},true);
               if (!stillCurrent()) return;
               if (result.frame.deviceId!==row.deviceId || result.frame.siteId!==row.siteId || result.frame.assetId!==row.assetId) throw new Error("파형 대상 불일치");
               preview.replaceChildren();
@@ -1303,7 +1307,8 @@ def render_page() -> str:
               }
               const download=document.createElement("button"); download.textContent="분석 JSON 저장 (전체 샘플 · 미라벨)";
               download.addEventListener("click",()=>{
-                const url=URL.createObjectURL(new Blob([JSON.stringify(result)],{type:"application/json"}));
+                // Keep the server's numeric representation for the AI1 checksum.
+                const url=URL.createObjectURL(new Blob([original],{type:"application/json"}));
                 const link=document.createElement("a"); link.href=url; link.download=`analysis-${row.id}.json`; link.click(); URL.revokeObjectURL(url);
               });
               preview.appendChild(download);

@@ -1,52 +1,9 @@
 // Execute the shipped inline dashboard against a deterministic DOM/API double.
 import assert from 'node:assert/strict';
-import {readFileSync} from 'node:fs';
-import vm from 'node:vm';
-import {randomUUID} from 'node:crypto';
-
-const source = readFileSync(new URL('../motor_diagnosis/web.py', import.meta.url), 'utf8');
-const script = source.match(/<script>([\s\S]*?)<\/script>/)[1];
+import {harness, source} from './dashboard_harness.mjs';
 let checks = 0;
 const failures = [];
 const clone = value => JSON.parse(JSON.stringify(value));
-function harness() {
-  const calls = [], requests = [], elements = new Map(), intervals = [];
-  const canvas = Object.fromEntries(['arc','beginPath','clearRect','fill','fillRect','fillText','lineTo','moveTo','setLineDash','stroke'].map(name => [name,(...args) => calls.push([name,...args])]));
-  canvas.measureText = text => ({width:String(text).length * 8});
-  class Element {
-    children = []; textContent = ''; hidden = false; disabled = false; value = '';
-    width = 900; height = 280; listeners = {}; dataset = {};
-    attributes = {}; style = {};
-    constructor(tag = 'div') {this.tagName = tag;}
-    addEventListener(name, callback) {this.listeners[name] = callback;}
-    setAttribute(name, value) {this.attributes[name] = String(value);}
-    getAttribute(name) {return this.attributes[name] ?? null;}
-    append(...children) {this.children.push(...children);}
-    appendChild(child) {this.children.push(child);}
-    replaceChildren(...children) {this.children = children; this.textContent = ''; if (this.tagName === 'select') this.value = children[0]?.value || '';}
-    getContext() {return canvas;}
-    getBoundingClientRect() {return {left:0,width:900};}
-    click() {} remove() {}
-  }
-  const selectIds = new Set([...source.matchAll(/<select id="([^"]+)"/g)].map(match => match[1]));
-  const get = id => {if (!elements.has(id)) elements.set(id,new Element(selectIds.has(id) ? 'select' : 'div')); return elements.get(id);};
-  const context = vm.createContext({
-    document:{body:new Element(),getElementById:get,createElement:tag => new Element(tag),addEventListener() {}},
-    URL, URLSearchParams, atob, Blob, crypto:{randomUUID}, setTimeout, console, setInterval:fn => intervals.push(fn), confirm:() => true, alert:message => {throw new Error(message);},
-    fetch:async (path,options = {}) => {
-      requests.push({path,options});
-      const body = await context.respond(path,options);
-      return {ok:true,status:200,headers:{get:() => 'application/json'},json:async () => body,text:async () => JSON.stringify(body)};
-    },
-  });
-  context.respond = async () => {throw new Error('Unexpected request');};
-  const run = code => vm.runInContext(code,context);
-  vm.runInContext(script,context);
-  run(`permissions = ['*']; token = 'test-token'; sites = [{id:'S1',name:'Site 1'}];`);
-  get('siteSelect').value = 'S1'; get('assetSelect').value = 'A1'; get('periodSelect').value = '24';
-  get('eventSort').value = 'occurredAt_desc';
-  return {run,get,context,requests,calls,intervals,Element};
-}
 function detail(id) {
   return {event:{id,title:`<img onerror=attack()> ${id}`,occurredAt:'2026-09-06T00:00:00Z',label:'needs_review',note:'original',durationSec:10,status:'closed'},
     context:{from:'2026-09-05T23:59:30Z',to:'2026-09-06T00:01:00Z',points:[],units:{},rawDataMissing:true,source:'unavailable'},
@@ -1032,6 +989,47 @@ await check('raw preview decodes float32 and summaries never expose a waveform b
   assert.match(textOf(card),/분석 JSON 저장/);
   h.context.respond=()=>analysisList({items:[{...row,hasWaveform:false}]}); await h.run('loadOpsAnalysis()');
   assert.ok(!h.get('opsAnalysisRows').children[0].children.some(c=>c.tagName==='button'));
+});
+
+await check('raw response download keeps numeric spelling and uses authenticated API', async () => {
+  const h=harness(); let saved, clicks=0;
+  const original='{"frame":{"deviceId":"D1","siteId":"S1","assetId":"A1","channels":{},"numericFixture":[4999947392.0,-0.0,1e+20]},"sha256":"fixture"}';
+  h.context.fetch=async(path,options)=>{
+    assert.equal(path,'/api/analysis/frame-1'); assert.equal(options.headers.authorization,'Bearer test-token');
+    return new Response(original,{headers:{'content-type':'application/json'}});
+  };
+  h.context.URL={createObjectURL:blob=>{saved=blob;return 'blob:fixture';},revokeObjectURL() {}};
+  h.Element.prototype.click=function() {if(this.tagName==='a') clicks++;};
+  h.run('renderAnalysisRows($("opsAnalysisRows"),{items:[{id:"frame-1",deviceId:"D1",siteId:"S1",assetId:"A1",hasWaveform:true}]},()=>true)');
+  const card=h.get('opsAnalysisRows').children[0];
+  await card.children.find(c=>c.tagName==='button').listeners.click();
+  card.children.at(-1).children.find(c=>c.tagName==='button').listeners.click();
+  assert.equal(await saved.text(),original); assert.equal(clicks,1);
+});
+await check('raw response HTTP errors and wrong scope never expose a download', async () => {
+  for(const [status,body,message,type='application/json'] of [
+    [403,'{"error":{"message":"Forbidden fixture"}}',/Forbidden fixture/],
+    [200,'{"frame":{"deviceId":"D1","siteId":"S1","assetId":"OTHER","channels":{}}}',/대상 불일치/],
+    [200,'invalid JSON',/파형 조회 실패/],
+    [200,'<html>proxy response</html>',/JSON 응답이 아닙니다/,'text/html'],
+  ]) {
+    const h=harness(); h.context.fetch=async()=>new Response(body,{status,headers:{'content-type':type}});
+    h.run('renderAnalysisRows($("opsAnalysisRows"),{items:[{id:"f",deviceId:"D1",siteId:"S1",assetId:"A1",hasWaveform:true}]},()=>true)');
+    const card=h.get('opsAnalysisRows').children[0];
+    await card.children.find(c=>c.tagName==='button').listeners.click();
+    const preview=card.children.at(-1);
+    assert.match(preview.textContent,message); assert.equal(preview.children.length,0);
+  }
+});
+await check('late original response cannot expose a download on a different selection', async () => {
+  const h=harness(), late=deferred(); h.context.current=true;
+  h.context.fetch=()=>late.promise;
+  h.run('renderAnalysisRows($("opsAnalysisRows"),{items:[{id:"f",deviceId:"D1",siteId:"S1",assetId:"A1",hasWaveform:true}]},()=>current)');
+  const card=h.get('opsAnalysisRows').children[0], reading=card.children.find(c=>c.tagName==='button').listeners.click();
+  h.context.current=false;
+  late.resolve(new Response('{"frame":{"deviceId":"D1","siteId":"S1","assetId":"A1","channels":{}}}',{headers:{'content-type':'application/json'}}));
+  await reading;
+  assert.equal(card.children.at(-1).children.length,0);
 });
 
 assert.deepEqual(failures,[],`${failures.length} behavior checks failed`);

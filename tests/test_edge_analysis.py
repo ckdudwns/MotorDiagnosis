@@ -6,12 +6,15 @@ import http.client
 import json
 import math
 import os
+import shutil
 import sqlite3
 import subprocess
 import struct
 import tempfile
 import threading
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -106,6 +109,110 @@ class EdgeAnalysisTest(RpmSetup):
         for cursor in ("broken", base64.b64encode(b'[true,"a"]').decode(), "x" * 201):
             with self.assertRaises(data.ApiError):
                 self.store.list_device(self.admin, DEVICE, cursor=cursor)
+
+    def test_pending_exposes_expiry_and_valid_capture_survives_late_replay(self):
+        request = self.request()
+        pending = self.store.pending(self.principal, DEVICE)
+        self.assertEqual(pending["expiresAtEpoch"], request["expiresAtEpoch"])
+        payload = frame(request_id=request["requestId"])
+        # Offline upload after expiry is still valid when capture was in the window.
+        with mock.patch(
+            "motor_diagnosis.edge_analysis.time.time", return_value=time.time() + 600
+        ):
+            pending = self.store.pending(self.principal, DEVICE)
+            self.assertIsNone(pending["requestId"])
+            self.assertIsNone(pending["expiresAtEpoch"])
+            accepted, status = self.store.ingest(self.principal, DEVICE, payload)
+            self.assertEqual(status, 201)
+            self.assertEqual(self.store.ingest(self.principal, DEVICE, payload)[1], 200)
+        self.assertEqual(
+            self.store.detail(self.admin, accepted["frameId"])["frame"]["requestId"],
+            request["requestId"],
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("IOT_ANALYSIS_FIXTURE_EXE"),
+        "Build the edge-analysis host fixture",
+    )
+    def test_expired_pending_cpp_capture_keeps_analysis_flowing(self):
+        self.request(requestId="a" * 32)
+        pending = self.store.pending(self.principal, DEVICE)
+        expired = math.ceil(pending["expiresAtEpoch"]) + 1
+        timestamp = data.format_rfc3339(datetime.fromtimestamp(expired, timezone.utc))
+        payload = json.loads(
+            subprocess.check_output(
+                [
+                    os.environ["IOT_ANALYSIS_FIXTURE_EXE"],
+                    "--capture-fixture",
+                    timestamp,
+                    str(expired),
+                    str(expired),
+                    json.dumps(pending),
+                ],
+                text=True,
+            )
+        )
+        self.assertIsNone(payload["requestId"])
+        self.assertNotIn("samplesFloat32LE", payload["channels"]["acoustic"])
+        with mock.patch(
+            "motor_diagnosis.edge_analysis.time.time", return_value=expired
+        ):
+            _, status = self.store.ingest(self.principal, DEVICE, payload)
+            self.assertEqual(status, 201)  # No permanently rejected raw queue head.
+            request = self.request(requestId="b" * 32)
+            pending = self.store.pending(self.principal, DEVICE)
+            self.assertEqual(pending["requestId"], request["requestId"])
+            next_payload = json.loads(
+                subprocess.check_output(
+                    [
+                        os.environ["IOT_ANALYSIS_FIXTURE_EXE"],
+                        "--capture-fixture",
+                        timestamp,
+                        str(expired),
+                        str(expired),
+                        json.dumps(pending),
+                    ],
+                    text=True,
+                )
+            )
+            next_payload["sequence"] = 2
+            self.assertEqual(next_payload["requestId"], request["requestId"])
+            self.assertEqual(
+                self.store.ingest(self.principal, DEVICE, next_payload)[1], 201
+            )
+
+    def test_event_request_history_uses_same_inclusive_time_bounds(self):
+        now = time.time()
+        start, end = now - 86400, now - 86000
+        expected = []
+        for index, created in enumerate((start - 1, start, end, end + 1, now)):
+            with mock.patch(
+                "motor_diagnosis.edge_analysis.time.time", return_value=created
+            ):
+                request = self.request(requestId=f"{index:032x}")
+            # Permit independent requests inside the short event interval.
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE requests SET frame='fixture' WHERE id=?",
+                    (request["requestId"],),
+                )
+            if start <= created <= end:
+                expected.insert(0, request["requestId"])
+        listing = self.store.list_for(
+            self.admin,
+            "SITE-01",
+            "SITE-01-GEN-01",
+            device_id=DEVICE,
+            start=start,
+            end=end,
+        )
+        self.assertEqual(listing["items"], [])
+        self.assertEqual([r["id"] for r in listing["requests"]], expected)
+        self.assertEqual(len(self.store.list_device(self.admin, DEVICE)["requests"]), 5)
+        empty = self.store.list_for(
+            self.admin, "SITE-01", "SITE-01-GEN-01", start=start - 100, end=start - 50
+        )
+        self.assertEqual(empty["requests"], [])
 
     def test_expiry_remapping_and_numeric_rejection(self):
         request = self.request()
@@ -347,6 +454,7 @@ class EdgeAnalysisHttpTest(RpmSetup):
         )
         self.assertEqual(status, 200, pending)
         self.assertEqual(pending["requestId"], request["requestId"])
+        self.assertEqual(pending["expiresAtEpoch"], request["expiresAtEpoch"])
         status, accepted = self.call(
             path,
             "POST",
@@ -368,6 +476,101 @@ class EdgeAnalysisHttpTest(RpmSetup):
         self.assertNotIn(
             "samplesFloat32LE", listing["items"][0]["channels"]["acoustic"]
         )
+
+    @unittest.skipUnless(
+        os.environ.get("IOT_ANALYSIS_FIXTURE_EXE") and shutil.which("node"),
+        "Build the C++ analysis fixture and install Node",
+    )
+    def test_cpp_http_dashboard_download_is_accepted_by_ai1(self):
+        path = f"/api/devices/{DEVICE}/analysis"
+        status, request = self.call(
+            path + "/requests",
+            "POST",
+            {
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-GEN-01",
+                "reason": "Browser handoff",
+                "requestId": "a" * 32,
+            },
+        )
+        self.assertEqual(status, 201, request)
+        payload = json.loads(
+            subprocess.check_output(
+                [
+                    os.environ["IOT_ANALYSIS_FIXTURE_EXE"],
+                    "--emit-fixture",
+                    data.now_iso(),
+                ],
+                text=True,
+            )
+        )
+        status, accepted = self.call(
+            path, "POST", payload, token="demo-telemetry-ingest-token"
+        )
+        self.assertEqual(status, 201, accepted)
+        status, listing = self.call(path)
+        self.assertEqual(status, 200)
+        downloaded = json.loads(
+            subprocess.check_output(
+                [
+                    "node",
+                    str(Path(__file__).with_name("analysis_download_fixture.mjs")),
+                ],
+                input=json.dumps(
+                    {
+                        "baseUrl": f"http://127.0.0.1:{self.server.server_address[1]}",
+                        "token": self.token,
+                        "row": listing["items"][0],
+                    }
+                ),
+                text=True,
+                timeout=30,
+            )
+        )
+        self.assertIn("4999947392.0", downloaded["original"])
+        direct = convert(json.loads(downloaded["original"]))
+        through_dashboard = convert(json.loads(downloaded["downloaded"]))
+        self.assertEqual(through_dashboard, direct)
+        self.assertEqual(downloaded["downloaded"], downloaded["original"])
+
+    def test_http_past_event_excludes_later_requests_but_device_screen_keeps_them(self):
+        path = f"/api/devices/{DEVICE}/analysis"
+        status, request = self.call(
+            path + "/requests",
+            "POST",
+            {
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-GEN-01",
+                "reason": "Current device request",
+            },
+        )
+        self.assertEqual(status, 201, request)
+        # Control only the event fixture; route authorization and analysis storage are real.
+        yesterday = time.time() - 86400
+        detail = {
+            "event": {
+                "id": "PAST",
+                "deviceId": DEVICE,
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-GEN-01",
+            },
+            "context": {
+                "source": "unavailable",
+                "from": data.format_rfc3339(
+                    datetime.fromtimestamp(yesterday - 30, timezone.utc)
+                ),
+                "to": data.format_rfc3339(
+                    datetime.fromtimestamp(yesterday + 30, timezone.utc)
+                ),
+            },
+        }
+        with mock.patch("motor_diagnosis.server.event_detail_for", return_value=detail):
+            status, result = self.call("/api/anomaly/events/PAST")
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["analysis"]["requests"], [])
+        status, result = self.call(path)
+        self.assertEqual(status, 200, result)
+        self.assertEqual([r["id"] for r in result["requests"]], [request["requestId"]])
 
 
 if __name__ == "__main__":

@@ -323,7 +323,7 @@ class AnalysisStore:
             )
         with self.lock:
             row = self.db.execute(
-                "SELECT id FROM requests WHERE device=? AND site=? AND asset=? AND expires>=? AND frame IS NULL ORDER BY created LIMIT 1",
+                "SELECT id,expires FROM requests WHERE device=? AND site=? AND asset=? AND expires>=? AND frame IS NULL ORDER BY created LIMIT 1",
                 (device_id, device["siteId"], device["assetId"], time.time()),
             ).fetchone()
             return {
@@ -331,6 +331,7 @@ class AnalysisStore:
                 "siteId": device["siteId"],
                 "assetId": device["assetId"],
                 "requestId": row["id"] if row else None,
+                "expiresAtEpoch": row["expires"] if row else None,
             }
 
     @device_lifecycle.serialized
@@ -503,12 +504,19 @@ class AnalysisStore:
                         "sha256": row["digest"],
                     }
                 )
-            request_params = [site_id, asset_id] + (
-                [device_id] if device_id is not None else []
-            )
+            request_clauses = ["site=?", "asset=?"]
+            request_params = [site_id, asset_id]
+            for clause, value in (
+                ("device=?", device_id),
+                ("created>=?", start),
+                ("created<=?", end),
+            ):
+                if value is not None:
+                    request_clauses.append(clause)
+                    request_params.append(value)
             requests = self.db.execute(
-                "SELECT * FROM requests WHERE site=? AND asset=?"
-                + (" AND device=?" if device_id is not None else "")
+                "SELECT * FROM requests WHERE "
+                + " AND ".join(request_clauses)
                 + " ORDER BY created DESC LIMIT 20",
                 request_params,
             ).fetchall()

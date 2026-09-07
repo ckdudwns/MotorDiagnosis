@@ -1071,6 +1071,39 @@ await check('raw preprocessing configuration is never displayed as verified fiel
   assert.doesNotMatch(textOf(rows[2]),/임계값 이내/);
 });
 
+await check('continuous windows expose XYZ values and never call waiting or invalid normal', async () => {
+  const h=opsHarness(); await h.run('loadDeviceOperations()');
+  const window={bootId:'b'.repeat(32),windowIndex:3,timestamp:'2026-09-07T10:00:00Z',quality:'valid',features:[0.1,0.2,3,1,2,3,4,0.2,0.3,3,1,2,3,4,0.3,0.4,3,1,2,3,4]};
+  h.context.respond=()=>({deviceId:'D1',siteId:'S1',assetId:'A1',retentionHours:48,items:[
+    {window,missingWindowsBefore:2,analysis:{status:'waiting_model',verdict:null}},
+    {window:{...window,quality:'fifo_overrun',features:null},missingWindowsBefore:0,analysis:{status:'unavailable',verdict:null}},
+  ]});
+  await h.run('loadOpsWindows()');
+  const table=h.get('opsWindowsRows').children[0];
+  assert.match(textOf(table),/0.1 \/ 0.2 \/ 0.3/);
+  assert.match(textOf(table),/모델 대기/); assert.match(textOf(table),/판정 불가/);
+  assert.doesNotMatch(textOf(table),/정상 후보/);
+  assert.match(h.get('opsWindowsStatus').textContent,/48시간/);
+});
+await check('continuous window replies cannot cross device scope or clear newer results', async () => {
+  const h=opsHarness(); await h.run('loadDeviceOperations()');
+  const late=deferred(); let count=0;
+  h.context.respond=()=>++count===1?late.promise:{deviceId:'D1',siteId:'S1',assetId:'A1',retentionHours:48,items:[]};
+  const pending=h.run('loadOpsWindows()'); await h.run('loadOpsWindows()');
+  late.resolve({deviceId:'D1',siteId:'S1',assetId:'OTHER',items:[]}); await pending;
+  assert.equal(h.run('opsDevice.id'),'D1');
+  h.context.respond=()=>({deviceId:'D1',siteId:'S1',assetId:'OTHER',items:[]});
+  await h.run('loadOpsWindows()'); assert.equal(h.run('opsDevice'),null);
+  assert.equal(h.get('opsWindowsRows').children.length,0);
+});
+await check('continuous window permission gate makes no unauthorized request', async () => {
+  const h=opsHarness(); await h.run('loadDeviceOperations()');
+  h.run('permissions=["device:read","telemetry:read"]; opsControls()');
+  assert.equal(h.get('opsWindowsLoad').disabled,true);
+  const before=h.requests.length; await h.run('loadOpsWindows()');
+  assert.equal(h.requests.length,before);
+});
+
 assert.deepEqual(failures,[],`${failures.length} behavior checks failed`);
 console.log(`AI2 dashboard: ${checks} behavior checks passed.`);
 

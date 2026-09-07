@@ -67,6 +67,12 @@
 #include "device_health.h"
 #include "remote_config.h"
 #include "communication_quality.h"
+#include "backend_http.h"
+SemaphoreHandle_t BackendHttp::gate = nullptr;
+
+#ifndef CONTINUOUS_VIBRATION_ENABLED
+#define CONTINUOUS_VIBRATION_ENABLED 0
+#endif
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -250,11 +256,10 @@ constexpr uint32_t AUDIO_SAMPLE_RATE =
 constexpr size_t COMMON_AUDIO_SAMPLES =
     10240;
 
-// Ring holds 1.024 s of audio at 16 kHz.
-// This is larger than the 0.64 s synchronized window and provides
-// margin while the main task copies/analyzes a completed window.
+// Continuous mode copies immediately in the feature task: 0.768 s suffices
+// for 640 ms plus 128 ms margin. Legacy main-loop collection keeps 1.024 s.
 constexpr size_t AUDIO_RING_CAPACITY =
-    16384;
+    CONTINUOUS_VIBRATION_ENABLED ? 12288 : 16384;
 
 // Continuous I2S reader consumes small blocks to keep DMA backlog low.
 // 128 samples = 8 ms at 16 kHz.
@@ -430,15 +435,20 @@ int32_t commonAudioWindow[
     COMMON_AUDIO_SAMPLES
 ];
 
-double audioFFTReal[
+#if CONTINUOUS_VIBRATION_ENABLED
+using AudioFftValue = float; // Audio is not a vibration-model input.
+#else
+using AudioFftValue = double;
+#endif
+AudioFftValue audioFFTReal[
     AUDIO_FFT_SAMPLES
 ];
 
-double audioFFTImag[
+AudioFftValue audioFFTImag[
     AUDIO_FFT_SAMPLES
 ];
 
-double audioSpectrumAverage[
+AudioFftValue audioSpectrumAverage[
     AUDIO_FFT_SAMPLES / 2
 ];
 
@@ -453,14 +463,16 @@ SemaphoreHandle_t audioRingMutex;
 // FFT Objects
 // =====================================================
 
+#if !CONTINUOUS_VIBRATION_ENABLED
 ArduinoFFT<double> vibFFT(
     vibFFTReal,
     vibFFTImag,
     VIB_SAMPLES,
     VIB_SAMPLE_RATE
 );
+#endif
 
-ArduinoFFT<double> audioFFT(
+ArduinoFFT<AudioFftValue> audioFFT(
     audioFFTReal,
     audioFFTImag,
     AUDIO_FFT_SAMPLES,
@@ -1040,6 +1052,9 @@ double calculateRms(
 
 VibrationFeatures acquireVibration()
 {
+#if CONTINUOUS_VIBRATION_ENABLED
+    return VibrationFeatures();
+#else
     VibrationFeatures result;
 
     uint32_t nextSample =
@@ -1201,6 +1216,7 @@ VibrationFeatures acquireVibration()
         vibFFT.majorPeak();
 
     return result;
+#endif
 }
 
 // =====================================================
@@ -1631,6 +1647,8 @@ AcousticFeatures analyzeCommonAudioWindow(
 // Vibration Task
 // =====================================================
 
+#include "continuous_vibration_runtime.h"
+
 void vibrationTask(void* parameter)
 {
     (void)parameter;
@@ -1659,6 +1677,10 @@ bool acquireSynchronizedFeatures(
     AcousticFeatures& audio
 )
 {
+#if CONTINUOUS_VIBRATION_ENABLED
+    // Summary telemetry consumes a completed window; it never starts/stops ADC.
+    return ContinuousVibration::snapshot(vib, audio);
+#endif
     if (vibrationBusy.load())
     {
         observeSensorFault(DeviceHealth::Fault::VIBRATION_TIMEOUT, true, healthUptimeMs());
@@ -2089,11 +2111,12 @@ String formatTimestampFromEpoch(
 // =====================================================
 
 bool beginBackendHttp(
-    HTTPClient& http,
+    BackendHttp& http,
     WiFiClientSecure& secureClient,
     const char* url
 )
 {
+    if (!http.acquire()) return false;
     if (
         !FirmwareLogic::isBackendTransportAllowed(
             url,
@@ -2165,8 +2188,8 @@ bool syncTimeFromBackend()
         return false;
     }
 
-    HTTPClient http;
     WiFiClientSecure secureClient;
+    BackendHttp http;
 
     http.setConnectTimeout(
         3000
@@ -5601,8 +5624,8 @@ PostOutcome postPacket(
         return outcome;
     }
 
-    HTTPClient http;
     WiFiClientSecure secureClient;
+    BackendHttp http;
 
     http.setConnectTimeout(
         3000
@@ -6318,6 +6341,11 @@ bool readAnalysis(unsigned slot, AnalysisHeader& header, std::string& body)
 
 void preserveAnalysis(const TelemetryPacket& packet)
 {
+#if CONTINUOUS_VIBRATION_ENABLED
+    // Legacy raw arrays belong to the old on-demand collector, not this stream.
+    // Do not upload stale arrays as a newly measured waveform.
+    return;
+#endif
     if (!EDGE_ANALYSIS_ENABLED_VALUE || !analysisStorageUsable || !packet.timestampResolved || !psramFound()) return;
     timeval now{};
     gettimeofday(&now, nullptr);
@@ -6355,6 +6383,11 @@ void preserveAnalysis(const TelemetryPacket& packet)
 
 void serviceEdgeAnalysis()
 {
+#if CONTINUOUS_VIBRATION_ENABLED
+    // Old raw-capture ownership is incompatible with the continuous FIFO owner.
+    // Preserve files, but do not allocate/serve legacy raw captures in this mode.
+    return;
+#endif
     if (!EDGE_ANALYSIS_ENABLED_VALUE || !analysisStorageUsable || !psramFound() || WiFi.status() != WL_CONNECTED || !timeReady ||
         (analysisAttempted && millis() - analysisLastAttempt < 5000U)) return;
     const String ingest = INGEST_URL;
@@ -6373,7 +6406,7 @@ void serviceEdgeAnalysis()
         }
         if (head == ANALYSIS_SLOTS || header.sequence < selected.sequence) {head=i; selected=header; body=std::move(candidate);}
     }
-    HTTPClient http; WiFiClientSecure secure;
+    WiFiClientSecure secure; BackendHttp http;
     secure.setHandshakeTimeout(3); http.setConnectTimeout(1500); http.setTimeout(1500);
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     // Drain exactly one saved frame before polling a new capture request.
@@ -6469,8 +6502,8 @@ void serviceRemoteConfiguration()
         WiFi.status() != WL_CONNECTED || !timeReady || !remoteConfigSchedule.due(millis())) return;
     const bool reporting = pendingConfigResult.status != RemoteConfig::Status::NONE;
     const String endpoint = String(DEVICE_CONFIG_URL) + (reporting ? "/result" : "/pending");
-    HTTPClient http;
     WiFiClientSecure secureClient;
+    BackendHttp http;
     secureClient.setHandshakeTimeout(3);
     http.setConnectTimeout(1500);
     http.setTimeout(1500);
@@ -6600,8 +6633,8 @@ void serviceCommunicationQuality()
         qualitySchedule.completed(millis(), false);
         return;
     }
-    HTTPClient http;
     WiFiClientSecure secureClient;
+    BackendHttp http;
     secureClient.setHandshakeTimeout(3);
     http.setConnectTimeout(1500);
     http.setTimeout(1500);
@@ -6682,7 +6715,7 @@ void serviceSensors()
         healthObservationBlocked = true;
         return;
     }
-    if (!vibrationBusy.load() && adxlRetry.due(millis()))
+    if (!CONTINUOUS_VIBRATION_ENABLED && !vibrationBusy.load() && adxlRetry.due(millis()))
     {
         const bool initialized = initADXL345();
         adxlInitFailed = !initialized;
@@ -6752,8 +6785,8 @@ void serviceDeviceHealth()
     bool accepted = false;
     if (!body.empty())
     {
-        HTTPClient http;
         WiFiClientSecure secureClient;
+        BackendHttp http;
         secureClient.setHandshakeTimeout(3);
         http.setConnectTimeout(1500);
         http.setTimeout(1500);
@@ -6785,6 +6818,8 @@ void serviceDeviceHealth()
 
 void setup()
 {
+    BackendHttp::gate = xSemaphoreCreateMutex();
+    if (!BackendHttp::gate) { while (true) { delay(1000); } }
     Serial.begin(
         115200
     );
@@ -6933,7 +6968,7 @@ void setup()
         }
     }
 
-    const BaseType_t vibrationCreated = xTaskCreatePinnedToCore(
+    const BaseType_t vibrationCreated = CONTINUOUS_VIBRATION_ENABLED ? pdPASS : xTaskCreatePinnedToCore(
         vibrationTask,
         "VibrationTask",
         8192,
@@ -6961,6 +6996,12 @@ void setup()
         Serial.println("[FATAL] Sensor task allocation failed; no unsafe acquisition.");
         while (true) { delay(1000); }
     }
+#if CONTINUOUS_VIBRATION_ENABLED
+    if (!ContinuousVibration::start()) {
+        Serial.println("[FATAL] Continuous window task/buffer allocation failed.");
+        while (true) { delay(1000); }
+    }
+#endif
 
     Serial.println(
         "[OK] Vibration Task -> Core 0"
@@ -7106,7 +7147,7 @@ void loop()
     // P5: one common 0.64 s vibration/acoustic window
     // =================================================
 
-    if (!adxlRetry.ready() || !audioReady.load() || !healthJournalUsable ||
+    if ((!CONTINUOUS_VIBRATION_ENABLED && !adxlRetry.ready()) || !audioReady.load() || !healthJournalUsable ||
         healthJournalDirty || healthObservationBlocked)
     {
         delay(200); // Wi-Fi, health reporting and bounded replay remain alive.

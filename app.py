@@ -20,6 +20,9 @@ def main() -> None:
         state_database=os.environ.get("STATE_DB_PATH", "output/runtime.sqlite3"),
         analysis_database=os.environ.get("ANALYSIS_DB_PATH", "output/analysis.sqlite3"),
         model_artifact=os.environ.get("SHADOW_MODEL_ARTIFACT"),
+        window_database=os.environ.get("VIBRATION_WINDOW_DB_PATH", "output/vibration-windows.sqlite3"),
+        raw_window_database=os.environ.get("RAW_VIBRATION_WINDOW_DB_PATH", "output/raw-vibration-windows.sqlite3"),
+        window_model_variant=os.environ.get("WINDOW_MODEL_VARIANT") or None,
         model_candidate=os.environ.get("SHADOW_MODEL_CANDIDATE", "lstm_autoencoder"),
         model_checksum=os.environ.get("SHADOW_MODEL_CHECKSUM"),
         model_preprocessing_profile=os.environ.get(

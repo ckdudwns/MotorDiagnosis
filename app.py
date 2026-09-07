@@ -19,6 +19,12 @@ def main() -> None:
         alert_adapters=configured_adapters(),
         state_database=os.environ.get("STATE_DB_PATH", "output/runtime.sqlite3"),
         analysis_database=os.environ.get("ANALYSIS_DB_PATH", "output/analysis.sqlite3"),
+        model_artifact=os.environ.get("SHADOW_MODEL_ARTIFACT"),
+        model_candidate=os.environ.get("SHADOW_MODEL_CANDIDATE", "lstm_autoencoder"),
+        model_checksum=os.environ.get("SHADOW_MODEL_CHECKSUM"),
+        model_database=os.environ.get(
+            "SHADOW_MODEL_DB_PATH", "output/model-inference.sqlite3"
+        ),
         communication_database=os.environ.get(
             "COMMUNICATION_QUALITY_DB_PATH", "output/communication-quality.sqlite3"
         ),

@@ -73,6 +73,15 @@ void testAckAcceptsNew201()
     );
 }
 
+void testAckAcceptsNestedNonAckMetadata()
+{
+    assertAckResult(
+        AckValidationResult::VALID,
+        201,
+        "{\"accepted\":true,\"duplicate\":false,\"deviceId\":\"DEV-01-MOT-02\",\"sequence\":1234,\"receivedAt\":\"2026-09-07T13:18:16.795Z\",\"lifecycleUpdates\":[{\"kind\":\"asset_event_updated\",\"eventId\":\"AI2-EVENT\",\"created\":false}]}"
+    );
+}
+
 void testAckAcceptsDuplicate200()
 {
     assertAckResult(
@@ -921,6 +930,7 @@ int main(
     UNITY_BEGIN();
 
     RUN_TEST(testAckAcceptsNew201);
+    RUN_TEST(testAckAcceptsNestedNonAckMetadata);
     RUN_TEST(testAckAcceptsDuplicate200);
     RUN_TEST(testAckRejects204EvenThough2xx);
     RUN_TEST(testAckRejectsWrongDevice);

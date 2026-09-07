@@ -17,7 +17,8 @@ enum class PrimitiveType
     STRING,
     BOOLEAN,
     NUMBER,
-    NULL_VALUE
+    NULL_VALUE,
+    NESTED
 };
 
 struct PrimitiveValue
@@ -317,15 +318,64 @@ bool parsePrimitiveValue(
         return false;
     }
 
-    // Deliberately reject nested objects/arrays. ACK and /api/health are
-    // flat API-v1.3 contracts. This prevents keys hidden inside nested
-    // documents from being mistaken for top-level acknowledgement fields.
     if (
         json[cursor] == '{' ||
         json[cursor] == '['
     )
     {
-        return false;
+        std::string nesting;
+        nesting += json[cursor++];
+        bool inString = false;
+        bool escaped = false;
+
+        while (cursor < json.size() && !nesting.empty())
+        {
+            const char c = json[cursor++];
+
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (c == '\\')
+                {
+                    escaped = true;
+                }
+                else if (c == '"')
+                {
+                    inString = false;
+                }
+
+                continue;
+            }
+
+            if (c == '"')
+            {
+                inString = true;
+            }
+            else if (c == '{' || c == '[')
+            {
+                nesting += c;
+            }
+            else if (c == '}' || c == ']')
+            {
+                const char expected = nesting.back() == '{' ? '}' : ']';
+                if (c != expected)
+                {
+                    return false;
+                }
+                nesting.pop_back();
+            }
+        }
+
+        if (!nesting.empty() || inString)
+        {
+            return false;
+        }
+
+        value.type = PrimitiveType::NESTED;
+        return true;
     }
 
     if (

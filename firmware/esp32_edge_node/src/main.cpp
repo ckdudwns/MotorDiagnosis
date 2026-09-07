@@ -125,6 +125,9 @@ const char* HEALTH_URL =
 const char* INGEST_TOKEN =
     INGEST_TOKEN_VALUE;
 
+const char* DEVICE_HEALTH_TOKEN =
+    DEVICE_HEALTH_TOKEN_VALUE;
+
 #ifndef BACKEND_CA_CERT_VALUE
 #define BACKEND_CA_CERT_VALUE ""
 #endif
@@ -2090,6 +2093,11 @@ bool syncTimeFromBackend()
 
         return false;
     }
+
+    http.addHeader(
+        "Authorization",
+        String("Bearer ") + DEVICE_HEALTH_TOKEN
+    );
 
     const int statusCode =
         http.GET();
@@ -5180,18 +5188,16 @@ bool writeIsolationEnvelopeAtomic(
             sequence
         );
 
-    // Avoid noisy VFS errors when the fixed-slot temp file does not
-    // exist yet. This is expected on the first use of a slot.
-    if (
-        fileExistsQuiet(
-            tempPath
-        )
-    )
-    {
-        LittleFS.remove(
-            tempPath.c_str()
-        );
-    }
+    Serial.printf(
+        "[ISOLATION] Begin Sequence %lu.\n",
+        static_cast<unsigned long>(sequence)
+    );
+
+    // A fixed-slot temp path is safe to replace. Avoid a full parent-directory
+    // scan here; on-device LittleFS traversal can block replay for a long time.
+    LittleFS.remove(
+        tempPath.c_str()
+    );
 
     File file =
         LittleFS.open(
@@ -5203,6 +5209,8 @@ bool writeIsolationEnvelopeAtomic(
     {
         return false;
     }
+
+    Serial.println("[ISOLATION] Temp file opened.");
 
     file.print("{\n  \"sequence\": ");
     file.print(sequence);
@@ -5322,6 +5330,8 @@ bool writeIsolationEnvelopeAtomic(
     file.print("\n}\n");
     file.flush();
 
+    Serial.println("[ISOLATION] Temp file flushed.");
+
     const bool writeError =
         file.getWriteError() != 0;
 
@@ -5357,6 +5367,8 @@ bool writeIsolationEnvelopeAtomic(
         return false;
     }
 
+    Serial.println("[ISOLATION] Temp file verified.");
+
     verify.close();
 
     // Fixed-slot archive: the new temp file is fully written and verified
@@ -5367,18 +5379,11 @@ bool writeIsolationEnvelopeAtomic(
     // function reports a verified successful replacement. Therefore a cut
     // after destination deletion but before rename cannot lose telemetry.
     //
-    // The fixed slot may be unused on its first write. Only remove an
-    // existing destination so LittleFS does not emit a false error log.
-    if (
-        fileExistsQuiet(
-            finalPath
-        )
-    )
-    {
-        LittleFS.remove(
-            finalPath.c_str()
-        );
-    }
+    // Replace the fixed slot directly. Avoid another full directory scan;
+    // missing destinations are harmless and rename remains the commit point.
+    LittleFS.remove(
+        finalPath.c_str()
+    );
 
     if (
         !LittleFS.rename(
@@ -5392,6 +5397,8 @@ bool writeIsolationEnvelopeAtomic(
         );
         return false;
     }
+
+    Serial.println("[ISOLATION] Temp file renamed.");
 
     Serial.printf(
         "[ISOLATION] Stored Sequence %lu in bounded slot %lu/%u.\n",

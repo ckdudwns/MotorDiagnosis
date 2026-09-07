@@ -10,6 +10,7 @@
 #define INGEST_URL_VALUE "https://backend.example.com/api/telemetry/ingest"
 #define HEALTH_URL_VALUE "https://backend.example.com/api/health"
 #define INGEST_TOKEN_VALUE "YOUR_TELEMETRY_TOKEN"
+#define DEVICE_HEALTH_TOKEN_VALUE "YOUR_DEVICE_HEALTH_TOKEN"
 
 // PEM-encoded CA certificate that validates the backend TLS certificate.
 // Keep this empty in the example so CI can compile without distributing

@@ -2,7 +2,7 @@
 ANOMALY_RULE_01 테스트 — 임계값·히스테리시스·설비별 기준선 레지스트리 검증 (AI-1, 3주차)
 
 합성(fixture) 스트림으로 히스테리시스/레지스트리 로직을 항상 검증하고, 실제 CWRU
-데이터(97.mat NORMAL 119윈도우 -> 105/118/130.mat 결함 177윈도우)로 week2가 산출한
+데이터(기준선 출처와 같은 0HP 정상 97.mat -> 결함 파일들 전환)로 week2가 산출한
 baseline.json을 그대로 써서 "정상 구간에서는 이벤트가 거의/전혀 안 생기고, 결함
 구간 진입 시 실제로 이상 판정되는지"를 확인한다.
 """
@@ -403,7 +403,12 @@ class TestAnomalyRuleWithRealCwruData(unittest.TestCase):
         from extract_features import extract_all_features, FeatureConfig
 
         records = load_cwru_dataset(_CWRU_DATA_DIR)
-        cls.normal = [r for r in records if r["label"] == "NORMAL"]
+        # baseline.json은 0HP 정상(97.mat) 단독으로 산출됐다. NORMAL 자산이 4개
+        # (0/1/2/3 HP)로 늘면서 98/99/100.mat의 정상 윈도우는 이 0HP 기준선
+        # 대비 수십 σ 밖에 놓인다(부하가 다르면 RMS/스펙트럼도 다르다). 이
+        # 스트림 테스트는 "기준선 출처와 같은 운전 조건의 정상 -> 결함 전환"을
+        # 보는 것이므로 NORMAL을 97.mat로 고정한다.
+        cls.normal = [r for r in records if r["source_label"] == "97.mat"]
         cls.fault = [r for r in records if r["label"] != "NORMAL"]
         self_config = FeatureConfig(sample_rate=cls.normal[0]["sample_rate"])
 

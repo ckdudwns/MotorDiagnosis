@@ -35,7 +35,11 @@ def _print_console_safe(message: str) -> None:
         print(message)
     except UnicodeEncodeError:
         encoding = getattr(sys.stdout, "encoding", None) or "ascii"
-        print(message.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+        print(
+            message.encode(encoding, errors="replace").decode(
+                encoding, errors="replace"
+            )
+        )
 
 
 @dataclass
@@ -143,13 +147,16 @@ def compute_spectral_features(signal: np.ndarray, config: FeatureConfig) -> dict
 
 
 def compute_mfcc(signal: np.ndarray, config: FeatureConfig) -> np.ndarray:
-    """MFCC 계산. librosa가 있으면 사용, 없으면 0벡터 반환(경고 출력)."""
+    """MFCC 계산. n_mfcc=0은 명시적 특징 제외이며, 누락 의존성은 오류다."""
+    if type(config.n_mfcc) is not int or config.n_mfcc < 0:
+        raise ValueError("n_mfcc must be a nonnegative integer")
+    if config.n_mfcc == 0:
+        return np.empty(0)
     if not _HAS_LIBROSA:
-        _print_console_safe(
-            "[경고] librosa 미설치 — MFCC는 0벡터로 대체됩니다. "
-            "pip install librosa 후 재실행하세요."
+        raise ImportError(
+            "MFCC requires librosa; install the feature requirements or explicitly "
+            "set n_mfcc=0 and create a new feature schema/dataset version."
         )
-        return np.zeros(config.n_mfcc)
 
     mfcc = librosa.feature.mfcc(
         y=signal.astype(np.float32),

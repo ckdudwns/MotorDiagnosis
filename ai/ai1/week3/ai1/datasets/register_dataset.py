@@ -1,10 +1,11 @@
 """
 기존 데이터셋 등록 매니페스트 빌더 (AI-1, 3주차 DATA_EXPORT_01)
 
-CWRU Bearing Dataset(1주차 인계 경로의 .mat 4개)을 API 명세서 v1.2
+CWRU Bearing Dataset(1주차 인계 경로의 .mat 4개)을 API 명세서 v1.3
 `09_보완API상세` 시트의 `POST /api/datasets`(MVP-042) 계약에 맞춰 정규화한
-불변 데이터셋 버전 매니페스트로 만든다. 필드 정의와 분할 전략의 근거는
-`dataset_manifest_format.md`를 참고한다.
+불변 데이터셋 버전 매니페스트로 만든다 — v1.3의 `labelPolicyVersion`/
+`snapshotSchemaVersion`과 export 행 라벨 상태까지 반영한다. 필드 정의와 분할
+전략의 근거는 `dataset_manifest_format.md`를 참고한다.
 
 원본 데이터/로더는 1주차 경로(`ai/ai1/week1/ai1/`)의 것을 그대로 재사용하고
 복제하지 않는다. 특징값 계산도 week2의 `extract_all_features()`를 그대로
@@ -68,6 +69,15 @@ _week2_extract_features = _import_module_from_path(
 extract_all_features = _week2_extract_features.extract_all_features
 FeatureConfig = _week2_extract_features.FeatureConfig
 
+# week1 build_ai1_handoff_dataset.compute_peak_frequency(피크 주파수)도 같은
+# 이유(모듈명 충돌 회피)로 파일 경로로 명시 로드한다. 이 모듈의 top-level
+# import(load_cwru_vibration / load_mimii_acoustic)는 모두 guarded라 안전하다.
+_week1_build_handoff = _import_module_from_path(
+    "ai1_week3_register_dataset.week1_build_handoff",
+    os.path.join(_WEEK1_SCRIPTS_DIR, "build_ai1_handoff_dataset.py"),
+)
+compute_peak_frequency = _week1_build_handoff.compute_peak_frequency
+
 CWRU_SOURCE_URI = "https://engineering.case.edu/bearingdatacenter/welcome"
 CWRU_LICENSE_NOTE = (
     "Case Western Reserve University Bearing Data Center — 학술/연구 목적 "
@@ -87,10 +97,32 @@ DATASET_LABEL_MAPPING = {
 LABEL_TAXONOMY_VERSION = "CWRU-FAULT-V1"
 DEFAULT_SPLIT_RATIOS = {"train": 0.7, "validation": 0.2, "test": 0.1}
 
-# week2 extract_features.py의 특징 추출 로직(계산식/특징 목록)을 식별하는 버전표.
-# extract_all_features()의 산출 스키마나 계산식이 바뀌면 반드시 함께 올려야
-# 체크섬이 "같은 원본에서 다른 특징값이 나온" 상황을 잡아낼 수 있다.
-FEATURE_PIPELINE_VERSION = "week2.extract_all_features.v1"
+# 특징 추출 로직(계산식/특징 목록)을 식별하는 버전표. 산출 스키마나 계산식이
+# 바뀌면 반드시 함께 올려야 체크섬이 "같은 원본에서 다른 특징값이 나온"
+# 상황을 잡아낸다. v1(week2 extract_all_features 26개) -> peak_hz 추가로 v2
+# (week2 26개 + week1 compute_peak_frequency = vibration_peak_hz, 총 27개).
+FEATURE_PIPELINE_VERSION = "week2.extract_all_features+week1.peak_hz.v2"
+
+# 매니페스트 rows에 붙이는 피크 주파수 특징 이름 (week4 features.py와 동일).
+PEAK_FEATURE_NAME = "vibration_peak_hz"
+
+# API 명세서 v1.3 `05_데이터모델`의 라벨 정책·snapshot 스키마 버전.
+# 신규 데이터셋은 이 값을 fingerprint(compute_version_checksum)와 manifest에 포함해
+# 동결한다 — 정책이 바뀌면 다른 id가 나온다. 기존 frozen 데이터셋은 재계산하지 않는다.
+LABEL_POLICY_VERSION = "LABEL-POLICY-V2"
+SNAPSHOT_SCHEMA_VERSION = "2"
+
+# export 행의 라벨 상태 값 (v1.3 DatasetExportRow.label_status).
+#   verified  = 신뢰된 라벨 + taxonomy 매핑 성공 → 지도학습 사용
+#   weak      = 미검수 이벤트 후보만 존재 → 학습 제외 (CWRU 공개 데이터셋 경로에서는
+#               이벤트가 없어 발생하지 않음. parity 위해 값만 정의)
+#   unlabeled = 라벨·후보 없음
+#   unmapped  = 신뢰 라벨은 있으나 taxonomy 매핑 실패
+LABEL_STATUSES = ("verified", "weak", "unlabeled", "unmapped")
+
+# CWRU known_label의 출처: 공개 데이터셋 파일→라벨 맵(신뢰된 import).
+# source/isSynthetic이 아니라 이 검증 가능한 출처로만 supervised target을 승격한다.
+DATASET_REGISTRATION_LABEL_SOURCE = "dataset_registration"
 
 
 def sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
@@ -179,13 +211,17 @@ def validate_split_ratios(ratios: dict) -> None:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"split_ratios[{key!r}]는 숫자여야 합니다: {value!r}")
         if not math.isfinite(value):
-            raise ValueError(f"split_ratios[{key!r}]는 유한한 값이어야 합니다: {value!r}")
+            raise ValueError(
+                f"split_ratios[{key!r}]는 유한한 값이어야 합니다: {value!r}"
+            )
         if not (0 <= value <= 1):
             raise ValueError(f"split_ratios[{key!r}]는 0~1 범위여야 합니다: {value!r}")
 
     total = sum(ratios[key] for key in _REQUIRED_SPLIT_KEYS)
     if not math.isclose(total, 1.0, rel_tol=0, abs_tol=1e-6):
-        raise ValueError(f"split_ratios 합계는 1.0이어야 합니다 (현재 {total}): {ratios!r}")
+        raise ValueError(
+            f"split_ratios 합계는 1.0이어야 합니다 (현재 {total}): {ratios!r}"
+        )
 
 
 def _validate_finite_features(features: dict, sample_id: str) -> None:
@@ -228,9 +264,13 @@ def group_split(
     train/validation/test 3개)보다 적으면 그룹을 쪼개지 않는 한 리크 없이
     분할을 만들 수 없다 — 이 경우 조용히 윈도우 단위로 섞는 대신
     `InsufficientAssetGroupsError`를 발생시켜 "데이터 부족" 상태를 명시적으로
-    드러낸다 (근거: dataset_manifest_format.md "분할 전략"). CWRU는 현재
-    라벨당 자산이 1개뿐이라 기본 3-way 분할에서는 이 예외가 발생하는 것이
-    정상이며, 자산이 늘어나거나 train 전용 등 분할 비율을 조정해야 해소된다.
+    드러낸다 (근거: dataset_manifest_format.md "분할 전략").
+
+    `build_manifest`는 `group_key="specimen_id"`(물리 베어링)로 이 함수를 호출한다.
+    CWRU는 IR/Ball/OR 결함마다 specimen 3개(0.007/0.014/0.021")를 확보했지만
+    **NORMAL specimen은 1개뿐**이라(건강 베어링 1개) 기본 3-way 분할에서는 이
+    예외가 발생하는 것이 정상이다 — 정직한 실패다. 데모/리포트용으로는
+    `operating_condition_split()`(부하조건 기준, 독립 검증 아님)을 opt-in으로 쓴다.
     """
     ratios = DEFAULT_SPLIT_RATIOS if ratios is None else ratios
     validate_split_ratios(ratios)
@@ -306,9 +346,7 @@ def group_split(
         if pair_index == len(coverage_pairs):
             return True
         label, name = coverage_pairs[pair_index]
-        if any(
-            coverage_assignment.get(gid) == name for gid in label_group_ids[label]
-        ):
+        if any(coverage_assignment.get(gid) == name for gid in label_group_ids[label]):
             return _backtrack(pair_index + 1, coverage_assignment)
         for gid in _candidate_order(label):
             if gid in coverage_assignment:
@@ -341,6 +379,7 @@ def group_split(
     remaining.sort(key=lambda gid: -len(groups[gid]))
 
     for group_id in remaining:
+
         def deficit(split_name: str, group_id: str = group_id) -> float:
             return sum(
                 targets[label][split_name] - assigned_counts[label][split_name]
@@ -358,19 +397,46 @@ def group_split(
     return [split_of_index[i] for i in range(len(records))]
 
 
+# 부하조건(0/1/2/3 HP) → split 고정 배정. test는 가장 낮은 부하(0HP), validation은
+# 1HP, train은 2·3HP. 결정적(seed 무관)이며 각 부하 tier의 윈도우는 통째로 한 split에만
+# 들어간다.
+_OPERATING_CONDITION_SPLIT_MAP = {0: "test", 1: "validation", 2: "train", 3: "train"}
+
+
+def operating_condition_split(records: list, ratios: dict = None) -> list:
+    """부하조건(`load_hp`) 기준으로 split을 고정 배정한다 — **specimen 독립 아님**.
+
+    같은 물리 베어링(specimen)이 모든 부하조건에 걸쳐 있으므로 이 분할에서는 같은
+    specimen이 train/validation/test에 함께 들어간다(누수). CWRU는 건강한 베어링이
+    1개뿐이라 specimen 독립 holdout 자체가 불가능해서, 데모/리포트용으로만 이 분할을
+    opt-in으로 쓴다. 매니페스트에 `independentHoldout=False`가 붙는다.
+
+    `ratios`는 시그니처 호환을 위해 받지만 무시한다(부하 tier가 배정을 결정).
+    """
+    del ratios  # 부하 tier 배정이 우선. 시그니처 호환용으로만 받는다.
+    missing = [rec.get("sample_id") for rec in records if rec.get("load_hp") is None]
+    if missing:
+        raise ValueError(
+            "operating_condition_split에는 레코드마다 load_hp(0~3)가 필요합니다. "
+            f"누락: {missing[:5]}{'...' if len(missing) > 5 else ''}"
+        )
+    unknown = sorted(
+        {rec["load_hp"] for rec in records} - set(_OPERATING_CONDITION_SPLIT_MAP)
+    )
+    if unknown:
+        raise ValueError(f"알 수 없는 load_hp 값: {unknown} (허용: 0~3).")
+    return [_OPERATING_CONDITION_SPLIT_MAP[rec["load_hp"]] for rec in records]
+
+
 def compute_feature_output_fingerprint(rows: list) -> str:
     """실제로 계산된 특징값 산출물 자체의 canonical hash.
 
-    week2 `extract_all_features()`의 MFCC는 librosa가 없으면 조용히 0벡터로
-    대체된다(`compute_mfcc()` fallback). 이 차이는 소스 코드/설정 어디에도
-    드러나지 않으므로, feature_pipeline_version이나 FeatureConfig만으로는
-    같은 원본에서 실제 MFCC 값과 0벡터가 나온 두 실행을 구분할 수 없다.
-    그래서 메타데이터가 아니라 **최종 산출된 특징값 자체**를 해시해, 실행
-    환경 차이로 산출물이 달라지면 반드시 체크섬도 달라지게 한다.
+    과거 MFCC 0벡터 대체 문제를 막기 위해 도입했다. 현재는 의존성이 없으면
+    명시적으로 실패하지만, 라이브러리 버전 등 실행 환경에 따른 수치 차이는
+    남을 수 있다. 메타데이터뿐 아니라 **최종 산출된 특징값 자체**를 해시해
+    산출물이 달라지면 반드시 체크섬도 달라지게 한다.
     """
-    payload = [
-        {name: row[name] for name in sorted(row)} for row in rows
-    ]
+    payload = [{name: row[name] for name in sorted(row)} for row in rows]
     encoded = json.dumps(
         payload, sort_keys=True, ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
@@ -388,16 +454,22 @@ def compute_version_checksum(
     feature_config: FeatureConfig,
     feature_output_fingerprint: str,
     feature_pipeline_version: str = FEATURE_PIPELINE_VERSION,
+    label_policy_version: str = LABEL_POLICY_VERSION,
+    snapshot_schema_version: str = SNAPSHOT_SCHEMA_VERSION,
+    split_strategy: str = "specimen_group",
 ) -> str:
     """원본 파일·라벨·전처리/분할/특징 추출 설정 + 실제 산출물로 불변 버전 체크섬을 만든다.
 
     입력 파일 sha256 + **파일별 source label**, window/hop 크기, 분할 비율,
     seed, label taxonomy 버전, label mapping, 특징 추출 설정(FeatureConfig:
     sample_rate/frame_length/hop_length/n_mfcc/band_edges), 파이프라인 버전,
+    라벨 정책·snapshot 스키마 버전(API 명세서 v1.3),
     **실제 계산된 특징값의 fingerprint(compute_feature_output_fingerprint())**
     중 하나라도 달라지면 다른 체크섬이 나와야 한다. feature_output_fingerprint를
     포함해야 librosa 유무처럼 소스 코드/설정에는 드러나지 않는 실행 환경
     차이(MFCC 0벡터 폴백 등)로 산출물이 달라진 경우까지 잡아낼 수 있다.
+    label_policy_version을 포함해야 라벨 정책이 바뀐 신규 데이터셋이 기존 frozen
+    버전과 같은 id를 재사용하지 않는다.
     """
     payload = {
         "files": {
@@ -419,11 +491,122 @@ def compute_version_checksum(
             "band_edges": list(feature_config.band_edges),
         },
         "feature_output_fingerprint": feature_output_fingerprint,
+        "label_policy_version": label_policy_version,
+        "snapshot_schema_version": snapshot_schema_version,
+        "split_strategy": split_strategy,
     }
     encoded = json.dumps(
         payload, sort_keys=True, ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+# export 행에 붙는 v1.3 DatasetExportRow 라벨 필드의 고정 순서(CSV/XLSX 컬럼 순서).
+DATASET_EXPORT_LABEL_FIELDS = (
+    "scenario_label",
+    "known_vibration_label",
+    "known_acoustic_label",
+    "ground_truth_label",
+    "ground_truth_source",
+    "target_label",
+    "target_label_taxonomy_version",
+    "label_status",
+    "training_eligible",
+    "event_reviewed",
+)
+
+
+def dataset_export_label_fields(
+    row: dict, label_mapping: dict, taxonomy_version: str
+) -> dict:
+    """CWRU 매니페스트 행 하나에 대한 v1.3 라벨 필드 dict를 만든다.
+
+    CWRU의 ``known_label``은 공개 데이터셋 파일→라벨 맵에서 온 **신뢰된 외부 라벨**
+    (검증 가능한 출처: ``dataset_registration``)이므로, taxonomy 매핑에 성공한 행은
+    전부 ``label_status="verified"`` / ``training_eligible=True``다. 미검수 이벤트·모델
+    판정 같은 약한 후보는 이 경로에 존재하지 않는다.
+
+    - ``known_label`` ∈ ``label_mapping``  → verified, target_label = 공통 라벨
+    - ``known_label`` 있으나 매핑 실패      → unmapped, target_label = None (학습 제외)
+    - ``known_label`` 없음/빈값             → unlabeled (학습 제외)
+    """
+    known_label = str(row.get("known_label") or "").strip() or None
+    fields = {
+        "scenario_label": None,
+        "known_vibration_label": None,
+        "known_acoustic_label": None,
+        "ground_truth_label": known_label,
+        "ground_truth_source": (
+            DATASET_REGISTRATION_LABEL_SOURCE if known_label else None
+        ),
+        "target_label": None,
+        "target_label_taxonomy_version": None,
+        "label_status": "unlabeled",
+        "training_eligible": False,
+        "event_reviewed": False,
+    }
+    if known_label is None:
+        return fields
+    if row.get("modality") == "acoustic":
+        fields["known_acoustic_label"] = known_label
+    if known_label in label_mapping:
+        fields["target_label"] = label_mapping[known_label]
+        fields["target_label_taxonomy_version"] = taxonomy_version
+        fields["label_status"] = "verified"
+        fields["training_eligible"] = True
+    else:
+        fields["label_status"] = "unmapped"
+    return fields
+
+
+def summarize_dataset_labels(
+    rows: list, label_mapping: dict, taxonomy_version: str
+) -> dict:
+    """행 전체의 라벨 상태 집계 (v1.3 DatasetExportManifest 필드).
+
+    반환: ``{labelCounts: {verified, weak, unlabeled, unmapped},
+    trainingEligibleCount: int, trainingEligibleSplitCounts: {train, validation, test}}``
+    """
+    label_counts = {status: 0 for status in LABEL_STATUSES}
+    eligible_split_counts = {"train": 0, "validation": 0, "test": 0}
+    eligible_total = 0
+    for row in rows:
+        info = dataset_export_label_fields(row, label_mapping, taxonomy_version)
+        label_counts[info["label_status"]] += 1
+        if info["training_eligible"]:
+            eligible_total += 1
+            split = row.get("split")
+            if split in eligible_split_counts:
+                eligible_split_counts[split] += 1
+    return {
+        "labelCounts": label_counts,
+        "trainingEligibleCount": eligible_total,
+        "trainingEligibleSplitCounts": eligible_split_counts,
+    }
+
+
+# 분할 전략.
+#   specimen_group            : 물리 베어링(specimen) 단위 group split. 라벨별로 독립
+#                               specimen이 분할 수보다 적으면 InsufficientAssetGroupsError.
+#                               CWRU는 NORMAL specimen이 1개뿐이라 기본 3-way에서 실패한다
+#                               (정직한 실패). independentHoldout=True.
+#   operating_condition_holdout: 부하조건(0/1/2/3 HP) 기준 고정 배정. 같은 specimen이 여러
+#                               split에 등장 → specimen 독립 검증이 아님. 데모/리포트 opt-in.
+#                               independentHoldout=False.
+SPLIT_STRATEGIES = ("specimen_group", "operating_condition_holdout")
+
+_SPLIT_STRATEGY_TEXT = {
+    "specimen_group": (
+        "specimen_group: 물리 베어링(결함타입+직경, 부하 무관) 단위로 group split. "
+        "같은 specimen의 윈도우는 통째로 한 split에만 — specimen-independent holdout."
+    ),
+    "operating_condition_holdout": (
+        "operating_condition_holdout: 부하조건(test=0HP, validation=1HP, train=2·3HP) "
+        "기준 고정 배정. 같은 물리 베어링이 train/validation/test에 함께 들어간다 — "
+        "specimen 독립 검증이 아니라 운전조건 기준 in-distribution 평가다 "
+        "(independentHoldout=False). split 비율은 부하 tier가 결정한다."
+    ),
+}
 
 
 def build_manifest(
@@ -432,29 +615,71 @@ def build_manifest(
     hop_size: int = 2048,
     split_ratios: dict = None,
     seed: int = 42,
+    split_strategy: str = "specimen_group",
 ) -> dict:
-    """CWRU 데이터를 로드해 DATA_EXPORT_01 매니페스트(dict)를 만든다."""
+    """CWRU 데이터를 로드해 DATA_EXPORT_01 매니페스트(dict)를 만든다.
+
+    split_strategy 기본값은 `specimen_group`(물리 베어링 단위 독립 분할)이다. CWRU는
+    NORMAL specimen이 1개뿐이라 기본 3-way에서 `InsufficientAssetGroupsError`가 나는
+    것이 정상이다. 데모/리포트가 필요하면 `operating_condition_holdout`를 명시적으로
+    지정한다 — 이 경우 결과에 `independentHoldout=False`가 붙는다.
+    """
+    if split_strategy not in SPLIT_STRATEGIES:
+        raise ValueError(
+            f"split_strategy는 {SPLIT_STRATEGIES} 중 하나여야 합니다: {split_strategy!r}"
+        )
     split_ratios = DEFAULT_SPLIT_RATIOS if split_ratios is None else split_ratios
     validate_split_ratios(split_ratios)
 
     records = load_cwru_dataset(data_dir, window_size=window_size, hop_size=hop_size)
     if not records:
-        raise FileNotFoundError(f"{data_dir}에서 CWRU 레코드를 하나도 로드하지 못했습니다.")
+        raise FileNotFoundError(
+            f"{data_dir}에서 CWRU 레코드를 하나도 로드하지 못했습니다."
+        )
 
     source = build_source_block(data_dir)
     config = FeatureConfig(sample_rate=records[0]["sample_rate"])
     compatibility = build_compatibility_block(records)
-    splits = group_split(records, split_ratios, seed)
+
+    if split_strategy == "specimen_group":
+        splits = group_split(records, split_ratios, seed, group_key="specimen_id")
+        holdout_type = "specimen"
+        independent_holdout = True
+        recorded_split_ratios = split_ratios
+        recorded_seed = seed
+    else:  # operating_condition_holdout
+        # [리뷰 P1] operating_condition_split은 부하 tier로 배정을 고정하고
+        # split_ratios 인자를 완전히 무시한다(시그니처 호환용). 그런데 예전
+        # 코드는 이 무시된 입력값을 그대로 매니페스트["split"]/체크섬에 기록해서,
+        # 예를 들어 train=1.0/validation=test=0.0을 넘겨도 실제 rows에는
+        # validation/test가 들어가는데 매니페스트는 "전부 train"이라고 거짓말했다.
+        # 실제 적용된(rows 기준) 비율을 아래에서 계산해 기록한다.
+        splits = operating_condition_split(records, split_ratios)
+        holdout_type = "operating_condition"
+        independent_holdout = False
+        recorded_split_ratios = None  # split_counts 계산 후 채운다
+        # [리뷰 P2] operating_condition_split은 seed를 전혀 쓰지 않는다(부하 tier로
+        # 배정이 고정). 그런데 체크섬 payload에는 호출자의 seed가 그대로 들어가서,
+        # 실제 rows/split이 완전히 동일해도 seed만 바꾸면 다른 checksum/id가 나왔다
+        # (버전 identity가 결과에 영향 없는 입력에 좌우됨). 이 전략에서는 seed를
+        # canonical 값(None)으로 정규화해 checksum 입력에서 사실상 제외한다.
+        recorded_seed = None
 
     rows = []
     for rec, split in zip(records, splits):
         known_label = rec["label"]
         common_label = DATASET_LABEL_MAPPING[known_label]
         features = extract_all_features(rec["signal"], config)
+        # 기능정의가 특징에 "피크"를 명시하므로 week1 피크 주파수를 결합한다
+        # (계산 재구현 없이 compute_peak_frequency 재사용).
+        features[PEAK_FEATURE_NAME] = compute_peak_frequency(
+            rec["signal"], rec["sample_rate"]
+        )
         _validate_finite_features(features, rec["sample_id"])
         row = {
             "sample_id": rec["sample_id"],
             "source_file": rec["source_label"],
+            "specimen_id": rec["specimen_id"],
             "known_label": known_label,
             "common_label": common_label,
             "split": split,
@@ -464,22 +689,39 @@ def build_manifest(
         }
         rows.append(row)
 
+    split_counts = {"train": 0, "validation": 0, "test": 0}
+    for split in splits:
+        split_counts[split] += 1
+
+    if recorded_split_ratios is None:
+        # operating_condition_holdout: 실제로 rows에 반영된(요청 비율과 무관한
+        # 고정 tier 배정 결과의) 비율을 계산해 기록한다 — 매니페스트/체크섬이
+        # 무시된 요청값이 아니라 실제 데이터를 정직하게 반영하도록.
+        total = len(records)
+        recorded_split_ratios = {
+            name: split_counts[name] / total for name in ("train", "validation", "test")
+        }
+
+    feature_output_fingerprint = compute_feature_output_fingerprint(rows)
     version_checksum = compute_version_checksum(
         source["files"],
         window_size,
         hop_size,
-        split_ratios,
-        seed,
+        recorded_split_ratios,
+        recorded_seed,
         LABEL_TAXONOMY_VERSION,
         DATASET_LABEL_MAPPING,
         config,
-        compute_feature_output_fingerprint(rows),
+        feature_output_fingerprint,
+        label_policy_version=LABEL_POLICY_VERSION,
+        snapshot_schema_version=SNAPSHOT_SCHEMA_VERSION,
+        split_strategy=split_strategy,
     )
     source["checksum"] = version_checksum
 
-    split_counts = {"train": 0, "validation": 0, "test": 0}
-    for split in splits:
-        split_counts[split] += 1
+    label_summary = summarize_dataset_labels(
+        rows, DATASET_LABEL_MAPPING, LABEL_TAXONOMY_VERSION
+    )
 
     version_short_hash = version_checksum.split(":", 1)[1][:12]
     return {
@@ -492,16 +734,45 @@ def build_manifest(
         "compatibility": compatibility,
         "labelTaxonomyVersion": LABEL_TAXONOMY_VERSION,
         "labelMapping": DATASET_LABEL_MAPPING,
-        "split": split_ratios,
-        "splitStrategy": (
-            "group_split_by_source_file (per-label; whole source_label groups are "
-            "assigned to a single split — never split at window level to avoid leakage)"
-        ),
+        "labelPolicyVersion": LABEL_POLICY_VERSION,
+        "snapshotSchemaVersion": SNAPSHOT_SCHEMA_VERSION,
+        # [리뷰 P1, 2차] rows만으로 재계산 가능한 fingerprint. dataset_version.py의
+        # freeze_dataset_version()이 동결 직전에 이 값을 rows에서 다시 계산해
+        # 대조한다 — build 이후 rows/라벨이 바뀐 draft가 (재계산 없이 복사된) 이전
+        # source.checksum/id로 동결·승인되는 것을 막는다.
+        "featureOutputFingerprint": feature_output_fingerprint,
+        # [리뷰 P1, 3차] compute_version_checksum() payload를 만드는 데 쓰인 나머지
+        # 입력(rows/labelMapping만으로는 재현 불가능한 것들)을 그대로 노출한다.
+        # week4 dataset_version.freeze_dataset_version()이 이 필드들로 source.checksum/id를
+        # 독립 재계산해, rows만 바꾸고 featureOutputFingerprint만 재계산하거나
+        # (fingerprint에는 안 들어가지만 checksum에는 들어가는) labelMapping만 바꿔도
+        # 예전 source.checksum/id를 그대로 승계해 동결되는 것을 막는다.
+        "checksumInputs": {
+            "windowSize": window_size,
+            "hopSize": hop_size,
+            "seed": recorded_seed,
+            "featurePipelineVersion": FEATURE_PIPELINE_VERSION,
+            "featureConfig": {
+                "sampleRate": config.sample_rate,
+                "frameLength": config.frame_length,
+                "hopLength": config.hop_length,
+                "nMfcc": config.n_mfcc,
+                "bandEdges": list(config.band_edges),
+            },
+            "splitStrategyKey": split_strategy,
+        },
+        "split": recorded_split_ratios,
+        "splitStrategy": _SPLIT_STRATEGY_TEXT[split_strategy],
+        "holdoutType": holdout_type,
+        "independentHoldout": independent_holdout,
         "status": "draft",
         "reason": "3주차 기존 데이터셋 선정 및 정규화 — AI_FREQ_MODEL_01 선행학습 입력 준비",
         "createdAt": datetime.now(timezone.utc).isoformat(),
         "rowCount": len(rows),
         "splitCounts": split_counts,
+        "labelCounts": label_summary["labelCounts"],
+        "trainingEligibleCount": label_summary["trainingEligibleCount"],
+        "trainingEligibleSplitCounts": label_summary["trainingEligibleSplitCounts"],
         "rows": rows,
     }
 
@@ -524,18 +795,29 @@ if __name__ == "__main__":
         "--test-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["test"]
     )
     parser.add_argument(
+        "--split-strategy",
+        choices=SPLIT_STRATEGIES,
+        default="specimen_group",
+        help=(
+            "specimen_group(기본, 물리 베어링 단위 독립 분할 — CWRU는 NORMAL specimen이 "
+            "1개뿐이라 3-way에서 InsufficientAssetGroupsError) 또는 "
+            "operating_condition_holdout(부하조건 기준, independentHoldout=False)"
+        ),
+    )
+    parser.add_argument(
         "--output",
         default=os.path.normpath(
-            os.path.join(_THIS_DIR, "..", "data", "handoff", "dataset_manifest_full.json")
+            os.path.join(
+                _THIS_DIR, "..", "data", "handoff", "dataset_manifest_full.json"
+            )
         ),
     )
     args = parser.parse_args()
 
-    # 기본 비율(0.7/0.2/0.1)은 라벨당 자산이 여러 개일 때를 전제로 한다. 지금처럼
-    # CWRU가 라벨당 자산 1개뿐이면 group_split이 InsufficientAssetGroupsError를
-    # 낸다 — 조용히 window 셔플로 우회하지 않고, 자산을 추가하거나
-    # --train-ratio 1 --validation-ratio 0 --test-ratio 0 처럼 명시적으로
-    # train 전용 비율을 지정해야 한다.
+    # 기본(specimen_group)은 물리 베어링 단위 독립 분할이다. CWRU는 건강한 베어링이
+    # 1개뿐(NORMAL specimen 1개)이라 기본 3-way에서 InsufficientAssetGroupsError가 나는
+    # 것이 정상이다 — 조용히 우회하지 않는다. 데모/리포트가 필요하면
+    # --split-strategy operating_condition_holdout 를 명시한다 (independentHoldout=False).
     manifest = build_manifest(
         data_dir=args.data_dir,
         window_size=args.window_size,
@@ -546,6 +828,7 @@ if __name__ == "__main__":
             "test": args.test_ratio,
         },
         seed=args.seed,
+        split_strategy=args.split_strategy,
     )
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -553,5 +836,8 @@ if __name__ == "__main__":
         json.dump(manifest, f, ensure_ascii=False, indent=2, allow_nan=False)
 
     print(f"데이터셋 {manifest['id']} 매니페스트 생성 완료: {manifest['rowCount']}행")
+    print(
+        f"  분할 전략: {args.split_strategy} (independentHoldout={manifest['independentHoldout']})"
+    )
     print(f"  분할 건수: {manifest['splitCounts']}")
     print(f"  저장 위치: {args.output}")

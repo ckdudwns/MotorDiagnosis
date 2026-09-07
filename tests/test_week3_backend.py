@@ -275,9 +275,8 @@ class Week3DataBoundaryTest(unittest.TestCase):
 
         detail = event_detail_for(self.operator, event["id"])
 
-        self.assertIsNotNone(frozen_snapshot)
+        self.assertIsNone(frozen_snapshot)
         self.assertEqual(detail["featureSnapshot"], frozen_snapshot)
-        self.assertNotEqual(detail["featureSnapshot"].get("sequence"), 2)
 
     def test_event_evidence_snapshots_do_not_change_after_late_updates(self) -> None:
         event = next(item for item in EVENTS if item["id"] == "EV-241")
@@ -454,7 +453,7 @@ class Week3DataBoundaryTest(unittest.TestCase):
             )
         self.assertEqual(update_error.exception.code, "VALUE_OUT_OF_RANGE")
         self.assertEqual(get_asset_by_id(asset["id"])["ratedRpm"], 1800)
-        self.assertTrue(telemetry_for("SITE-01", asset["id"]))
+        self.assertEqual(telemetry_for("SITE-01", asset["id"]), [])
 
         for invalid_rpm in (True, 1800.9, 120000.9):
             with self.subTest(create_invalid_rpm=invalid_rpm):
@@ -2175,9 +2174,9 @@ class Week3HttpContractTest(unittest.TestCase):
             detail_before["event"]["thresholdVersion"], "RULE-SITE-01-MOT-02-v1"
         )
         self.assertTrue(detail_before["context"]["rawDataMissing"])
-        self.assertEqual(detail_before["context"]["source"], "demo")
-        self.assertTrue(detail_before["context"]["points"])
-        self.assertIsNotNone(detail_before["featureSnapshot"])
+        self.assertEqual(detail_before["context"]["source"], "unavailable")
+        self.assertEqual(detail_before["context"]["points"], [])
+        self.assertIsNone(detail_before["featureSnapshot"])
         self.assertEqual(detail_before["appliedRule"]["assetId"], "SITE-01-MOT-02")
 
         status, review_result = self.request(
@@ -2575,10 +2574,10 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertIn("label_taxonomy_version", csv_text.splitlines()[0])
         self.assertIn("dataset_split", csv_text.splitlines()[0])
         self.assertIn("operating_conditions", csv_text.splitlines()[0])
-        self.assertIn("api://telemetry", csv_text)
+        self.assertEqual(list(csv.DictReader(csv_text.splitlines())), [])
         self.assertNotIn(dataset_payload["source"]["uri"], csv_text)
         self.assertTrue(headers["x-dataset-checksum"].startswith("sha256:"))
-        self.assertGreater(int(headers["x-dataset-record-count"]), 0)
+        self.assertEqual(int(headers["x-dataset-record-count"]), 0)
 
         TELEMETRY_RECORDS.extend(
             [
@@ -2599,6 +2598,15 @@ class Week3HttpContractTest(unittest.TestCase):
                 )
             ]
         )
+        status, live_csv_body, live_headers = self.request_raw(
+            "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01&format=csv",
+            token=self.operator_token,
+        )
+        self.assertEqual(status, 200)
+        live_rows = list(csv.DictReader(live_csv_body.decode("utf-8-sig").splitlines()))
+        self.assertEqual(len(live_rows), 3)
+        self.assertTrue(all(row["source_uri"] == "api://telemetry" for row in live_rows))
+        self.assertEqual(int(live_headers["x-dataset-record-count"]), 3)
         TELEMETRY_RECORDS[0].update(
             {
                 "vibrationPeakHz": 1037.11,
@@ -2737,13 +2745,15 @@ class Week3HttpContractTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(reversed_range["error"]["code"], "INVALID_TIME_RANGE")
 
-        status, not_implemented = self.request(
+        status, workbook, headers = self.request_raw(
             "/api/datasets/export?siteId=SITE-01&assetId=SITE-01-GEN-01&format=xlsx",
             token=self.operator_token,
         )
-        self.assertEqual(status, 501)
+        self.assertEqual(status, 200)
+        self.assertTrue(workbook.startswith(b"PK"))
         self.assertEqual(
-            not_implemented["error"]["code"], "EXPORT_FORMAT_NOT_IMPLEMENTED"
+            headers.get_content_type(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
 

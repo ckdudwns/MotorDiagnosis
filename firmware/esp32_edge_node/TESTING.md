@@ -1,6 +1,6 @@
-# ESP32 firmware regression testing — v1.2-beta.11.8.5
+# ESP32 firmware regression testing — v1.3-signal-analysis.1
 
-This revision addresses the second PR #13 data-integrity review round. The native test suite exercises production helper code used directly by `main.cpp`.
+This revision includes device health, bounded remote configuration, communication quality and opt-in edge statistics/requested waveforms while retaining the data-integrity regressions. The native test suite exercises production helper code used directly by `main.cpp`. See [analysis operations](../../docs/signal-analysis-operations.md) for the expanded contract and physical-test limitations.
 
 ## Native regression suite
 
@@ -8,11 +8,58 @@ Run from `firmware/esp32_edge_node`:
 
 ```powershell
 $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
-Remove-Item -Recurse -Force .pio\build\native -ErrorAction SilentlyContinue
 & "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" test -e native
 ```
 
-Expected suite size for this revision: **55 tests**.
+Expected suite size for this revision: **126 tests** (55 firmware logic + 29 device health + 22 remote configuration + 15 communication quality + 5 edge analysis).
+
+The native compiler must support C++11. ArduinoJson and Unity are resolved by PlatformIO.
+Run all five suites, or select one with `test -e native -f test_device_health` or `test -e native -f test_edge_analysis`. The native environment enables Unity double assertions for FFT numerical checks.
+
+The analysis fixture also supports `--emit-fixture <RFC3339-UTC>` to emit a deterministic raw frame using production C++ code. Set `IOT_ANALYSIS_FIXTURE_EXE` to this executable when running `tests.test_edge_analysis`; Python checks actual backend acceptance, float32 samples and independently recomputed AI1 features. The four-channel samples are synthetic test vectors, not actual board measurements.
+
+Item 2 (RPM acquisition/estimation) is excluded. Analysis frames remain schema v1 with four-channel statistics and optional requested waveforms. Existing telemetry keeps `rpm:null`; `tests.test_edge_analysis` also checks that the analysis contract rejects unsupported schema versions and speed fields.
+
+## Device-health integration
+
+See [device-health setup and behavior](../../docs/iot-device-health.md) for separate credentials,
+fault codes, NVS journal boundaries, bounded retries and timestamp fallback.
+
+After building/running `test_device_health`, run the optional backend HTTP contract tests
+from the repository root. Point the environment variable at that native executable (not
+the ESP32 firmware binary):
+
+```powershell
+$env:IOT_HEALTH_FIXTURE_EXE = (Resolve-Path firmware/esp32_edge_node/.pio/build/native/program.exe).Path
+python -m unittest discover -s tests -p test_iot_health_contract.py -v
+```
+
+These five tests use generated C++ requests and a temporary local HTTP server. They
+exercise health-only authorization, active/recovered retry behavior, metrics and
+firmware validation of the actual server response. They skip when no native executable
+is supplied. No production credentials, persistent production database or board is used.
+
+Device-health native tests cover CRC/restart, FIFO/full-queue safety, ACK loss/marker
+failure, same-/previous-boot time handling, recovery ordering, bounded report and sensor
+retries, millis wrap, invalid metrics, stuck PCM and exact device/time response matching.
+PR23 regressions additionally cover multiple replay batches, timestamp equality,
+unknown/read-failed heads, metrics-only ACKs, shared fault boundaries and failed
+transition-marker persistence. The C++ replay fixture uses the same production
+dispatcher and payload builders as `main.cpp`. HTTP tests assert zero analysis
+failures for 15 pre-fault and 15 post-recovery measurements, and verify that the
+old health-first ordering fails analysis for all 15 earlier points despite 201 ACKs.
+
+On hardware, additionally test:
+
+- absent ADXL345 / failed I2S initialization: health servicing remains available;
+- I2S read timeout, missing/constant digital channel and successful recovery window;
+- initialization retry exhaustion: no infinite reinitialization, network remains alive;
+- delayed vibration worker: no overlapping measurement requests or concurrent SPI reset;
+- health 401/403/5xx, ACK loss and NVS write failure: no silent transition consumption;
+- power cut with active/recovered pending and cold boot before UTC;
+- unchanged telemetry sequence/ring/replay and no new verified ground-truth labels.
+
+## Existing telemetry integrity regressions
 
 Coverage includes:
 

@@ -624,6 +624,14 @@ class Week4HttpTest(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read())
 
+    def request_csv(self, path, token):
+        request = Request(
+            f"http://127.0.0.1:{self.server.server_port}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urlopen(request, timeout=5) as response:
+            return response.status, response.read().decode("utf-8-sig")
+
     def test_demo_default_off_site_auth_and_automatic_notification_flow(self):
         body = {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"}
         self.assertEqual(
@@ -636,6 +644,38 @@ class Week4HttpTest(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         self.assertTrue(event["isSynthetic"])
+        self.assertEqual(event["scenarioLabel"], "combined_anomaly")
+        self.assertEqual(event["source"], "ai2-week4-combined-signal-demo")
+        samples = [
+            record
+            for record in data.DEMO_TELEMETRY_RECORDS
+            if record["source"] == event["source"]
+        ]
+        self.assertEqual(len(samples), event["telemetrySampleCount"])
+        self.assertEqual(len(samples), event["durationSec"] + 2)
+        self.assertEqual(samples[-1]["timestamp"], event["occurredAt"])
+        self.assertTrue(all(record["isSynthetic"] for record in samples))
+        self.assertTrue(
+            all(
+                record["vibrationRmsMmS"] is None
+                and record["acousticDb"] is None
+                and "anomalyScore" not in record
+                for record in samples
+            )
+        )
+        self.assertEqual(samples[0]["scenarioLabel"], "normal")
+        self.assertTrue(
+            all(record["scenarioLabel"] == "combined_anomaly" for record in samples[1:])
+        )
+        self.assertGreater(
+            samples[-1]["vibrationRmsRaw"], samples[0]["vibrationRmsRaw"]
+        )
+        self.assertGreater(samples[-1]["acousticRmsRaw"], samples[0]["acousticRmsRaw"])
+        self.assertLess(samples[-1]["rpm"], samples[0]["rpm"])
+        self.assertEqual(data.TELEMETRY_RECORDS, [])
+        self.assertTrue(
+            all(record["deviceId"].startswith("DEMO-") for record in samples)
+        )
         deadline = time.monotonic() + 3
         while True:
             status, alerts = self.request(
@@ -737,6 +777,9 @@ class Week4HttpTest(unittest.TestCase):
         )
 
     def test_production_demo_guard_and_restricted_admin_site_authorization(self):
+        from tests.auth_fixtures import install_production_auth
+
+        install_production_auth(self)
         with patch.dict(
             "os.environ", {"APP_ENV": "production", "DEMO_ENABLED": "true"}
         ):
@@ -746,7 +789,7 @@ class Week4HttpTest(unittest.TestCase):
             finally:
                 server.server_close()
         self.server.demo_enabled = True
-        restricted = user("admin")
+        restricted = data.public_user(data.USERS[1])
         restricted["allowedSiteIds"] = ["SITE-01"]
         before = len(data.EVENTS)
         with patch(
@@ -757,6 +800,205 @@ class Week4HttpTest(unittest.TestCase):
             )
         self.assertEqual((status, body["error"]["code"]), (403, "SITE_FORBIDDEN"))
         self.assertEqual(len(data.EVENTS), before)
+
+    def test_demo_data_function_is_also_blocked_in_production(self):
+        with patch.dict("os.environ", {"APP_ENV": "production"}):
+            with self.assertRaises(data.ApiError) as error:
+                data.inject_anomaly({"siteId": "SITE-01"})
+        self.assertEqual(error.exception.code, "DEMO_DISABLED")
+
+    def test_demo_storage_does_not_consume_physical_device_sequences_or_health(self):
+        principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+        first = telemetry(1)
+        data.ingest_telemetry(principal, first)
+        device = data.get_device(first["deviceId"])
+        before_demo_received_at = device["lastReceivedAt"]
+
+        event = data.inject_anomaly(
+            {"siteId": first["siteId"], "assetId": first["assetId"]}
+        )
+        self.assertEqual(
+            data.get_device(first["deviceId"])["lastReceivedAt"],
+            before_demo_received_at,
+        )
+
+        second = telemetry(2)
+        _, status = data.ingest_telemetry(principal, second)
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            [record["sequence"] for record in data.TELEMETRY_RECORDS], [1, 2]
+        )
+        self.assertNotEqual(event["deviceId"], first["deviceId"])
+        self.assertTrue(
+            all(
+                record["deviceId"] == event["deviceId"]
+                for record in data.DEMO_TELEMETRY_RECORDS
+            )
+        )
+        self.assertNotEqual(before_demo_received_at, "")
+
+    def test_real_event_evidence_never_uses_demo_telemetry_as_a_fallback(self):
+        demo_event = data.inject_anomaly(
+            {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"}
+        )
+        real_event = {
+            "id": "EV-REAL-DEVICE-01",
+            "siteId": "SITE-01",
+            "assetId": "SITE-01-MOT-02",
+            "deviceId": "DEV-01-MOT-02",
+            "severity": "device",
+            "eventType": "device_offline",
+            "title": "Physical device telemetry offline",
+            "occurredAt": demo_event["occurredAt"],
+            "time": demo_event["occurredAt"],
+            "duration": ">120s",
+            "score": 0,
+            "label": "needs_review",
+            "note": "No physical telemetry was received.",
+        }
+        data.EVENTS.insert(0, real_event)
+
+        detail = data.event_detail_for(user("operator"), real_event["id"])
+
+        self.assertEqual(detail["context"]["points"], [])
+        self.assertEqual(detail["context"]["source"], "unavailable")
+        self.assertTrue(detail["context"]["rawDataMissing"])
+        self.assertIsNone(detail["featureSnapshot"])
+
+    def test_demo_event_detail_uses_raw_telemetry_units(self):
+        demo_event = data.inject_anomaly(
+            {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"}
+        )
+
+        detail = data.event_detail_for(user("operator"), demo_event["id"])
+
+        self.assertTrue(detail["context"]["points"])
+        self.assertEqual(detail["context"]["source"], "demo")
+        self.assertIn("vibrationRmsRaw", detail["context"]["units"])
+        self.assertIn("acousticRmsRaw", detail["context"]["units"])
+        self.assertNotIn("vibrationRmsMmS", detail["context"]["units"])
+        self.assertNotIn("acousticDb", detail["context"]["units"])
+
+    def test_source_less_real_event_keeps_reviewed_training_label(self):
+        event = next(item for item in data.EVENTS if item["id"] == "EV-241")
+        event["reviewed"] = True
+        event["label"] = "confirmed_anomaly"
+        occurred_at = data.parse_rfc3339("occurredAt", event["occurredAt"])
+        principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+        real_point = telemetry(
+            1,
+            timestamp=data.format_rfc3339(occurred_at + timedelta(seconds=1)),
+        )
+        real_point["isSynthetic"] = False
+        real_point["source"] = "esp32"
+        data.ingest_telemetry(principal, real_point)
+        dataset = {
+            "labelMapping": {"confirmed_anomaly": "BEARING_SUSPECT"},
+            "labelTaxonomyVersion": "ACOUSTIC-V1",
+        }
+
+        rows = data._dataset_rows_for_points(
+            dataset,
+            real_point["siteId"],
+            real_point["assetId"],
+            data.TELEMETRY_RECORDS,
+        )
+
+        self.assertEqual(rows[0]["event_id"], "EV-241")
+        self.assertEqual(rows[0]["ground_truth_label"], "confirmed_anomaly")
+        self.assertEqual(rows[0]["target_label"], "BEARING_SUSPECT")
+        self.assertTrue(rows[0]["training_eligible"])
+
+    def test_demo_data_is_excluded_from_csv_and_dataset_training_labels(self):
+        demo_event = data.inject_anomaly(
+            {"siteId": "SITE-01", "assetId": "SITE-01-MOT-02"}
+        )
+        demo_event["reviewed"] = True
+        demo_event["label"] = "confirmed_anomaly"
+        data.EVENTS.insert(
+            0,
+            {
+                "id": "EV-OTHER-TELEMETRY-DOMAIN",
+                "siteId": "SITE-01",
+                "assetId": "SITE-01-MOT-02",
+                "deviceId": "DEV-01-MOT-02",
+                "severity": "critical",
+                "eventType": "asset_anomaly_candidate",
+                "title": "Different collector domain",
+                "occurredAt": demo_event["occurredAt"],
+                "time": demo_event["occurredAt"],
+                "durationSec": 10,
+                "score": 99,
+                "label": "confirmed_anomaly",
+                "reviewed": True,
+                "source": "other-collector-domain",
+            },
+        )
+        principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+        real_point = telemetry(1, timestamp=data.now_iso())
+        data.ingest_telemetry(principal, real_point)
+        dataset = {
+            "labelMapping": {"confirmed_anomaly": "BEARING_SUSPECT"},
+            "labelTaxonomyVersion": "ACOUSTIC-V1",
+        }
+
+        rows = data._dataset_rows_for_points(
+            dataset,
+            real_point["siteId"],
+            real_point["assetId"],
+            data.TELEMETRY_RECORDS,
+        )
+        live_export = data.dataset_export_for(
+            user("operator"), real_point["siteId"], real_point["assetId"]
+        )
+        status, csv_text = self.request_csv(
+            "/api/export?siteId=SITE-01&assetId=SITE-01-MOT-02",
+            self.tokens["operator"],
+        )
+
+        self.assertEqual(rows[0]["event_id"], None)
+        self.assertEqual(rows[0]["ground_truth_label"], None)
+        self.assertFalse(rows[0]["training_eligible"])
+        self.assertTrue(
+            all(
+                row["device_id"] != demo_event["deviceId"]
+                for row in live_export["rows"]
+            )
+        )
+        self.assertNotIn("DEMO-", csv_text)
+        self.assertNotIn("ai2-week4-combined-signal-demo", csv_text)
+        self.assertEqual(status, 200)
+
+    def test_long_demo_duration_is_downsampled_without_deleting_real_telemetry(self):
+        principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+        real_record = telemetry(1)
+        data.ingest_telemetry(principal, real_record)
+        rule = next(
+            item
+            for item in data.ANOMALY_RULES
+            if item["assetId"] == real_record["assetId"]
+        )
+        rule["durationSec"] = 3600
+
+        event = data.inject_anomaly(
+            {"siteId": real_record["siteId"], "assetId": real_record["assetId"]}
+        )
+
+        self.assertEqual(len(data.TELEMETRY_RECORDS), 1)
+        self.assertEqual(data.TELEMETRY_RECORDS[0]["sequence"], 1)
+        self.assertEqual(
+            event["telemetrySampleCount"], data.MAX_DEMO_ANOMALY_SAMPLES + 1
+        )
+        self.assertLess(event["telemetrySampleCount"], event["durationSec"] + 2)
+        self.assertEqual(event["telemetryIntervalSec"], 31)
+        points = data.telemetry_for(
+            real_record["siteId"], real_record["assetId"], include_demo=True
+        )
+        self.assertEqual(len(points), event["telemetrySampleCount"] + 1)
+        self.assertEqual(points[0]["deviceId"], event["deviceId"])
+        self.assertTrue(
+            any(point["deviceId"] == real_record["deviceId"] for point in points)
+        )
 
     def test_model_registration_http_contract_and_authorization(self):
         status, dataset = self.request(

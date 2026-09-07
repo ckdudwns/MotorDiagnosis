@@ -118,6 +118,20 @@ def _frozen_dataset(user, dataset_id):
         raise data.ApiError(
             409, "DATASET_NOT_FROZEN", "A frozen dataset version is required."
         )
+    if dataset.get("source", {}).get("type") == "internal":
+        installation = dataset.get("installationValidation")
+        if not isinstance(installation, dict) or installation.get("status") != "ready":
+            raise data.ApiError(
+                409,
+                "DATASET_INSTALLATION_INCOMPLETE",
+                "Internal datasets require complete installation metadata before training use.",
+                installation
+                or {
+                    "status": "missing",
+                    "assets": [],
+                    "missing": [{"reason": "installationValidation is unavailable"}],
+                },
+            )
     return dataset
 
 
@@ -304,11 +318,11 @@ def versions_for(
     data.require_permission(user, f"{kind}:read")
     if site_id:
         data.require_site_access(user, site_id)
-    if status and status != "draft":
+    if status and status not in {"draft", "approved", "rejected"}:
         raise data.ApiError(
             400,
             "INVALID_VERSION_STATUS",
-            "Only draft versions are supported in this MVP.",
+            "Use draft, approved or rejected.",
         )
     with data.STORE_LOCK:
         records = data.MODEL_VERSIONS if kind == "model" else data.BASELINE_VERSIONS
@@ -324,6 +338,7 @@ def versions_for(
             data.copy_payload(row)
             for row in records
             if _visible(user, row)
+            and (not status or row.get("status") == status)
             and (
                 not site_id
                 or row.get("siteId", row.get("baselineSnapshot", {}).get("siteId"))

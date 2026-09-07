@@ -2,7 +2,11 @@
 
 Bind Edge AI 프로젝트 3주차, AI-1 담당 영역.
 
-3주차 기능정의서(W3.2, 2026-08-24)와 API 명세서(v1.2)를 기준으로 작업했다. 원래
+추가 AI1-01/02: `datasets/register_acoustic_dataset.py`에서 MIMII 음향 manifest를
+생성하고 기존 CSV/XLSX 내보내기·4주차 동결/후보 학습에 연결한다.
+실행 방법과 신호별 기준선 입력 계약은 [음향/RPM 안내](../../../../docs/ai1-acoustic-baselines.md)를 참고한다.
+
+3주차 기능정의서(W3.2, 2026-08-24)와 API 명세서(v1.3)를 기준으로 작업했다. 원래
 초안(W3.1)과 달리 **DATA_EXPORT_01의 범위가 "기존 공개·보유 데이터셋 선정·정규화"로
 확장**되었고, AI-1의 착수 순서도 재조정되었다. 이 폴더의 4개 기능은 "선행일정" 시트에
 명시된 순서 그대로 작업했다:
@@ -48,10 +52,13 @@ ai/ai1/week3/ai1/
 MIMII 음향 데이터는 이 저장소에 실제 파일이 배치돼 있지 않아(로더 코드만 존재),
 이번 3주차 등록·내보내기는 **CWRU Bearing Dataset(진동)만** 대상으로 했다.
 
-`register_dataset.py`가 CWRU 4개 `.mat` 파일을 API 명세서 v1.2 `POST /api/datasets`
-계약(`source`/`compatibility`/`labelMapping`/`split`) 형태의 매니페스트로 정규화하고,
+`register_dataset.py`가 CWRU 40개 `.mat` 파일(10 물리 specimen, 각 부하조건 4개)을 API 명세서 v1.3
+`POST /api/datasets` 계약(`source`/`compatibility`/`labelMapping`/`split` +
+`labelPolicyVersion`/`snapshotSchemaVersion`/`labelCounts`) 형태의 매니페스트로 정규화하고,
 `export_dataset.py`가 `dataset_manifest.json`(GET 응답 형태) + `dataset_rows.csv` +
-`dataset_export.xlsx`(manifest/rows 2개 시트)로 내보낸다.
+`dataset_export.xlsx`(manifest/rows 2개 시트)로 내보낸다. CSV/XLSX 행에는 v1.3
+`DatasetExportRow` 라벨 컬럼(`label_status`/`training_eligible`/`ground_truth_*`/`target_label*`)이
+붙는다 — CWRU 원본 라벨은 신뢰된 외부 라벨이라 전 행 `verified`/`training_eligible`.
 
 **XLSX 내보내기는 루트 `requirements.txt`에 없는 `openpyxl`이 필요하다** — 실행·테스트
 전에 이 폴더의 의존성을 추가로 설치해야 한다:
@@ -63,25 +70,28 @@ python -m pip install -r ai/ai1/week3/ai1/requirements.txt
 - 원본 파일별 SHA-256 체크섬을 매니페스트에 기록해 원본 추적 가능 — 원본 체크섬들 +
   window/hop 크기 + 분할 비율 + seed로 만든 불변 버전 체크섬(`source.checksum`)을 데이터셋
   `id`에도 반영해, 같은 날짜에 입력·설정이 다른 버전이 같은 ID로 충돌하지 않도록 했다
-- **`source_label`(원본 파일) 단위 group split** — 동일 그룹의 윈도우가 여러 split에
-  나뉘지 않게 통째로 하나의 split에만 배정한다. 라벨의 독립 그룹 수가 요청한 분할 수보다
-  적으면(현재 CWRU는 라벨당 자산 1개뿐) 윈도우를 섞는 대신 `InsufficientAssetGroupsError`로
-  데이터 부족 상태를 명시적으로 드러낸다 (근거: `datasets/dataset_manifest_format.md`)
-- 특징값 계산은 week2 `extract_all_features()`를 그대로 재사용
+- **물리 베어링(specimen) 단위 group split** — CWRU 부하별 4파일은 같은 베어링이므로
+  `specimen_id`(결함타입+직경) 단위로 배정한다. `build_manifest` 기본 `specimen_group`은
+  NORMAL specimen이 1개뿐이라 3-way에서 `InsufficientAssetGroupsError`로 **정직하게
+  실패**한다. 데모용 `operating_condition_holdout`(부하조건 기준)은 `independentHoldout=false`
+  플래그를 붙인다 (근거: `datasets/dataset_manifest_format.md`)
+- 특징값은 week2 `extract_all_features()`(26개)에 week1 `compute_peak_frequency()`
+  (`vibration_peak_hz`)를 더한 27개 — 계산 로직은 재구현하지 않고 그대로 재사용
 - **산출물 3종(csv/xlsx/manifest.json)을 원자적으로 배치** — `output_dir/versions/<dataset
   id>/`에 세 파일을 모두 만들고 검증한 뒤 그 디렉터리 자체를 단일 rename으로 배치하고,
   `output_dir/CURRENT` 포인터를 새 버전으로 원자적으로 전환한다. 중간 실패나 동시 export가
   서로 다른 버전의 파일을 섞어 놓지 않는다(근거·구현: `datasets/export_dataset.py`)
 
-**실행 결과 (실제 CWRU 4개 파일, seed=42 기준):** 라벨당 자산이 1개뿐이라 기본 3-way
-비율은 `InsufficientAssetGroupsError`를 낸다(의도된 동작 — 테스트로 확인). 그래서
-`--train-ratio 1 --validation-ratio 0 --test-ratio 0`으로 실행해 총 296행(NORMAL 119 +
-결함 177) 전부를 train으로 등록했다. 변환 전후 건수(296==296)가 정확히 일치하고, 체크섬
-재계산 값이 매니페스트 기록과 일치함을 테스트로 확인했다. 실제 자산이 여러 개 확보되면
-기본 3-way 비율로 전환하면 된다.
+**실행 결과 (실제 CWRU 40개 파일 / 10 물리 specimen):**
+- 기본 `specimen_group` 3-way → `InsufficientAssetGroupsError` (NORMAL specimen 1개). 정상.
+- `operating_condition_holdout` → 총 2953행을 부하 tier 기준으로 등록
+  (test=0HP, validation=1HP, train=2·3HP). `independentHoldout=false` — 같은 물리 베어링이
+  여러 split에 등장하므로 이 분할은 specimen 독립 검증이 아니다.
+- 결함 3클래스는 specimen 3개(0.007/0.014/0.021")라 결함 데이터만으로는 specimen 독립
+  3-way가 성립함을 테스트로 확인했다.
 
 ```bash
-python ai/ai1/week3/ai1/datasets/export_dataset.py --train-ratio 1 --validation-ratio 0 --test-ratio 0
+python ai/ai1/week3/ai1/datasets/export_dataset.py
 # 결과: ai/ai1/week3/ai1/data/handoff/versions/<dataset id>/{dataset_manifest.json,
 #       dataset_rows.csv, dataset_export.xlsx} + CURRENT 포인터(최신 버전 id)
 ```
@@ -100,7 +110,7 @@ history 엔트리로 반환한다(원본 이벤트 값 불변 수용 기준 충�
 (`normal_false_positive`/`confirmed_anomaly`)로 매핑해, 데이터셋을 리플레이한 합성
 이벤트의 학습 라벨을 자동으로 채운다.
 
-실제 CWRU 매니페스트의 296행 전부를 시딩해본 결과 두 라벨(`normal_false_positive`,
+실제 CWRU 매니페스트의 전 행을 시딩해본 결과 두 라벨(`normal_false_positive`,
 `confirmed_anomaly`)이 모두 정상적으로 나오는 것을 확인했다.
 
 ## 3. EVENT_DETAIL_01 — 이벤트 전후 특징량 비교
@@ -129,13 +139,14 @@ history 엔트리로 반환한다(원본 이벤트 값 불변 수용 기준 충�
   둬서 단발성 스파이크로 이벤트가 깜빡이는 것을 막는다. 이벤트마다 `baseline_version`/
   `config_version`을 기록해 임계값 변경 전후 적용 버전을 추적한다.
 
-**실행 결과 (실제 CWRU 데이터, 정상 119윈도우 + 결함 177윈도우, 기본 설정):**
-정상 구간에서는 이벤트가 **전혀** 생기지 않았고(week2에서 확인된 정상 구간 자체
-이상치 플래그 4/119는 연속되지 않는 단발성이라 히스테리시스에 걸러짐), 정상→결함
-경계(인덱스 119)에서 이벤트가 **정확히 1개** 열려 결함 구간(177윈도우) 끝까지
-끊기지 않고 유지됐다(`max_deviation_sigma≈343.7`). 결함 윈도우 100%가 개별적으로는
-이상치로 플래그되는 상황에서도 이벤트가 1개로 안정화됨을 확인 — 히스테리시스가
-실제로 깜빡임을 억제하는 것을 검증했다.
+**실행 결과 (실제 CWRU 데이터, baseline 출처와 같은 0HP 정상 97.mat 119윈도우 →
+결함 파일 전환, 기본 설정):** 정상 구간에서는 이벤트가 **전혀** 생기지 않았고
+(week2에서 확인된 정상 구간 자체 이상치 플래그는 연속되지 않는 단발성이라
+히스테리시스에 걸러짐), 정상→결함 경계(인덱스 119)에서 이벤트가 열려 결함 구간
+끝까지 유지됐다. 결함 윈도우 100%가 개별적으로는 이상치로 플래그되는 상황에서도
+이벤트 수가 낮게 안정화됨을 확인 — 히스테리시스가 실제로 깜빡임을 억제하는 것을
+검증했다. (기준선은 0HP 정상 단독으로 산출됐으므로, 다른 부하 조건의 정상 데이터는
+이 기준선 대비 크게 벗어난다 — 운전 조건별 기준선 재보정이 필요하다.)
 
 ```bash
 python -m unittest discover ai/ai1/week3/ai1/tests
@@ -158,9 +169,10 @@ CWRU 실데이터(`ai/ai1/week1/ai1/data/external/cwru/*.mat`)가 없는 환경�
 
 - MIMII 음향 데이터가 배치되면 `DATA_EXPORT_01`에 `modality: "acoustic"` 데이터셋
   버전을 같은 스키마로 추가 등록
-- 라벨당 자산이 여러 개가 되면 `DATA_EXPORT_01`을 기본 3-way 비율(`--train-ratio 0.7
-  --validation-ratio 0.2 --test-ratio 0.1`)로 전환 (group split 로직 자체는 이미 구현됨 —
-  자산 부족 문제만 남음)
+- (완료) CWRU 자산을 라벨당 4개로 확보해 `DATA_EXPORT_01`을 기본 3-way group split로
+  전환했다. 다만 CWRU에서 자산 = 부하 조건(0/1/2/3 HP)이라 split 간 운전 조건이
+  겹치지 않는다 — 현장에서 라벨당 여러 자산이 다양한 운전 조건으로 쌓이면 이
+  한계가 자연히 해소된다
 - `sigma_enter`/`sigma_exit`/`min_consecutive_*`는 실측 정상·이상 분포로 재보정 필요
 - `EVENT_DETAIL_01`의 장치 상태 스냅샷 연동, `ANOMALY_RULE_01`의 음향·RPM 임계값 추가는
   해당 데이터 확보 후 진행

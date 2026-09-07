@@ -13,23 +13,33 @@ export_dataset()의 docstring 참고). week1 `build_ai1_handoff_dataset.py`처�
 """
 
 import os
+import copy
+import re
 import csv
 import json
 import time
 import shutil
+import hashlib
 import tempfile
 import argparse
 
 from openpyxl import Workbook, load_workbook
 
 from register_dataset import (  # noqa: E402
+    _import_module_from_path,
     build_manifest,
+    dataset_export_label_fields,
+    summarize_dataset_labels,
+    DATASET_EXPORT_LABEL_FIELDS,
+    SPLIT_STRATEGIES,
     _DEFAULT_DATA_DIR,
     DEFAULT_SPLIT_RATIOS,
 )
 
 
-def _replace_with_retry(src: str, dst: str, attempts: int = 10, delay: float = 0.05) -> None:
+def _replace_with_retry(
+    src: str, dst: str, attempts: int = 10, delay: float = 0.05
+) -> None:
     """os.replace()를 짧은 backoff로 재시도한다.
 
     Windows에서는 방금 만든 파일/디렉터리를 백신·검색 인덱서가 짧게
@@ -48,10 +58,233 @@ def _replace_with_retry(src: str, dst: str, attempts: int = 10, delay: float = 0
             time.sleep(delay)
 
 
-def _manifest_without_rows(manifest: dict, artifact_refs: dict) -> dict:
-    """GET /api/datasets/{id} 응답 형태 (rows 제외, artifactRefs 포함)."""
+class VersionContentConflictError(RuntimeError):
+    """같은 version_id(=dataset id)로 서로 다른 내용의 산출물을 내보내려 할 때 발생한다.
+
+    [리뷰 P1] version_id는 `build_manifest()`의 `source.checksum`(원본 파일·전처리·
+    특징 산출물 기준)으로 결정되고, export 시점에만 바뀌는 값(예: `export_dataset()`
+    호출 직전에 `manifest["labelMapping"]`을 수정)은 반영하지 않는다. 그래서 같은
+    id로 실제로 다른 라벨 상태를 담은 CSV를 두 번 내보내려 하면 "이미 있는
+    version_dir는 방금 만든 staged 산출물과 내용이 같다"는 가정이 깨진다.
+    """
+
+
+class IncompleteVersionDirectoryError(RuntimeError):
+    """기존 `version_dir`가 있지만 JSON manifest/XLSX가 없거나 손상돼 그 안의
+    내용을 신뢰 가능하게 확인할 수 없을 때 발생한다.
+
+    [리뷰 P1, 4차] 기존 산출물이 불완전하면(수동 삭제, 이전 실행 중단 등) CSV만
+    같다고 해서 안전하게 재사용하거나 자동으로 덮어쓸 수 없다 — `source.license`처럼
+    CSV에는 나타나지 않는 필드가 실제로는 달라졌을 수 있고, 이를 확인할 신뢰 가능한
+    registry나 snapshot digest가 이 함수 안에는 없다. 자동 복구(치유) 대신 명시적으로
+    실패해 운영자가 디렉터리를 직접 확인하게 한다.
+    """
+
+
+def _sha256_of_file(path: str, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# [리뷰 P1, 4차] version_id(=manifest["id"]나 CURRENT 파일 내용)를 검증 없이
+# os.path.join에 쓰면 "../escaped-version"이나 절대경로 같은 값이 versions_dir
+# 밖에 디렉터리를 만들 수 있다(경로 이탈). 실제 id 형식(예: "DS-CWRU-VIBRATION-
+# 20260824-abcdef123456")을 포함하는 안전한 문자(영숫자/./_/-)로만 구성된 단일
+# 경로 세그먼트만 허용한다.
+_SAFE_VERSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+
+
+def _resolve_version_dir(versions_dir: str, version_id: str) -> str:
+    """`versions_dir` 안의 `version_id` 경로를 안전하게 계산한다.
+
+    [리뷰 P1, 4차] `version_id`가 안전한 문자만으로 구성된 단일 경로 세그먼트인지
+    정규식으로 먼저 걸러내고(`..`, `/`, `\\`, 절대경로 등을 모두 차단), 그래도
+    `os.path.realpath()` 기준으로 최종 경로가 실제로 `versions_dir` 내부인지
+    한 번 더 확인한다(defense in depth) — 정규식 하나로만 막으면 플랫폼별 경로
+    구분자 처리 차이를 놓칠 수 있다.
+    """
+    if not isinstance(version_id, str) or not _SAFE_VERSION_ID_RE.match(version_id):
+        raise ValueError(f"안전하지 않은 version_id입니다: {version_id!r}")
+    if version_id in (".", ".."):
+        raise ValueError(f"안전하지 않은 version_id입니다: {version_id!r}")
+
+    candidate = os.path.join(versions_dir, version_id)
+    versions_dir_real = os.path.realpath(versions_dir)
+    candidate_real = os.path.realpath(candidate)
+    try:
+        common = os.path.commonpath([versions_dir_real, candidate_real])
+    except ValueError:
+        common = None
+    if common != versions_dir_real:
+        raise ValueError(
+            f"version_id가 대상 디렉터리 밖을 가리킵니다: {version_id!r} "
+            f"(resolved={candidate_real!r})"
+        )
+    return candidate
+
+
+# manifest 시트에서 재생성마다 값이 달라지는 필드명. JSON manifest 비교의
+# _MANIFEST_JSON_VOLATILE_KEYS와 같은 이유로 뺀다.
+_MANIFEST_SHEET_VOLATILE_FIELDS = frozenset({"createdAt"})
+
+
+_MANIFEST_SHEET_HEADER = ["field", "value"]
+
+
+def _canonical_manifest_sheet(ws) -> dict:
+    """manifest 시트([field, value] 행들)를 field -> value dict로 canonical화한다.
+
+    [리뷰 P1] `field` 컬럼은 `manifest_sheet.append(...)` 호출 순서(딕셔너리
+    순회 순서에 의존하는 `labelMapping.*`/`source.files.*` 등 포함)를 그대로
+    반영한다 — 의미가 같은 내용이라도 삽입 순서만 달라지면 raw 행 비교에서
+    다른 것으로 오판된다. field -> value dict로 바꾸면 순서와 무관하게
+    비교되고(파이썬 dict 동등 비교는 키 순서를 보지 않는다), `createdAt`처럼
+    재실행마다 달라지는 필드도 JSON manifest 비교와 동일하게 제외한다.
+
+    [리뷰 P1, 5차] 예전에는 첫 행을 검사 없이(헤더라고 가정만 하고) 그대로
+    버렸다 — 헤더가 변조돼도(예: `["field", "tampered"]`나 데이터 행이 하나 더
+    있는 경우) 탐지하지 못했다. 그리고 `dict` 컴프리헨션은 같은 `field`가 두 번
+    나오면 나중 값으로 조용히 덮어써, 중복 `field` 행으로 원래 값을 가리는 변조도
+    "정상"으로 오판됐다. 이제 첫 행이 정확히 `["field", "value"]`인지, 각 행이
+    `[field, value]` 2열이고 field가 비어있지 않은 문자열인지, 같은 field가
+    (volatile 필드 제외하고) 두 번 나오지 않는지까지 검증한다 — 하나라도 어긋나면
+    ValueError로 거부한다(호출자인 `_xlsx_content_matches`가 "내용 불일치"로
+    처리해 export 재사용을 거부한다).
+    """
+    rows = [[cell.value for cell in row] for row in ws.iter_rows()]
+    if not rows:
+        raise ValueError("manifest 시트가 비어 있습니다(헤더 행조차 없음).")
+    header, data_rows = rows[0], rows[1:]
+    if header != _MANIFEST_SHEET_HEADER:
+        raise ValueError(
+            f"manifest 시트 헤더가 예상과 다릅니다 (기대={_MANIFEST_SHEET_HEADER!r}, "
+            f"실제={header!r})."
+        )
+    result: dict = {}
+    for row in data_rows:
+        if len(row) != 2:
+            raise ValueError(
+                f"manifest 시트에 [field, value] 형식이 아닌 행이 있습니다: {row!r}"
+            )
+        field, value = row
+        if not isinstance(field, str) or not field.strip():
+            raise ValueError(
+                f"manifest 시트의 field가 비어있지 않은 문자열이어야 합니다: {row!r}"
+            )
+        if field in _MANIFEST_SHEET_VOLATILE_FIELDS:
+            continue
+        if field in result:
+            raise ValueError(f"manifest 시트에 중복된 field가 있습니다: {field!r}")
+        result[field] = value
+    return result
+
+
+def _xlsx_content_matches(staged_path: str, existing_path: str) -> bool:
+    """두 XLSX가 시트 이름뿐 아니라 실제 셀 값까지 동일한지 비교한다.
+
+    [리뷰 P1, 4차] openpyxl은 저장 시각을 파일에 넣어 내용이 같아도 바이트가
+    다르므로 바이트 비교를 쓸 수 없다. 예전에는 두 시트("manifest"/"rows")의
+    존재 여부만 확인해서, 기존 XLSX의 셀 값이 변조돼도(예: manifest 시트의 특정
+    필드) "재사용 가능"으로 오판했다. 시트별 전체 셀 값을 직접 비교한다.
+
+    [리뷰 P1, 5차] "manifest" 시트는 JSON manifest 비교(`_canonical_manifest_json`)와
+    달리 `createdAt`을 빼지 않고 raw 행을 그대로 비교했다 — 같은 입력으로 같은
+    id를 다시 export해도 `createdAt`만 달라지면 (내용은 동일한데도)
+    `VersionContentConflictError`가 났다. "manifest" 시트만 `createdAt`을 뺀
+    field->value dict로 canonical 비교하고, "rows" 시트는 기존처럼 raw 행을
+    엄격하게 비교한다(행 데이터는 재실행마다 값이 달라질 이유가 없다).
+    """
+    if not os.path.exists(existing_path):
+        return False
+    try:
+        staged_wb = load_workbook(staged_path)
+        existing_wb = load_workbook(existing_path)
+    except Exception:
+        return False
+    if staged_wb.sheetnames != existing_wb.sheetnames:
+        return False
+    for name in staged_wb.sheetnames:
+        if name == "manifest":
+            # [리뷰 P1, 5차] 헤더 변조·중복 field 등으로 canonical화 자체가 실패하면
+            # (staged든 existing이든) "내용이 같다고 안전하게 판단할 수 없다" ==
+            # 불일치로 취급한다 — 여기서 예외가 그대로 새 나가면 호출자
+            # `export_dataset()`이 이 XLSX 재사용 판정 도중 알 수 없는 예외로
+            # 죽는다.
+            try:
+                staged_manifest_sheet = _canonical_manifest_sheet(staged_wb[name])
+                existing_manifest_sheet = _canonical_manifest_sheet(existing_wb[name])
+            except ValueError:
+                return False
+            if staged_manifest_sheet != existing_manifest_sheet:
+                return False
+            continue
+        staged_rows = [
+            [cell.value for cell in row] for row in staged_wb[name].iter_rows()
+        ]
+        existing_rows = [
+            [cell.value for cell in row] for row in existing_wb[name].iter_rows()
+        ]
+        if staged_rows != existing_rows:
+            return False
+    return True
+
+
+# [리뷰 P1] 동시 export 재사용 판정 시, createdAt처럼 "내용은 같지만 다시 만들면
+# 값이 달라지는" 필드는 JSON manifest 비교에서 뺀다 — 그렇지 않으면 진짜로 같은
+# 내용을 다시 export했을 뿐인데도 매번 충돌로 오판된다.
+_MANIFEST_JSON_VOLATILE_KEYS = frozenset({"createdAt"})
+
+
+def _canonical_manifest_json(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return {k: v for k, v in data.items() if k not in _MANIFEST_JSON_VOLATILE_KEYS}
+
+
+def _version_dir_is_complete(version_dir: str) -> bool:
+    """`version_dir`가 CURRENT가 가리켜도 안전할 만큼 온전한지 확인한다.
+
+    [리뷰 P1] 동시 export 충돌 처리에서 CSV 내용만 같으면 기존 디렉터리를 그대로
+    재사용했는데, JSON manifest가 (수동 삭제나 이전 실행 중단 등으로) 없거나
+    손상된 채 남아 있어도 CURRENT가 계속 그 불완전한 디렉터리를 가리켰다. CSV/
+    JSON/XLSX 세 파일이 모두 존재하고, JSON은 파싱 가능하며, XLSX는 manifest/rows
+    시트를 모두 갖췄을 때만 "완전하다"고 본다.
+    """
+    csv_path = os.path.join(version_dir, "dataset_rows.csv")
+    manifest_path = os.path.join(version_dir, "dataset_manifest.json")
+    xlsx_path = os.path.join(version_dir, "dataset_export.xlsx")
+    for path in (csv_path, manifest_path, xlsx_path):
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return False
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            json.load(f)
+        wb = load_workbook(xlsx_path)
+        return "manifest" in wb.sheetnames and "rows" in wb.sheetnames
+    except Exception:
+        return False
+
+
+def _manifest_without_rows(
+    manifest: dict, artifact_refs: dict, label_summary: dict
+) -> dict:
+    """GET /api/datasets/{id} 응답 형태 (rows 제외, artifactRefs 포함).
+
+    [리뷰 P2] labelCounts/trainingEligibleCount/trainingEligibleSplitCounts는
+    manifest에 저장된(build_manifest 시점) 값이 아니라, export 시점에 rows·
+    labelMapping으로 다시 계산한 `label_summary`로 덮어쓴다 — CSV/XLSX 행은
+    이미 export 시점 값(dataset_export_label_fields)으로 계산하므로, 호출자가
+    export 전에 manifest["labelMapping"]을 바꾸면 manifest에 캐시된 집계값과
+    실제 내보낸 행이 서로 다른 라벨 상태를 보고하게 된다.
+    """
     result = {k: v for k, v in manifest.items() if k != "rows"}
     result["artifactRefs"] = artifact_refs
+    result["labelCounts"] = label_summary["labelCounts"]
+    result["trainingEligibleCount"] = label_summary["trainingEligibleCount"]
+    result["trainingEligibleSplitCounts"] = label_summary["trainingEligibleSplitCounts"]
     return result
 
 
@@ -68,6 +301,25 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
     새 버전 id로 원자적으로 교체하는 것까지가 마지막 단계다 — 실패하면
     output_dir(과 CURRENT가 가리키는 버전)은 이전 상태 그대로 남는다.
     """
+    # Validate and export the same detached snapshot, before any filesystem write.
+    manifest = copy.deepcopy(manifest)
+    if manifest.get("status") in ("frozen", "approved") or "snapshotDigest" in manifest:
+        versions = _import_module_from_path(
+            "ai1_dataset_export.dataset_version",
+            os.path.normpath(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "..",
+                    "..",
+                    "..",
+                    "week4",
+                    "ai1",
+                    "dataset_versions",
+                    "dataset_version.py",
+                )
+            ),
+        )
+        versions.verify_frozen_integrity(manifest)
     os.makedirs(output_dir, exist_ok=True)
     versions_dir = os.path.join(output_dir, "versions")
     os.makedirs(versions_dir, exist_ok=True)
@@ -76,17 +328,34 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
     if not rows:
         raise ValueError("내보낼 행이 없습니다 (manifest['rows']가 비어 있음).")
 
+    # 매니페스트 rows(윈도우별 특징값)는 그대로 두고, export 산출물에만 v1.3
+    # DatasetExportRow 라벨 필드를 파생 컬럼으로 붙인다 — label_status/training_eligible
+    # 등은 known_label + labelMapping의 결정적 함수라 특징 산출물 fingerprint에는
+    # 넣지 않는다.
+    label_mapping = manifest["labelMapping"]
+    taxonomy_version = manifest["labelTaxonomyVersion"]
+    export_rows = [
+        {
+            **row,
+            **dataset_export_label_fields(row, label_mapping, taxonomy_version),
+        }
+        for row in rows
+    ]
+    # CSV/XLSX 행과 정확히 같은 (label_mapping, taxonomy_version)으로 다시 집계한다
+    # — manifest에 캐시된 labelCounts 등을 그대로 신뢰하지 않는다(리뷰 P2).
+    label_summary = summarize_dataset_labels(rows, label_mapping, taxonomy_version)
+
     version_id = manifest["id"]
-    version_dir = os.path.join(versions_dir, version_id)
+    version_dir = _resolve_version_dir(versions_dir, version_id)
 
     staging_dir = tempfile.mkdtemp(prefix=".export-staging-", dir=versions_dir)
     try:
         csv_path = os.path.join(staging_dir, "dataset_rows.csv")
-        fieldnames = list(rows[0].keys())
+        fieldnames = list(rows[0].keys()) + list(DATASET_EXPORT_LABEL_FIELDS)
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(export_rows)
 
         xlsx_path = os.path.join(staging_dir, "dataset_export.xlsx")
         wb = Workbook()
@@ -104,17 +373,55 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
             manifest_sheet.append([f"source.files.{filename}.sha256", info["sha256"]])
             manifest_sheet.append([f"source.files.{filename}.label", info["label"]])
         manifest_sheet.append(
-            ["compatibility.signalType", ",".join(manifest["compatibility"]["signalType"])]
+            [
+                "compatibility.signalType",
+                ",".join(manifest["compatibility"]["signalType"]),
+            ]
         )
         manifest_sheet.append(
-            ["compatibility.samplingRateHz", manifest["compatibility"]["samplingRateHz"]]
+            [
+                "compatibility.samplingRateHz",
+                manifest["compatibility"]["samplingRateHz"],
+            ]
+        )
+        for modality, unit in manifest["compatibility"]["units"].items():
+            manifest_sheet.append([f"compatibility.units.{modality}", unit])
+        for condition, value in manifest["compatibility"][
+            "operatingConditions"
+        ].items():
+            if isinstance(value, (dict, list)):
+                value = json.dumps(
+                    value, ensure_ascii=False, sort_keys=True, allow_nan=False
+                )
+            manifest_sheet.append(
+                [f"compatibility.operatingConditions.{condition}", value]
+            )
+        for field in ("featureNames", "labelCriteria", "checksumInputs"):
+            if field in manifest:
+                manifest_sheet.append(
+                    [
+                        field,
+                        json.dumps(
+                            manifest[field],
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            allow_nan=False,
+                        ),
+                    ]
+                )
+        if "channel" in manifest["compatibility"]:
+            manifest_sheet.append(
+                ["compatibility.channel", manifest["compatibility"]["channel"]]
+            )
+        manifest_sheet.append(
+            ["labelTaxonomyVersion", manifest["labelTaxonomyVersion"]]
         )
         manifest_sheet.append(
-            ["compatibility.units.vibration", manifest["compatibility"]["units"]["vibration"]]
+            ["labelPolicyVersion", manifest.get("labelPolicyVersion")]
         )
-        rpm_range = manifest["compatibility"]["operatingConditions"]["rpmRange"]
-        manifest_sheet.append(["compatibility.operatingConditions.rpmRange", str(rpm_range)])
-        manifest_sheet.append(["labelTaxonomyVersion", manifest["labelTaxonomyVersion"]])
+        manifest_sheet.append(
+            ["snapshotSchemaVersion", manifest.get("snapshotSchemaVersion")]
+        )
         for src_label, common_label in manifest["labelMapping"].items():
             manifest_sheet.append([f"labelMapping.{src_label}", common_label])
         manifest_sheet.append(["split.train", manifest["split"]["train"]])
@@ -127,10 +434,17 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
         manifest_sheet.append(["rowCount", manifest["rowCount"]])
         for split_name, count in manifest["splitCounts"].items():
             manifest_sheet.append([f"splitCounts.{split_name}", count])
+        for status, count in label_summary["labelCounts"].items():
+            manifest_sheet.append([f"labelCounts.{status}", count])
+        manifest_sheet.append(
+            ["trainingEligibleCount", label_summary["trainingEligibleCount"]]
+        )
+        for split_name, count in label_summary["trainingEligibleSplitCounts"].items():
+            manifest_sheet.append([f"trainingEligibleSplitCounts.{split_name}", count])
 
         rows_sheet = wb.create_sheet("rows")
         rows_sheet.append(fieldnames)
-        for row in rows:
+        for row in export_rows:
             rows_sheet.append([row.get(name) for name in fieldnames])
 
         wb.save(xlsx_path)
@@ -143,7 +457,7 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
         manifest_path = os.path.join(staging_dir, "dataset_manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(
-                _manifest_without_rows(manifest, artifact_refs),
+                _manifest_without_rows(manifest, artifact_refs, label_summary),
                 f,
                 ensure_ascii=False,
                 indent=2,
@@ -169,14 +483,62 @@ def export_dataset(manifest: dict, output_dir: str) -> dict:
         try:
             _replace_with_retry(staging_dir, version_dir)
         except OSError:
-            # version_id는 원본·전처리·산출물 내용으로 결정되는 불변
-            # 체크섬을 담고 있다(compute_version_checksum). 그래서
-            # version_dir가 이미 존재한다면 동시에 실행된 다른 export가
-            # 정확히 같은 내용을 이미 배치를 마쳤다는 뜻이며, 이 시도는
-            # 버리고 기존 버전을 그대로 재사용한다(같은 입력은 항상 같은
-            # 산출물이어야 하는 불변 버전 원칙).
             if not os.path.isdir(version_dir):
                 raise
+            # [리뷰 P1, 4차] 기존 디렉터리가 불완전하면(JSON manifest·XLSX가
+            # 없거나 손상됨) 그 안에 무엇이 들어있었는지 신뢰 가능하게 확인할
+            # 방법이 이 함수 안에는 없다 — CSV만 같다고(license처럼 CSV에 안
+            # 나타나는 필드가 실제로는 다를 수 있으므로) 자동으로 지우고
+            # 덮어쓰지 않는다. 예전에는 여기서 `shutil.rmtree(version_dir)` 후
+            # `_replace_with_retry()`로 "치유"했는데, 그 두 연산 사이에 rename이
+            # 실패하면 CURRENT는 이 version_id를 계속 가리키는데 정작
+            # version_dir 자체가 사라지는 상태가 될 수 있었다(비원자적 복구).
+            # 신뢰 가능한 registry/snapshot digest 없이는 자동 복구 대신
+            # 명시적으로 실패하는 편이 더 안전하다(리뷰어 권고).
+            if not _version_dir_is_complete(version_dir):
+                raise IncompleteVersionDirectoryError(
+                    f"version_id {version_id!r}의 기존 산출물 디렉터리({version_dir})가 "
+                    "불완전합니다(JSON manifest 또는 XLSX가 없거나 손상됨) — 이전 "
+                    "내용을 신뢰 가능하게 확인할 수 없어 자동으로 덮어쓰지 않습니다. "
+                    "디렉터리를 직접 확인해 정리한 뒤 다시 시도하세요."
+                ) from None
+
+            # 기존 디렉터리가 완전하다 — CSV/JSON/XLSX 세 산출물 모두 대조해야만
+            # "동시 export가 이미 같은 내용을 배치했다"고 안전하게 판단할 수 있다.
+            # [리뷰 P1] version_id(=source.checksum)는 원본 파일·전처리·특징
+            # 산출물로 결정되지만, export 시점에만 바뀌는 값(예: 호출 직전
+            # manifest["source"]["license"]나 현재 rows에서 쓰이지 않는
+            # labelMapping 항목만 수정)은 반영하지 않는다 — 그래서 "version_dir가
+            # 이미 있다 == 동시 export가 정확히 같은 내용을 이미 배치했다"는 예전
+            # 가정이 항상 참은 아니다.
+            existing_csv_path = os.path.join(version_dir, "dataset_rows.csv")
+            existing_manifest_path = os.path.join(version_dir, "dataset_manifest.json")
+            existing_xlsx_path = os.path.join(version_dir, "dataset_export.xlsx")
+            csv_matches = os.path.exists(existing_csv_path) and (
+                _sha256_of_file(csv_path) == _sha256_of_file(existing_csv_path)
+            )
+            manifest_matches = False
+            if os.path.exists(existing_manifest_path):
+                try:
+                    manifest_matches = _canonical_manifest_json(
+                        manifest_path
+                    ) == _canonical_manifest_json(existing_manifest_path)
+                except (OSError, ValueError):
+                    manifest_matches = False
+            xlsx_matches = _xlsx_content_matches(xlsx_path, existing_xlsx_path)
+
+            if not (csv_matches and manifest_matches and xlsx_matches):
+                raise VersionContentConflictError(
+                    f"version_id {version_id!r}가 이미 존재하지만 내보내려는 rows/라벨/"
+                    "메타데이터 내용이 기존 산출물과 다릅니다. 이 id는 source.checksum만 "
+                    "반영하며 export 시점에만 바뀐 값(예: license, 미사용 labelMapping "
+                    "항목 변경)은 반영하지 않습니다 — 기존 버전을 조용히 재사용하면 방금 "
+                    "내보내려던 내용이 사라집니다. 매니페스트를 다시 생성하거나 원인을 "
+                    "확인하세요."
+                ) from None
+            # 세 산출물 모두 완전하고 내용까지 같다 -> 동시에 실행된 다른 export가
+            # 이미 같은 내용을 배치했다는 뜻이므로, 이번 staged 시도는 버리고
+            # 기존 버전을 그대로 재사용한다(디렉터리를 건드리지 않음).
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
@@ -217,19 +579,35 @@ def resolve_current_version_dir(output_dir: str) -> str:
     current_pointer = os.path.join(output_dir, "CURRENT")
     with open(current_pointer, encoding="utf-8") as f:
         version_id = f.read().strip()
-    return os.path.join(output_dir, "versions", version_id)
+    # [리뷰 P1, 4차] CURRENT 파일 내용도 신뢰하지 않는다 — export_dataset()이
+    # 쓴 값이라 해도, 파일이 외부에서 조작됐을 가능성을 배제할 수 없다.
+    return _resolve_version_dir(os.path.join(output_dir, "versions"), version_id)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="CWRU 데이터셋 매니페스트를 CSV/XLSX로 내보내기"
+        description="진동/음향 데이터셋 매니페스트를 CSV/XLSX로 내보내기"
+    )
+    parser.add_argument(
+        "--manifest", help="Inline-row JSON manifest; skips CWRU loading"
     )
     parser.add_argument("--data-dir", default=_DEFAULT_DATA_DIR)
-    parser.add_argument("--train-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["train"])
+    parser.add_argument(
+        "--train-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["train"]
+    )
     parser.add_argument(
         "--validation-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["validation"]
     )
-    parser.add_argument("--test-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["test"])
+    parser.add_argument(
+        "--test-ratio", type=float, default=DEFAULT_SPLIT_RATIOS["test"]
+    )
+    parser.add_argument(
+        "--split-strategy",
+        choices=SPLIT_STRATEGIES,
+        default="specimen_group",
+        help="specimen_group(기본, CWRU는 InsufficientAssetGroupsError) 또는 "
+        "operating_condition_holdout(independentHoldout=False)",
+    )
     parser.add_argument(
         "--output-dir",
         default=os.path.normpath(
@@ -238,19 +616,30 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # 기본 비율은 라벨당 자산이 여러 개일 때를 전제로 한다 — CWRU처럼 자산이
-    # 1개뿐이면 build_manifest가 InsufficientAssetGroupsError를 낸다 (의도된 동작).
-    manifest = build_manifest(
-        data_dir=args.data_dir,
-        split_ratios={
-            "train": args.train_ratio,
-            "validation": args.validation_ratio,
-            "test": args.test_ratio,
-        },
-    )
+    # 기본 specimen_group은 CWRU의 NORMAL specimen 1개 제약으로 3-way에서
+    # InsufficientAssetGroupsError를 낸다 (의도된 정직한 실패).
+    if args.manifest:
+        with open(args.manifest, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    else:
+        manifest = build_manifest(
+            data_dir=args.data_dir,
+            split_ratios={
+                "train": args.train_ratio,
+                "validation": args.validation_ratio,
+                "test": args.test_ratio,
+            },
+            split_strategy=args.split_strategy,
+        )
     result = export_dataset(manifest, args.output_dir)
 
     print(f"{result['row_count']}행 내보내기 완료")
+    print(
+        f"  라벨: {manifest['labelCounts']} / "
+        f"학습가능 {manifest['trainingEligibleCount']}건 "
+        f"{manifest['trainingEligibleSplitCounts']} "
+        f"(정책 {manifest['labelPolicyVersion']}, 스키마 {manifest['snapshotSchemaVersion']})"
+    )
     print(f"  매니페스트: {result['manifest_path']}")
     print(f"  CSV: {result['csv_path']}")
     print(f"  XLSX: {result['xlsx_path']}")

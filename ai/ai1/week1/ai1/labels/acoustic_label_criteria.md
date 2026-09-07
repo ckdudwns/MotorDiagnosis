@@ -3,6 +3,18 @@
 기능ID: `ACOUSTIC_LABEL_01`
 상태: **초안 — 전문가 자문 전, 검토·수정 필요**
 
+## 공개 데이터 학습 경로의 적용 범위 (AI1-01)
+
+MIMII pump 등록 경로는 공개 데이터 디렉터리 라벨을 그대로 보존한다.
+`normal → NORMAL → NORMAL`, `abnormal → PUMP_ANOMALY → ANOMALY`의
+원본·공통 라벨 대응만 `MIMII-PUMP-BINARY-V1`로 사용한다. 공개 이진 라벨을 아래의
+`BEARING_FAULT`·`FRICTION`·`IMBALANCE` 등 상세 고장 정답으로 승격하지 않는다.
+
+manifest의 `labelCriteria`에 이 문서의 경로·해시와 적용 범위를 기록하고,
+행별 `source_ref`에 WAV 상대경로와 샘플 구간을 기록한다. `source.files`에는
+원본 파일 해시가 있다. 이는 라벨 근거를 추적하기 위한 연결이며, 아래 초안의
+전문가 검토 완료나 현장 라벨 검증을 뜻하지 않는다.
+
 ## 목적
 
 모터·펌프·발전기의 음향 신호를 정상/이상 유형으로 분류하기 위한 라벨 기준을 정의한다.

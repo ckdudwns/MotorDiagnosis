@@ -1,7 +1,7 @@
 /*
  * MotorDiagnosis Edge Node
  *
- * Firmware Version : v1.2-beta.11.8.5
+ * Firmware Version : v1.3-signal-analysis.1
  * Revision Summary :
  *   P1 Atomic Queue Recovery
  *   P2 Unlabeled Real Telemetry Contract
@@ -48,8 +48,12 @@
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <LittleFS.h>
+#include "edge_analysis.h"
+#include <ArduinoJson.h>
 #include <arduinoFFT.h>
 #include "driver/i2s.h"
+#include "freertos/queue.h"
+#include "esp_timer.h"
 
 #include <time.h>
 #include <sys/time.h>
@@ -57,8 +61,12 @@
 #include <stddef.h>
 #include <algorithm>
 #include <cstring>
+#include <atomic>
 
 #include "firmware_logic.h"
+#include "device_health.h"
+#include "remote_config.h"
+#include "communication_quality.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -71,7 +79,7 @@
 // =====================================================
 
 constexpr char FIRMWARE_VERSION[] =
-    "v1.2-beta.11.8.5";
+    "v1.3-signal-analysis.1";
 
 // =====================================================
 // Test Config
@@ -127,6 +135,35 @@ const char* INGEST_TOKEN =
 
 const char* DEVICE_HEALTH_TOKEN =
     DEVICE_HEALTH_TOKEN_VALUE;
+
+// Existing ignored secrets.h files still compile; reporting stays disabled
+// until a separate limited-scope credential and matching device URL are set.
+#ifndef DEVICE_HEALTH_URL_VALUE
+#define DEVICE_HEALTH_URL_VALUE ""
+#endif
+#ifndef DEVICE_HEALTH_TOKEN_VALUE
+#define DEVICE_HEALTH_TOKEN_VALUE ""
+#endif
+const char* DEVICE_HEALTH_URL = DEVICE_HEALTH_URL_VALUE;
+const char* DEVICE_HEALTH_TOKEN = DEVICE_HEALTH_TOKEN_VALUE;
+
+#ifndef DEVICE_CONFIG_URL_VALUE
+#define DEVICE_CONFIG_URL_VALUE ""
+#endif
+#ifndef DEVICE_CONFIG_TOKEN_VALUE
+#define DEVICE_CONFIG_TOKEN_VALUE ""
+#endif
+const char* DEVICE_CONFIG_URL = DEVICE_CONFIG_URL_VALUE;
+const char* DEVICE_CONFIG_TOKEN = DEVICE_CONFIG_TOKEN_VALUE;
+
+#ifndef DEVICE_QUALITY_URL_VALUE
+#define DEVICE_QUALITY_URL_VALUE ""
+#endif
+#ifndef DEVICE_QUALITY_TOKEN_VALUE
+#define DEVICE_QUALITY_TOKEN_VALUE ""
+#endif
+const char* DEVICE_QUALITY_URL = DEVICE_QUALITY_URL_VALUE;
+const char* DEVICE_QUALITY_TOKEN = DEVICE_QUALITY_TOKEN_VALUE;
 
 #ifndef BACKEND_CA_CERT_VALUE
 #define BACKEND_CA_CERT_VALUE ""
@@ -349,12 +386,11 @@ constexpr uint8_t LITTLEFS_MOUNT_ATTEMPTS =
 constexpr size_t ACK_WATERMARK_BATCH_SIZE =
     32;
 
-// Replay at most four old records per loop, then return to fresh sensing.
-constexpr size_t REPLAY_MAX_RECORDS_PER_LOOP =
-    4;
+// Only the main task changes these after verified configuration persistence.
+// Bounds preserve the existing queue capacity and maximum replay starvation.
+size_t REPLAY_MAX_RECORDS_PER_LOOP = RemoteConfig::DEFAULT_REPLAY_BATCH;
 
-constexpr uint32_t MEASUREMENT_INTERVAL_MS =
-    3000;
+uint32_t MEASUREMENT_INTERVAL_MS = RemoteConfig::DEFAULT_INTERVAL_MS;
 
 constexpr uint32_t NETWORK_RETRY_MS =
     5000;
@@ -546,6 +582,12 @@ uint64_t ringNextOrdinal =
 uint64_t droppedOldestCount =
     0;
 
+CommunicationQuality::Collector qualityCollector;
+CommunicationQuality::Schedule qualitySchedule;
+CommunicationQuality::Outbox qualityOutbox;
+const CommunicationQuality::Identity qualityIdentity{DEVICE_ID, SITE_ID, ASSET_ID};
+bool qualityStorageUsable = true;
+
 // Highest ring ordinal durably known to be consumed.
 // Stored in Preferences key "ringConsumed".
 uint64_t committedConsumedOrdinal =
@@ -575,6 +617,26 @@ TaskHandle_t audioCaptureTaskHandle =
 
 volatile bool vibrationFinished =
     false;
+
+std::atomic<bool> vibrationBusy{false};
+bool vibrationChannelValid = false; // protected by vibrationResultMutex
+std::atomic<bool> audioReady{false};
+std::atomic<bool> audioReinitializeRequested{false};
+std::atomic<uint32_t> audioErrorGeneration{0};
+struct SensorObservation {
+    DeviceHealth::Fault fault;
+    bool active;
+    uint64_t observedMs;
+};
+QueueHandle_t sensorObservations = nullptr;
+DeviceHealth::SensorRetry adxlRetry;
+bool adxlInitFailed = false;
+DeviceHealth::Journal healthJournal = DeviceHealth::emptyJournal();
+DeviceHealth::ReportSchedule healthSchedule;
+DeviceHealth::Metrics lastHealthMetrics;
+bool healthJournalUsable = true;
+bool healthJournalDirty = false;
+bool healthObservationBlocked = false;
 
 // =====================================================
 // Persistent / Network State
@@ -635,6 +697,14 @@ String getTimestamp();
 bool syncTime();
 
 bool syncTimeFromBackend();
+
+uint64_t healthUptimeMs();
+int64_t currentHealthEpochMs();
+bool observeSensorFault(DeviceHealth::Fault fault, bool active, uint64_t observedMs);
+void serviceDeviceHealth();
+void serviceSensors();
+bool initializeDeviceHealth();
+void queueAudioFault(DeviceHealth::Fault fault, uint64_t observedMs);
 
 // =====================================================
 // ADXL345
@@ -795,7 +865,11 @@ bool initADXL345()
         0x08
     );
 
-    return true;
+    // SPI has no ACK: verify identity and configuration read-back.
+    return adxlRead(REG_DEVID) == 0xE5 &&
+           (adxlRead(REG_DATA_FORMAT) & 0x0F) == 0x0B &&
+           (adxlRead(REG_POWER_CTL) & 0x08) != 0 &&
+           (adxlRead(REG_BW_RATE) & 0x0F) == 0x0D;
 }
 
 // =====================================================
@@ -891,6 +965,8 @@ bool initINMP441()
             "[I2S] Pin setup failed: %d\n",
             result
         );
+
+        i2s_driver_uninstall(I2S_PORT);
 
         return false;
     }
@@ -1185,55 +1261,52 @@ uint64_t getAudioTotalSamples()
     return value;
 }
 
-void audioCaptureTask(
-    void* parameter
-)
+void audioCaptureTask(void* parameter)
 {
-    int32_t dmaSamples[
-        AUDIO_DMA_READ_SAMPLES
-    ];
-
+    (void)parameter;
+    int32_t dmaSamples[AUDIO_DMA_READ_SAMPLES];
+    DeviceHealth::SensorRetry retry;
     while (true)
     {
-        size_t bytesRead =
-            0;
-
-        esp_err_t status =
-            i2s_read(
-                I2S_PORT,
-                dmaSamples,
-                sizeof(dmaSamples),
-                &bytesRead,
-                portMAX_DELAY
-            );
-
-        if (
-            status != ESP_OK
-        )
+        if (audioReinitializeRequested.exchange(false) && retry.ready())
         {
-            Serial.printf(
-                "[AUDIO] Continuous I2S read error: %d\n",
-                status
-            );
-
-            delay(10);
+            audioReady.store(false);
+            const uint64_t errorAt = healthUptimeMs();
+            audioErrorGeneration.fetch_add(1);
+            i2s_driver_uninstall(I2S_PORT);
+            retry.failed(millis());
+            queueAudioFault(DeviceHealth::Fault::I2S_CHANNEL, errorAt);
+        }
+        if (!retry.ready())
+        {
+            if (retry.due(millis()))
+            {
+                const bool initialized = initINMP441();
+                retry.attempted(millis(), initialized);
+                audioReady.store(initialized);
+                if (!initialized) queueAudioFault(DeviceHealth::Fault::I2S_INIT, healthUptimeMs());
+            }
+            if (!retry.ready()) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+        }
+        size_t bytesRead = 0;
+        const esp_err_t status = i2s_read(I2S_PORT, dmaSamples, sizeof(dmaSamples),
+                                         &bytesRead, pdMS_TO_TICKS(100));
+        if (status != ESP_OK || bytesRead == 0 ||
+            bytesRead > sizeof(dmaSamples) || bytesRead % sizeof(int32_t) != 0)
+        {
+            audioReady.store(false);
+            const uint64_t errorAt = healthUptimeMs();
+            audioErrorGeneration.fetch_add(1);
+            Serial.printf("[AUDIO] Channel error/timeout: %d, bytes=%u\n", status,
+                          static_cast<unsigned>(bytesRead));
+            // This task alone owns I2S; no concurrent uninstall/read.
+            i2s_driver_uninstall(I2S_PORT);
+            retry.failed(millis());
+            queueAudioFault(DeviceHealth::Fault::I2S_CHANNEL, errorAt);
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-
-        size_t sampleCount =
-            bytesRead /
-            sizeof(int32_t);
-
-        if (
-            sampleCount >
-            0
-        )
-        {
-            appendAudioSamplesToRing(
-                dmaSamples,
-                sampleCount
-            );
-        }
+        appendAudioSamplesToRing(dmaSamples, bytesRead / sizeof(int32_t));
     }
 }
 
@@ -1561,34 +1634,22 @@ AcousticFeatures analyzeCommonAudioWindow(
 // Vibration Task
 // =====================================================
 
-void vibrationTask(
-    void* parameter
-)
+void vibrationTask(void* parameter)
 {
+    (void)parameter;
     while (true)
     {
-        ulTaskNotifyTake(
-            pdTRUE,
-            portMAX_DELAY
-        );
-
-        VibrationFeatures local =
-            acquireVibration();
-
-        xSemaphoreTake(
-            vibrationResultMutex,
-            portMAX_DELAY
-        );
-
-        vibrationResult =
-            local;
-
-        vibrationFinished =
-            true;
-
-        xSemaphoreGive(
-            vibrationResultMutex
-        );
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        bool channelValid = adxlRead(REG_DEVID) == 0xE5;
+        VibrationFeatures local;
+        if (channelValid) local = acquireVibration();
+        channelValid = channelValid && adxlRead(REG_DEVID) == 0xE5;
+        xSemaphoreTake(vibrationResultMutex, portMAX_DELAY);
+        vibrationResult = local;
+        vibrationChannelValid = channelValid;
+        vibrationFinished = true;
+        vibrationBusy.store(false);
+        xSemaphoreGive(vibrationResultMutex);
     }
 }
 
@@ -1601,6 +1662,12 @@ bool acquireSynchronizedFeatures(
     AcousticFeatures& audio
 )
 {
+    if (vibrationBusy.load())
+    {
+        observeSensorFault(DeviceHealth::Fault::VIBRATION_TIMEOUT, true, healthUptimeMs());
+        return false; // A late worker must finish before another request.
+    }
+    const uint32_t audioGeneration = audioErrorGeneration.load();
     Serial.println();
     Serial.println(
         "[SYNC] Starting synchronized vibration + acoustic acquisition..."
@@ -1627,6 +1694,7 @@ bool acquireSynchronizedFeatures(
     uint32_t startedMs =
         millis();
 
+    vibrationBusy.store(true);
     xTaskNotifyGive(
         vibrationTaskHandle
     );
@@ -1663,10 +1731,22 @@ bool acquireSynchronizedFeatures(
                 "[SYNC] Vibration acquisition timeout."
             );
 
+            observeSensorFault(DeviceHealth::Fault::VIBRATION_TIMEOUT, true, healthUptimeMs());
+
             return false;
         }
 
         delay(1);
+    }
+
+    xSemaphoreTake(vibrationResultMutex, portMAX_DELAY);
+    const bool validVibration = vibrationChannelValid;
+    xSemaphoreGive(vibrationResultMutex);
+    if (!validVibration)
+    {
+        adxlRetry.failed(millis());
+        observeSensorFault(DeviceHealth::Fault::ADXL_CHANNEL, true, healthUptimeMs());
+        return false;
     }
 
     // The common acoustic interval is exactly 10,240 samples = 0.64 s.
@@ -1692,6 +1772,8 @@ bool acquireSynchronizedFeatures(
                 "[SYNC] Acoustic common-window timeout."
             );
 
+            observeSensorFault(DeviceHealth::Fault::AUDIO_WINDOW, true, healthUptimeMs());
+
             return false;
         }
 
@@ -1710,6 +1792,8 @@ bool acquireSynchronizedFeatures(
             "[SYNC] Failed to copy synchronized acoustic window."
         );
 
+        observeSensorFault(DeviceHealth::Fault::AUDIO_WINDOW, true, healthUptimeMs());
+
         return false;
     }
 
@@ -1724,6 +1808,22 @@ bool acquireSynchronizedFeatures(
     xSemaphoreGive(
         vibrationResultMutex
     );
+
+    if (!audioReady.load() || audioGeneration != audioErrorGeneration.load())
+    {
+        // The audio owner queues the actual occurrence time; serviceSensors()
+        // drains it after this acquisition fails, without replacing it with now.
+        return false; // No features across a discontinuous DMA stream.
+    }
+
+    if (!DeviceHealth::hasPcmVariation(commonAudioWindow, COMMON_AUDIO_SAMPLES))
+    {
+        // A whole constant digital window is a suspected stuck/missing channel,
+        // not evidence of a perfectly healthy silent machine.
+        audioReinitializeRequested.store(true);
+        observeSensorFault(DeviceHealth::Fault::I2S_CHANNEL, true, healthUptimeMs());
+        return false;
+    }
 
     audio =
         analyzeCommonAudioWindow(
@@ -3796,6 +3896,7 @@ bool consumeHeadOrdinal(
         );
 
     queueCount--;
+    qualityCollector.sampleBuffer(queueCount, droppedOldestCount);
 
     if (
         unresolvedTimestamp &&
@@ -4119,6 +4220,7 @@ bool enqueuePersistent(
         );
 
     queueCount++;
+    qualityCollector.sampleBuffer(queueCount, droppedOldestCount);
 
     Serial.printf(
         "[BUFFER] Queue : %u / %u | physical slots=%u | dropped=%llu\n",
@@ -5483,7 +5585,8 @@ bool moveQueuedPacketToRejected(
 // =====================================================
 
 PostOutcome postPacket(
-    const TelemetryPacket& packet
+    const TelemetryPacket& packet,
+    bool replay = false
 )
 {
     PostOutcome outcome;
@@ -5533,6 +5636,8 @@ PostOutcome postPacket(
         outcome.response =
             "backend-transport-policy-rejected";
 
+        qualityCollector.attempt(packet.sequence, replay,
+            CommunicationQuality::Outcome::CONFIGURATION_FAILURE, 0);
         return outcome;
     }
 
@@ -5569,6 +5674,7 @@ PostOutcome postPacket(
         )
     );
 
+    const uint64_t qualityStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
     const int statusCode =
         http.POST(
             packet.payload
@@ -5592,6 +5698,15 @@ PostOutcome postPacket(
             );
     }
 
+    outcome.result = classifyHttpOutcome(packet, statusCode, outcome.response);
+    using QualityOutcome = CommunicationQuality::Outcome;
+    const QualityOutcome qualityOutcome = outcome.result == PostResult::SUCCESS ? QualityOutcome::ACK :
+        outcome.result == PostResult::PERMANENT_PACKET_REJECT ? QualityOutcome::PACKET_REJECT :
+        outcome.result == PostResult::CONFIGURATION_ERROR ? QualityOutcome::CONFIGURATION_FAILURE :
+        statusCode <= 0 ? QualityOutcome::TRANSPORT_FAILURE : QualityOutcome::RETRYABLE_RESPONSE;
+    qualityCollector.attempt(packet.sequence, replay, qualityOutcome,
+        static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - qualityStartedMs);
+
     Serial.printf(
         "HTTP     : %d\n",
         statusCode
@@ -5607,13 +5722,6 @@ PostOutcome postPacket(
     }
 
     http.end();
-
-    outcome.result =
-        classifyHttpOutcome(
-            packet,
-            statusCode,
-            outcome.response
-        );
 
     return outcome;
 }
@@ -5792,6 +5900,18 @@ void replayQueueBatch()
             continue;
         }
 
+        const auto order = DeviceHealth::dispatchOrder(
+            healthJournal, true, packet.timestampResolved,
+            static_cast<int64_t>(packet.epochSeconds) * 1000LL,
+            bootSessionId, healthUptimeMs(), currentHealthEpochMs());
+        if (!order.telemetry)
+        {
+            // The next health transition must commit before this later point.
+            // Re-evaluate for EVERY head, not just once per replay batch.
+            commitConsumedWatermark();
+            return;
+        }
+
         const uint32_t sequence =
             packet.sequence;
 
@@ -5807,7 +5927,8 @@ void replayQueueBatch()
 
         const PostOutcome outcome =
             postPacket(
-                packet
+                packet,
+                true
             );
 
         if (
@@ -6147,6 +6268,528 @@ bool initPersistentStorage()
 // Setup
 // =====================================================
 
+// Device-health outbox is independent of the telemetry ring and sequence.
+// Only the main task mutates it or Preferences; sensor tasks expose observations.
+uint64_t healthUptimeMs()
+{
+    return static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+}
+
+int64_t currentHealthEpochMs()
+{
+    if (!timeReady) return 0;
+    timeval now;
+    gettimeofday(&now, nullptr);
+    return static_cast<int64_t>(now.tv_sec) * 1000LL + now.tv_usec / 1000;
+}
+
+bool persistHealthJournal(const DeviceHealth::Journal& candidate)
+{
+    if (!DeviceHealth::validJournal(candidate)) return false;
+    const size_t written = preferences.putBytes("healthJournal", &candidate, sizeof(candidate));
+    DeviceHealth::Journal readback;
+    return written == sizeof(candidate) &&
+           preferences.getBytes("healthJournal", &readback, sizeof(readback)) == sizeof(readback) &&
+           DeviceHealth::validJournal(readback) && memcmp(&candidate, &readback, sizeof(candidate)) == 0;
+}
+
+RemoteConfig::Controller remoteConfiguration;
+RemoteConfig::Schedule remoteConfigSchedule;
+RemoteConfig::Result pendingConfigResult;
+const RemoteConfig::Identity remoteConfigIdentity{DEVICE_ID, SITE_ID, ASSET_ID};
+bool remoteConfigStorageUsable = true;
+
+// Separate bounded outbox; never changes the existing 48-byte telemetry ring.
+#ifndef EDGE_ANALYSIS_ENABLED_VALUE
+#define EDGE_ANALYSIS_ENABLED_VALUE false
+#endif
+struct AnalysisHeader { uint32_t magic = 0x45414631, sequence = 0, bytes = 0, crc = 0; };
+constexpr unsigned ANALYSIS_SLOTS = 8;
+EdgeAnalysis::PendingRequest analysisRequest;
+uint32_t analysisLastAttempt = 0;
+uint32_t analysisLastCapture = 0;
+bool analysisCaptured = false;
+bool analysisAttempted = false, analysisStorageUsable = true;
+String analysisPath(unsigned slot) { return String("/analysis-") + slot + ".bin"; }
+
+bool readAnalysis(unsigned slot, AnalysisHeader& header, std::string& body)
+{
+    File file = LittleFS.open(analysisPath(slot), "r");
+    if (!file || file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) != sizeof(header) ||
+        header.magic != 0x45414631 || !header.sequence || !header.bytes || header.bytes > EdgeAnalysis::MAX_FRAME_BYTES ||
+        file.size() != sizeof(header) + header.bytes) return false;
+    body.resize(header.bytes);
+    return file.read(reinterpret_cast<uint8_t*>(&body[0]), header.bytes) == header.bytes &&
+        EdgeAnalysis::checksum(body.data(), body.size()) == header.crc;
+}
+
+void preserveAnalysis(const TelemetryPacket& packet)
+{
+    if (!EDGE_ANALYSIS_ENABLED_VALUE || !analysisStorageUsable || !packet.timestampResolved || !psramFound()) return;
+    timeval now{};
+    gettimeofday(&now, nullptr);
+    const char* request = analysisRequest.forCapture(packet.epochSeconds, static_cast<double>(now.tv_sec) + now.tv_usec / 1000000.0);
+    // Analysis is a sampled 30-second stream, not the realtime summary channel.
+    // A pending operator request captures the next valid window immediately.
+    if (!request && analysisCaptured && millis() - analysisLastCapture < 30000U) return;
+    unsigned slot = 0;
+    while (slot < ANALYSIS_SLOTS && LittleFS.exists(analysisPath(slot))) ++slot;
+    if (slot == ANALYSIS_SLOTS) {
+        Serial.println("[ANALYSIS] Outbox full; existing captures retained, new analysis window not stored.");
+        return;
+    }
+    const std::string body = EdgeAnalysis::frame(packet.payload.c_str(), vibX, vibY, vibZ, commonAudioWindow, request);
+    if (body.empty()) return;
+    AnalysisHeader header;
+    header.sequence = packet.sequence; header.bytes = body.size();
+    header.crc = EdgeAnalysis::checksum(body.data(), body.size());
+    const String pending = analysisPath(slot) + ".tmp";
+    File file = LittleFS.open(pending, "w");
+    if (!file) return;
+    const bool written = file.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) == sizeof(header) &&
+        file.write(reinterpret_cast<const uint8_t*>(body.data()), body.size()) == body.size();
+    file.flush(); file.close();
+    if (!written || !LittleFS.rename(pending, analysisPath(slot))) return;
+    AnalysisHeader verified; std::string restored;
+    if (!readAnalysis(slot, verified, restored) || restored != body) {
+        analysisStorageUsable = false;
+        Serial.println("[ANALYSIS] Verification failed; capture preserved, channel disabled.");
+        return;
+    }
+    analysisRequest.clear(); // The request identity now lives in the durable outbox.
+    analysisCaptured = true; analysisLastCapture = millis();
+}
+
+void serviceEdgeAnalysis()
+{
+    if (!EDGE_ANALYSIS_ENABLED_VALUE || !analysisStorageUsable || !psramFound() || WiFi.status() != WL_CONNECTED || !timeReady ||
+        (analysisAttempted && millis() - analysisLastAttempt < 5000U)) return;
+    const String ingest = INGEST_URL;
+    const String suffix = "/api/telemetry/ingest";
+    if (!ingest.endsWith(suffix)) return;
+    const String endpoint = ingest.substring(0, ingest.length()-suffix.length()) + "/api/devices/" + DEVICE_ID + "/analysis";
+    analysisAttempted = true; analysisLastAttempt = millis();
+    unsigned head = ANALYSIS_SLOTS; AnalysisHeader selected; std::string body;
+    for (unsigned i=0; i<ANALYSIS_SLOTS; ++i) {
+        if (!LittleFS.exists(analysisPath(i))) continue;
+        AnalysisHeader header; std::string candidate;
+        if (!readAnalysis(i,header,candidate)) {
+            analysisStorageUsable = false;
+            Serial.println("[ANALYSIS] Corrupt/read-failed capture retained; channel disabled.");
+            return;
+        }
+        if (head == ANALYSIS_SLOTS || header.sequence < selected.sequence) {head=i; selected=header; body=std::move(candidate);}
+    }
+    HTTPClient http; WiFiClientSecure secure;
+    secure.setHandshakeTimeout(3); http.setConnectTimeout(1500); http.setTimeout(1500);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    // Drain exactly one saved frame before polling a new capture request.
+    if (!beginBackendHttp(http,secure,(endpoint+(head==ANALYSIS_SLOTS?"/pending":"")).c_str())) return;
+    http.addHeader("Authorization", String("Bearer ") + INGEST_TOKEN);
+    int status;
+    if (head == ANALYSIS_SLOTS) status=http.GET();
+    else {
+        http.addHeader("Content-Type","application/json");
+        status=http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())),body.size());
+    }
+    const int length=http.getSize(); String response;
+    if (length>=0 && length<=2048) response=http.getString();
+    if (length==static_cast<int>(response.length())) {
+        if (head != ANALYSIS_SLOTS) {
+            if (EdgeAnalysis::accepted(status,response.c_str(),selected.sequence)) LittleFS.remove(analysisPath(head));
+        } else if (status==200) {
+            analysisRequest.load(response.c_str(), DEVICE_ID, SITE_ID, ASSET_ID);
+        }
+    }
+    http.end();
+}
+
+void activateRemoteConfiguration()
+{
+    // The main loop is the sole reader/writer; no sensor window is in progress
+    // here. Sampling frequency, packet format and queued records never change.
+    MEASUREMENT_INTERVAL_MS = remoteConfiguration.active().measurementIntervalMs;
+    REPLAY_MAX_RECORDS_PER_LOOP = remoteConfiguration.active().replayBatchSize;
+    healthSchedule.setInterval(remoteConfiguration.active().healthReportIntervalMs);
+}
+
+bool persistRemoteConfiguration(const RemoteConfig::Blob& candidate, void*)
+{
+    if (!remoteConfigStorageUsable || !RemoteConfig::validBlob(candidate, remoteConfigIdentity)) return false;
+    RemoteConfig::Blob readback;
+    return preferences.putBytes("remoteConfigV2", &candidate, sizeof(candidate)) == sizeof(candidate) &&
+        preferences.getBytesLength("remoteConfigV2") == sizeof(readback) &&
+        preferences.getBytes("remoteConfigV2", &readback, sizeof(readback)) == sizeof(readback) &&
+        RemoteConfig::validBlob(readback, remoteConfigIdentity) &&
+        memcmp(&candidate, &readback, sizeof(candidate)) == 0;
+}
+
+void initializeRemoteConfiguration()
+{
+    if (!preferences.isKey("remoteConfigV2") && preferences.isKey("remoteConfig"))
+    {
+        RemoteConfig::LegacyBlob legacy;
+        if (preferences.getBytesLength("remoteConfig") != sizeof(legacy) ||
+            preferences.getBytes("remoteConfig", &legacy, sizeof(legacy)) != sizeof(legacy) ||
+            !remoteConfiguration.restoreLegacy(legacy, remoteConfigIdentity) ||
+            !persistRemoteConfiguration(remoteConfiguration.active(), nullptr))
+        {
+            remoteConfigStorageUsable = false;
+            Serial.println("[CONFIG] Legacy migration failed; original value retained, channel disabled.");
+            return;
+        }
+    }
+    if (preferences.isKey("remoteConfigV2"))
+    {
+        RemoteConfig::Blob stored;
+        if (preferences.getBytesLength("remoteConfigV2") != sizeof(stored) ||
+            preferences.getBytes("remoteConfigV2", &stored, sizeof(stored)) != sizeof(stored) ||
+            !remoteConfiguration.restore(stored, remoteConfigIdentity))
+        {
+            // Preserve the blob and sequence/telemetry state. Never lower the
+            // version floor and accept an older command after corrupt storage.
+            remoteConfigStorageUsable = false;
+            Serial.println("[CONFIG] Invalid/mismatched stored configuration; channel disabled, safe defaults retained. Local repair required.");
+            return;
+        }
+        activateRemoteConfiguration();
+        pendingConfigResult = remoteConfiguration.appliedResult();
+        Serial.printf("[CONFIG] Restored version %lu.\n", static_cast<unsigned long>(remoteConfiguration.active().version));
+    }
+}
+
+bool remoteConfigurationProvisioned()
+{
+    const size_t length = strlen(DEVICE_CONFIG_TOKEN);
+    if (length < 32 || length > 128) return false;
+    for (const char* p = DEVICE_CONFIG_TOKEN; *p; ++p)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-')) return false;
+    // The base URL is local provisioning, never supplied by a remote response.
+    const String suffix = String("/api/devices/") + DEVICE_ID + "/configuration";
+    return *DEVICE_CONFIG_URL && String(DEVICE_CONFIG_URL).endsWith(suffix);
+}
+
+void serviceRemoteConfiguration()
+{
+    if (!remoteConfigStorageUsable || !remoteConfigurationProvisioned() ||
+        WiFi.status() != WL_CONNECTED || !timeReady || !remoteConfigSchedule.due(millis())) return;
+    const bool reporting = pendingConfigResult.status != RemoteConfig::Status::NONE;
+    const String endpoint = String(DEVICE_CONFIG_URL) + (reporting ? "/result" : "/pending");
+    HTTPClient http;
+    WiFiClientSecure secureClient;
+    secureClient.setHandshakeTimeout(3);
+    http.setConnectTimeout(1500);
+    http.setTimeout(1500);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    bool success = false;
+    int status = 0;
+    if (beginBackendHttp(http, secureClient, endpoint.c_str()))
+    {
+        http.addHeader("Authorization", String("Bearer ") + DEVICE_CONFIG_TOKEN);
+        if (reporting)
+        {
+            http.addHeader("Content-Type", "application/json");
+            const std::string body = RemoteConfig::resultPayload(pendingConfigResult);
+            status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
+        }
+        else status = http.GET();
+        // The backend sends Content-Length. Refuse unbounded/chunked responses.
+        String response;
+        const int length = http.getSize();
+        if (status == 200 && length >= 0 && length <= static_cast<int>(RemoteConfig::MAX_RESPONSE_BYTES))
+            response = http.getString();
+        if (reporting)
+        {
+            success = length == static_cast<int>(response.length()) &&
+                RemoteConfig::resultAccepted(status, response.c_str(), DEVICE_ID, pendingConfigResult);
+            if (success || status == 409)
+            {
+                // A superseded result must not block fetching the newer command.
+                pendingConfigResult = RemoteConfig::Result{};
+                success = true;
+            }
+        }
+        else if (status == 200 && !response.isEmpty() && length == static_cast<int>(response.length()))
+        {
+            pendingConfigResult = remoteConfiguration.receive(response.c_str(), remoteConfigIdentity, persistRemoteConfiguration);
+            activateRemoteConfiguration(); // Changed only after verified persistence.
+            success = true;
+        }
+        http.end();
+    }
+    // At most one bounded request per service call. No redirects, arbitrary
+    // commands, network changes, queue clearing, or busy retry loop.
+    remoteConfigSchedule.completed(millis(), success, pendingConfigResult.status != RemoteConfig::Status::NONE);
+    Serial.printf("[CONFIG] %s HTTP %d; active version %lu.\n", reporting ? "result" : "poll", status,
+                  static_cast<unsigned long>(remoteConfiguration.active().version));
+}
+
+bool qualityProvisioned()
+{
+    const size_t length = strlen(DEVICE_QUALITY_TOKEN);
+    if (length < 32 || length > 128) return false;
+    for (const char* p = DEVICE_QUALITY_TOKEN; *p; ++p)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-')) return false;
+    const String suffix = String("/api/devices/") + DEVICE_ID + "/communication-quality";
+    return *DEVICE_QUALITY_URL && String(DEVICE_QUALITY_URL).endsWith(suffix);
+}
+
+void initializeCommunicationQuality()
+{
+    if (preferences.isKey("qualityPending"))
+    {
+        CommunicationQuality::Window pendingQuality;
+        if (preferences.getBytesLength("qualityPending") != sizeof(pendingQuality) ||
+            preferences.getBytes("qualityPending", &pendingQuality, sizeof(pendingQuality)) != sizeof(pendingQuality) ||
+            !qualityOutbox.restore(pendingQuality, qualityIdentity))
+        {
+            qualityStorageUsable = false;
+            Serial.println("[QUALITY] Invalid/mismatched pending report preserved; quality reporting disabled. Telemetry continues.");
+            return;
+        }
+    }
+    if (!qualityProvisioned()) Serial.println("[QUALITY] Not provisioned; automatic quality reporting disabled.");
+}
+
+bool persistQualityWindow(const CommunicationQuality::Window& window, void*)
+{
+    CommunicationQuality::Window verified;
+    return preferences.putBytes("qualityPending", &window, sizeof(window)) == sizeof(window) &&
+        preferences.getBytesLength("qualityPending") == sizeof(verified) &&
+        preferences.getBytes("qualityPending", &verified, sizeof(verified)) == sizeof(verified) &&
+        CommunicationQuality::validWindow(verified, qualityIdentity) &&
+        memcmp(&window, &verified, sizeof(verified)) == 0;
+}
+
+bool eraseQualityWindow(void*)
+{
+    // A prior ambiguous remove may already have committed. Absence is success
+    // here only because Outbox first validates the server ACK for this report.
+    return (!preferences.isKey("qualityPending") || preferences.remove("qualityPending")) &&
+        !preferences.isKey("qualityPending");
+}
+
+void serviceCommunicationQuality()
+{
+    if (!qualityStorageUsable || !qualityProvisioned()) return;
+    const uint64_t now = healthUptimeMs();
+    if (!qualityCollector.started() && timeReady)
+    {
+        char bootId[33];
+        // Existing durable boot generation refuses overflow. A device ID must
+        // not be reused after erasing its NVS boot/sequence history.
+        snprintf(bootId, sizeof(bootId), "%032lx", static_cast<unsigned long>(bootSessionId));
+        if (!qualityCollector.begin(qualityIdentity, bootId, now, currentHealthEpochMs(), QUEUE_CAPACITY, droppedOldestCount))
+        {
+            qualityStorageUsable = false;
+            Serial.println("[QUALITY] Cannot initialize observation scope/clock; telemetry continues.");
+            return;
+        }
+    }
+    qualityCollector.sampleBuffer(queueCount, droppedOldestCount);
+    qualityCollector.sampleWifi(WiFi.status() == WL_CONNECTED);
+    if (!qualitySchedule.due(millis())) return;
+    if (!qualityOutbox.pending() && qualityCollector.ready(now))
+    {
+        if (!qualityOutbox.capture(qualityCollector, now)) return;
+    }
+    if (!qualityOutbox.pending()) return;
+    if (!qualityOutbox.checkpoint(persistQualityWindow))
+    {
+        qualitySchedule.completed(millis(), false);
+        Serial.println("[QUALITY] Report checkpoint failed; RAM report retained, telemetry continues.");
+        return;
+    }
+    if (WiFi.status() != WL_CONNECTED || !timeReady)
+    {
+        qualitySchedule.completed(millis(), false);
+        return;
+    }
+    HTTPClient http;
+    WiFiClientSecure secureClient;
+    secureClient.setHandshakeTimeout(3);
+    http.setConnectTimeout(1500);
+    http.setTimeout(1500);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    bool success = false;
+    int status = 0;
+    if (beginBackendHttp(http, secureClient, DEVICE_QUALITY_URL))
+    {
+        http.addHeader("Authorization", String("Bearer ") + DEVICE_QUALITY_TOKEN);
+        http.addHeader("Content-Type", "application/json");
+        const std::string body = CommunicationQuality::payload(qualityOutbox.window());
+        status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
+        String response;
+        const int length = http.getSize();
+        if ((status == 200 || status == 201) && length >= 0 && length <= 1024) response = http.getString();
+        success = length == static_cast<int>(response.length()) &&
+            qualityOutbox.acknowledge(status, response.c_str(), eraseQualityWindow);
+        http.end();
+    }
+    qualitySchedule.completed(millis(), success);
+    Serial.printf("[QUALITY] HTTP %d; pending=%s, counter overflow=%s.\n", status,
+        qualityOutbox.pending() ? "yes" : "no", qualityCollector.overflowed() ? "yes" : "no");
+}
+
+bool initializeDeviceHealth()
+{
+    if (preferences.isKey("healthJournal"))
+    {
+        if (preferences.getBytesLength("healthJournal") != sizeof(healthJournal) ||
+            preferences.getBytes("healthJournal", &healthJournal, sizeof(healthJournal)) != sizeof(healthJournal) ||
+            !DeviceHealth::validJournal(healthJournal))
+        {
+            healthJournalUsable = false;
+            Serial.println("[HEALTH] Journal invalid; preserved for inspection. Sensor acquisition paused.");
+            return false;
+        }
+    }
+    else
+    {
+        healthJournalDirty = !persistHealthJournal(healthJournal);
+    }
+    if (!*DEVICE_HEALTH_URL || !*DEVICE_HEALTH_TOKEN ||
+        strcmp(DEVICE_HEALTH_TOKEN, "YOUR_DEVICE_HEALTH_TOKEN") == 0)
+        Serial.println("[HEALTH] Configure the separate device-health URL/token; reporting is not provisioned.");
+    return !healthJournalDirty;
+}
+
+bool observeSensorFault(DeviceHealth::Fault fault, bool active, uint64_t observedMs)
+{
+    if (!healthJournalUsable) return false;
+    DeviceHealth::Journal candidate = healthJournal;
+    const uint64_t age = healthUptimeMs() - observedMs;
+    const int64_t now = currentHealthEpochMs();
+    const int64_t observedEpoch = now >= 1700000000000LL &&
+        age <= static_cast<uint64_t>(now - 1700000000000LL) ? now - static_cast<int64_t>(age) : 0;
+    if (!DeviceHealth::observe(candidate, fault, active, bootSessionId, observedMs, observedEpoch))
+    {
+        healthObservationBlocked = true;
+        Serial.println("[HEALTH] Transition queue full/invalid; sensing paused until it can be recorded.");
+        return false;
+    }
+    if (candidate.crc == healthJournal.crc) return !healthJournalDirty;
+    // Retain an uncommitted observation in RAM, but never transmit/continue
+    // sensing until the NVS write/read-back succeeds. No silent drop on error.
+    healthJournal = candidate;
+    healthJournalDirty = !persistHealthJournal(candidate);
+    if (healthJournalDirty)
+        Serial.println("[HEALTH] Observation not durable yet; retrying storage, sensing paused.");
+    return !healthJournalDirty;
+}
+
+void serviceSensors()
+{
+    healthObservationBlocked = false;
+    if (!healthJournalUsable || healthJournalDirty) return;
+    if (healthJournal.count == DeviceHealth::JOURNAL_CAPACITY)
+    {
+        healthObservationBlocked = true;
+        return;
+    }
+    if (!vibrationBusy.load() && adxlRetry.due(millis()))
+    {
+        const bool initialized = initADXL345();
+        adxlInitFailed = !initialized;
+        adxlRetry.attempted(millis(), initialized);
+    }
+    if (adxlRetry.attempts())
+        observeSensorFault(DeviceHealth::Fault::ADXL_INIT, adxlInitFailed, healthUptimeMs());
+    SensorObservation observation;
+    // Peek until the observation is durably recorded. A failed write or full
+    // journal cannot discard a short-lived audio failure between main loops.
+    while (xQueuePeek(sensorObservations, &observation, 0) == pdTRUE)
+    {
+        if (!observeSensorFault(observation.fault, observation.active, observation.observedMs)) break;
+        xQueueReceive(sensorObservations, &observation, 0);
+    }
+}
+
+void queueAudioFault(DeviceHealth::Fault fault, uint64_t observedMs)
+{
+    const SensorObservation observation{fault, true, observedMs};
+    // Bounded queue with backpressure, not a lossy mailbox. This task owns no
+    // mutex or live I2S read while waiting; the main task keeps servicing HTTP.
+    xQueueSend(sensorObservations, &observation, portMAX_DELAY);
+}
+
+void serviceDeviceHealth()
+{
+    if (!healthJournalUsable) return;
+    static uint32_t lastStorageRetry = 0;
+    if (healthJournalDirty)
+    {
+        if (millis() - lastStorageRetry >= 5000U)
+        {
+            lastStorageRetry = millis();
+            healthJournalDirty = !persistHealthJournal(healthJournal);
+        }
+        if (healthJournalDirty) return;
+    }
+    if (WiFi.status() != WL_CONNECTED || !timeReady || !*DEVICE_HEALTH_URL ||
+        !*DEVICE_HEALTH_TOKEN || strcmp(DEVICE_HEALTH_TOKEN, "YOUR_DEVICE_HEALTH_TOKEN") == 0) return;
+    DeviceHealth::Metrics metrics;
+    metrics.rssiDbm = std::max(-120, std::min(0, static_cast<int>(WiFi.RSSI())));
+    metrics.rebootCount = std::min<uint32_t>(bootSessionId - 1U, 2147483647U);
+    metrics.queuedRecords = queueCount;
+    metrics.queueCapacity = QUEUE_CAPACITY;
+    metrics.firmwareVersion = FIRMWARE_VERSION;
+    if (!healthSchedule.due(millis(), DeviceHealth::metricsChanged(lastHealthMetrics, metrics),
+                            healthJournal.count != 0)) return;
+    const int64_t epochMs = currentHealthEpochMs();
+    const uint64_t reportMonotonic = healthUptimeMs();
+    TelemetryPacket oldest;
+    BinaryTelemetryRecord raw;
+    uint64_t ordinal = 0;
+    bool queued = !queueIsEmpty();
+    const bool headKnown = queued &&
+        readOldestPersistent(oldest, ordinal, raw) == QueueReadResult::READY;
+    queued = !queueIsEmpty(); // Reading may safely skip proven corruption.
+    const auto order = DeviceHealth::dispatchOrder(
+        healthJournal, queued, headKnown,
+        static_cast<int64_t>(oldest.epochSeconds) * 1000LL,
+        bootSessionId, reportMonotonic, epochMs);
+    const bool includesFaults = order.transition || order.snapshot;
+    // Current metrics need not wait for an old backlog, but they must not
+    // advance analysis boundaries or acknowledge a deferred fault transition.
+    const std::string body = DeviceHealth::payload(
+        healthJournal, metrics, bootSessionId, reportMonotonic, epochMs, includesFaults);
+    bool accepted = false;
+    if (!body.empty())
+    {
+        HTTPClient http;
+        WiFiClientSecure secureClient;
+        secureClient.setHandshakeTimeout(3);
+        http.setConnectTimeout(1500);
+        http.setTimeout(1500);
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        if (beginBackendHttp(http, secureClient, DEVICE_HEALTH_URL))
+        {
+            http.addHeader("Content-Type", "application/json");
+            http.addHeader("Authorization", String("Bearer ") + DEVICE_HEALTH_TOKEN);
+            const int status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
+            const String response = status == 200 ? http.getString() : String();
+            accepted = DeviceHealth::accepted(status, response.c_str(), DEVICE_ID, epochMs);
+            Serial.printf("[HEALTH] HTTP %d, confirmed=%s, pending=%u\n", status,
+                          accepted ? "yes" : "no", static_cast<unsigned>(healthJournal.count));
+            http.end();
+        }
+    }
+    if (accepted && order.transition && healthJournal.count)
+    {
+        DeviceHealth::Journal candidate = healthJournal;
+        DeviceHealth::acknowledgeHead(candidate, bootSessionId, reportMonotonic, epochMs);
+        // A failed ACK-marker write leaves the old head for an idempotent retry.
+        // Never send its successor until this removal is durable.
+        if (persistHealthJournal(candidate)) healthJournal = candidate;
+        else accepted = false;
+    }
+    healthSchedule.completed(millis(), accepted);
+    if (accepted) lastHealthMetrics = metrics;
+}
+
 void setup()
 {
     Serial.begin(
@@ -6196,6 +6839,8 @@ void setup()
             delay(1000);
         }
     }
+
+    initializeRemoteConfiguration();
 
     telemetrySequence =
         preferences.getUInt(
@@ -6250,6 +6895,9 @@ void setup()
         }
     }
 
+    initializeDeviceHealth();
+    initializeCommunicationQuality();
+
     pinMode(
         ADXL_CS,
         OUTPUT
@@ -6267,45 +6915,19 @@ void setup()
         ADXL_CS
     );
 
-    if (
-        !initADXL345()
-    )
-    {
-        Serial.println(
-            "[FATAL] ADXL345 failed."
-        );
-
-        while (true)
-        {
-            delay(1000);
-        }
-    }
-
-    if (
-        !initINMP441()
-    )
-    {
-        Serial.println(
-            "[FATAL] INMP441 failed."
-        );
-
-        while (true)
-        {
-            delay(1000);
-        }
-    }
-
     vibrationResultMutex =
         xSemaphoreCreateMutex();
 
     audioRingMutex =
         xSemaphoreCreateMutex();
 
+    sensorObservations = xQueueCreate(32, sizeof(SensorObservation));
+
     if (
         vibrationResultMutex ==
             nullptr ||
         audioRingMutex ==
-            nullptr
+            nullptr || sensorObservations == nullptr
     )
     {
         Serial.println(
@@ -6318,7 +6940,7 @@ void setup()
         }
     }
 
-    xTaskCreatePinnedToCore(
+    const BaseType_t vibrationCreated = xTaskCreatePinnedToCore(
         vibrationTask,
         "VibrationTask",
         8192,
@@ -6331,7 +6953,7 @@ void setup()
     // P5:
     // Continuous audio task never waits for per-cycle notification.
     // It continuously drains I2S so stale DMA samples do not accumulate.
-    xTaskCreatePinnedToCore(
+    const BaseType_t audioCreated = xTaskCreatePinnedToCore(
         audioCaptureTask,
         "AudioCaptureTask",
         8192,
@@ -6340,6 +6962,12 @@ void setup()
         &audioCaptureTaskHandle,
         1
     );
+
+    if (vibrationCreated != pdPASS || audioCreated != pdPASS)
+    {
+        Serial.println("[FATAL] Sensor task allocation failed; no unsafe acquisition.");
+        while (true) { delay(1000); }
+    }
 
     Serial.println(
         "[OK] Vibration Task -> Core 0"
@@ -6430,13 +7058,17 @@ void loop()
 
     serviceWiFi();
 
-    // Recover absolute time when network becomes available.
+    static uint32_t lastTimeSyncAttempt = 0;
+    static bool timeSyncAttempted = false;
+    // Recover absolute time with bounded attempts, including sensor-fault mode.
     if (
         WiFi.status() ==
             WL_CONNECTED &&
-        !timeReady
+        !timeReady && (!timeSyncAttempted || millis() - lastTimeSyncAttempt >= 30000U)
     )
     {
+        timeSyncAttempted = true;
+        lastTimeSyncAttempt = millis();
         if (
             syncTime()
         )
@@ -6454,6 +7086,12 @@ void loop()
     {
         persistCurrentSessionTimeAnchor();
     }
+
+    serviceCommunicationQuality();
+    serviceRemoteConfiguration();
+    serviceEdgeAnalysis();
+    serviceSensors();
+    serviceDeviceHealth(); // Metrics only while an older telemetry head exists.
 
     // Replay only a bounded slice of old data before each fresh
     // measurement. This prevents a full 24-hour backlog from starving
@@ -6475,8 +7113,26 @@ void loop()
     // P5: one common 0.64 s vibration/acoustic window
     // =================================================
 
+    if (!adxlRetry.ready() || !audioReady.load() || !healthJournalUsable ||
+        healthJournalDirty || healthObservationBlocked)
+    {
+        delay(200); // Wi-Fi, health reporting and bounded replay remain alive.
+        return;
+    }
+
+    // Telemetry UTC has whole-second precision, health has milliseconds.
+    // Start a new window only after the acknowledged boundary's second, rather
+    // than creating a fresh point that the backend would reject as <= boundary.
+    if (timeReady && currentHealthEpochMs() / 1000LL * 1000LL <=
+        DeviceHealth::acknowledgedBoundary(healthJournal))
+    {
+        delay(200);
+        return;
+    }
+
     VibrationFeatures vib;
     AcousticFeatures audio;
+    const uint32_t acquisitionAudioGeneration = audioErrorGeneration.load();
 
     if (
         !acquireSynchronizedFeatures(
@@ -6488,6 +7144,8 @@ void loop()
         Serial.println(
             "[SENSOR] Synchronized acquisition failed."
         );
+        serviceSensors();
+        serviceDeviceHealth();
 
         delay(
             MEASUREMENT_INTERVAL_MS
@@ -6514,11 +7172,32 @@ void loop()
         Serial.println(
             "[SENSOR] Invalid NaN/Inf measurement."
         );
+        observeSensorFault(DeviceHealth::Fault::INVALID_FEATURES, true, healthUptimeMs());
+        serviceDeviceHealth();
 
         delay(
             MEASUREMENT_INTERVAL_MS
         );
 
+        return;
+    }
+
+    // A successful synchronized, finite window is the recovery evidence;
+    // successful driver installation alone cannot clear runtime sensor faults.
+    if (!audioReady.load() || acquisitionAudioGeneration != audioErrorGeneration.load())
+    {
+        serviceSensors();
+        serviceDeviceHealth();
+        delay(MEASUREMENT_INTERVAL_MS);
+        return;
+    }
+    for (size_t code = 0; code < DeviceHealth::FAULT_COUNT; ++code)
+        observeSensorFault(static_cast<DeviceHealth::Fault>(code), false, healthUptimeMs());
+    // Send these observations on the next service pass. An HTTP health request
+    // here would shift the fresh packet timestamp after the measured window.
+    if (healthJournalDirty || healthObservationBlocked)
+    {
+        delay(MEASUREMENT_INTERVAL_MS);
         return;
     }
 
@@ -6552,6 +7231,7 @@ void loop()
             ? ""
             : " (UTC unresolved)"
     );
+    preserveAnalysis(packet);
 
     // True cold boot without UTC:
     // even if the station is associated with Wi-Fi but NTP/backend time is
@@ -6586,7 +7266,8 @@ void loop()
         return;
     }
 
-    // Existing backlog always wins FIFO.
+    // Existing backlog and pending health transitions always win the ordered
+    // dispatcher. Do not bypass a deferred health boundary via direct POST.
     //
     // replayQueueBatch() consumed only a bounded number of oldest
     // records at the start of this loop. If backlog remains, this fresh
@@ -6594,7 +7275,7 @@ void loop()
     // telemetry. Therefore catch-up and acquisition are interleaved
     // without reordering packets.
     if (
-        !queueIsEmpty()
+        !queueIsEmpty() || healthJournal.count != 0
     )
     {
         if (

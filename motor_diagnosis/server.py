@@ -26,6 +26,8 @@ from .data import (
     ROLE_POLICIES,
     TELEMETRY_RECORDS,
     ApiError,
+    authentication_users,
+    validate_ingest_auth,
     acoustic_taxonomies_for,
     alert_policies_for,
     anomaly_rule_for,
@@ -33,6 +35,8 @@ from .data import (
     assets_for,
     authenticate,
     copy_payload,
+    close_runtime_state,
+    configure_runtime_state,
     create_asset,
     create_connectivity_test,
     create_device,
@@ -51,8 +55,11 @@ from .data import (
     delete_site,
     devices_for,
     device_health_for,
+    update_device_health,
     environment_inspections_for,
     event_detail_for,
+    event_note_history_for,
+    event_notes_for,
     event_reviews_for,
     get_asset_by_id,
     get_device,
@@ -64,6 +71,7 @@ from .data import (
     install_points_for,
     install_points_for_asset,
     logout,
+    maintain_runtime_retention,
     network_profile,
     network_profiles_for_sites,
     now_iso,
@@ -74,6 +82,9 @@ from .data import (
     require_permission,
     require_site_access,
     review_event,
+    create_event_note,
+    update_event_note,
+    delete_event_note,
     role_policy,
     rollout_plans,
     rollout_plan_for,
@@ -97,16 +108,24 @@ from .data import (
     visible_sites_for_user,
     connectivity_tests_for_device,
     parameters_for,
+    now_iso,
 )
 from .json_validation import loads_strict_json
 from .alerts import AlertService
+from .edge_analysis import AnalysisStore
+from .model_inference import ModelInferenceStore
+from .model_history import ModelHistoryGuard
 from .model_registry import create_baseline_version, create_model_version, versions_for
+from .ai_results import submit_result, review_model
 from .telemetry_bulk import ingest_telemetry_bulk
 from .web import render_page
-
+from .xlsx_export import dataset_xlsx_bytes
+from . import remote_config
+from .communication_quality import CommunicationQualityStore
 
 LOGGER = logging.getLogger("motor_diagnosis")
 MAX_JSON_BODY_BYTES = 64 * 1024
+RETENTION_MAINTENANCE_INTERVAL_SEC = 60.0
 
 
 def _safe_csv_cell(value: Any) -> Any:
@@ -199,7 +218,83 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "devices"]
+            and segments[3:] == ["configuration", "pending"]
+        ):
+            self.send_json(
+                remote_config.pending_configuration(self.bearer_token(), segments[2])
+            )
+            return
+
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "devices"]
+            and segments[3:] == ["analysis", "pending"]
+        ):
+            self.send_json(
+                self.server.analysis.pending(
+                    telemetry_principal_for_token(self.bearer_token()), segments[2]
+                )
+            )
+            return
         user = self.require_user()
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "model-inference"
+        ):
+            if self.server.model_inference is None:
+                raise ApiError(
+                    409, "MODEL_NOT_CONFIGURED", "No shadow checkpoint is configured"
+                )
+            self.send_json(self.server.model_inference.list_device(user, segments[2]))
+            return
+        if len(segments) == 3 and segments[:2] == ["api", "analysis"]:
+            self.send_json(self.server.analysis.detail(user, segments[2]))
+            return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "analysis"
+        ):
+            result = self.server.analysis.list_device(
+                user, segments[2], cursor=query.get("cursor", [None])[0]
+            )
+            if self.server.model_inference is not None and has_permission(
+                user, "model:read"
+            ):
+                result["shadowInference"] = self.server.model_inference.list_for(
+                    user, result["siteId"], result["assetId"], device_id=segments[2]
+                )
+            self.send_json(result)
+            return
+
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "communication-quality"
+        ):
+            self.send_json(
+                self.server.communication_quality.query(user, segments[2], query)
+            )
+            return
+
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "configuration"
+        ):
+            self.send_json(remote_config.configuration_for(user, segments[2]))
+            return
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "devices"]
+            and segments[3:] == ["configuration", "history"]
+        ):
+            self.send_json(remote_config.configuration_history(user, segments[2]))
+            return
 
         if segments == ["api", "bootstrap"]:
             response: dict[str, Any] = {"sites": visible_sites_for_user(user)}
@@ -509,6 +604,32 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if len(segments) == 4 and segments[:3] == ["api", "anomaly", "events"]:
             detail = event_detail_for(user, segments[3])
+            if has_permission(user, "telemetry:read"):
+                detail["analysis"] = self.server.analysis.list_for(
+                    user,
+                    detail["event"]["siteId"],
+                    detail["event"]["assetId"],
+                    device_id=detail["event"].get("deviceId"),
+                    start=parse_rfc3339("from", detail["context"]["from"]).timestamp(),
+                    end=parse_rfc3339("to", detail["context"]["to"]).timestamp(),
+                )
+                if self.server.model_inference is not None and has_permission(
+                    user, "model:read"
+                ):
+                    detail["analysis"]["shadowInference"] = (
+                        self.server.model_inference.list_for(
+                            user,
+                            detail["event"]["siteId"],
+                            detail["event"]["assetId"],
+                            device_id=detail["event"].get("deviceId"),
+                            start=parse_rfc3339(
+                                "from", detail["context"]["from"]
+                            ).timestamp(),
+                            end=parse_rfc3339(
+                                "to", detail["context"]["to"]
+                            ).timestamp(),
+                        )
+                    )
             if detail["context"]["source"] == "stored":
                 detail["context"]["points"] = annotate_telemetry_points(
                     detail["context"]["points"]
@@ -523,6 +644,21 @@ class AppHandler(BaseHTTPRequestHandler):
             page = positive_query_int(query, "page", 1)
             size = positive_query_int(query, "size", 50, maximum=200)
             self.send_json(event_reviews_for(user, segments[2], page=page, size=size))
+            return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "notes"
+        ):
+            self.send_json(event_notes_for(user, segments[2]))
+            return
+        if (
+            len(segments) == 6
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "notes"
+            and segments[5] == "history"
+        ):
+            self.send_json(event_note_history_for(user, segments[2], segments[4]))
             return
         if segments == ["api", "events"]:
             self.send_json(paginated_events(user, query))
@@ -539,13 +675,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     asset_id,
                     from_timestamp=query.get("from", [None])[0],
                     to_timestamp=query.get("to", [None])[0],
+                    include_demo=True,
                 )
             )
             self.send_json(
                 {
                     "siteId": site_id,
                     "assetId": asset_id,
-                    "units": telemetry_units(site_id, asset_id),
+                    "units": telemetry_units(site_id, asset_id, include_demo=True),
                     "points": points,
                 }
             )
@@ -560,29 +697,80 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if segments == ["api", "datasets", "export"]:
             export_format = query.get("format", ["csv"])[0].strip().lower()
-            if export_format != "csv":
+            if export_format not in {"csv", "xlsx"}:
                 raise ApiError(
-                    501,
-                    "EXPORT_FORMAT_NOT_IMPLEMENTED",
-                    "Only CSV export is available in the week 3 backend.",
+                    400,
+                    "INVALID_EXPORT_FORMAT",
+                    "format must be csv or xlsx.",
                 )
             site_id = required_query(query, "siteId")
             asset_id = required_query(query, "assetId")
-            self.send_dataset_csv(
-                dataset_export_for(
-                    user,
-                    site_id,
-                    asset_id,
-                    dataset_id=query.get("datasetId", [""])[0],
-                    from_timestamp=query.get("from", [None])[0],
-                    to_timestamp=query.get("to", [None])[0],
-                )
+            export = dataset_export_for(
+                user,
+                site_id,
+                asset_id,
+                dataset_id=query.get("datasetId", [""])[0],
+                from_timestamp=query.get("from", [None])[0],
+                to_timestamp=query.get("to", [None])[0],
             )
+            if export_format == "xlsx":
+                self.send_dataset_xlsx(export)
+            else:
+                self.send_dataset_csv(export)
             return
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
     def route_post(self, segments: list[str]) -> None:
-        payload = self.read_json()
+        raw_model_path = (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "model-raw-inputs"
+        )
+        analysis_path = (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "analysis"
+        )
+        payload = (
+            self.read_json(maximum=512 * 1024)
+            if raw_model_path
+            else (
+                self.read_json(maximum=1024 * 1024)
+                if analysis_path
+                else self.read_json()
+            )
+        )
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] in {"model-inputs", "model-raw-inputs"}
+        ):
+            principal = telemetry_principal_for_token(self.bearer_token())
+            if self.server.model_inference is None:
+                raise ApiError(
+                    409, "MODEL_NOT_CONFIGURED", "No shadow checkpoint is configured"
+                )
+            result, status = self.server.model_inference.ingest(
+                principal, segments[2], payload, raw=raw_model_path
+            )
+            self.send_json(result, status=status)
+            return
+        if analysis_path:
+            result, status = self.server.analysis.ingest(
+                telemetry_principal_for_token(self.bearer_token()), segments[2], payload
+            )
+            self.send_json(result, status=status)
+            return
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "devices"]
+            and segments[3:] == ["analysis", "requests"]
+        ):
+            self.send_json(
+                self.server.analysis.request(self.require_user(), segments[2], payload),
+                status=201,
+            )
+            return
         if segments == ["api", "auth", "login"]:
             self.send_json(authenticate(payload))
             return
@@ -595,6 +783,10 @@ class AppHandler(BaseHTTPRequestHandler):
             result, status = ingest_telemetry(
                 telemetry_principal_for_token(self.bearer_token()), payload
             )
+            self.send_json(result, status=status)
+            return
+        if segments == ["api", "ai1", "results"]:
+            result, status = submit_result(self.bearer_token(), payload)
             self.send_json(result, status=status)
             return
         if segments == ["api", "telemetry", "bulk"]:
@@ -619,6 +811,42 @@ class AppHandler(BaseHTTPRequestHandler):
                     payload,
                 )
             )
+            return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "health"
+        ):
+            self.send_json(
+                update_device_health(
+                    telemetry_principal_for_token(self.bearer_token()),
+                    segments[2],
+                    payload,
+                )
+            )
+            return
+
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "devices"]
+            and segments[3:] == ["configuration", "result"]
+        ):
+            self.send_json(
+                remote_config.report_configuration(
+                    self.bearer_token(), segments[2], payload
+                )
+            )
+            return
+
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "communication-quality"
+        ):
+            response, status = self.server.communication_quality.ingest(
+                self.bearer_token(), segments[2], payload
+            )
+            self.send_json(response, status=status)
             return
 
         user = self.require_user()
@@ -725,6 +953,13 @@ class AppHandler(BaseHTTPRequestHandler):
         if segments == ["api", "baseline-versions"]:
             self.send_json(create_baseline_version(user, payload), status=201)
             return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "model-versions"]
+            and segments[3] == "reviews"
+        ):
+            self.send_json(review_model(user, segments[2], payload))
+            return
         if segments == ["api", "model-versions"]:
             self.send_json(create_model_version(user, payload), status=201)
             return
@@ -736,6 +971,13 @@ class AppHandler(BaseHTTPRequestHandler):
             require_permission(user, "event:review")
             self.send_json(review_event(user, segments[2], payload))
             return
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "notes"
+        ):
+            self.send_json(create_event_note(user, segments[2], payload), status=201)
+            return
         if segments == ["api", "datasets"]:
             self.send_json(create_dataset_version(user, payload), status=201)
             return
@@ -744,6 +986,15 @@ class AppHandler(BaseHTTPRequestHandler):
     def route_put(self, segments: list[str]) -> None:
         payload = self.read_json()
         user = self.require_user()
+        if (
+            len(segments) == 4
+            and segments[:2] == ["api", "devices"]
+            and segments[3] == "configuration"
+        ):
+            self.send_json(
+                remote_config.request_configuration(user, segments[2], payload)
+            )
+            return
         if (
             len(segments) == 4
             and segments[:2] == ["api", "sites"]
@@ -792,6 +1043,13 @@ class AppHandler(BaseHTTPRequestHandler):
         ):
             self.send_json(update_asset(user, segments[2], segments[4], payload))
             return
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "notes"
+        ):
+            self.send_json(update_event_note(user, segments[2], segments[4], payload))
+            return
         if len(segments) == 3 and segments[:2] == ["api", "devices"]:
             self.send_json(update_device(user, segments[2], payload))
             return
@@ -821,6 +1079,13 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(segments) == 3 and segments[:2] == ["api", "devices"]:
             self.send_json(delete_device(user, segments[2]))
             return
+        if (
+            len(segments) == 5
+            and segments[:2] == ["api", "events"]
+            and segments[3] == "notes"
+        ):
+            self.send_json(delete_event_note(user, segments[2], segments[4]))
+            return
         raise ApiError(404, "NOT_FOUND", "API route was not found.")
 
     def require_user(self) -> dict[str, Any]:
@@ -835,7 +1100,7 @@ class AppHandler(BaseHTTPRequestHandler):
             raise ApiError(401, "AUTH_REQUIRED", "A bearer session token is required.")
         return token
 
-    def read_json(self) -> dict[str, Any]:
+    def read_json(self, *, maximum=MAX_JSON_BODY_BYTES) -> dict[str, Any]:
         length_text = self.headers.get("content-length", "0")
         try:
             length = int(length_text)
@@ -845,9 +1110,11 @@ class AppHandler(BaseHTTPRequestHandler):
             ) from exc
         if length < 0:
             raise ApiError(400, "INVALID_CONTENT_LENGTH", "Content-Length is invalid.")
-        if length > MAX_JSON_BODY_BYTES:
+        if length > maximum:
             raise ApiError(
-                413, "REQUEST_TOO_LARGE", "Request body must be 64KB or less."
+                413,
+                "REQUEST_TOO_LARGE",
+                f"Request body must be {maximum} bytes or less.",
             )
         if length == 0:
             return {}
@@ -884,9 +1151,10 @@ class AppHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_error_json(self, exc: ApiError) -> None:
-        self.send_json(
-            {"error": {"code": exc.code, "message": exc.message}}, status=exc.status
-        )
+        error = {"code": exc.code, "message": exc.message}
+        if exc.details is not None:
+            error["details"] = exc.details
+        self.send_json({"error": error}, status=exc.status)
 
     def send_text(
         self,
@@ -1112,6 +1380,11 @@ class AppHandler(BaseHTTPRequestHandler):
             "training_eligible_split_counts",
             "split_policy",
         ]
+        fieldnames.extend(
+            key
+            for key in ("rpm_status", "rpm_measured_at", "rpm_source")
+            if any(key in row for row in rows)
+        )
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
@@ -1122,6 +1395,28 @@ class AppHandler(BaseHTTPRequestHandler):
         filename = f"{manifest['siteId']}_{manifest['assetId']}_dataset.csv"
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")
+        self.send_header("content-disposition", f'attachment; filename="{filename}"')
+        self.send_header("x-dataset-checksum", manifest["checksum"])
+        self.send_header("x-dataset-record-count", str(manifest["recordCount"]))
+        self.send_header("cache-control", "no-store")
+        self.send_header("access-control-allow-origin", "*")
+        self.send_header(
+            "access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        )
+        self.send_header("access-control-allow-headers", "authorization, content-type")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_dataset_xlsx(self, export: dict[str, Any]) -> None:
+        manifest = export["manifest"]
+        body = dataset_xlsx_bytes(export)
+        filename = f"{manifest['siteId']}_{manifest['assetId']}_dataset.xlsx"
+        self.send_response(200)
+        self.send_header(
+            "content-type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
         self.send_header("content-disposition", f'attachment; filename="{filename}"')
         self.send_header("x-dataset-checksum", manifest["checksum"])
         self.send_header("x-dataset-record-count", str(manifest["recordCount"]))
@@ -1346,12 +1641,67 @@ def optional_boolean_query(query: dict[str, list[str]], key: str) -> bool | None
 
 
 class MotorDiagnosisServer(ThreadingHTTPServer):
+    # ThreadingHTTPServer defaults to daemon request threads, which are not
+    # joined by server_close. A 2xx write must commit before its DB is closed.
+    daemon_threads = False
+    block_on_close = True
+
+    def __init__(self, *args, **kwargs):
+        self._admission_lock = threading.Lock()
+        self._closing = False
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        with self._admission_lock:
+            if self._closing:
+                self.shutdown_request(request)
+                return
+            # Include thread registration in the admission fence so close()
+            # cannot miss an accepted request that has not started running yet.
+            super().process_request(request, client_address)
+
+    def get_request(self):
+        request, address = super().get_request()
+        # A client that never finishes its headers/body cannot hold shutdown
+        # indefinitely now that accepted request threads are drained.
+        request.settimeout(30.0)
+        return request, address
+
     def start_alert_worker(self):
         self._alert_stop = threading.Event()
         self._alert_worker = threading.Thread(
             target=self._run_alert_worker, name="alert-outbox", daemon=True
         )
         self._alert_worker.start()
+
+    def start_retention_worker(self):
+        self._retention_stop = threading.Event()
+        self._retention_worker = threading.Thread(
+            target=self._run_retention_worker, name="runtime-retention", daemon=True
+        )
+        self._retention_worker.start()
+
+    def _run_retention_worker(self):
+        # Independent of alert delivery and of the HTTP accept loop: expiration
+        # continues on an idle server, including when auto_alerts is disabled.
+        while not self._retention_stop.wait(RETENTION_MAINTENANCE_INTERVAL_SEC):
+            try:
+                maintain_runtime_retention()
+            except Exception:
+                LOGGER.exception("Runtime retention failed; will retry on next tick")
+            try:
+                self.communication_quality.prune()
+            except Exception:
+                LOGGER.exception("Quality retention failed; will retry on next tick")
+            try:
+                self.analysis.prune()
+            except Exception:
+                LOGGER.exception("Analysis retention failed; will retry on next tick")
+            if self.model_inference is not None:
+                try:
+                    self.model_inference.prune()
+                except Exception:
+                    LOGGER.exception("Shadow retention failed; will retry on next tick")
 
     def _run_alert_worker(self):
         # SQLite can wait on another writer. Never perform this work in
@@ -1368,13 +1718,28 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
                 )
 
     def server_close(self):
+        with self._admission_lock:
+            self._closing = True
+        if hasattr(self, "_retention_stop"):
+            self._retention_stop.set()
+            if self._retention_worker.ident is not None:
+                self._retention_worker.join()
         if hasattr(self, "_alert_stop"):
             self._alert_stop.set()
             if self._alert_worker.ident is not None:
                 self._alert_worker.join()
         super().server_close()
+        if getattr(self, "model_inference", None) is not None:
+            self.model_inference.close()
+        if getattr(self, "model_history", None) is not None:
+            self.model_history.close()
+        if hasattr(self, "communication_quality"):
+            self.communication_quality.close()
         if hasattr(self, "alerts"):
             self.alerts.close()
+        if hasattr(self, "analysis"):
+            self.analysis.close()
+        close_runtime_state()
 
 
 def create_server(
@@ -1385,20 +1750,71 @@ def create_server(
     alert_database=":memory:",
     alert_adapters=None,
     auto_alerts=True,
+    state_database=None,
+    communication_database=":memory:",
+    analysis_database=":memory:",
+    model_artifact=None,
+    model_candidate="lstm_autoencoder",
+    model_checksum=None,
+    model_database=":memory:",
+    model_preprocessing_profile=None,
 ) -> ThreadingHTTPServer:
+    # Fail closed before opening sockets or persistent databases in production.
+    authentication_users()
+    validate_ingest_auth()
     if demo_enabled is None:
         demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
-    server = MotorDiagnosisServer((host, port), AppHandler)
+    configure_runtime_state(state_database)
+    try:
+        server = MotorDiagnosisServer((host, port), AppHandler)
+    except Exception:
+        close_runtime_state()
+        raise
     server.demo_enabled = (
         bool(demo_enabled) and os.environ.get("APP_ENV", "").lower() != "production"
     )
     server.auto_alerts = auto_alerts
+    server.model_inference = None
+    server.model_history = None
     try:
+        # Identity protection must survive disabling/replacing the ML runtime.
+        server.model_history = ModelHistoryGuard(model_database)
+        if model_preprocessing_profile and not model_artifact:
+            raise ValueError("Raw preprocessing requires an explicit checkpoint")
+        if model_artifact:
+            from ai.ai2.model_runtime import Checkpoint
+
+            checkpoint = Checkpoint.load(
+                model_artifact,
+                candidate=model_candidate,
+                expected_checksum=model_checksum,
+            )
+            preprocessor = None
+            if model_preprocessing_profile:
+                from ai.ai2.raw_preprocessing import RawPreprocessor
+
+                preprocessor = RawPreprocessor.load(
+                    checkpoint, model_preprocessing_profile
+                )
+            server.model_inference = ModelInferenceStore(
+                checkpoint, model_database, preprocessor=preprocessor
+            )
+        server.analysis = AnalysisStore(analysis_database)
+        server.communication_quality = CommunicationQualityStore(communication_database)
         server.alerts = AlertService(
             alert_database,
             adapters=alert_adapters,
         )
+        if server.model_inference is not None:
+            server.model_inference.start()
         server.start_alert_worker()
+        if (
+            state_database
+            or communication_database != ":memory:"
+            or analysis_database != ":memory:"
+            or (model_artifact and model_database != ":memory:")
+        ):
+            server.start_retention_worker()
     except Exception:
         server.server_close()
         raise

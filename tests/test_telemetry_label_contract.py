@@ -80,12 +80,15 @@ class TelemetryLabelAuthorizationTest(unittest.TestCase):
                 self.assertEqual(invalid.exception.code, "INVALID_TELEMETRY_PAYLOAD")
 
     def test_demo_validation_token_is_disabled_in_production(self) -> None:
+        from tests.auth_fixtures import install_ingest_auth
+
+        token = install_ingest_auth(self)
         with patch.dict("os.environ", {"APP_ENV": "production"}):
             with self.assertRaises(data.ApiError) as disabled:
                 data.telemetry_principal_for_token("demo-telemetry-validation-token")
             self.assertEqual(disabled.exception.status, 401)
             self.assertEqual(disabled.exception.code, "AUTH_REQUIRED")
-            general = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+            general = data.telemetry_principal_for_token(token)
         self.assertNotIn("telemetry:label", general["permissions"])
 
     def test_only_explicit_label_principal_can_store_labels_with_provenance(
@@ -727,6 +730,12 @@ class DatasetLabelPolicyTest(unittest.TestCase):
             "SITE-01-MOT-02",
             {"ratedRpm": 1450},
         )
+        # Use an actual accepted measurement, not the former display fallback.
+        principal = data.telemetry_principal_for_token("demo-telemetry-ingest-token")
+        data.ingest_telemetry(principal, telemetry_payload(
+            assetId="SITE-01-MOT-02", deviceId="DEV-01-MOT-02",
+            rpm=1450, isSynthetic=False,
+        ))
 
         rows_ready = threading.Event()
         continue_export = threading.Event()
@@ -777,7 +786,8 @@ class DatasetLabelPolicyTest(unittest.TestCase):
             1450,
         )
         self.assertEqual(data.get_asset("SITE-01", "SITE-01-MOT-02")["ratedRpm"], 1950)
-        self.assertTrue(all(1400 <= row["rpm"] < 1500 for row in result["rows"]))
+        self.assertEqual([row["rpm"] for row in result["rows"]], [1450])
+        self.assertEqual([row["sequence"] for row in result["rows"]], [1])
 
     def test_dataset_fingerprint_includes_policy_and_snapshot_versions(self) -> None:
         source = {

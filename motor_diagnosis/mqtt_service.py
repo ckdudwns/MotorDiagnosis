@@ -2245,7 +2245,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--client-key", default=os.environ.get("MQTT_CLIENT_KEY"))
     parser.add_argument(
         "--ingest-token",
-        default=os.environ.get("MQTT_INGEST_TOKEN", "demo-mqtt-ingest-token"),
+        default=os.environ.get("MQTT_INGEST_TOKEN"),
+    )
+    parser.add_argument(
+        "--ingest-token-file",
+        default=os.environ.get("MQTT_INGEST_TOKEN_FILE"),
+        help="Private client JSON file; preferred over a token in command arguments.",
     )
     parser.add_argument(
         "--ingest-endpoint",
@@ -2278,7 +2283,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable broker hostname verification for local testing only.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.ingest_token_file:
+        if args.ingest_token is not None:
+            parser.error(
+                "Configure either an ingest token file or an ingest token, not both."
+            )
+        from .ingest_auth import IngestAuthError, read_client_token
+
+        try:
+            args.ingest_token = read_client_token(args.ingest_token_file)
+        except IngestAuthError:
+            parser.error("The private ingest token file is missing or invalid.")
+    production = os.environ.get("APP_ENV", "").strip().lower() == "production"
+    if production and (not args.ingest_token or args.ingest_token.startswith("demo-")):
+        parser.error("Production MQTT requires a non-demo ingest credential.")
+    if args.ingest_token is None:
+        args.ingest_token = "demo-mqtt-ingest-token"
+    return args
 
 
 def mqtt_reason_failed(reason_code: Any) -> bool:

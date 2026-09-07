@@ -70,6 +70,15 @@ AI-1이 별도 체계를 새로 만들면 백엔드·AI-2와 어긋난다.
 이 자동 라벨은 **출발점일 뿐 최종 확정이 아니다** — 운영자가 검토 후 `apply_label_change()`로
 언제든 재조정할 수 있고, 그 변경도 위 history 스키마에 그대로 기록된다.
 
+### 데이터셋 export에서의 취급 (API 명세서 v1.3)
+
+시드 라벨이 붙었더라도 **사람의 검수(`reviewed=true`) 전에는 supervised target으로 승격되지
+않는다.** DATA_EXPORT_01의 `dataset_export_label_fields()`는 신뢰된 라벨 출처
+(사람 검수 결과, 또는 CWRU 같은 검증 가능한 외부 import)만 `ground_truth`/`target_label`로
+올리고, 미검수 이벤트·모델 판정·규칙 기반 이상 후보는 candidate metadata로만 남긴다
+(`label_status`=`weak`, `training_eligible`=`false`). 즉 이 시드 라벨의 역할은 "운영자가
+빠르게 확정하도록 돕는 초기값"이지 학습 정답이 아니다.
+
 ## 대상 확정 후 보완
 
 - 대상 모터의 실제 고장 유형이 정해지면, `NORMAL`/`ANOMALY` 2분류가 아니라

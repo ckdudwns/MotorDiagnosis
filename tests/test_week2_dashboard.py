@@ -22,7 +22,7 @@ class Week2DashboardTest(unittest.TestCase):
         page = render_page()
 
         for text in (
-            "<th>Region</th>",
+            "<th>지역</th>",
             "site.normalAssets",
             "site.warningAssets",
             "site.criticalAssets",
@@ -71,4 +71,4 @@ class Week2DashboardTest(unittest.TestCase):
             page,
         )
         self.assertIn("if (!await renderAssets(assetRequestGeneration)) return;", page)
-        self.assertIn('$("refreshBtn").addEventListener("click", render);', page)
+        self.assertIn('$("refreshBtn").addEventListener("click", () => act(async () => {', page)

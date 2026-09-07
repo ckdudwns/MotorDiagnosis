@@ -111,7 +111,7 @@ def _unique_object(pairs):
     return result
 
 
-def read_account_file(path: str | Path) -> list[dict]:
+def read_private_json(path: str | Path) -> object:
     """Read afresh: revocation/file loss must not reuse a cached account list."""
     try:
         path = Path(path)
@@ -134,10 +134,14 @@ def read_account_file(path: str | Path) -> list[dict]:
             raise AuthConfigurationError(CONFIG_ERROR)
         payload = json.loads(contents, object_pairs_hook=_unique_object)
         validate_json_values(payload)
-        return validate_accounts(payload)
+        return payload
     except (OSError, ValueError, TypeError, RecursionError):
         # Do not expose file contents, hashes, or parser excerpts to HTTP/logs.
         raise AuthConfigurationError(CONFIG_ERROR) from None
+
+
+def read_account_file(path: str | Path) -> list[dict]:
+    return validate_accounts(read_private_json(path))
 
 
 def configured_users() -> list[dict] | None:
@@ -178,6 +182,12 @@ def write_accounts(path: Path, users: list[dict], *, create: bool) -> None:
     """Exclusive create, or atomic replacement. Caller holds the CLI update lock."""
     payload = {"schemaVersion": 1, "users": users}
     validate_accounts(payload)
+    write_private_json(path, payload, create=create)
+
+
+def write_private_json(path: Path, payload: object, *, create: bool) -> None:
+    """Write private JSON exclusively or atomically; caller serializes updates."""
+    validate_json_values(payload)
     encoded = (json.dumps(payload, indent=2, ensure_ascii=True) + "\n").encode()
     if len(encoded) > MAX_FILE_BYTES:
         raise ValueError("Account file is too large.")

@@ -18,7 +18,7 @@ from urllib.request import Request, urlopen
 
 from motor_diagnosis import data
 from motor_diagnosis.server import create_server
-from tests.auth_fixtures import install_production_auth
+from tests.auth_fixtures import install_production_auth, install_ingest_auth
 
 FIXTURE_EXE = os.environ.get("IOT_HEALTH_FIXTURE_EXE", "")
 
@@ -30,6 +30,7 @@ FIXTURE_EXE = os.environ.get("IOT_HEALTH_FIXTURE_EXE", "")
 class IotHealthHttpContractTest(unittest.TestCase):
     def setUp(self):
         install_production_auth(self)
+        self.ingest_token = install_ingest_auth(self)
         self.environment = patch.dict(
             os.environ,
             {"APP_ENV": "production", "DEVICE_HEALTH_TOKEN": "iot-test-health-only"},
@@ -156,7 +157,7 @@ class IotHealthHttpContractTest(unittest.TestCase):
                     status, result = self.post(
                         "/api/telemetry/ingest",
                         body,
-                        token="demo-telemetry-ingest-token",
+                        token=self.ingest_token,
                     )
                     self.assertEqual(status, 201, result)
                     self.assertTrue(result["accepted"])

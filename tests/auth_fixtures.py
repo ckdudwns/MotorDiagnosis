@@ -55,3 +55,31 @@ def install_production_auth(test):
     environment.start()
     test.addCleanup(environment.stop)
     return path
+
+
+def install_ingest_auth(test, *, devices=("DEV-01-MOT-02",), kind="device"):
+    from motor_diagnosis import ingest_auth
+
+    temporary = tempfile.TemporaryDirectory()
+    test.addCleanup(temporary.cleanup)
+    path = Path(temporary.name) / "ingest-tokens.json"
+    token = (
+        "ingest-" + "t" * 43
+    )  # Test-only; production CLI uses secrets.token_urlsafe.
+    payload = {
+        "schemaVersion": 1,
+        "credentials": [
+            {
+                "id": "test-device",
+                "kind": kind,
+                "deviceIds": list(devices),
+                "tokenSha256": ingest_auth.token_hash(token),
+            }
+        ],
+    }
+    ingest_auth.validate_credentials(payload)
+    auth_config.write_private_json(path, payload, create=True)
+    environment = patch.dict(os.environ, {"INGEST_TOKENS_FILE": str(path)})
+    environment.start()
+    test.addCleanup(environment.stop)
+    return token

@@ -94,6 +94,9 @@ def registration(device_id=DEVICE):
 
 class QualitySetup(unittest.TestCase):
     def setUp(self):
+        from tests.auth_fixtures import credentials, install_production_auth
+
+        install_production_auth(self)
         data.close_runtime_state()
         data.reset_runtime_state()
         self.addCleanup(data.reset_runtime_state)
@@ -114,7 +117,7 @@ class QualitySetup(unittest.TestCase):
         )
         self.clock.start()
         self.addCleanup(self.clock.stop)
-        login = data.authenticate({"username": "admin", "password": "admin123"})
+        login = data.authenticate(credentials("admin"))
         self.admin_token = login["session"]["token"]
         self.admin = data.current_user_for_token(self.admin_token)
 

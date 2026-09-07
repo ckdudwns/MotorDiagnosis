@@ -17,6 +17,7 @@ from ai.ai2.week2.anomaly_score import score_telemetry_point
 from ai.ai2.week3.event_lifecycle import AnomalyEventLifecycle, EventLifecycleConfig
 
 from . import device_lifecycle
+from .auth_config import AuthConfigurationError, configured_users, user_fingerprint
 from .demo_signals import (
     DEMO_MODEL_VERSION,
     DEMO_SIGNAL_SOURCE,
@@ -635,7 +636,12 @@ def hash_password(password: str, salt: str) -> str:
 
 
 def verify_password(password: str, user: dict[str, Any]) -> bool:
-    actual = hash_password(password, str(user["passwordSalt"]))
+    actual = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        str(user["passwordSalt"]).encode("utf-8"),
+        user.get("passwordIterations", 100000),
+    ).hex()
     return hmac.compare_digest(actual, str(user["passwordHash"]))
 
 
@@ -1378,15 +1384,28 @@ def reset_runtime_state() -> None:
             LOGIN_STATE[username] = {"failures": 0, "lockedUntil": 0.0}
 
 
+def authentication_users() -> list[dict[str, Any]]:
+    try:
+        users = configured_users()
+    except AuthConfigurationError:
+        raise ApiError(
+            503,
+            "AUTH_NOT_CONFIGURED",
+            "Operator authentication is not configured safely.",
+        ) from None
+    return USERS if users is None else users
+
+
 def authenticate(payload: dict[str, Any]) -> dict[str, Any]:
     username = str(payload.get("username", "")).strip()
     password = str(payload.get("password", ""))
-    user = next((item for item in USERS if item["username"] == username), None)
+    users = authentication_users()
+    user = next((item for item in users if item["username"] == username), None)
     if not user:
         raise ApiError(400, "INVALID_CREDENTIALS", "Check the username or password.")
 
     with STORE_LOCK:
-        state = LOGIN_STATE[username]
+        state = LOGIN_STATE.setdefault(username, {"failures": 0, "lockedUntil": 0.0})
         if float(state["lockedUntil"]) > time.time():
             raise ApiError(
                 423,
@@ -1408,10 +1427,11 @@ def authenticate(payload: dict[str, Any]) -> dict[str, Any]:
 
         state["failures"] = 0
         state["lockedUntil"] = 0.0
-        token = "demo-" + secrets.token_urlsafe(24)
+        token = ("demo-" if users is USERS else "session-") + secrets.token_urlsafe(24)
         SESSIONS[token] = {
             "userId": user["id"],
             "username": username,
+            "authFingerprint": user_fingerprint(user),
             "expiresAt": time.time() + SESSION_SECONDS,
         }
 
@@ -1426,13 +1446,15 @@ def authenticate(payload: dict[str, Any]) -> dict[str, Any]:
 def current_user_for_token(token: str) -> dict[str, Any]:
     if not token:
         raise ApiError(401, "AUTH_REQUIRED", "A bearer session token is required.")
+    users = authentication_users()
     with STORE_LOCK:
         session = SESSIONS.get(token)
         if not session or float(session["expiresAt"]) <= time.time():
             SESSIONS.pop(token, None)
             raise ApiError(401, "INVALID_SESSION", "The session is expired or invalid.")
-        user = next((item for item in USERS if item["id"] == session["userId"]), None)
-        if not user:
+        user = next((item for item in users if item["id"] == session["userId"]), None)
+        if not user or session.get("authFingerprint") != user_fingerprint(user):
+            SESSIONS.pop(token, None)
             raise ApiError(401, "INVALID_SESSION", "The session is expired or invalid.")
         return public_user(user)
 

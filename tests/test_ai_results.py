@@ -19,12 +19,14 @@ from ai.ai1.week4.ai1.tests.test_dataset_version import _draft_manifest
 from ai.ai1.week4.ai1.dataset_versions.dataset_version import freeze_dataset_version
 from motor_diagnosis import ai_results, data, model_registry
 from motor_diagnosis.server import create_server
+from tests.auth_fixtures import credentials, install_production_auth
 
 TOKEN = "ai1-result-test-" + "A" * 40
 
 
 class AIResultTest(unittest.TestCase):
     def setUp(self):
+        install_production_auth(self)
         data.close_runtime_state()
         data.reset_runtime_state()
         self.temp = tempfile.TemporaryDirectory()
@@ -48,7 +50,7 @@ class AIResultTest(unittest.TestCase):
         self.addCleanup(self.finish)
         self.users, self.tokens = {}, {}
         for name in ("system", "admin", "operator"):
-            login = data.authenticate({"username": name, "password": name + "123"})
+            login = data.authenticate(credentials(name))
             self.tokens[name] = login["session"]["token"]
             self.users[name] = data.current_user_for_token(self.tokens[name])
         self.frozen = freeze_dataset_version(_draft_manifest())

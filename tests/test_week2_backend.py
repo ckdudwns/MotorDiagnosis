@@ -26,6 +26,7 @@ from ai.ai2.week1.replay_telemetry import (
 from ai.ai2.week2.anomaly_score import latest_asset_statuses
 
 from motor_diagnosis.data import (
+    DEVICES,
     EVENTS,
     QUARANTINED_DEVICE_MESSAGES,
     TELEMETRY_METRICS,
@@ -197,6 +198,13 @@ class Week2BackendTest(unittest.TestCase):
         ):
             with self.subTest(label=label):
                 reset_runtime_state()
+                # Keep fixture ages independent of elapsed suite time. This test
+                # covers asset review counts, not new device-offline events.
+                for device in DEVICES:
+                    device["lastReceivedAt"] = (
+                        datetime.now(timezone.utc)
+                        - timedelta(seconds=device["lastSeenSecAgo"])
+                    ).isoformat()
                 review_event(
                     self.user("admin", "admin123"),
                     "EV-241",

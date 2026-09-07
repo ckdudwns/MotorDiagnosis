@@ -82,7 +82,7 @@ def render_page() -> str:
   </header>
   <main>
     <section class="login panel" id="loginPanel">
-      <label>사용자<input id="username" value="admin" autocomplete="username"></label>
+      <label>사용자<input id="username" autocomplete="username"></label>
       <label>비밀번호<input id="password" type="password" autocomplete="current-password"></label>
       <button id="loginBtn">로그인</button>
     </section>

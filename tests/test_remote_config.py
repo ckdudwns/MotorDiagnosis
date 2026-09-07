@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from motor_diagnosis import data, remote_config as config
 from motor_diagnosis.server import create_server
+from tests.auth_fixtures import credentials, install_production_auth
 
 DEVICE = "DEV-01-MOT-02"
 TOKEN = "fixture-config-device-one-" + "A" * 32
@@ -26,6 +27,7 @@ FIXTURE = os.environ.get("IOT_CONFIG_FIXTURE_EXE", "")
 
 class ConfigSetup(unittest.TestCase):
     def setUp(self):
+        install_production_auth(self)
         data.close_runtime_state()
         data.reset_runtime_state()
         self.environment = patch.dict(
@@ -42,9 +44,7 @@ class ConfigSetup(unittest.TestCase):
         self.users = {}
         self.tokens = {}
         for username in ("operator", "admin", "system"):
-            login = data.authenticate(
-                {"username": username, "password": username + "123"}
-            )
+            login = data.authenticate(credentials(username))
             self.tokens[username] = login["session"]["token"]
             self.users[username] = data.current_user_for_token(self.tokens[username])
         self.admin = self.users["admin"]

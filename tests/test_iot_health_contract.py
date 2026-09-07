@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 
 from motor_diagnosis import data
 from motor_diagnosis.server import create_server
+from tests.auth_fixtures import install_production_auth
 
 FIXTURE_EXE = os.environ.get("IOT_HEALTH_FIXTURE_EXE", "")
 
@@ -28,6 +29,7 @@ FIXTURE_EXE = os.environ.get("IOT_HEALTH_FIXTURE_EXE", "")
 )
 class IotHealthHttpContractTest(unittest.TestCase):
     def setUp(self):
+        install_production_auth(self)
         self.environment = patch.dict(
             os.environ,
             {"APP_ENV": "production", "DEVICE_HEALTH_TOKEN": "iot-test-health-only"},

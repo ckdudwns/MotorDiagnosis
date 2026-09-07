@@ -1,6 +1,7 @@
 #include <unity.h>
 #include <ArduinoJson.h>
 #include "device_health.h"
+#include "continuous_vibration_health.h"
 #include "firmware_logic.h"
 #include <cstring>
 #include <cstdio>
@@ -9,6 +10,68 @@
 using namespace DeviceHealth;
 namespace {
 constexpr std::int64_t EPOCH = 1788656400000LL;
+void testContinuousBootDisconnectIsJournaledOnceAndRecoveryNeedsWindow() {
+    ContinuousVibration::CaptureHealth health;
+    using State = ContinuousVibration::CaptureHealth::State;
+    auto journal = emptyJournal();
+    const auto sink = [&](Fault fault, bool active, std::uint64_t ms) {
+        return observe(journal, fault, active, 1, ms, EPOCH + ms);
+    };
+    TEST_ASSERT_TRUE(health.record(State::InitFailed, 100, sink));
+    TEST_ASSERT_TRUE(health.record(State::InitFailed, 740, sink));
+    TEST_ASSERT_EQUAL(1, journal.count);
+    TEST_ASSERT_EQUAL(static_cast<unsigned>(Fault::ADXL_INIT), journal.pending[0].code);
+    TEST_ASSERT_EQUAL(100, journal.pending[0].monotonicMs);
+    TEST_ASSERT_EQUAL(1, journal.latest[0].active);
+    // Successful driver initialization does not call Healthy. A complete
+    // acquisition window is the event that clears the latched capture faults.
+    TEST_ASSERT_TRUE(health.record(State::Healthy, 1400, sink));
+    TEST_ASSERT_EQUAL(0, journal.latest[0].active);
+    TEST_ASSERT_EQUAL(1, journal.pending[0].active);
+    TEST_ASSERT_EQUAL(0, journal.pending[1].active);
+    const auto count = journal.count;
+    TEST_ASSERT_TRUE(health.record(State::Healthy, 2040, sink));
+    TEST_ASSERT_EQUAL(count, journal.count);
+}
+
+void testContinuousRuntimeFaultsAreLatchedUntilFullWindow() {
+    ContinuousVibration::CaptureHealth health;
+    using State = ContinuousVibration::CaptureHealth::State;
+    auto journal = emptyJournal();
+    const auto sink = [&](Fault fault, bool active, std::uint64_t ms) {
+        return observe(journal, fault, active, 1, ms, EPOCH + ms);
+    };
+    TEST_ASSERT_TRUE(health.record(State::Healthy, 100, sink));
+    TEST_ASSERT_TRUE(health.record(State::ChannelFailed, 200, sink));
+    TEST_ASSERT_TRUE(health.record(State::TimedOut, 300, sink));
+    TEST_ASSERT_EQUAL(1, journal.latest[static_cast<unsigned>(Fault::ADXL_CHANNEL)].active);
+    TEST_ASSERT_EQUAL(1, journal.latest[static_cast<unsigned>(Fault::VIBRATION_TIMEOUT)].active);
+    TEST_ASSERT_TRUE(health.record(State::Healthy, 1000, sink));
+    TEST_ASSERT_EQUAL(0, journal.latest[static_cast<unsigned>(Fault::ADXL_CHANNEL)].active);
+    TEST_ASSERT_EQUAL(0, journal.latest[static_cast<unsigned>(Fault::VIBRATION_TIMEOUT)].active);
+    TEST_ASSERT_TRUE(validJournal(journal));
+}
+
+void testContinuousRejectedTransitionRemainsRetryable() {
+    ContinuousVibration::CaptureHealth health;
+    using State = ContinuousVibration::CaptureHealth::State;
+    unsigned attempts = 0;
+    const auto blocked = [&](Fault, bool, std::uint64_t) { ++attempts; return false; };
+    TEST_ASSERT_FALSE(health.record(State::InitFailed, 100, blocked));
+    TEST_ASSERT_FALSE(health.record(State::InitFailed, 100, blocked));
+    TEST_ASSERT_EQUAL(2, attempts);
+    auto journal = emptyJournal();
+    const auto sink = [&](Fault fault, bool active, std::uint64_t ms) {
+        return observe(journal, fault, active, 1, ms, EPOCH + ms);
+    };
+    TEST_ASSERT_TRUE(health.record(State::InitFailed, 100, sink));
+    TEST_ASSERT_EQUAL(1, journal.count);
+    TEST_ASSERT_EQUAL(100, journal.pending[0].monotonicMs);
+    TEST_ASSERT_TRUE(ContinuousVibration::CaptureHealth::owns(Fault::ADXL_INIT));
+    TEST_ASSERT_TRUE(ContinuousVibration::CaptureHealth::owns(Fault::ADXL_CHANNEL));
+    TEST_ASSERT_TRUE(ContinuousVibration::CaptureHealth::owns(Fault::VIBRATION_TIMEOUT));
+    TEST_ASSERT_FALSE(ContinuousVibration::CaptureHealth::owns(Fault::I2S_CHANNEL));
+}
 Metrics metrics() {
     Metrics value;
     value.rssiDbm = -61;
@@ -380,6 +443,9 @@ int main(int argc, char** argv) {
         return 0;
     }
     UNITY_BEGIN();
+    RUN_TEST(testContinuousBootDisconnectIsJournaledOnceAndRecoveryNeedsWindow);
+    RUN_TEST(testContinuousRuntimeFaultsAreLatchedUntilFullWindow);
+    RUN_TEST(testContinuousRejectedTransitionRemainsRetryable);
     RUN_TEST(testMetricsFollowBackendContract);
     RUN_TEST(testPayloadRejectsInvalidMetrics);
     RUN_TEST(testPayloadRequiresKnownReportTime);

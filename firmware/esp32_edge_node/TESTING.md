@@ -1,5 +1,11 @@
 # ESP32 firmware regression testing — v1.3-signal-analysis.1
 
+연속 800Hz/640ms 모드는 [연속 진동 구간 안내](../../docs/continuous-vibration-windows.md)를 참고하세요.
+기본 대상은 `esp32-s3-devkitc-1-n8`(8MB, No PSRAM)이며 `test_vibration_window`가 추가됐습니다.
+기존 `esp32-s3-devkitc-1` 환경은 16MB/PSRAM 설정을 보존한 별도 환경입니다.
+2026-09-08 N8 기본은 원시 XYZ 전송입니다. [원시 전송 규격·실보드 시험](../../docs/raw-vibration-windows.md)의
+8구간(5.12초) RAM 큐와 부팅 후 미전송 유실 제한을 확인하세요. 특징 전송 모드는 RAW_VIBRATION_ENABLED=0입니다.
+
 This revision includes device health, bounded remote configuration, communication quality and opt-in edge statistics/requested waveforms while retaining the data-integrity regressions. The native test suite exercises production helper code used directly by `main.cpp`. See [analysis operations](../../docs/signal-analysis-operations.md) for the expanded contract and physical-test limitations.
 
 ## Native regression suite
@@ -120,6 +126,31 @@ API v1.3 defines `timestamp` as an RFC3339 string. Example:
 ```
 
 The firmware now follows this contract. A legacy numeric Unix epoch health timestamp is intentionally rejected so implementation and specification cannot silently drift again.
+
+## Continuous vibration health regression (PR35)
+
+The FIFO owner now queues ADXL initialization/disconnect/timeout transitions
+to `sensorObservations`; the main task alone persists the health journal.
+Repeated identical failures do not enqueue another transition. Only a complete
+512-sample FIFO window clears these capture faults; a cached summary cannot
+clear a newer failure. This is sensor acquisition recovery, not a model verdict.
+When the observation queue fills, acquisition waits rather than discarding the
+transition. A resulting FIFO overrun remains an invalid measurement, not normal.
+
+Native `test_device_health` covers initialization failure/recovery, runtime
+fault latching, transition retry, and capture-owned fault codes. Before release,
+repeat on the actual N8 board with both `RAW_VIBRATION_ENABLED=1` and `=0`:
+
+1. Boot with ADXL345 disconnected; confirm `adxl345_init_failed` in the health
+   API/journal even though the legacy retry counter is not used.
+2. Reconnect; confirm initialization alone does not clear the fault, then a
+   complete window produces the ordered recovery. Audio need not be available.
+3. Disconnect while running, and separately force FIFO overflow/no data;
+   confirm channel-error/timeout and later recovery while HTTP remains usable.
+4. Delay health ACKs/fill the journal, then restore service; confirm pending
+   failure/recovery order and original occurrence times survive without loss.
+
+These hardware cases are a checklist, not completed board-test results.
 
 ## Transport policy
 

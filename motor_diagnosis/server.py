@@ -113,6 +113,8 @@ from .json_validation import loads_strict_json
 from .alerts import AlertService
 from .edge_analysis import AnalysisStore
 from .model_inference import ModelInferenceStore
+from .vibration_windows import VibrationWindowStore
+from .raw_vibration import RawVibrationStore
 from .model_history import ModelHistoryGuard
 from .model_registry import create_baseline_version, create_model_version, versions_for
 from .ai_results import submit_result, review_model
@@ -239,6 +241,11 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
         user = self.require_user()
+        if (len(segments) == 4 and segments[:2] == ["api", "devices"]
+                and segments[3] in {"vibration-windows", "raw-vibration-windows"}):
+            store = self.server.raw_vibration if segments[3] == "raw-vibration-windows" else self.server.vibration_windows
+            self.send_json(store.list_device(user, segments[2]))
+            return
         if (
             len(segments) == 4
             and segments[:2] == ["api", "devices"]
@@ -751,6 +758,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
             result, status = self.server.model_inference.ingest(
                 principal, segments[2], payload, raw=raw_model_path
+            )
+            self.send_json(result, status=status)
+            return
+        if (len(segments) == 4 and segments[:2] == ["api", "devices"]
+                and segments[3] in {"vibration-windows", "raw-vibration-windows"}):
+            store = self.server.raw_vibration if segments[3] == "raw-vibration-windows" else self.server.vibration_windows
+            result, status = store.ingest(
+                telemetry_principal_for_token(self.bearer_token()), segments[2], payload
             )
             self.send_json(result, status=status)
             return
@@ -1701,6 +1716,11 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
                     self.model_inference.prune()
                 except Exception:
                     LOGGER.exception("Shadow retention failed; will retry on next tick")
+            try:
+                self.vibration_windows.prune()
+                self.raw_vibration.prune()
+            except Exception:
+                LOGGER.exception("Window retention failed; will retry on next tick")
 
     def _run_alert_worker(self):
         # SQLite can wait on another writer. Never perform this work in
@@ -1728,6 +1748,10 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
             if self._alert_worker.ident is not None:
                 self._alert_worker.join()
         super().server_close()
+        if getattr(self, "vibration_windows", None) is not None:
+            self.vibration_windows.close()
+        if getattr(self, "raw_vibration", None) is not None:
+            self.raw_vibration.close()
         if getattr(self, "model_inference", None) is not None:
             self.model_inference.close()
         if getattr(self, "model_history", None) is not None:
@@ -1757,6 +1781,9 @@ def create_server(
     model_checksum=None,
     model_database=":memory:",
     model_preprocessing_profile=None,
+    window_database=":memory:",
+    raw_window_database=":memory:",
+    window_model_variant=None,
 ) -> ThreadingHTTPServer:
     # Fail closed before opening sockets or persistent databases in production.
     authentication_users()
@@ -1775,9 +1802,14 @@ def create_server(
     server.auto_alerts = auto_alerts
     server.model_inference = None
     server.model_history = None
+    server.vibration_windows = None
+    server.raw_vibration = None
     try:
         # Identity protection must survive disabling/replacing the ML runtime.
         server.model_history = ModelHistoryGuard(model_database)
+        checkpoint = None
+        if window_model_variant and not model_artifact:
+            raise ValueError("Window inference requires an explicit checkpoint")
         if model_preprocessing_profile and not model_artifact:
             raise ValueError("Raw preprocessing requires an explicit checkpoint")
         if model_artifact:
@@ -1798,6 +1830,12 @@ def create_server(
             server.model_inference = ModelInferenceStore(
                 checkpoint, model_database, preprocessor=preprocessor
             )
+        server.vibration_windows = VibrationWindowStore(
+            window_database,
+            checkpoint=checkpoint if window_model_variant else None,
+            variant=window_model_variant or "base21",
+        )
+        server.raw_vibration = RawVibrationStore(raw_window_database)
         server.analysis = AnalysisStore(analysis_database)
         server.communication_quality = CommunicationQualityStore(communication_database)
         server.alerts = AlertService(
@@ -1806,11 +1844,15 @@ def create_server(
         )
         if server.model_inference is not None:
             server.model_inference.start()
+        server.vibration_windows.start()
+        server.raw_vibration.start()
         server.start_alert_worker()
         if (
             state_database
             or communication_database != ":memory:"
             or analysis_database != ":memory:"
+            or window_database != ":memory:"
+            or raw_window_database != ":memory:"
             or (model_artifact and model_database != ":memory:")
         ):
             server.start_retention_worker()

@@ -244,6 +244,10 @@ def render_page() -> str:
           <label>원시 파형 요청 사유<input id="opsAnalysisReason" maxlength="1000" disabled></label>
           <div class="actions"><button id="opsAnalysisRequest" disabled>다음 구간 파형 보존 요청</button><button id="opsAnalysisLoad" class="secondary" disabled>분석 기록 조회</button></div>
           <div id="opsAnalysisStatus" role="status"></div><div id="opsAnalysisRows"></div><div id="opsWaveform"></div>
+          <h3>연속 진동 구간 · 800Hz / 640ms</h3>
+          <p>구간별 21개 특징과 비교 판정을 조회합니다. 모델 대기·불량 구간은 정상 판정이 아닙니다.</p>
+          <button id="opsWindowsLoad" class="secondary" disabled>최근 진동 구간 100건 조회</button>
+          <div id="opsWindowsStatus" role="status"></div><div id="opsWindowsRows"></div>
         </article>
       </section>
     </section>
@@ -258,6 +262,7 @@ def render_page() -> str:
     let managementGeneration = 0, managementRows = [], managementRow = null, managementInputs = [], managementCreating = false, managementDirty = false, managementScope = null;
     let auditPageNumber = 1, auditGeneration = 0;
     let analysisGeneration = 0, analysisBusy = false, analysisIntent = null;
+    let windowsGeneration = 0;
     let modelQueueGeneration = 0, modelReviewGeneration = 0, modelQueueRows = [], modelReviewRow = null;
     let modelQueuePage = 1, modelQueueTotal = 0, modelReviewBusy = false, pendingModelReview = null;
     let reviewSaving = false, noteSaving = false, managementSaving = false, noteHistoryGeneration = 0;
@@ -1255,10 +1260,13 @@ def render_page() -> str:
       $("opsQualityLoad").disabled = !opsDevice;
       $("opsHistoryLoad").disabled = !opsDevice;
       $("opsAnalysisLoad").disabled = !opsDevice || analysisBusy || !can("telemetry:read");
+      $("opsWindowsLoad").disabled = !opsDevice || !can("telemetry:read") || !can("model:read");
       $("opsAnalysisRequest").disabled = !opsDevice || analysisBusy || !can("telemetry:read") || !can("device:write") || opsDevice.mappingStatus !== "active";
       $("opsAnalysisReason").disabled = $("opsAnalysisRequest").disabled;
     }
     function clearOpsDevice() {
+      windowsGeneration++;
+      $("opsWindowsRows").replaceChildren(); $("opsWindowsStatus").textContent="";
       analysisGeneration++; analysisBusy = false; analysisIntent = null;
       for (const id of ["opsAnalysisRows","opsWaveform"]) $(id).replaceChildren();
       $("opsAnalysisReason").value = ""; $("opsAnalysisStatus").textContent = "";
@@ -1330,6 +1338,25 @@ def render_page() -> str:
         }
         panel.appendChild(card);
       }
+    }
+    async function loadOpsWindows() {
+      if(!opsDevice || !can("telemetry:read") || !can("model:read")) return;
+      const key=opsKey(), generation=++windowsGeneration;
+      $("opsWindowsRows").replaceChildren(); $("opsWindowsStatus").textContent="조회 중…";
+      try {
+        const result=await api(`/api/devices/${encodeURIComponent(opsDevice.id)}/vibration-windows`);
+        if(key!==opsKey() || generation!==windowsGeneration) return;
+        if(result.deviceId!==opsDevice.id || !opsScopeMatches(result)) {rejectOpsScope();return;}
+        const labels={queued:"처리 대기",waiting_model:"모델 대기",unavailable:"판정 불가",completed:"비교 판정 완료"};
+        $("opsWindowsRows").appendChild(statusTable("구간별 수집·분석",["구간 시작","부팅 / 순번","품질","앞선 누락 구간","RMS X / Y / Z (g)","처리 상태","비교 판정"],(result.items||[]).map(item=>{
+          const w=item.window, a=item.analysis, f=w.features;
+          return [formatLocalTime(w.timestamp),`${w.bootId.slice(0,8)} / ${w.windowIndex}`,w.quality,item.missingWindowsBefore,
+            f ? [f[0],f[7],f[14]].join(" / ") : "판정 불가",labels[a.status]||a.status,
+            a.status==="completed" && typeof a.verdict==="boolean" ? (a.verdict?"이상 후보":"정상 후보") : "미판정"];
+        })));
+        $("opsWindowsRows").appendChild(rawDetails("21개 특징·모델 입력·판정 사유 원문",result));
+        $("opsWindowsStatus").textContent=`최근 ${(result.items||[]).length}건 · ${result.retentionHours}시간 보관 · 비교용(알림 미반영)`;
+      } catch(error) {if(key===opsKey() && generation===windowsGeneration) $("opsWindowsStatus").textContent=`조회 실패: ${error.message}`;}
     }
     async function loadOpsAnalysis(prefix="",cursor=null) {
       if(!opsDevice || !can("telemetry:read")) return;
@@ -1588,6 +1615,7 @@ def render_page() -> str:
     $("opsConfigPublish").addEventListener("click", () => act(publishOpsConfig));
     for (const id of ["opsInterval","opsReplay","opsHealthInterval","opsConfigReason"]) $(id).addEventListener("input", () => {opsDirty = true; opsControls();});
     $("opsAnalysisLoad").addEventListener("click",()=>loadOpsAnalysis());
+    $("opsWindowsLoad").addEventListener("click",()=>loadOpsWindows());
     $("opsAnalysisRequest").addEventListener("click",()=>requestOpsWaveform());
     $("opsConfigCancel").addEventListener("click", () => {if (!opsSaving && !opsUncertain) {fillOpsConfig(); opsIntent = null;}});
     for (const [id,step] of [["opsQualityPrev",-1],["opsQualityNext",1]]) $(id).addEventListener("click", () => {if (opsQuality) {opsQualityPage = Math.min(Math.max(1,Math.ceil(opsQuality.items.length / PAGE_SIZE)),Math.max(1,opsQualityPage + step)); renderOpsQuality();}});

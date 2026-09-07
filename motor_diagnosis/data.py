@@ -2971,6 +2971,14 @@ def normalize_rpm_observation(
             reject(
                 "rpmMeasuredAt must be an RFC3339 timestamp (up to six fractional digits) or null."
             )
+        # Validate before parsing: Python 3.14 normalizes 24:00 to the next day.
+        # This contract allows only hours 00-23 and minutes/seconds 00-59.
+        if (
+            int(measured_at[11:13]) > 23
+            or int(measured_at[14:16]) > 59
+            or int(measured_at[17:19]) > 59
+        ):
+            reject("rpmMeasuredAt has an invalid clock time.")
         # Limit offset components as fromisoformat also accepts overflowing minutes.
         if measured_at[-1:] not in {"Z", "z"} and (
             int(measured_at[-5:-3]) > 23 or int(measured_at[-2:]) > 59

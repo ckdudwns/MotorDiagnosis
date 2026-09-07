@@ -9,6 +9,7 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.etree import ElementTree
@@ -175,6 +176,11 @@ class MeasuredRpmContractTest(RpmSetup):
             "2026-09-02T10:00:00",
             "2026-02-30T10:00:00Z",
             "2026-09-02T24:00:00Z",
+            "2026-09-02T24:00:00.000000Z",
+            "2026-09-02t24:00:00z",
+            "2026-09-02T24:00:00+09:00",
+            "2026-09-02T25:00:00Z",
+            "2026-09-02T10:60:00Z",
             "2026-09-02T10:00:60Z",
             "2026-09-02T10:00:00+01:60",
             "2026-09-02T10:00:00+24:00",
@@ -182,12 +188,48 @@ class MeasuredRpmContractTest(RpmSetup):
             "2026-09-02T10:00:00.1234567Z",
             "0001-01-01T00:00:00+01:00",
         ):
-            with (
-                self.subTest(timestamp=timestamp),
-                self.assertRaises(data.ApiError) as error,
-            ):
-                data.normalize_telemetry_payload(self.payload(rpmMeasuredAt=timestamp))
-            self.assertEqual(error.exception.status, 400)
+            with self.subTest(timestamp=timestamp):
+                with self.assertRaises(data.ApiError) as error:
+                    data.normalize_telemetry_payload(
+                        self.payload(rpmMeasuredAt=timestamp)
+                    )
+                self.assertEqual(error.exception.status, 400)
+
+    def test_clock_range_is_rejected_before_permissive_datetime_parser(self):
+        # Python 3.14 accepts 24:00 as the next day. The contract must not
+        # depend on the interpreter rejecting or normalizing clock fields.
+        for clock in (
+            "24:00:00",
+            "24:00:00.000000",
+            "25:00:00",
+            "10:60:00",
+            "10:00:60",
+        ):
+            with self.subTest(clock=clock):
+                with patch.object(
+                    data, "parse_rfc3339", return_value=self.started
+                ) as parser:
+                    with self.assertRaises(data.ApiError) as error:
+                        data.normalize_rpm_observation(
+                            self.payload(rpmMeasuredAt=f"2026-09-02T{clock}Z"),
+                            self.started,
+                        )
+                    self.assertEqual(error.exception.status, 400)
+                    parser.assert_not_called()
+
+    def test_clock_boundaries_remain_valid(self):
+        capture = datetime(2026, 9, 4, tzinfo=timezone.utc)
+        for measured_at, expected in (
+            ("2026-09-02T00:00:00Z", "2026-09-02T00:00:00.000Z"),
+            ("2026-09-02T23:59:59.999999Z", "2026-09-02T23:59:59.999Z"),
+            ("2026-09-02t23:59:59z", "2026-09-02T23:59:59.000Z"),
+            ("2026-09-02T23:59:59+09:00", "2026-09-02T14:59:59.000Z"),
+        ):
+            with self.subTest(measured_at=measured_at):
+                result = data.normalize_rpm_observation(
+                    self.payload(rpmMeasuredAt=measured_at), capture
+                )
+                self.assertEqual(result["rpmMeasuredAt"], expected)
 
     def test_measurement_time_is_normalized_to_utc_and_kept_during_delayed_ingest(self):
         measured = self.started - timedelta(minutes=10)
@@ -371,6 +413,21 @@ class MeasuredRpmHttpTest(RpmSetup):
         )
         self.assertEqual(status, 400, result)
         self.assertEqual(data.TELEMETRY_RECORDS, [])
+
+    def test_http_rejects_end_of_day_measurement_without_storing_it(self):
+        for measured_at in (
+            "2026-09-02T24:00:00Z",
+            "2026-09-02T24:00:00.000000Z",
+            "2026-09-02T24:00:00+09:00",
+        ):
+            with self.subTest(measured_at=measured_at):
+                status, result = self.request(
+                    "/api/telemetry/ingest",
+                    self.payload(rpmMeasuredAt=measured_at),
+                    token="demo-telemetry-ingest-token",
+                )
+                self.assertEqual(status, 400, result)
+                self.assertEqual(data.TELEMETRY_RECORDS, [])
 
     def test_mqtt_http_bridge_preserves_original_observation(self):
         payload = self.payload(rpm=None, rpmStatus="stale")

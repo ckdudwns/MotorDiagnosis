@@ -84,7 +84,9 @@ void finish(Quality quality) {
         heap_caps_free(capturing.audioWindow);
         capturing.audioWindow = nullptr;
     }
-    if (capturing.quality == Quality::Valid && audioReady.load() &&
+    // Audio validity is independent from vibration quality. A partial
+    // vibration capture may still have a valid, silent acoustic window.
+    if (capturing.count > 0 && audioReady.load() &&
         capturing.audioGeneration == audioErrorGeneration.load()) {
         auto* window = static_cast<std::int32_t*>(heap_caps_malloc(
             sizeof(std::int32_t) * COMMON_AUDIO_SAMPLES,
@@ -337,7 +339,7 @@ bool snapshot(VibrationFeatures& vib, AcousticFeatures& audio) {
     bool hasLatestSnapshot;
     bool latestAudioValidSnapshot;
     xSemaphoreTake(mutex, portMAX_DELAY);
-    available=hasLatest && latestAudioValid;
+    available=hasLatest;
     hasLatestSnapshot=hasLatest;
     latestAudioValidSnapshot=latestAudioValid;
     f=latest; generation=latestAudioGeneration;

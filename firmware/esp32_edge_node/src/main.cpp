@@ -2186,6 +2186,7 @@ bool syncTimeFromBackend()
     WiFiClientSecure secureClient;
     BackendHttp http;
 
+
     http.setConnectTimeout(
         3000
     );
@@ -5626,12 +5627,13 @@ PostOutcome postPacket(
     WiFiClientSecure secureClient;
     BackendHttp http;
 
+    secureClient.setHandshakeTimeout(10);
     http.setConnectTimeout(
-        3000
+        10000
     );
 
     http.setTimeout(
-        3000
+        10000
     );
 
     if (
@@ -5711,6 +5713,19 @@ PostOutcome postPacket(
             http.errorToString(
                 statusCode
             );
+
+        char tlsError[128] = {};
+        const int tlsErrorCode =
+            secureClient.lastError(
+                tlsError,
+                sizeof(tlsError)
+            );
+        Serial.printf(
+            "[TELEMETRY] POST failed: status=%d, tls_error=%d, detail=%s\n",
+            statusCode,
+            tlsErrorCode,
+            tlsError[0] != '\0' ? tlsError : "none"
+        );
     }
 
     outcome.result = classifyHttpOutcome(packet, statusCode, outcome.response);

@@ -267,6 +267,9 @@ pio run -d firmware/esp32_edge_node -e esp32-s3-devkitc-1
 
 ## 10. 개발·협업 규칙
 
+EC2 백업·복구 점검, 용량·장시간 수집 검사 및 임시 SSH 키 정리는
+[운영 마무리 절차](docs/production-operations.md)를 참고하세요.
+
 신호별 실시간 기준선, 요청 파형·AI1 인계, 이벤트 설치 정보와 건강 보고 주기 확장은
 [신호 분석 운영 확장 안내](docs/signal-analysis-operations.md)를 참고하세요.
 

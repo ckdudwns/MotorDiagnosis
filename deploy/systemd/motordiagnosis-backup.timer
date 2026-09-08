@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily MotorDiagnosis backup at 03:30 UTC (12:30 Korea)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+Unit=motordiagnosis-backup.service
+
+[Install]
+WantedBy=timers.target

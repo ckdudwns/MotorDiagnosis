@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
+import threading
 
 from motor_diagnosis.server import create_server
 from motor_diagnosis.alerts import configured_adapters
@@ -40,12 +42,24 @@ def main() -> None:
     )
     print(f"Bind Edge AI app is running at http://{HOST}:{PORT}")
     print("Press Ctrl+C to stop.")
+    # systemd sends SIGTERM by default. shutdown() must run off the serving thread.
+    stopping = threading.Event()
+
+    def stop_service(signum, frame):
+        if not stopping.is_set():
+            stopping.set()
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+    previous_term = signal.signal(signal.SIGTERM, stop_service)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
+        try:
+            server.server_close()
+        finally:
+            signal.signal(signal.SIGTERM, previous_term)
 
 
 if __name__ == "__main__":

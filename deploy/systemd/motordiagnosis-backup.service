@@ -1,0 +1,13 @@
+[Unit]
+Description=MotorDiagnosis verified database backup
+After=motordiagnosis.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/ubuntu/MotorDiagnosis
+ExecStart=/usr/bin/python3 -m motor_diagnosis.operations backup --service motordiagnosis --destination /var/backups/motordiagnosis
+UMask=0077
+TimeoutStartSec=30min
+# Last resort if the backup helper is killed while the application is stopped.
+ExecStopPost=/usr/bin/python3 -m motor_diagnosis.operations resume-backup --service motordiagnosis

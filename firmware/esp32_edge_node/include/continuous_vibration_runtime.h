@@ -4,6 +4,7 @@
 #include "vibration_window.h"
 #include "continuous_vibration_health.h"
 #include <mbedtls/base64.h>
+#include <esp_heap_caps.h>
 
 #ifndef RAW_VIBRATION_ENABLED
 #define RAW_VIBRATION_ENABLED 0
@@ -18,7 +19,8 @@ bool beginBackendHttp(BackendHttp&, WiFiClientSecure&, const char*);
 namespace ContinuousVibration {
 using namespace VibrationWindow;
 #if RAW_VIBRATION_ENABLED
-constexpr unsigned PendingCapacity = 8; // 5.12 s, internal RAM only; not the feature queue.
+constexpr unsigned PendingCapacity = 8; // PSRAM-backed processing keeps capture from stalling.
+// Keep one raw window per HTTPS request on the N8 internal heap.
 constexpr unsigned BatchCapacity = 2;
 using PendingWindow = Raw;
 constexpr unsigned BatchIntervalMs = 400;
@@ -30,21 +32,23 @@ constexpr unsigned BatchIntervalMs = 1500;
 #endif
 Queue<PendingWindow, PendingCapacity> pending;
 // Static network-task-owned buffers: do not place raw batches on its stack.
-PendingWindow batch[BatchCapacity];
+PendingWindow* batch = nullptr;
 #if RAW_VIBRATION_ENABLED
-unsigned char rawBytes[Samples*3*2];
-unsigned char encodedRaw[Samples*3*2*4/3+1];
+constexpr size_t RawBytesCapacity = Samples*3*2;
+constexpr size_t EncodedRawCapacity = RawBytesCapacity*4/3+1;
+unsigned char* rawBytes = nullptr;
+unsigned char* encodedRaw = nullptr;
 bool encodeRaw(const Raw& raw, JsonObject w) {
-    if (!serializeCountsLE(raw,rawBytes,sizeof(rawBytes))) return false;
+    if (!rawBytes || !encodedRaw || !serializeCountsLE(raw,rawBytes,RawBytesCapacity)) return false;
     size_t length=0;
-    if (mbedtls_base64_encode(encodedRaw,sizeof(encodedRaw),&length,rawBytes,raw.count*6)) return false;
+    if (mbedtls_base64_encode(encodedRaw,EncodedRawCapacity,&length,rawBytes,raw.count*6)) return false;
     encodedRaw[length]=0;
     // Own each string; subsequent windows reuse encodedRaw.
     w["samples"] = String(reinterpret_cast<const char*>(encodedRaw));
     return true;
 }
 #endif
-Workspace workspace;
+Workspace* workspace = nullptr;
 Raw capturing;
 QueueHandle_t rawQueue = nullptr;
 SemaphoreHandle_t mutex = nullptr;
@@ -76,7 +80,35 @@ void resetFifo() {
 void finish(Quality quality) {
     capturing.quality = quality;
     if (quality == Quality::Valid) reportCaptureHealth(CaptureHealth::State::Healthy);
-    if (xQueueSend(rawQueue, &capturing, 0) != pdTRUE) ++processingDrops;
+    if (capturing.audioWindow) {
+        heap_caps_free(capturing.audioWindow);
+        capturing.audioWindow = nullptr;
+    }
+    if (capturing.quality == Quality::Valid && audioReady.load() &&
+        capturing.audioGeneration == audioErrorGeneration.load()) {
+        auto* window = static_cast<std::int32_t*>(heap_caps_malloc(
+            sizeof(std::int32_t) * COMMON_AUDIO_SAMPLES,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!window) window = static_cast<std::int32_t*>(heap_caps_malloc(
+            sizeof(std::int32_t) * COMMON_AUDIO_SAMPLES,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        const auto readyAt = millis();
+        while (window && getAudioTotalSamples() < capturing.audioStart + COMMON_AUDIO_SAMPLES &&
+               millis() - readyAt < 20) vTaskDelay(1);
+        if (window && copyAudioWindow(capturing.audioStart, COMMON_AUDIO_SAMPLES, window))
+            capturing.audioWindow = window;
+        else if (window) heap_caps_free(window);
+    }
+    // Backpressure instead of silently dropping a raw window when processing
+    // is behind; the sample index remains continuous and the queue is bounded.
+    const bool queued = xQueueSend(rawQueue, &capturing, portMAX_DELAY) == pdTRUE;
+    if (queued) {
+        // Ownership of the copied audio buffer moves to the queue item.
+        capturing.audioWindow = nullptr;
+    } else if (capturing.audioWindow) {
+        heap_caps_free(capturing.audioWindow);
+        capturing.audioWindow = nullptr;
+    }
     ++capturing.index; // Includes invalid/dropped windows, never renumber.
     capturing.count = 0;
     capturing.quality = Quality::Valid;
@@ -141,21 +173,26 @@ void processingTask(void*) {
     Raw raw;
     while (true) {
         if (xQueueReceive(rawQueue, &raw, portMAX_DELAY) != pdTRUE) continue;
-        auto features = extract(raw, workspace);
-        // Copy/analyze audio immediately after acquisition, not after HTTP.
-        // The shorter ring covers 640ms plus 128ms scheduling margin.
-        const std::uint32_t waitStart = millis();
-        while (getAudioTotalSamples() < raw.audioStart + COMMON_AUDIO_SAMPLES &&
-               millis() - waitStart < 20) vTaskDelay(1);
-        bool audioValid = raw.quality==Quality::Valid && audioReady.load() &&
-            raw.audioGeneration==audioErrorGeneration.load() &&
-            copyAudioWindow(raw.audioStart,COMMON_AUDIO_SAMPLES,commonAudioWindow) &&
-            DeviceHealth::hasPcmVariation(commonAudioWindow,COMMON_AUDIO_SAMPLES);
+        auto features = extract(raw, *workspace);
+        const auto* audioWindow = raw.audioWindow;
+        // Vibration quality is independent from acoustic validity. A FIFO
+        // overrun must not turn a valid/silent audio window into audio_invalid.
+        bool audioValid = audioWindow && audioReady.load() &&
+            raw.audioGeneration==audioErrorGeneration.load();
         AcousticFeatures acoustic;
-        if (audioValid) acoustic=analyzeCommonAudioWindow(commonAudioWindow,COMMON_AUDIO_SAMPLES);
+        if (audioValid) acoustic=analyzeCommonAudioWindow(audioWindow,COMMON_AUDIO_SAMPLES);
         audioValid = audioValid && raw.audioGeneration==audioErrorGeneration.load();
+        if (raw.audioWindow) {
+            heap_caps_free(raw.audioWindow);
+            raw.audioWindow = nullptr;
+        }
         xSemaphoreTake(mutex, portMAX_DELAY);
 #if RAW_VIBRATION_ENABLED
+        while (pending.size() == PendingCapacity) {
+            xSemaphoreGive(mutex);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            xSemaphoreTake(mutex, portMAX_DELAY);
+        }
         raw.quality = features.quality;
         pending.push(raw);
 #else
@@ -166,6 +203,9 @@ void processingTask(void*) {
         latestAudioGeneration = raw.audioGeneration;
         hasLatest = true;
         xSemaphoreGive(mutex);
+#if RAW_VIBRATION_ENABLED
+        vTaskDelay(1); // Keep raw backlog processing from starving the other tasks.
+#endif
     }
 }
 String timestamp(std::uint64_t sampleUs, std::int64_t epochOffsetUs) {
@@ -184,6 +224,7 @@ void networkTask(void*) {
     unsigned size = 0;
     std::int64_t epochOffset = 0;
     std::uint32_t lastBatch = millis();
+    std::uint32_t retryDelayMs = 2000;
     std::uint64_t reportedDrops = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -248,9 +289,18 @@ void networkTask(void*) {
 #endif
         WiFiClientSecure secure;
         BackendHttp http;
+        const auto cleanupHttp = [&]() {
+            http.end();
+            secure.stop();
+        };
         secure.setHandshakeTimeout(3); http.setConnectTimeout(1500); http.setTimeout(1500);
         http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-        if (!beginBackendHttp(http, secure, url.c_str())) continue;
+        if (!beginBackendHttp(http, secure, url.c_str())) {
+            cleanupHttp();
+            vTaskDelay(pdMS_TO_TICKS(retryDelayMs));
+            retryDelayMs = std::min<std::uint32_t>(60000, retryDelayMs * 2);
+            continue;
+        }
         http.addHeader("Authorization", String("Bearer ")+INGEST_TOKEN);
         http.addHeader("Content-Type", "application/json");
         const int status=http.POST(body);
@@ -265,44 +315,94 @@ void networkTask(void*) {
                              ack[i]["windowIndex"].as<std::uint32_t>()==batch[i].index;
             }
         }
-        http.end();
+        cleanupHttp();
         if (accepted) {
             xSemaphoreTake(mutex, portMAX_DELAY);
             pending.acknowledge(size);
             xSemaphoreGive(mutex);
             Serial.printf("[WINDOW] ACK %u windows through index %lu\n",size,static_cast<unsigned long>(batch[size-1].index));
             size=0; body=""; lastBatch=millis();
+            retryDelayMs = 2000;
         } else {
             Serial.printf("[WINDOW] HTTP %d; unchanged batch retained\n",status);
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            vTaskDelay(pdMS_TO_TICKS(retryDelayMs));
+            retryDelayMs = std::min<std::uint32_t>(60000, retryDelayMs * 2);
         }
     }
 }
 bool snapshot(VibrationFeatures& vib, AcousticFeatures& audio) {
     Features f;
     std::uint32_t generation;
+    bool available;
+    bool hasLatestSnapshot;
+    bool latestAudioValidSnapshot;
     xSemaphoreTake(mutex, portMAX_DELAY);
-    const bool available=hasLatest && latestAudioValid;
+    available=hasLatest && latestAudioValid;
+    hasLatestSnapshot=hasLatest;
+    latestAudioValidSnapshot=latestAudioValid;
     f=latest; generation=latestAudioGeneration;
     audio=latestAudio;
     xSemaphoreGive(mutex);
-    if (!available || f.quality!=Quality::Valid || !audioReady.load() ||
-        generation!=audioErrorGeneration.load() ||
-        static_cast<std::uint64_t>(esp_timer_get_time())-f.startUs>1500000) return false;
+    // The raw capture already copied the exact audio window at completion.
+    // Processing/network backpressure may make the cached feature older than
+    // 1.5 s; age alone does not make this vibration/audio pair unsynchronized.
+    const bool validVibration=f.quality==Quality::Valid;
+    const bool ready=audioReady.load();
+    const std::uint32_t currentGeneration=audioErrorGeneration.load();
+    if (!available || !validVibration || !ready || generation!=currentGeneration) {
+        const char* reason=!hasLatestSnapshot ? "no_latest" :
+            !latestAudioValidSnapshot ? "audio_invalid" :
+            !validVibration ? "vibration_invalid" :
+            !ready ? "audio_not_ready" : "audio_generation_changed";
+        static std::uint32_t lastLogMs=0;
+        const std::uint32_t now=millis();
+        if (now-lastLogMs>=1000) {
+            Serial.printf("[SYNC] snapshot unavailable: reason=%s generation=%lu current=%lu ready=%s quality=%u\n",
+                          reason, static_cast<unsigned long>(generation),
+                          static_cast<unsigned long>(currentGeneration),
+                          ready ? "yes" : "no", static_cast<unsigned>(f.quality));
+            lastLogMs=now;
+        }
+        return false;
+    }
     vib.rmsX=f.values[0]; vib.rmsY=f.values[7]; vib.rmsZ=f.values[14];
     vib.totalRms=std::sqrt(vib.rmsX*vib.rmsX+vib.rmsY*vib.rmsY+vib.rmsZ*vib.rmsZ);
     unsigned axis=vib.rmsY>vib.rmsX?1:0;
     if (vib.rmsZ>f.values[axis*7]) axis=2;
     vib.fftAxis="XYZ"[axis]; vib.peakHz=f.peakHz[axis];
-    return generation==audioErrorGeneration.load();
+    if (generation!=audioErrorGeneration.load()) {
+        Serial.printf("[SYNC] snapshot invalidated during copy: generation=%lu current=%lu\n",
+                      static_cast<unsigned long>(generation),
+                      static_cast<unsigned long>(audioErrorGeneration.load()));
+        return false;
+    }
+    return true;
 }
 bool start() {
+    Serial.printf("[PSRAM] found=%s size=%u free=%u\n",
+                  psramFound() ? "yes" : "no",
+                  static_cast<unsigned>(ESP.getPsramSize()),
+                  static_cast<unsigned>(ESP.getFreePsram()));
     snprintf(boot,sizeof(boot),"%08lx%08lx%08lx%08lx",
              static_cast<unsigned long>(esp_random()),static_cast<unsigned long>(esp_random()),
              static_cast<unsigned long>(esp_random()),static_cast<unsigned long>(esp_random()));
     mutex=xSemaphoreCreateMutex();
-    rawQueue=xQueueCreate(3,sizeof(Raw));
-    if (!mutex || !rawQueue) return false;
+    rawQueue=xQueueCreate(1,sizeof(Raw));
+    const auto alloc = [](size_t bytes) {
+        void* value = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        return value ? value : heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    };
+    workspace = static_cast<Workspace*>(alloc(sizeof(Workspace)));
+    batch = static_cast<PendingWindow*>(alloc(sizeof(PendingWindow) * BatchCapacity));
+#if RAW_VIBRATION_ENABLED
+    rawBytes = static_cast<unsigned char*>(alloc(RawBytesCapacity));
+    encodedRaw = static_cast<unsigned char*>(alloc(EncodedRawCapacity));
+#endif
+    if (!mutex || !rawQueue || !workspace || !batch
+#if RAW_VIBRATION_ENABLED
+        || !rawBytes || !encodedRaw
+#endif
+    ) return false;
     return xTaskCreatePinnedToCore(processingTask,"WindowFeatures",8192,nullptr,2,nullptr,0)==pdPASS &&
            xTaskCreatePinnedToCore(captureTask,"VibrationFIFO",4096,nullptr,4,nullptr,0)==pdPASS &&
            xTaskCreatePinnedToCore(networkTask,"WindowHTTPS",12288,nullptr,1,nullptr,1)==pdPASS;

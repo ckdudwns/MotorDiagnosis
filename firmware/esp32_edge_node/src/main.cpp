@@ -109,6 +109,10 @@ constexpr bool TEST_FORCE_SEQUENCE_NVS_FAIL =
 constexpr bool TEST_FORCE_LITTLEFS_MOUNT_FAIL =
     false;
 
+#ifndef ALLOW_EMPTY_LITTLEFS_FORMAT
+#define ALLOW_EMPTY_LITTLEFS_FORMAT 0
+#endif
+
 // Runtime fault-injection hooks for regression testing. Leave false in
 // production. These never classify an I/O failure as acknowledged data.
 constexpr bool TEST_FORCE_RING_READ_IO_FAIL =
@@ -1833,15 +1837,6 @@ bool acquireSynchronizedFeatures(
         // The audio owner queues the actual occurrence time; serviceSensors()
         // drains it after this acquisition fails, without replacing it with now.
         return false; // No features across a discontinuous DMA stream.
-    }
-
-    if (!DeviceHealth::hasPcmVariation(commonAudioWindow, COMMON_AUDIO_SAMPLES))
-    {
-        // A whole constant digital window is a suspected stuck/missing channel,
-        // not evidence of a perfectly healthy silent machine.
-        audioReinitializeRequested.store(true);
-        observeSensorFault(DeviceHealth::Fault::I2S_CHANNEL, true, healthUptimeMs());
-        return false;
     }
 
     audio =
@@ -6241,6 +6236,20 @@ bool initPersistentStorage()
         !mounted
     )
     {
+#if ALLOW_EMPTY_LITTLEFS_FORMAT
+        Serial.println("[FLASH] N8 test mode: formatting empty LittleFS partition.");
+        mounted = LittleFS.format() && LittleFS.begin(false);
+        if (mounted)
+        {
+            Serial.println("[FLASH] LittleFS formatted and mounted.");
+        }
+#endif
+    }
+
+    if (
+        !mounted
+    )
+    {
         Serial.println(
             "[FLASH] Mount failed after retries. Refusing automatic format to protect existing backlog."
         );
@@ -6335,12 +6344,21 @@ String analysisPath(unsigned slot) { return String("/analysis-") + slot + ".bin"
 bool readAnalysis(unsigned slot, AnalysisHeader& header, std::string& body)
 {
     File file = LittleFS.open(analysisPath(slot), "r");
-    if (!file || file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) != sizeof(header) ||
-        header.magic != 0x45414631 || !header.sequence || !header.bytes || header.bytes > EdgeAnalysis::MAX_FRAME_BYTES ||
-        file.size() != sizeof(header) + header.bytes) return false;
+    if (!file) return false;
+    const bool headerValid =
+        file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) == sizeof(header) &&
+        header.magic == 0x45414631 && header.sequence && header.bytes &&
+        header.bytes <= EdgeAnalysis::MAX_FRAME_BYTES &&
+        file.size() == sizeof(header) + header.bytes;
+    if (!headerValid)
+    {
+        return false;
+    }
     body.resize(header.bytes);
-    return file.read(reinterpret_cast<uint8_t*>(&body[0]), header.bytes) == header.bytes &&
+    const bool valid =
+        file.read(reinterpret_cast<uint8_t*>(&body[0]), header.bytes) == header.bytes &&
         EdgeAnalysis::checksum(body.data(), body.size()) == header.crc;
+    return valid;
 }
 
 void preserveAnalysis(const TelemetryPacket& packet)
@@ -6697,7 +6715,7 @@ bool observeSensorFault(DeviceHealth::Fault fault, bool active, uint64_t observe
     if (!DeviceHealth::observe(candidate, fault, active, bootSessionId, observedMs, observedEpoch))
     {
         healthObservationBlocked = true;
-        Serial.println("[HEALTH] Transition queue full/invalid; sensing paused until it can be recorded.");
+        Serial.println("[HEALTH] Health journal full/invalid; sensing continues without this observation.");
         return false;
     }
     if (candidate.crc == healthJournal.crc) return !healthJournalDirty;
@@ -6706,19 +6724,15 @@ bool observeSensorFault(DeviceHealth::Fault fault, bool active, uint64_t observe
     healthJournal = candidate;
     healthJournalDirty = !persistHealthJournal(candidate);
     if (healthJournalDirty)
-        Serial.println("[HEALTH] Observation not durable yet; retrying storage, sensing paused.");
+        Serial.println("[HEALTH] Observation not durable yet; retrying storage while sensing continues.");
     return !healthJournalDirty;
 }
 
 void serviceSensors()
 {
     healthObservationBlocked = false;
-    if (!healthJournalUsable || healthJournalDirty) return;
-    if (healthJournal.count == DeviceHealth::JOURNAL_CAPACITY)
-    {
-        healthObservationBlocked = true;
-        return;
-    }
+    // Health journaling is auxiliary state; a full/temporarily dirty journal
+    // must not stop vibration or audio acquisition.
     if (!CONTINUOUS_VIBRATION_ENABLED && !vibrationBusy.load() && adxlRetry.due(millis()))
     {
         const bool initialized = initADXL345();
@@ -6741,9 +6755,9 @@ void serviceSensors()
 void queueAudioFault(DeviceHealth::Fault fault, uint64_t observedMs)
 {
     const SensorObservation observation{fault, true, observedMs};
-    // Bounded queue with backpressure, not a lossy mailbox. This task owns no
-    // mutex or live I2S read while waiting; the main task keeps servicing HTTP.
-    xQueueSend(sensorObservations, &observation, portMAX_DELAY);
+    // Never block a sensor task on auxiliary health persistence.
+    if (xQueueSend(sensorObservations, &observation, 0) != pdTRUE)
+        Serial.println("[HEALTH] Observation queue full; sensing continues.");
 }
 
 void serviceDeviceHealth()
@@ -6782,7 +6796,11 @@ void serviceDeviceHealth()
         healthJournal, queued, headKnown,
         static_cast<int64_t>(oldest.epochSeconds) * 1000LL,
         bootSessionId, reportMonotonic, epochMs);
-    const bool includesFaults = order.transition || order.snapshot;
+    const bool includesFaults = order.transition || order.snapshot
+#if RAW_VIBRATION_ENABLED
+        || healthJournal.count != 0
+#endif
+        ;
     // Current metrics need not wait for an old backlog, but they must not
     // advance analysis boundaries or acknowledge a deferred fault transition.
     const std::string body = DeviceHealth::payload(
@@ -6803,18 +6821,26 @@ void serviceDeviceHealth()
             const int status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
             const String response = status == 200 ? http.getString() : String();
             accepted = DeviceHealth::accepted(status, response.c_str(), DEVICE_ID, epochMs);
-            Serial.printf("[HEALTH] HTTP %d, confirmed=%s, pending=%u\n", status,
+            Serial.printf("[HEALTH] HTTP %d, confirmed=%s, pending(before ACK)=%u\n", status,
                           accepted ? "yes" : "no", static_cast<unsigned>(healthJournal.count));
             http.end();
         }
     }
-    if (accepted && order.transition && healthJournal.count)
+    if (accepted && (order.transition
+#if RAW_VIBRATION_ENABLED
+                     || healthJournal.count != 0
+#endif
+                     ) && healthJournal.count)
     {
         DeviceHealth::Journal candidate = healthJournal;
         DeviceHealth::acknowledgeHead(candidate, bootSessionId, reportMonotonic, epochMs);
         // A failed ACK-marker write leaves the old head for an idempotent retry.
         // Never send its successor until this removal is durable.
-        if (persistHealthJournal(candidate)) healthJournal = candidate;
+        if (persistHealthJournal(candidate)) {
+            healthJournal = candidate;
+            Serial.printf("[HEALTH] ACK durable; pending(after ACK)=%u\n",
+                          static_cast<unsigned>(healthJournal.count));
+        }
         else accepted = false;
     }
     healthSchedule.completed(millis(), accepted);
@@ -7152,8 +7178,7 @@ void loop()
     // P5: one common 0.64 s vibration/acoustic window
     // =================================================
 
-    if ((!CONTINUOUS_VIBRATION_ENABLED && !adxlRetry.ready()) || !audioReady.load() || !healthJournalUsable ||
-        healthJournalDirty || healthObservationBlocked)
+    if ((!CONTINUOUS_VIBRATION_ENABLED && !adxlRetry.ready()) || !audioReady.load())
     {
         delay(200); // Wi-Fi, health reporting and bounded replay remain alive.
         return;
@@ -7242,12 +7267,6 @@ void loop()
     }
     // Send these observations on the next service pass. An HTTP health request
     // here would shift the fresh packet timestamp after the measured window.
-    if (healthJournalDirty || healthObservationBlocked)
-    {
-        delay(MEASUREMENT_INTERVAL_MS);
-        return;
-    }
-
     TelemetryPacket packet;
 
     if (

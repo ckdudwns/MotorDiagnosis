@@ -18,6 +18,8 @@ struct Raw {
     std::uint64_t startUs = 0;
     std::uint64_t audioStart = 0;
     std::uint32_t audioGeneration = 0;
+    // Owned by the processing task after capture; released after analysis.
+    std::int32_t* audioWindow = nullptr;
     std::uint16_t count = 0;
     Quality quality = Quality::Valid;
     std::int16_t xyz[Samples][3]{};

@@ -20,6 +20,8 @@ import subprocess
 import time
 import uuid
 
+from .rf66_package import read_package_files
+
 DB_DEFAULTS = {
     "STATE_DB_PATH": "output/runtime.sqlite3",
     "ALERT_DB_PATH": "output/alerts.sqlite3",
@@ -137,6 +139,8 @@ def maintenance_lock(project):
 
 
 def inventory(project, env, info):
+    if env.get("RF66_MODEL_CHECKSUM") and not env.get("RF66_MODEL_ARTIFACT"):
+        raise ValueError("RF66 checksum requires a model artifact")
     files, absent, seen = [], [], set()
     for key, default in DB_DEFAULTS.items():
         path = local_path(project, env.get(key, default))
@@ -205,8 +209,10 @@ def make_backup(project, env, info, destination, *, stopped):
         if not stopped():
             raise ValueError("Service restarted during backup; incomplete backup retained")
         sha = digest(output)
-        if key == "RF66_MODEL_ARTIFACT" and env.get("RF66_MODEL_CHECKSUM") != "sha256:" + sha:
-            raise ValueError("RF66 artifact checksum mismatch")
+        if key == "RF66_MODEL_ARTIFACT":
+            # sha tracks the entire backup ZIP; the configured checksum pins
+            # model/candidate.joblib inside it. Never deserialize for maintenance.
+            read_package_files(output, env.get("RF66_MODEL_CHECKSUM"))
         manifest["files"].append({"key": key, "file": output.name, "kind": kind,
                                   "originalPath": str(path), "bytes": output.stat().st_size, "sha256": sha})
     write_json(folder / "manifest.json", manifest)  # completion marker LAST
@@ -271,6 +277,8 @@ def verify_backup(folder):
     required = (set(DB_DEFAULTS) - {"SHADOW_MODEL_DB_PATH"}) | {"AUTH_USERS_FILE"}
     if not required <= set(keys) or len(keys) != len(set(keys)) or len(names) != len(set(names)):
         raise ValueError("Incomplete/duplicate database set")
+    if manifest.get("modelChecksum") and "RF66_MODEL_ARTIFACT" not in keys:
+        raise ValueError("RF66 model is missing from backup")
     for item in files:
         if not re.fullmatch(r"[A-Z0-9_]+\.(sqlite3|bin)", item["file"]):
             raise ValueError("Invalid backup member name")
@@ -281,6 +289,8 @@ def verify_backup(folder):
             if item["kind"] != "sqlite":
                 raise ValueError("Database type mismatch")
             check_database(path)
+        if item["key"] == "RF66_MODEL_ARTIFACT":
+            read_package_files(path, manifest.get("modelChecksum"))
     return manifest
 
 

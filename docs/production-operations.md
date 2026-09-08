@@ -60,14 +60,26 @@ sudo /usr/bin/python3 -m motor_diagnosis.operations restore-drill --backup BACKU
 
 검사 폴더는 새 경로여야 한다. 이미 존재하면 실패하며 운영 DB는 덮어쓰지 않는다.
 복원 후 실제 서비스는 여전히 기존 DB를 사용한다. 검증 성공은 파일 해시·크기 및
-SQLite `quick_check` 통과를 뜻한다.
+SQLite `quick_check`, RF66 패키지 내부 무결성·모델 체크섬 검사 통과를 뜻한다.
+모델을 실행하거나 현장 성능을 확인하는 검사는 아니다.
 
 백업 내용은 runtime, alerts, analysis, communication-quality, vibration-windows,
 raw-vibration-windows, 존재하는 기존 model-inference DB, 계정·수집 토큰 설정,
 설정된 모델 파일과 systemd 본체·추가 설정, 존재하는 Caddyfile이다.
 원시 DB의 3구간 상태·RF66 사건 이력과 runtime 검수 이력·알림 outbox를 같은 중단 구간에
-저장한다. SQLite backup API로 WAL에 커밋된 내용도 포함한다. 모델 ZIP의 SHA-256을
-기존 설정과 대조하며 모델 역직렬화는 하지 않는다.
+저장한다. SQLite backup API로 WAL에 커밋된 내용도 포함한다.
+
+RF66 체크섬은 다음 두 대상을 구분한다.
+
+- 백업 `manifest.json`의 `files[].sha256`: 복사된 **ZIP 전체**의 SHA-256.
+  백업 파일의 손상·변경을 검사하며 `RF66_MODEL_CHECKSUM`과 비교하지 않는다.
+- `RF66_MODEL_CHECKSUM` 및 백업 `modelChecksum`: ZIP 내부
+  **`model/candidate.joblib`**의 `sha256:<해시>`.
+  내부 모델 바이트 및 패키지 `MANIFEST.json`의 `modelVersion`과 대조한다.
+
+백업 생성·검증·복구 검사 모두 내부 파일 목록과 각 파일의 해시도 확인한다.
+ZIP 크기·중복 파일·암호화 여부 검사는 추론 로더와 같은 코드를 사용한다.
+모델 역직렬화, 패키지에 포함된 코드 실행, ML 라이브러리 로딩은 하지 않는다.
 
 `manifest.json`을 마지막에 기록하며 파일별 해시·원래 경로·소스 커밋을 남긴다.
 실패한 디렉터리는 조사용으로 보존되고 유효한 백업으로 취급하지 않는다. 백업 전체를

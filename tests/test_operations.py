@@ -1,13 +1,17 @@
 """Maintenance failure/recovery contracts using disposable SQLite stores."""
 from contextlib import closing
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 from motor_diagnosis import operations as ops
 
@@ -47,6 +51,31 @@ class OperationsTest(unittest.TestCase):
     def backup(self, **options):
         return ops.make_backup(self.project, self.env, {"User": "ubuntu"}, self.root,
                                stopped=options.get("stopped", lambda: True))
+
+    def rf66_package(self, *, content=b"model bytes; never deserialize in maintenance",
+                     corrupt=None, model_version=None):
+        """Real handoff layout, without requiring executable pickle or ML packages."""
+        path = self.project / "model.zip"
+        checksum = "sha256:" + hashlib.sha256(content).hexdigest()
+        files = {
+            "model/candidate.joblib": content,
+            "input-contract.json": b'{"modelInputShape":[1,66]}',
+            "decision-rule.json": b'{"comparison":">","threshold":0.7}',
+            "environment.json": b'{"packages":{}}',
+        }
+        manifest = {
+            "modelVersion": model_version or checksum,
+            "files": {name: hashlib.sha256(body).hexdigest()
+                      for name, body in files.items()},
+        }
+        if corrupt:
+            files[corrupt] += b"changed after manifest was generated"
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, body in files.items():
+                archive.writestr(name, body)
+            archive.writestr("MANIFEST.json", json.dumps(manifest))
+        self.env.update(RF66_MODEL_ARTIFACT=str(path), RF66_MODEL_CHECKSUM=checksum)
+        return path, checksum
 
     def test_wal_backup_restore_and_private_output(self):
         path = self.project / ops.DB_DEFAULTS["STATE_DB_PATH"]
@@ -119,14 +148,159 @@ class OperationsTest(unittest.TestCase):
             self.assertFalse((self.project / ".operations-backup-resume.json").exists())
 
     def test_model_checksum_and_optional_history(self):
-        model = self.project / "model.zip"
-        model.write_bytes(b"trusted fixture model")
-        self.env.update(RF66_MODEL_ARTIFACT=str(model), RF66_MODEL_CHECKSUM="sha256:wrong")
-        with self.assertRaises(ValueError): self.backup()
-        self.env["RF66_MODEL_CHECKSUM"] = "sha256:" + ops.digest(model)
-        manifest = ops.verify_backup(self.backup())
+        model, checksum = self.rf66_package()
+        archive_hash = ops.digest(model)
+        self.assertNotEqual(checksum, "sha256:" + archive_hash)
+        folder = self.backup()
+        manifest = ops.verify_backup(folder)
         self.assertIn("SHADOW_MODEL_DB_PATH", manifest["absentOptional"])
-        self.assertIn("RF66_MODEL_ARTIFACT", [i["key"] for i in manifest["files"]])
+        item = next(i for i in manifest["files"] if i["key"] == "RF66_MODEL_ARTIFACT")
+        self.assertEqual(item["sha256"], archive_hash)
+        self.assertEqual(manifest["modelChecksum"], checksum)
+        restored = Path(self.temp.name) / "model-restore"
+        self.assertTrue(ops.restore_drill(folder, restored)["verified"])
+        self.assertEqual((restored / item["file"]).read_bytes(), model.read_bytes())
+        self.assertEqual(ops.verify_backup(restored)["modelChecksum"], checksum)
+
+    def test_rf66_backup_rejects_wrong_or_container_checksum(self):
+        model, _ = self.rf66_package()
+        for checksum in (None, "", "sha256:wrong", "sha256:" + "0" * 64,
+                         "sha256:" + ops.digest(model)):
+            with self.subTest(checksum=checksum):
+                self.env["RF66_MODEL_CHECKSUM"] = checksum
+                with self.assertRaises(ValueError):
+                    self.backup()
+                self.assertFalse(list(self.root.glob("*/manifest.json")))
+
+    def test_rf66_backup_rejects_corrupt_members_and_untrusted_model(self):
+        for member in ("model/candidate.joblib", "input-contract.json"):
+            with self.subTest(member=member):
+                self.rf66_package(corrupt=member)
+                with self.assertRaisesRegex(ValueError, "manifest checksum"):
+                    self.backup()
+                self.assertFalse(list(self.root.glob("*/manifest.json")))
+        self.rf66_package(model_version="sha256:" + "0" * 64)
+        with self.assertRaisesRegex(ValueError, "trusted model checksum"):
+            self.backup()
+        _, trusted = self.rf66_package()
+        self.rf66_package(content=b"replacement model", model_version=trusted)
+        self.env["RF66_MODEL_CHECKSUM"] = trusted
+        with self.assertRaisesRegex(ValueError, "trusted model checksum"):
+            self.backup()
+        self.assertFalse(list(self.root.glob("*/manifest.json")))
+
+    def test_rf66_checksum_without_artifact_rejected_before_stopping(self):
+        self.env["RF66_MODEL_CHECKSUM"] = "sha256:" + "0" * 64
+        with mock.patch.object(ops, "discover", return_value=(self.project, self.env, {})), \
+             mock.patch.object(ops, "run") as run:
+            with self.assertRaisesRegex(ValueError, "requires a model artifact"):
+                ops.backup_service("motordiagnosis", self.root)
+            run.assert_not_called()
+        self.assertFalse(self.root.exists())
+
+    def test_rf66_backup_and_restore_need_no_ml_or_application_imports(self):
+        model, checksum = self.rf66_package()
+        code = """
+from pathlib import Path
+import sys
+from tests.test_operations import OperationsTest
+from motor_diagnosis import operations
+
+case = OperationsTest()
+case.setUp()
+try:
+    case.env.update(RF66_MODEL_ARTIFACT=sys.argv[1], RF66_MODEL_CHECKSUM=sys.argv[2])
+    folder = case.backup()
+    assert operations.restore_drill(folder, Path(case.temp.name) / 'restore')['verified']
+    forbidden = {'numpy', 'scipy', 'sklearn', 'joblib', 'torch',
+                 'motor_diagnosis.data', 'motor_diagnosis.server', 'motor_diagnosis.rf66'}
+    assert not forbidden.intersection(sys.modules)
+finally:
+    case.doCleanups()
+"""
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", code, str(model), checksum],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rf66_backup_rejects_non_zip_missing_and_duplicate_model(self):
+        model, _ = self.rf66_package()
+        for kind in ("non_zip", "missing", "duplicate"):
+            with self.subTest(kind=kind):
+                if kind == "non_zip":
+                    model.write_bytes(b"not a ZIP")
+                elif kind == "missing":
+                    with zipfile.ZipFile(model, "w") as archive:
+                        archive.writestr("MANIFEST.json", json.dumps({
+                            "files": {}, "modelVersion": self.env["RF66_MODEL_CHECKSUM"]
+                        }))
+                else:
+                    self.rf66_package()
+                    with zipfile.ZipFile(model, "a") as archive:
+                        with self.assertWarns(UserWarning):
+                            archive.writestr("model/candidate.joblib", b"duplicate")
+                with self.assertRaises(ValueError):
+                    self.backup()
+                self.assertFalse(list(self.root.glob("*/manifest.json")))
+
+    def test_rf66_failure_still_restarts_service_without_complete_backup(self):
+        self.rf66_package(corrupt="model/candidate.joblib")
+        with mock.patch.object(ops, "discover", return_value=(self.project, self.env, {})), \
+             mock.patch.object(ops, "service_info", return_value={"ActiveState": "inactive", "MainPID": "0"}), \
+             mock.patch.object(ops, "run") as run:
+            with self.assertRaises(ValueError):
+                ops.backup_service("motordiagnosis", self.root)
+            self.assertEqual(run.call_args_list[-1], mock.call("systemctl", "start", "motordiagnosis"))
+        self.assertFalse(list(self.root.glob("*/manifest.json")))
+        self.assertFalse((self.project / ".operations-backup-resume.json").exists())
+
+    def test_rf66_restore_rejects_container_tamper_before_creating_destination(self):
+        self.rf66_package()
+        folder = self.backup()
+        model = folder / "RF66_MODEL_ARTIFACT.bin"
+        with model.open("ab") as handle:
+            handle.write(b"archive changed")
+        destination = Path(self.temp.name) / "tampered-restore"
+        with self.assertRaisesRegex(ValueError, "hash/size mismatch"):
+            ops.restore_drill(folder, destination)
+        self.assertFalse(destination.exists())
+
+    def test_rf66_restore_rechecks_inner_model_even_with_updated_archive_hash(self):
+        self.rf66_package()
+        folder = self.backup()
+        manifest_path = folder / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        replacement, _ = self.rf66_package(content=b"different model")
+        model = folder / "RF66_MODEL_ARTIFACT.bin"
+        shutil.copyfile(replacement, model)
+        item = next(i for i in manifest["files"] if i["key"] == "RF66_MODEL_ARTIFACT")
+        item.update(sha256=ops.digest(model), bytes=model.stat().st_size)
+        manifest_path.write_text(json.dumps(manifest))
+        destination = Path(self.temp.name) / "wrong-model-restore"
+        with self.assertRaisesRegex(ValueError, "trusted model checksum"):
+            ops.restore_drill(folder, destination)
+        self.assertFalse(destination.exists())
+
+    def test_rf66_restore_requires_model_entry_and_trusted_checksum(self):
+        self.rf66_package()
+        folder = self.backup()
+        manifest_path = folder / "manifest.json"
+        original = json.loads(manifest_path.read_text())
+        for kind in ("model_missing", "checksum_missing", "checksum_wrong"):
+            manifest = json.loads(json.dumps(original))
+            if kind == "model_missing":
+                manifest["files"] = [i for i in manifest["files"] if i["key"] != "RF66_MODEL_ARTIFACT"]
+            elif kind == "checksum_missing":
+                del manifest["modelChecksum"]
+            else:
+                manifest["modelChecksum"] = "sha256:" + "0" * 64
+            manifest_path.write_text(json.dumps(manifest))
+            destination = Path(self.temp.name) / kind
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                ops.restore_drill(folder, destination)
+            self.assertFalse(destination.exists())
 
     def test_inspection_absent_backlog_and_disk_no_secret_or_creation(self):
         missing = self.project / ops.DB_DEFAULTS["SHADOW_MODEL_DB_PATH"]

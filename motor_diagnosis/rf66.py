@@ -9,12 +9,10 @@ from importlib.metadata import version
 import io
 import json
 import math
-from pathlib import Path
-import re
 import warnings
-import zipfile
 
 from .raw_vibration import FEATURE_PROFILE, NAMES
+from .rf66_package import MAX_ARCHIVE_BYTES, read_package_files
 
 PACKAGES = {"numpy": "2.5.2", "scipy": "1.18.1", "scikit-learn": "1.9.0",
             "joblib": "1.6.0", "threadpoolctl": "3.6.0"}
@@ -22,7 +20,6 @@ PACKAGES = {"numpy": "2.5.2", "scipy": "1.18.1", "scikit-learn": "1.9.0",
 # A changed contract requires numerical acceptance and a new supported digest.
 CONTRACT_SHA256 = "54d50a8af512c0bbc5f43e4fb485f0a9dc1e1e37538b64926ac3c97cc7d88b19"
 NUMERIC_POLICY = "base21 cast float32 then promoted float64; extra45 float64"
-MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 CONFIRMATION_RULE = {
     "width": 3, "requiredHits": 3, "warmupOrInvalid": -1,
     "noConfirmedAnomaly": 0, "confirmedAnomaly": 1,
@@ -40,29 +37,8 @@ def _contract_digest(contract):
 
 
 def _read_package(path, expected_checksum):
-    if not isinstance(expected_checksum, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_checksum):
-        raise ValueError("RF66 requires an independently trusted sha256:<model digest>")
-    with Path(path).open("rb") as stream:
-        content = stream.read(MAX_ARCHIVE_BYTES + 1)
-    if len(content) > MAX_ARCHIVE_BYTES:
-        raise ValueError("RF66 archive exceeds size limit")
-    with zipfile.ZipFile(io.BytesIO(content)) as archive:
-        entries = archive.infolist()
-        names = [entry.filename for entry in entries]
-        if (len(entries) > 64 or len(set(names)) != len(names)
-                or sum(entry.file_size for entry in entries) > MAX_ARCHIVE_BYTES
-                or any(entry.is_dir() or entry.flag_bits & 1 for entry in entries)):
-            raise ValueError("Invalid or oversized RF66 archive")
-        files = {name: archive.read(name) for name in names}
-    manifest = json.loads(files["MANIFEST.json"])
-    hashes = manifest["files"]
-    if set(hashes) != set(files) - {"MANIFEST.json"}:
-        raise ValueError("RF66 manifest membership mismatch")
-    if any(_sha(files[name]) != digest for name, digest in hashes.items()):
-        raise ValueError("RF66 manifest checksum mismatch")
+    files = read_package_files(path, expected_checksum, max_bytes=MAX_ARCHIVE_BYTES)
     model_bytes = files["model/candidate.joblib"]
-    if "sha256:" + _sha(model_bytes) != expected_checksum or manifest["modelVersion"] != expected_checksum:
-        raise ValueError("RF66 trusted model checksum mismatch")
     spec = json.loads(files["input-contract.json"])
     rule = json.loads(files["decision-rule.json"])
     environment = json.loads(files["environment.json"])

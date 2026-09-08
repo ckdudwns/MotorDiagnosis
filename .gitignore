@@ -24,6 +24,8 @@ auth-users*.json.lock
 *.csv
 output/
 tmp/
+.operations-backup.lock
+.operations-backup-resume.json
 graphify-out/
 *.tar
 *.tar.gz

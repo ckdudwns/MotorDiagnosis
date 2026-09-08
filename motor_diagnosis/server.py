@@ -1756,6 +1756,9 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
             if self._alert_worker.ident is not None:
                 self._alert_worker.join()
         super().server_close()
+        # Delivery guards read raw event state; drain deliveries before that DB closes.
+        if hasattr(self, "alerts"):
+            self.alerts.close()
         if getattr(self, "vibration_windows", None) is not None:
             self.vibration_windows.close()
         if getattr(self, "raw_vibration", None) is not None:
@@ -1766,8 +1769,6 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
             self.model_history.close()
         if hasattr(self, "communication_quality"):
             self.communication_quality.close()
-        if hasattr(self, "alerts"):
-            self.alerts.close()
         if hasattr(self, "analysis"):
             self.analysis.close()
         close_runtime_state()

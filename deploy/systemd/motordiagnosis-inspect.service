@@ -1,0 +1,13 @@
+[Unit]
+Description=MotorDiagnosis capacity and data freshness inspection
+After=motordiagnosis.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/ubuntu/MotorDiagnosis
+ExecStart=/usr/bin/python3 -m motor_diagnosis.operations inspect --device DEV-01-MOT-02 --backup-root /var/backups/motordiagnosis
+UMask=0077
+TimeoutStartSec=120
+# Warning is recorded in JSON; critical status leaves the unit failed.
+SuccessExitStatus=1

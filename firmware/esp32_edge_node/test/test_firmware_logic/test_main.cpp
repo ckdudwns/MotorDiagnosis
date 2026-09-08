@@ -73,6 +73,46 @@ void testAckAcceptsNew201()
     );
 }
 
+void testAckAcceptsNestedNonAckMetadata()
+{
+    assertAckResult(
+        AckValidationResult::VALID,
+        201,
+        "{\"accepted\":true,\"duplicate\":false,\"deviceId\":\"DEV-01-MOT-02\",\"sequence\":1234,\"receivedAt\":\"2026-09-07T13:18:16.795Z\",\"lifecycleUpdates\":[{\"kind\":\"asset_event_updated\",\"eventId\":\"AI2-EVENT\",\"created\":false}]}"
+    );
+}
+
+void testAckRejectsMalformedNestedMetadata()
+{
+    const char* malformedResponses[] = {
+        "{\"accepted\":true,\"duplicate\":false,\"deviceId\":\"DEV-01-MOT-02\",\"sequence\":1234,\"lifecycleUpdates\":[not-json]}",
+        "{\"accepted\":true,\"duplicate\":false,\"deviceId\":\"DEV-01-MOT-02\",\"sequence\":1234,\"lifecycleUpdates\":[{\"kind\":}]}",
+        "{\"accepted\":true,\"duplicate\":false,\"deviceId\":\"DEV-01-MOT-02\",\"sequence\":1234,\"lifecycleUpdates\":[\"\\q\"]}"
+    };
+
+    for (const char* response : malformedResponses)
+    {
+        assertAckResult(
+            AckValidationResult::MALFORMED_RESPONSE,
+            201,
+            response
+        );
+    }
+}
+
+void testAckRejectsMalformedNestedStringPrefixes()
+{
+    const char* suffixes[] = {"\\qnull", "\\qtrue", "\\q123", "\\u1234"};
+    for (const char* suffix : suffixes)
+    {
+        std::string response =
+            "{\"accepted\":true,\"duplicate\":false,\"deviceId\":\"DEV-01-MOT-02\",\"sequence\":1234,\"lifecycleUpdates\":[\"";
+        response += suffix;
+        response += "\"]}";
+        assertAckResult(AckValidationResult::MALFORMED_RESPONSE, 201, response.c_str());
+    }
+}
+
 void testAckAcceptsDuplicate200()
 {
     assertAckResult(
@@ -307,6 +347,17 @@ void testHealthContractRejectsNestedTimestamp()
     TEST_ASSERT_FALSE(
         parseHealthTimestampJson(
             "{\"ok\":true,\"meta\":{\"timestamp\":\"2026-09-02T07:52:36Z\"}}",
+            epochMs
+        )
+    );
+}
+
+void testHealthContractRejectsMalformedNestedExtra()
+{
+    std::int64_t epochMs = 0;
+    TEST_ASSERT_FALSE(
+        parseHealthTimestampJson(
+            "{\"ok\":true,\"service\":\"Bind Edge AI backend\",\"timestamp\":\"2026-09-02T07:52:36Z\",\"extra\":[\"\\qnull]}",
             epochMs
         )
     );
@@ -921,6 +972,9 @@ int main(
     UNITY_BEGIN();
 
     RUN_TEST(testAckAcceptsNew201);
+    RUN_TEST(testAckAcceptsNestedNonAckMetadata);
+    RUN_TEST(testAckRejectsMalformedNestedMetadata);
+    RUN_TEST(testAckRejectsMalformedNestedStringPrefixes);
     RUN_TEST(testAckAcceptsDuplicate200);
     RUN_TEST(testAckRejects204EvenThough2xx);
     RUN_TEST(testAckRejectsWrongDevice);
@@ -944,6 +998,7 @@ int main(
     RUN_TEST(testHealthContractParsesActualV13Shape);
     RUN_TEST(testHealthContractRejectsLegacyNumericEpoch);
     RUN_TEST(testHealthContractRejectsNestedTimestamp);
+    RUN_TEST(testHealthContractRejectsMalformedNestedExtra);
 
     RUN_TEST(testCanonicalPayloadStableAcrossFloatRoundTrip);
     RUN_TEST(testCanonicalPayloadKeepsTelemetryUnlabeled);

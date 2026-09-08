@@ -17,7 +17,8 @@ enum class PrimitiveType
     STRING,
     BOOLEAN,
     NUMBER,
-    NULL_VALUE
+    NULL_VALUE,
+    NESTED
 };
 
 struct PrimitiveValue
@@ -298,6 +299,109 @@ bool parseNumberToken(
     return true;
 }
 
+bool parseJsonValueStrict(
+    const std::string& json,
+    std::size_t& cursor
+);
+
+bool parseJsonObjectStrict(
+    const std::string& json,
+    std::size_t& cursor
+)
+{
+    ++cursor;
+    cursor = skipWhitespace(json, cursor);
+    if (cursor < json.size() && json[cursor] == '}')
+    {
+        ++cursor;
+        return true;
+    }
+
+    while (cursor < json.size())
+    {
+        std::string key;
+        if (!parseJsonString(json, cursor, key)) return false;
+        cursor = skipWhitespace(json, cursor);
+        if (cursor >= json.size() || json[cursor++] != ':') return false;
+        if (!parseJsonValueStrict(json, cursor)) return false;
+        cursor = skipWhitespace(json, cursor);
+        if (cursor >= json.size()) return false;
+        if (json[cursor] == '}')
+        {
+            ++cursor;
+            return true;
+        }
+        if (json[cursor++] != ',') return false;
+        cursor = skipWhitespace(json, cursor);
+    }
+
+    return false;
+}
+
+bool parseJsonArrayStrict(
+    const std::string& json,
+    std::size_t& cursor
+)
+{
+    ++cursor;
+    cursor = skipWhitespace(json, cursor);
+    if (cursor < json.size() && json[cursor] == ']')
+    {
+        ++cursor;
+        return true;
+    }
+
+    while (cursor < json.size())
+    {
+        if (!parseJsonValueStrict(json, cursor)) return false;
+        cursor = skipWhitespace(json, cursor);
+        if (cursor >= json.size()) return false;
+        if (json[cursor] == ']')
+        {
+            ++cursor;
+            return true;
+        }
+        if (json[cursor++] != ',') return false;
+        cursor = skipWhitespace(json, cursor);
+    }
+
+    return false;
+}
+
+bool parseJsonValueStrict(
+    const std::string& json,
+    std::size_t& cursor
+)
+{
+    cursor = skipWhitespace(json, cursor);
+    if (cursor >= json.size()) return false;
+
+    if (json[cursor] == '{') return parseJsonObjectStrict(json, cursor);
+    if (json[cursor] == '[') return parseJsonArrayStrict(json, cursor);
+
+    if (json[cursor] == '"')
+    {
+        PrimitiveValue value;
+        return parseJsonString(json, cursor, value.text);
+    }
+
+    PrimitiveValue value;
+    if (
+        json.compare(cursor, 4, "true") == 0 ||
+        json.compare(cursor, 5, "false") == 0 ||
+        json.compare(cursor, 4, "null") == 0
+    )
+    {
+        if (json.compare(cursor, 4, "true") == 0) cursor += 4;
+        else if (json.compare(cursor, 5, "false") == 0) cursor += 5;
+        else cursor += 4;
+        return true;
+    }
+
+    std::string number;
+    return parseNumberToken(json, cursor, number);
+}
+
 bool parsePrimitiveValue(
     const std::string& json,
     std::size_t& cursor,
@@ -317,15 +421,11 @@ bool parsePrimitiveValue(
         return false;
     }
 
-    // Deliberately reject nested objects/arrays. ACK and /api/health are
-    // flat API-v1.3 contracts. This prevents keys hidden inside nested
-    // documents from being mistaken for top-level acknowledgement fields.
-    if (
-        json[cursor] == '{' ||
-        json[cursor] == '['
-    )
+    if (json[cursor] == '{' || json[cursor] == '[')
     {
-        return false;
+        if (!parseJsonValueStrict(json, cursor)) return false;
+        value.type = PrimitiveType::NESTED;
+        return true;
     }
 
     if (

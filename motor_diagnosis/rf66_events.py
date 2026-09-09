@@ -8,6 +8,7 @@ import json
 import time
 
 from . import data
+from .rf66_timing import continuous_interval, interval_range_us
 
 MODES = {"shadow", "events", "alerts"}
 POLICY = "rf66-event-lifecycle-v1"
@@ -31,6 +32,7 @@ class RF66Events:
     def metadata(self):
         return {"mode": self.mode, "policyId": POLICY, "openHits": 3,
                 "recoveryHits": 3, "maxObservationAgeSeconds": MAX_AGE,
+                "startIntervalRangeUs": interval_range_us(),
                 "notificationsEnabled": self.mode == "alerts", "fieldValidated": False}
 
     def _save_incident(self, event):
@@ -51,7 +53,7 @@ class RF66Events:
         context += [result.get("modelVersion"), result.get("threshold"), self.mode]
         continuous = (state.get("context") == context
                       and state.get("index") == window["windowIndex"] - 1
-                      and abs(window["startUptimeUs"] - state.get("uptime", -1) - 640000) <= 10000)
+                      and continuous_interval(window["startUptimeUs"], state.get("uptime", -1)))
         age = self.clock() - row["captured"]
         valid = (self.mode != "shadow" and -5 <= age <= MAX_AGE
                  and result.get("status") == "completed" and window["quality"] == "valid"

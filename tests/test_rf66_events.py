@@ -1,5 +1,6 @@
 """Synthetic lifecycle and delivery tests; no hardware or external notifications."""
 import json
+from datetime import timedelta
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -68,6 +69,29 @@ class LifecycleTest(RpmSetup):
         self.assertEqual(len(self.events()), 2)
         self.assertNotEqual(self.events()[0]["id"], event_id)
         self.assertIsNone(self.events()[0]["score"])
+
+    def test_time_limits_match_confirmation_for_open_and_recovery(self):
+        for interval, accepted in ((629999, False), (630000, True),
+                                   (655401, True), (656241, True),
+                                   (670000, True), (670001, False), (3000, False)):
+            with self.subTest(interval=interval):
+                self.store = RawVibrationStore(model=self.model, event_mode="events")
+                self.store.events.clock = lambda: self.now
+                self.addCleanup(self.store.close)
+                for i in range(6):
+                    result = self.step(i, score=.8 if i < 3 else 0,
+                        startUptimeUs=i*interval,
+                        timestamp=(self.started+timedelta(microseconds=i*interval)).isoformat())
+                    self.assertEqual(result["confirmation"]["validWindows"],
+                                     result["eventLifecycle"]["validWindows"])
+                    if i == 2:
+                        self.assertEqual(bool(result["eventLifecycle"]["activeEventId"]), accepted)
+                records = self.store.db.execute("SELECT payload FROM rf66_incidents").fetchall()
+                self.assertEqual(len(records), 1 if accepted else 0)
+                if accepted:
+                    event = json.loads(records[0][0])
+                    self.assertEqual(event["status"], "closed")
+                    self.assertEqual(event["rf66Policy"]["startIntervalRangeUs"], [630000, 670000])
 
     def test_invalid_gap_boot_and_missing_input_never_resolve(self):
         self.open_event()

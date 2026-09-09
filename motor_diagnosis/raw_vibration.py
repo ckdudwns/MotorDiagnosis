@@ -13,6 +13,7 @@ import struct
 
 from .vibration_windows import KEYS, VibrationWindowStore, reject, validate_envelope
 from .window_features import FEATURE_NAMES
+from .rf66_timing import continuous_interval, interval_range_us
 
 PROFILE_ID = "adxl345-800hz-xyz-counts-v1"
 FEATURE_PROFILE = "mcc5-vibration-800hz-spectral66-v1"
@@ -218,8 +219,8 @@ class RawVibrationStore(VibrationWindowStore):
                 reason = "MODEL_CHANGED"
             elif row["gap"] or window["windowIndex"] != old_window["windowIndex"] + 1:
                 reason = "WINDOW_GAP"
-            # Conservative continuity guard, not a field sampling calibration.
-            elif abs(window["startUptimeUs"] - old_window["startUptimeUs"] - 640000) > 10000:
+            # Explicit asymmetric limits: preserve the 630ms lower bound.
+            elif not continuous_interval(window["startUptimeUs"], old_window["startUptimeUs"]):
                 reason = "TIME_GAP"
             elif (old_result.get("status") != "completed" or old_window["quality"] != "valid"
                   or old.get("policyId") != policy or old_result.get("confirmationApplied") is not True):
@@ -245,6 +246,7 @@ class RawVibrationStore(VibrationWindowStore):
             "validWindows": len(history), "anomalyHits": sum(history),
             "verdicts": history, "decision": decision, "status": status,
             "resetReason": reason, "affectsAlerts": False,
+            "startIntervalRangeUs": interval_range_us(),
         }
         result["eventLifecycle"] = self.events.apply(row, window, result)
         return result

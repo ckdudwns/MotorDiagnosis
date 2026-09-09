@@ -91,6 +91,51 @@ class ConfirmationTest(RpmSetup):
         self.assertEqual(result["confirmation"]["resetReason"], "TIME_GAP")
         self.assertEqual(result["confirmation"]["validWindows"], 1)
 
+    def test_asymmetric_time_boundaries_and_measured_intervals(self):
+        for interval, accepted in ((629999, False), (630000, True),
+                                   (650000, True), (655401, True),
+                                   (656241, True), (670000, True),
+                                   (670001, False), (3000, False)):
+            with self.subTest(interval=interval):
+                self.store = RawVibrationStore(model=self.model)
+                self.addCleanup(self.store.close)
+                for i in range(3):
+                    result = self.step(i, startUptimeUs=i*interval,
+                        timestamp=(self.started+timedelta(microseconds=i*interval)).isoformat())
+                    self.assertEqual(result["score"], .8)
+                    self.assertTrue(result["verdict"])
+                c = result["confirmation"]
+                self.assertEqual(c["decision"], 1 if accepted else -1)
+                self.assertEqual(c["validWindows"], 3 if accepted else 1)
+                self.assertEqual(c["resetReason"], None if accepted else "TIME_GAP")
+                self.assertEqual(c["startIntervalRangeUs"], [630000, 670000])
+
+    def test_relaxed_intervals_still_reset_on_quality_index_and_boot(self):
+        def at(index, **changes):
+            return self.step(index, startUptimeUs=index*655000,
+                timestamp=(self.started+timedelta(microseconds=index*655000)).isoformat(), **changes)
+        at(0); at(1)
+        at(2, quality="fifo_overrun", sampleCount=0, samples="")
+        self.assertEqual(at(3)["confirmation"]["validWindows"], 1)
+        at(4)
+        self.assertEqual(at(6)["confirmation"]["resetReason"], "WINDOW_GAP")
+        at(7)
+        c = at(0, bootId="d"*32)["confirmation"]
+        self.assertEqual((c["resetReason"], c["validWindows"]), ("STREAM_CHANGED", 1))
+
+    def test_old_results_are_not_recalculated_when_range_changes(self):
+        def at(index):
+            return self.step(index, startUptimeUs=index*655000,
+                timestamp=(self.started+timedelta(microseconds=index*655000)).isoformat())
+        with mock.patch("motor_diagnosis.rf66_timing.MAX_START_INTERVAL_US", 650000):
+            at(0)
+            self.assertEqual(at(1)["confirmation"]["validWindows"], 1)
+        before = self.store.db.execute("SELECT result FROM vibration_windows ORDER BY ordinal").fetchall()
+        self.assertEqual(at(2)["confirmation"]["validWindows"], 2)
+        self.assertEqual(at(3)["confirmation"]["decision"], 1)
+        after = self.store.db.execute("SELECT result FROM vibration_windows ORDER BY ordinal LIMIT 2").fetchall()
+        self.assertEqual([r[0] for r in before], [r[0] for r in after])
+
     def test_duplicates_and_out_of_order_do_not_increment(self):
         self.step(0); self.step(1)
         self.assertEqual(self.send(self.window(0))[1], 200)

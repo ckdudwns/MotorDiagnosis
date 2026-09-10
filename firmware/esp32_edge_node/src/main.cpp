@@ -7141,7 +7141,11 @@ void loop()
         !queueIsEmpty()
     )
     {
+#if ADAPTIVE_TRANSMISSION_ENABLED
+        ContinuousVibration::AdaptiveRuntime::replaySummariesIfDue();
+#else
         replayQueueBatch();
+#endif
     }
 
     // A missing absolute clock no longer blocks sensing. createPacket()
@@ -7279,6 +7283,13 @@ void loop()
             : " (UTC unresolved)"
     );
     preserveAnalysis(packet);
+#if ADAPTIVE_TRANSMISSION_ENABLED
+    // Keep vibration/acoustic summary measurements durable too. The ordered
+    // replay dispatcher batches the upload period, without delaying health.
+    if (!enqueuePersistent(packet)) Serial.println("[ADAPTIVE] Summary persistence failed");
+    delay(MEASUREMENT_INTERVAL_MS);
+    return;
+#endif
 
     // True cold boot without UTC:
     // even if the station is associated with Wi-Fi but NTP/backend time is

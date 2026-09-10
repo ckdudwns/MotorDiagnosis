@@ -331,6 +331,7 @@ def inspect(project, env, device, *, now=None):
         try:
             with closing(readonly(path)) as db:
                 if key in {"RAW_VIBRATION_WINDOW_DB_PATH", "VIBRATION_WINDOW_DB_PATH"}:
+                    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                     item["statuses"] = dict(db.execute("SELECT status,count(*) FROM vibration_windows GROUP BY status"))
                     item["rows"] = sum(item["statuses"].values())
                     limit = 300000 if key == "RAW_VIBRATION_WINDOW_DB_PATH" else 500000
@@ -339,11 +340,16 @@ def inspect(project, env, device, *, now=None):
                         issue("warning", key + ":ROW_CAPACITY")
                     pending = item["statuses"].get("queued", 0)
                     oldest = db.execute("SELECT min(captured) FROM vibration_windows WHERE status='queued'").fetchone()[0]
+                    if key == "RAW_VIBRATION_WINDOW_DB_PATH" and "raw_delivery" in tables:
+                        item["oldestPendingMeasurementAgeSec"] = None if oldest is None else now-oldest
+                        # Archival acquisition time is not processing wait time.
+                        oldest = db.execute("""SELECT min(CASE WHEN d.metadata IS NOT NULL THEN d.received ELSE w.captured END)
+                            FROM vibration_windows w LEFT JOIN raw_delivery d ON w.ordinal=d.ordinal WHERE w.status='queued'""").fetchone()[0]
                     item["oldestPendingAgeSec"] = None if oldest is None else now-oldest
                     if pending >= 3276 or (oldest is not None and now-oldest > 30):
                         issue("warning", key + ":PROCESSING_BACKLOG")
                     if key == "RAW_VIBRATION_WINDOW_DB_PATH":
-                        row = db.execute("SELECT ordinal,captured,boot,idx,body,status,result FROM vibration_windows WHERE device=? ORDER BY ordinal DESC LIMIT 1", (device,)).fetchone()
+                        row = db.execute("SELECT ordinal,captured,boot,idx,body,status,result FROM vibration_windows WHERE device=? ORDER BY captured DESC,ordinal DESC LIMIT 1", (device,)).fetchone()
                         sequence = db.execute("SELECT seq FROM sqlite_sequence WHERE name='vibration_windows'").fetchone()
                         item["acceptedTotal"] = sequence[0] if sequence else 0
                         if row:
@@ -351,7 +357,17 @@ def inspect(project, env, device, *, now=None):
                             item["latest"] = {"ordinal": row[0], "captured": row[1], "bootId": row[2],
                                 "index": row[3], "uptimeUs": body["startUptimeUs"], "quality": body["quality"],
                                 "status": row[5], "reason": analysis.get("reason"), "ageSec": now-row[1]}
-                            if not -5 <= now-row[1] <= 30:
+                            cadence_limit = 30
+                            if "raw_delivery" in tables:
+                                delivery = db.execute("SELECT received,metadata FROM raw_delivery WHERE ordinal=?", (row[0],)).fetchone()
+                                if delivery and delivery[1]:
+                                    metadata = json.loads(delivery[1])
+                                    item["latest"]["transmission"] = metadata
+                                    item["latest"]["receivedAtEpoch"] = delivery[0]
+                                    if metadata.get("policyId") == "edge-trigger-batch-v1" and metadata.get("mode") == "periodic":
+                                        cadence_limit = 360  # 300s reporting period + 60s transport grace; NOT event freshness.
+                            item["latest"]["maxExpectedAgeSec"] = cadence_limit
+                            if not -5 <= now-row[1] <= cadence_limit:
                                 issue("warning", "RAW_INPUT_STALE_OR_FUTURE")
                             if body["quality"] != "valid":
                                 issue("warning", "RAW_INPUT_QUALITY")

@@ -4,6 +4,13 @@
 #include "vibration_window.h"
 #include "continuous_vibration_health.h"
 #include <mbedtls/base64.h>
+#include <cstddef>
+#include "adaptive_transmission.h"
+#include "adaptive_transmission_ack.h"
+#include "adaptive_transmission_config.h"
+#ifndef ADAPTIVE_TRANSMISSION_ENABLED
+#define ADAPTIVE_TRANSMISSION_ENABLED 0
+#endif
 
 #ifndef RAW_VIBRATION_ENABLED
 #define RAW_VIBRATION_ENABLED 0
@@ -15,6 +22,8 @@
 
 #if CONTINUOUS_VIBRATION_ENABLED
 bool beginBackendHttp(BackendHttp&, WiFiClientSecure&, const char*);
+bool queueIsEmpty();
+void replayQueueBatch();
 namespace ContinuousVibration {
 using namespace VibrationWindow;
 #if RAW_VIBRATION_ENABLED
@@ -57,6 +66,9 @@ std::atomic<bool> sensorReady{false};
 std::atomic<std::uint32_t> processingDrops{0};
 char boot[33];
 CaptureHealth captureHealth;
+#if ADAPTIVE_TRANSMISSION_ENABLED
+namespace AdaptiveRuntime { void submit(const Raw&,const Features&); }
+#endif
 
 void reportCaptureHealth(CaptureHealth::State state) {
     captureHealth.record(state, healthUptimeMs(),
@@ -154,10 +166,16 @@ void processingTask(void*) {
         AcousticFeatures acoustic;
         if (audioValid) acoustic=analyzeCommonAudioWindow(commonAudioWindow,COMMON_AUDIO_SAMPLES);
         audioValid = audioValid && raw.audioGeneration==audioErrorGeneration.load();
+        #if ADAPTIVE_TRANSMISSION_ENABLED
+        raw.quality=features.quality;
+        AdaptiveRuntime::submit(raw,features);
+        #endif
         xSemaphoreTake(mutex, portMAX_DELAY);
 #if RAW_VIBRATION_ENABLED
         raw.quality = features.quality;
+#if !ADAPTIVE_TRANSMISSION_ENABLED
         pending.push(raw);
+#endif
 #else
         pending.push(features);
 #endif
@@ -178,7 +196,13 @@ String timestamp(std::uint64_t sampleUs, std::int64_t epochOffsetUs) {
     snprintf(value, sizeof(value), "%s.%06ldZ", date, static_cast<long>(epochUs % 1000000));
     return String(value);
 }
+#if ADAPTIVE_TRANSMISSION_ENABLED
+#include "adaptive_vibration_runtime.h"
+#endif
 void networkTask(void*) {
+#if ADAPTIVE_TRANSMISSION_ENABLED
+    AdaptiveRuntime::networkTask(nullptr);
+#else
     // Frozen bytes/IDs remain identical across timeouts, auth errors and ACK loss.
     String body;
     unsigned size = 0;
@@ -277,6 +301,7 @@ void networkTask(void*) {
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
     }
+#endif
 }
 bool snapshot(VibrationFeatures& vib, AcousticFeatures& audio) {
     Features f;
@@ -303,6 +328,10 @@ bool start() {
     mutex=xSemaphoreCreateMutex();
     rawQueue=xQueueCreate(3,sizeof(Raw));
     if (!mutex || !rawQueue) return false;
+#if ADAPTIVE_TRANSMISSION_ENABLED
+    if (!AdaptiveRuntime::initialize() ||
+        xTaskCreatePinnedToCore(AdaptiveRuntime::spoolTask,"RawSpool",16384,nullptr,1,nullptr,1)!=pdPASS) return false;
+#endif
     return xTaskCreatePinnedToCore(processingTask,"WindowFeatures",8192,nullptr,2,nullptr,0)==pdPASS &&
            xTaskCreatePinnedToCore(captureTask,"VibrationFIFO",4096,nullptr,4,nullptr,0)==pdPASS &&
            xTaskCreatePinnedToCore(networkTask,"WindowHTTPS",12288,nullptr,1,nullptr,1)==pdPASS;

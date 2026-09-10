@@ -86,6 +86,21 @@ class VibrationWindowStore:
     max_rows = None
     max_batch = MAX_BATCH
     list_limit = 100
+    list_order = "ordinal DESC"
+
+    def batch_metadata(self, payload):
+        if not isinstance(payload, dict) or set(payload) != {"windows"}:
+            reject("Expected a windows batch")
+        return None
+
+    def accept_reordered(self, window, stream, metadata):
+        return False
+
+    def record_delivery(self, ordinal, metadata):
+        pass
+
+    def next_queued_row(self):
+        return self.db.execute("SELECT * FROM vibration_windows WHERE status='queued' ORDER BY ordinal LIMIT 1").fetchone()
 
     def input_names(self):
         return feature_names(self.variant)
@@ -159,8 +174,7 @@ class VibrationWindowStore:
 
     @device_lifecycle.serialized
     def ingest(self, principal, device_id, payload):
-        if not isinstance(payload, dict) or set(payload) != {"windows"}:
-            reject("Expected a windows batch")
+        metadata = self.batch_metadata(payload)
         windows = payload["windows"]
         if not isinstance(windows, list) or not 1 <= len(windows) <= self.max_batch:
             reject(f"Batch must contain 1 to {self.max_batch} windows")
@@ -193,18 +207,26 @@ class VibrationWindowStore:
                     context = json.dumps([window[k] for k in ("siteId", "assetId", "profileId")])
                     stream = self.db.execute(
                         "SELECT * FROM window_streams WHERE device=? AND boot=?", (device_id, boot)).fetchone()
-                    if stream and (stream["context"] != context or index <= stream["idx"] or window["startUptimeUs"] <= stream["uptime"]):
-                        reject("Stream context changed or expired/out-of-order window", 409, "WINDOW_SEQUENCE_CONFLICT")
+                    reordered = False
+                    if stream:
+                        if stream["context"] != context:
+                            reject("Stream context changed", 409, "WINDOW_SEQUENCE_CONFLICT")
+                        if index <= stream["idx"] or window["startUptimeUs"] <= stream["uptime"]:
+                            reordered = self.accept_reordered(window, stream, metadata)
+                            if not reordered:
+                                reject("Expired/out-of-order window", 409, "WINDOW_SEQUENCE_CONFLICT")
                     if not stream and self.db.execute("SELECT count(*) FROM window_streams").fetchone()[0] >= MAX_STREAMS:
                         reject("Stream identity capacity reached", 503, "WINDOW_BACKPRESSURE")
-                    gap = index - stream["idx"] - 1 if stream else index
+                    gap = max(0, index - stream["idx"] - 1) if stream else index
                     self.validate_stream_clock(window, captured)
-                    self.db.execute(
+                    inserted = self.db.execute(
                         "INSERT INTO vibration_windows(device,site,asset,boot,idx,captured,digest,body,gap,status) VALUES(?,?,?,?,?,?,?,?,?,'queued')",
                         (device_id, window["siteId"], window["assetId"], boot, index, captured, digest, body, gap))
                     self.db.execute("INSERT OR IGNORE INTO window_identities VALUES(?)", (device_id,))
-                    self.db.execute("INSERT OR REPLACE INTO window_streams VALUES(?,?,?,?,?)",
-                                    (device_id, boot, context, index, window["startUptimeUs"]))
+                    self.record_delivery(inserted.lastrowid, metadata)
+                    if not reordered:
+                        self.db.execute("INSERT OR REPLACE INTO window_streams VALUES(?,?,?,?,?)",
+                                        (device_id, boot, context, index, window["startUptimeUs"]))
                     accepted += 1
                 ack.append({"bootId": boot, "windowIndex": index, "digest": digest})
         return {"deviceId": device_id, "accepted": accepted, "acknowledged": ack}, 202 if accepted else 200
@@ -247,7 +269,7 @@ class VibrationWindowStore:
     def tick(self):
         with self.processing:
             with self.lock:
-                row = self.db.execute("SELECT * FROM vibration_windows WHERE status='queued' ORDER BY ordinal LIMIT 1").fetchone()
+                row = self.next_queued_row()
             if row is None:
                 return False
             window = json.loads(row["body"])
@@ -280,7 +302,7 @@ class VibrationWindowStore:
             data.require_site_access(user, device["siteId"])
         with self.lock:
             rows = self.db.execute(
-                "SELECT * FROM vibration_windows WHERE device=? AND site=? AND asset=? ORDER BY ordinal DESC LIMIT ?",
+                "SELECT * FROM vibration_windows WHERE device=? AND site=? AND asset=? ORDER BY " + self.list_order + " LIMIT ?",
                 (device_id, device["siteId"], device["assetId"], self.list_limit)).fetchall()
         return {"deviceId": device_id, "siteId": device["siteId"], "assetId": device["assetId"],
                 "profileId": self.profile_id, "featureNames": self.input_names(),

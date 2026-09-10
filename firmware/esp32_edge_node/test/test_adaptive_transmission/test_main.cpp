@@ -68,6 +68,82 @@ void testPressureTimerWrapAndUnresolvedOldBoot() {
     Slot slots[2]={{1,0,true,false,false,false},{2,0,true,true,false,true}};
     TEST_ASSERT_EQUAL_UINT(1,selectSlot(slots,2,false,0,2));
 }
+struct SummaryLoop {
+    std::uint32_t now;
+    unsigned queued=0, attempts=0;
+    SummarySchedule schedule;
+    explicit SummaryLoop(std::uint32_t start=0):now(start),schedule(start) {}
+    bool replay(unsigned accepted,bool priority=false,std::uint32_t latencyMs=0) {
+        return schedule.replayIfDue([&] {return now;}, [&] {return queued==0;}, [&] {
+            ++attempts;
+            queued-=accepted<queued?accepted:queued;
+            now+=latencyMs;
+        },priority);
+    }
+};
+void testSummaryWaitsFiveMinutesAfterEveryDrainBeforeFreshEnqueue() {
+    SummaryLoop loop;
+    // Match loop(): bounded replay first, fresh packet enqueue immediately after.
+    // Repeat three batches so a stuck draining flag cannot hide after batch one.
+    for (unsigned batch=0;batch<3;++batch) {
+        for (unsigned measurement=0;measurement<100;++measurement) {
+            ++loop.queued;
+            loop.now+=3000;
+            if (measurement<99) TEST_ASSERT_FALSE(loop.replay(1000));
+        }
+        TEST_ASSERT_TRUE(loop.replay(1000));
+        TEST_ASSERT_EQUAL_UINT(0,loop.queued);
+        ++loop.queued; // Same loop, after replay; no intervening empty poll.
+        TEST_ASSERT_FALSE(loop.replay(1000));
+        TEST_ASSERT_EQUAL_UINT(batch+1,loop.attempts);
+    }
+}
+void testSummaryFailedAndPartialReplayKeepDrainingUntilQueueIsEmpty() {
+    SummaryLoop loop;
+    loop.queued=10; loop.now=NormalIntervalMs;
+    TEST_ASSERT_TRUE(loop.replay(0)); // Failed HTTP/ACK: nothing consumed.
+    TEST_ASSERT_EQUAL_UINT(10,loop.queued);
+    ++loop.queued; loop.now+=3000;
+    TEST_ASSERT_TRUE(loop.replay(4));
+    TEST_ASSERT_EQUAL_UINT(7,loop.queued);
+    ++loop.queued; loop.now+=3000;
+    TEST_ASSERT_TRUE(loop.replay(4));
+    TEST_ASSERT_EQUAL_UINT(4,loop.queued);
+    loop.now+=3000;
+    TEST_ASSERT_TRUE(loop.replay(4, false, 2500));
+    const auto completed=loop.now;
+    ++loop.queued;
+    loop.now=completed+NormalIntervalMs-1;
+    TEST_ASSERT_FALSE(loop.replay(4));
+    loop.now=completed+NormalIntervalMs;
+    TEST_ASSERT_TRUE(loop.replay(4));
+}
+void testSummaryPriorityBypassesWaitAndNormalWaitResumesAfterRecovery() {
+    SummaryLoop loop;
+    loop.queued=1; loop.now=1000;
+    TEST_ASSERT_FALSE(loop.replay(1));
+    TEST_ASSERT_TRUE(loop.replay(1,true));
+    ++loop.queued; loop.now+=3000;
+    TEST_ASSERT_TRUE(loop.replay(1,true));
+    const auto completed=loop.now;
+    ++loop.queued;
+    TEST_ASSERT_FALSE(loop.replay(1));
+    loop.now=completed+NormalIntervalMs-1;
+    TEST_ASSERT_FALSE(loop.replay(1));
+    loop.now=completed+NormalIntervalMs;
+    TEST_ASSERT_TRUE(loop.replay(1));
+}
+void testSummaryEmptyQueueAndMillisWrapPreserveFiveMinuteWait() {
+    SummaryLoop loop(0xfffffff0U);
+    loop.now+=NormalIntervalMs;
+    TEST_ASSERT_FALSE(loop.replay(1)); // Empty scheduled batch starts a new wait.
+    ++loop.queued;
+    TEST_ASSERT_FALSE(loop.replay(1));
+    loop.now+=NormalIntervalMs;
+    TEST_ASSERT_TRUE(loop.replay(1));
+    ++loop.queued;
+    TEST_ASSERT_FALSE(loop.replay(1));
+}
 void testAckRequiresEveryImmutableIdentityAndSuccessfulStorageResponse() {
     struct Record { const char* device="DEV-01-MOT-02"; const char* bootId="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; Raw raw; } records[2];
     records[0].raw.index=2; records[1].raw.index=3;
@@ -97,6 +173,10 @@ int main() {
     RUN_TEST(testCrcDetectsTornPayload);
     RUN_TEST(testFiveMinuteSnapshotAndPriorityPreemption);
     RUN_TEST(testPressureTimerWrapAndUnresolvedOldBoot);
+    RUN_TEST(testSummaryWaitsFiveMinutesAfterEveryDrainBeforeFreshEnqueue);
+    RUN_TEST(testSummaryFailedAndPartialReplayKeepDrainingUntilQueueIsEmpty);
+    RUN_TEST(testSummaryPriorityBypassesWaitAndNormalWaitResumesAfterRecovery);
+    RUN_TEST(testSummaryEmptyQueueAndMillisWrapPreserveFiveMinuteWait);
     RUN_TEST(testAckRequiresEveryImmutableIdentityAndSuccessfulStorageResponse);
     return UNITY_END();
 }

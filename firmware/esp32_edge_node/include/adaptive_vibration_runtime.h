@@ -144,13 +144,10 @@ void spoolTask(void*) {
         else {storageFault.store(true); vTaskDelay(pdMS_TO_TICKS(200));}
     }
 }
-bool summaryDue() {
-    static std::uint32_t last=millis();
-    static bool draining=false;
-    if (urgent.load() || storageFault.load() || healthJournal.count) return true;
-    if (millis()-last>=AdaptiveTransmission::NormalIntervalMs) draining=true;
-    if (draining && queueIsEmpty()) {draining=false; last=millis();}
-    return draining;
+void replaySummariesIfDue() {
+    static AdaptiveTransmission::SummarySchedule schedule(millis());
+    schedule.replayIfDue([] {return millis();}, [] {return queueIsEmpty();},
+        [] {replayQueueBatch();}, urgent.load() || storageFault.load() || healthJournal.count);
 }
 void networkTask(void*) {
     AdaptiveTransmission::FlushSchedule schedule(millis());

@@ -23,6 +23,7 @@
 #if CONTINUOUS_VIBRATION_ENABLED
 bool beginBackendHttp(BackendHttp&, WiFiClientSecure&, const char*);
 bool queueIsEmpty();
+void replayQueueBatch();
 namespace ContinuousVibration {
 using namespace VibrationWindow;
 #if RAW_VIBRATION_ENABLED

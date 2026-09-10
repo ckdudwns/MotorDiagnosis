@@ -3,7 +3,7 @@
 Date: 2026-09-10  
 Branch: `feat/adaptive-https-transmission`  
 Base: `348f1ce`  
-Status: local changes only; no commit, push, deployment, board upload or flash format.
+Initial verification was recorded before commit `5287cc7`. The PR44 follow-up below is a local change; no deployment, board upload or flash format was performed.
 
 ## Results
 
@@ -54,3 +54,31 @@ The native raw parity check additionally needs `IOT_WINDOW_FIXTURE_EXE` to point
 - No RF66 accuracy improvement or guaranteed delivery deadline is claimed.
 
 The implementer-facing handoff and board test matrix are in [IoT proposal](IoT_전송정책_개발제안서_20260910.md).
+
+## PR44 follow-up: summary replay completion (2026-09-10)
+
+Base reviewed: `5287cc7`. The old summary gate only noticed an empty queue at the
+next loop entry. A fresh summary was enqueued after replay in the same loop, so
+the periodic drain could remain enabled indefinitely.
+
+The main loop now uses the host-testable `SummarySchedule` dispatcher. It checks
+the queue immediately after bounded replay returns, before the caller acquires
+and enqueues a fresh summary. An empty queue clears draining and starts a new
+300,000 ms wait from completion. Partial or failed replay leaves pending records
+eligible for retry. The urgent/storage-fault/health-journal bypass remains enabled;
+raw-window batching and the backend are unchanged.
+
+Regression verification:
+
+- Extracted the original gate behavior into the same dispatcher used by firmware;
+  all four new native tests failed before adding the post-replay completion check.
+- After the fix, all 13 adaptive native tests pass (9 existing + 4 new).
+- The 6 existing vibration native tests also pass: 19 C++ tests in total.
+- New cases cover three successive five-minute batches with immediate fresh
+  enqueue, partial/failed replay, completion-time accounting for HTTP latency,
+  priority bypass and normal recovery, an empty queue, and `millis()` wraparound.
+- Both N8 builds pass. Adaptive static RAM remains 205,832 / 327,680 bytes;
+  app size is 1,074,069 / 3,342,336 bytes. The existing N8 build remains unchanged
+  at 209,944 RAM bytes and 1,052,333 app bytes.
+- No backend changes were made or backend tests rerun for this focused follow-up.
+  No physical board measurement or upload was performed.

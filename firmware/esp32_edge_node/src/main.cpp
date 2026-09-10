@@ -7138,13 +7138,14 @@ void loop()
     if (
         WiFi.status() ==
             WL_CONNECTED &&
-#if ADAPTIVE_TRANSMISSION_ENABLED
-        ContinuousVibration::AdaptiveRuntime::summaryDue() &&
-#endif
         !queueIsEmpty()
     )
     {
+#if ADAPTIVE_TRANSMISSION_ENABLED
+        ContinuousVibration::AdaptiveRuntime::replaySummariesIfDue();
+#else
         replayQueueBatch();
+#endif
     }
 
     // A missing absolute clock no longer blocks sensing. createPacket()

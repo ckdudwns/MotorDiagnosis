@@ -101,6 +101,29 @@ inline unsigned selectSlot(const Slot* slots,unsigned capacity,bool priority,
     }
     return best;
 }
+// Summary replay and fresh summary enqueue run in that order in the main loop.
+// Keep this dispatcher portable so tests exercise the same ordering as firmware.
+class SummarySchedule {
+    std::uint32_t last_;
+    bool draining_=false;
+    bool due(std::uint32_t now,bool empty,bool priority) {
+        if (priority) return true;
+        if (now-last_>=NormalIntervalMs) draining_=true;
+        if (draining_ && empty) {draining_=false; last_=now;}
+        return draining_;
+    }
+public:
+    explicit SummarySchedule(std::uint32_t now=0):last_(now) {}
+    template<typename Clock,typename Empty,typename Replay>
+    bool replayIfDue(Clock clock,Empty empty,Replay replay,bool priority=false) {
+        if (!due(clock(),empty(),priority) || empty()) return false;
+        replay();
+        // Observe completion before the caller appends its fresh measurement.
+        // Failed/partial replay keeps the drain active and the source queued.
+        if (empty()) {draining_=false; last_=clock();}
+        return true;
+    }
+};
 class FlushSchedule {
     std::uint32_t last_;
     std::uint64_t cutoff_=0;

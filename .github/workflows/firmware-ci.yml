@@ -82,3 +82,6 @@ jobs:
         run: |
           test ! -f firmware/esp32_edge_node/include/secrets.h
           pio run -d firmware/esp32_edge_node -e "${{ steps.esp_env.outputs.name }}"
+
+      - name: Build opt-in adaptive HTTPS firmware
+        run: pio run -d firmware/esp32_edge_node -e esp32-s3-devkitc-1-n8-adaptive

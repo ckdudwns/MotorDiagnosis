@@ -10,6 +10,7 @@ import cmath
 import json
 import math
 import struct
+import time
 
 from .vibration_windows import KEYS, VibrationWindowStore, reject, validate_envelope
 from .window_features import FEATURE_NAMES
@@ -146,6 +147,45 @@ class RawVibrationStore(VibrationWindowStore):
     max_rows = 300000  # >48 hours for one device at 1.5625 windows/s; bounded globally.
     max_batch = 4
     list_limit = 20
+    list_order = "CASE WHEN EXISTS(SELECT 1 FROM raw_delivery WHERE metadata IS NOT NULL) THEN captured ELSE ordinal END DESC,ordinal DESC"
+
+    def batch_metadata(self, payload):
+        from .transmission_policy import validate_batch
+        return validate_batch(payload)
+
+    def accept_reordered(self, window, stream, metadata):
+        # Explicit opt-in only; legacy transport keeps the old strict contract.
+        if metadata is None or metadata["mode"] == "priority":
+            return False
+        index, uptime = window["windowIndex"], window["startUptimeUs"]
+        if not (index < stream["idx"] and uptime < stream["uptime"]):
+            return False
+        # A backfill may fill a real hole, not rewrite chronology or context.
+        for operator, order in (("<", "DESC"), (">", "ASC")):
+            neighbor = self.db.execute(
+                f"SELECT body FROM vibration_windows WHERE device=? AND boot=? AND idx{operator}? ORDER BY idx {order} LIMIT 1",
+                (window["deviceId"], window["bootId"], index)).fetchone()
+            if neighbor:
+                other = json.loads(neighbor[0])["startUptimeUs"]
+                if (operator == "<" and other >= uptime) or (operator == ">" and other <= uptime):
+                    return False
+        return True
+
+    def record_delivery(self, ordinal, metadata):
+        self.db.execute("INSERT INTO raw_delivery VALUES(?,?,?)",
+                        (ordinal, time.time(), json.dumps(metadata) if metadata else None))
+
+    def next_queued_row(self):
+        # Priority work cannot wait behind a five-minute archival backlog.
+        return self.db.execute("""SELECT w.* FROM vibration_windows w
+            LEFT JOIN raw_delivery d ON d.ordinal=w.ordinal WHERE w.status='queued'
+            ORDER BY CASE WHEN json_extract(d.metadata,'$.mode')='priority' THEN 0 ELSE 1 END,
+                     w.captured,w.ordinal LIMIT 1""").fetchone()
+
+    def prune(self):
+        super().prune()
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM raw_delivery WHERE ordinal NOT IN (SELECT ordinal FROM vibration_windows)")
 
     def __init__(self, database=":memory:", *, model=None, event_mode="shadow"):
         from .rf66_events import RF66Events, MODES
@@ -156,6 +196,8 @@ class RawVibrationStore(VibrationWindowStore):
         self.variant = "spectral66"
         self.db.execute("CREATE TABLE IF NOT EXISTS raw_clock_anchors(device TEXT, boot TEXT, uptime INTEGER, captured REAL, PRIMARY KEY(device,boot))")
         self.db.execute("CREATE INDEX IF NOT EXISTS raw_device_order ON vibration_windows(device,ordinal)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS raw_delivery(ordinal INTEGER PRIMARY KEY,received REAL NOT NULL,metadata TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS raw_confirmation_heads(device TEXT,lane TEXT,ordinal INTEGER,PRIMARY KEY(device,lane))")
         self.db.commit()
         try:
             self.events = RF66Events(self, event_mode)
@@ -204,9 +246,30 @@ class RawVibrationStore(VibrationWindowStore):
         policy = "rf66-consecutive-3-v1"
         history = []
         reason = "STREAM_START"
+        delivery = self.db.execute("SELECT received,metadata FROM raw_delivery WHERE ordinal=?", (row["ordinal"],)).fetchone()
+        metadata = json.loads(delivery["metadata"]) if delivery and delivery["metadata"] else None
+        lane = "live" if metadata and metadata["mode"] == "priority" and -5 <= self.events.clock()-row["captured"] <= 30 else "history"
         previous = self.db.execute(
             "SELECT * FROM vibration_windows WHERE device=? AND ordinal<? ORDER BY ordinal DESC LIMIT 1",
             (row["device"], row["ordinal"])).fetchone()
+        if metadata is not None:
+            previous = self.db.execute("""SELECT w.* FROM vibration_windows w
+                JOIN raw_confirmation_heads h ON w.ordinal=h.ordinal
+                WHERE h.device=? AND h.lane=?""", (row["device"], lane)).fetchone()
+            # Late history cannot move a lane's current observation backwards.
+            if previous is not None and previous["captured"] >= row["captured"]:
+                previous = None
+            else:
+                self.db.execute("INSERT OR REPLACE INTO raw_confirmation_heads VALUES(?,?,?)",
+                                (row["device"], lane, row["ordinal"]))
+            if lane == "history":
+                # Backfill can arrive behind an already analyzed later archive.
+                # Build its own measured-index chain without rewinding live state.
+                previous = self.db.execute("""SELECT * FROM vibration_windows
+                    WHERE device=? AND boot=? AND idx=? AND result IS NOT NULL
+                    AND json_extract(result,'$.transmission.lane')='history'""",
+                    (row["device"], window["bootId"], window["windowIndex"]-1)).fetchone()
+            result["transmission"] = {**metadata, "receivedAtEpoch": delivery["received"], "lane": lane}
         if previous is not None:
             old_window = json.loads(previous["body"])
             old_result = json.loads(previous["result"]) if previous["result"] else {}
@@ -248,7 +311,11 @@ class RawVibrationStore(VibrationWindowStore):
             "resetReason": reason, "affectsAlerts": False,
             "startIntervalRangeUs": interval_range_us(),
         }
-        result["eventLifecycle"] = self.events.apply(row, window, result)
+        if metadata is not None and lane == "history":
+            result["eventLifecycle"] = {**self.events.metadata(), "reason": "HISTORICAL_DELIVERY",
+                                        "activeEventId": None, "affectsAlerts": False}
+        else:
+            result["eventLifecycle"] = self.events.apply(row, window, result)
         return result
 
     def list_device(self, user, device_id):

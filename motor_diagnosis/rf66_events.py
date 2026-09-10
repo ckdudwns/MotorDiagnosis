@@ -45,6 +45,9 @@ class RF66Events:
         db = self.store.db
         record = db.execute("SELECT payload FROM rf66_event_state WHERE device=?", (row["device"],)).fetchone()
         state = json.loads(record[0]) if record else {}
+        if (result.get("transmission") is not None and state.get("captured", -1) >= row["captured"]):
+            return {**self.metadata(), "activeEventId": state.get("activeId"),
+                    "reason": "OUT_OF_ORDER_OBSERVATION", "affectsAlerts": False}
         active = None
         if state.get("activeId"):
             saved = db.execute("SELECT payload FROM rf66_incidents WHERE id=?", (state["activeId"],)).fetchone()

@@ -119,9 +119,39 @@ class RawWindowTest(RpmSetup):
         self.send(first)
         self.assertEqual(self.send(first)[1], 200)
         conflicting = self.window(samples=encoded([(1, 2, 3)]*512))
-        with self.assertRaises(data.ApiError):
+        with self.assertRaises(data.ApiError) as error:
             self.send(self.window(1), conflicting)
+        self.assertEqual(error.exception.code, "WINDOW_CONFLICT")
         self.assertEqual(len(self.store.list_device(self.admin, DEVICE)["items"]), 1)
+
+    def test_out_of_order_lower_index_is_accepted_without_high_water_regression(self):
+        self.send(self.window(5))
+        result, status = self.send(self.window(2))
+        self.assertEqual((result["accepted"], status), (1, 202))
+        stream = self.store.db.execute(
+            "SELECT idx,uptime FROM window_streams WHERE device=? AND boot=?",
+            (DEVICE, "c" * 32)).fetchone()
+        self.assertEqual((stream["idx"], stream["uptime"]), (5, 5 * 640000))
+        self.assertEqual(self.send(self.window(6))[1], 202)
+        self.assertEqual(
+            {item["window"]["windowIndex"] for item in self.store.list_device(self.admin, DEVICE)["items"]},
+            {2, 5, 6},
+        )
+
+    def test_out_of_order_clock_and_context_rejections_remain(self):
+        self.send(self.window(5))
+        with self.assertRaises(data.ApiError) as clock_error:
+            self.send(self.window(2, startUptimeUs=5 * 640000))
+        self.assertEqual(clock_error.exception.code, "WINDOW_SEQUENCE_CONFLICT")
+
+        self.store.db.execute(
+            "UPDATE window_streams SET context=? WHERE device=? AND boot=?",
+            (json.dumps(["SITE-OTHER", "SITE-OTHER-MOT-01", PROFILE_ID]), DEVICE, "c" * 32),
+        )
+        self.store.db.commit()
+        with self.assertRaises(data.ApiError) as context_error:
+            self.send(self.window(6))
+        self.assertEqual(context_error.exception.code, "WINDOW_SEQUENCE_CONFLICT")
 
     def test_frozen_utc_cumulative_clock_rejected_atomically(self):
         first = self.window()

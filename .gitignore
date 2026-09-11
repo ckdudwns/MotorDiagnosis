@@ -67,4 +67,5 @@ ai/ai1/week1/ai1/synthetic_data/
 ingest-tokens*.json
 ingest-tokens*.json.lock
 *.ingest-token.json
+firmware/esp32_edge_node/include/adaptive_transmission.local.h
 참고/

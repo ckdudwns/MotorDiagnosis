@@ -29,7 +29,9 @@ bool validTransition(const Transition& value) {
            (value.epochMs >= MIN_EPOCH && value.epochMs < MAX_EPOCH));
 }
 double usage(const Metrics& metrics) {
-    return 100.0 * static_cast<double>(metrics.queuedRecords) / metrics.queueCapacity;
+    return metrics.queueCapacity
+        ? 100.0 * static_cast<double>(metrics.queuedRecords) / metrics.queueCapacity
+        : 0.0;
 }
 std::int64_t observationTime(const Transition& value, std::uint32_t session,
                              std::uint64_t monotonicMs, std::int64_t epochMs) {

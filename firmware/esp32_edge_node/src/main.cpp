@@ -48,11 +48,13 @@
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <LittleFS.h>
+#include <esp_littlefs.h>
 #include "edge_analysis.h"
 #include <ArduinoJson.h>
 #include <arduinoFFT.h>
 #include "driver/i2s.h"
 #include "freertos/queue.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 
 #include <time.h>
@@ -67,8 +69,77 @@
 #include "device_health.h"
 #include "remote_config.h"
 #include "communication_quality.h"
+#include "adaptive_transmission.h"
 #include "backend_http.h"
 SemaphoreHandle_t BackendHttp::gate = nullptr;
+TaskHandle_t networkTaskHandle = nullptr;
+
+// LittleFS is shared by the telemetry task and the main-loop replay/archive
+// paths.  A recursive mutex keeps nested durable-queue helpers safe without
+// putting any filesystem wait on the sensor capture task.
+SemaphoreHandle_t littleFsMutex = nullptr;
+
+class LittleFsLock
+{
+public:
+    LittleFsLock()
+    {
+        locked_ = littleFsMutex != nullptr &&
+            xSemaphoreTakeRecursive(littleFsMutex, portMAX_DELAY) == pdTRUE;
+    }
+
+    ~LittleFsLock()
+    {
+        if (locked_) xSemaphoreGiveRecursive(littleFsMutex);
+    }
+
+    LittleFsLock(const LittleFsLock&) = delete;
+    LittleFsLock& operator=(const LittleFsLock&) = delete;
+
+private:
+    bool locked_ = false;
+};
+
+// Diagnostic-only snapshot for the LittleFS fault investigation. Callers
+// rate-limit this because integrity checks walk the internal heap.
+void logStorageMemoryDiagnostic(const char* phase)
+{
+    LittleFsLock fsLock;
+    const size_t internalFree =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internalMinFree =
+        heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const bool internalHeapOk =
+        heap_caps_check_integrity(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, false);
+    const size_t psramFree =
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t psramMinFree =
+        heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const bool psramHeapOk =
+        heap_caps_check_integrity(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, false);
+    const bool all8BitHeapOk =
+        heap_caps_check_integrity(MALLOC_CAP_8BIT, false);
+    const size_t totalBytes = LittleFS.totalBytes();
+    const size_t usedBytes = LittleFS.usedBytes();
+    const size_t freeBytes = totalBytes >= usedBytes ? totalBytes - usedBytes : 0;
+    Serial.printf(
+        "[STORAGE-DIAG] phase=%s task=%s stack_hw=%u internal_free=%u internal_min_free=%u internal_heap_ok=%s psram_free=%u psram_min_free=%u psram_heap_ok=%s all_8bit_heap_ok=%s littlefs_mounted=%s total=%u used=%u free=%u\n",
+        phase ? phase : "unknown",
+        pcTaskGetName(nullptr),
+        static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
+        static_cast<unsigned>(internalFree),
+        static_cast<unsigned>(internalMinFree),
+        internalHeapOk ? "true" : "false",
+        static_cast<unsigned>(psramFree),
+        static_cast<unsigned>(psramMinFree),
+        psramHeapOk ? "true" : "false",
+        all8BitHeapOk ? "true" : "false",
+        esp_littlefs_mounted("spiffs") ? "true" : "false",
+        static_cast<unsigned>(totalBytes),
+        static_cast<unsigned>(usedBytes),
+        static_cast<unsigned>(freeBytes)
+    );
+}
 
 #ifndef CONTINUOUS_VIBRATION_ENABLED
 #define CONTINUOUS_VIBRATION_ENABLED 0
@@ -78,6 +149,34 @@ SemaphoreHandle_t BackendHttp::gate = nullptr;
 #include "secrets.h"
 #else
 #include "secrets.example.h"
+#endif
+
+#if __has_include("adaptive_transmission.local.h")
+#include "adaptive_transmission.local.h"
+#else
+#include "adaptive_transmission.example.h"
+#endif
+
+#ifndef ADAPTIVE_BASELINE_ID
+#define ADAPTIVE_BASELINE_ID "unconfigured"
+#endif
+#ifndef ADAPTIVE_RMS_LOW_G
+#define ADAPTIVE_RMS_LOW_G 0.0
+#endif
+#ifndef ADAPTIVE_RMS_HIGH_G
+#define ADAPTIVE_RMS_HIGH_G 0.0
+#endif
+#ifndef ADAPTIVE_SEVERE_LOW_G
+#define ADAPTIVE_SEVERE_LOW_G 0.0
+#endif
+#ifndef ADAPTIVE_SEVERE_HIGH_G
+#define ADAPTIVE_SEVERE_HIGH_G 0.0
+#endif
+#ifndef ADAPTIVE_SEVERE_PEAK_G
+#define ADAPTIVE_SEVERE_PEAK_G 0.0
+#endif
+#ifndef ADAPTIVE_RECOVERY_MS
+#define ADAPTIVE_RECOVERY_MS 30000UL
 #endif
 
 // =====================================================
@@ -153,6 +252,28 @@ const char* INGEST_TOKEN =
 #endif
 const char* DEVICE_HEALTH_URL = DEVICE_HEALTH_URL_VALUE;
 const char* DEVICE_HEALTH_TOKEN = DEVICE_HEALTH_TOKEN_VALUE;
+
+extern const AdaptiveTransmission::Config adaptiveTransmissionConfig{
+    ADAPTIVE_BASELINE_ID,
+    ADAPTIVE_RMS_LOW_G,
+    ADAPTIVE_RMS_HIGH_G,
+    ADAPTIVE_SEVERE_LOW_G,
+    ADAPTIVE_SEVERE_HIGH_G,
+    ADAPTIVE_SEVERE_PEAK_G,
+    static_cast<std::uint32_t>(ADAPTIVE_RECOVERY_MS),
+};
+bool adaptiveBaselineConfigured = false;
+
+void initializeAdaptiveTransmission()
+{
+    adaptiveBaselineConfigured = AdaptiveTransmission::valid(adaptiveTransmissionConfig);
+    if (!adaptiveBaselineConfigured)
+    {
+        Serial.println("[ADAPTIVE] baseline_missing safe mode; capture continues and priority thresholds are disabled.");
+        return;
+    }
+    Serial.printf("[ADAPTIVE] baseline configured: %s\n", adaptiveTransmissionConfig.baselineId);
+}
 
 #ifndef DEVICE_CONFIG_URL_VALUE
 #define DEVICE_CONFIG_URL_VALUE ""
@@ -260,10 +381,9 @@ constexpr uint32_t AUDIO_SAMPLE_RATE =
 constexpr size_t COMMON_AUDIO_SAMPLES =
     10240;
 
-// Continuous mode copies immediately in the feature task: 0.768 s suffices
-// for 640 ms plus 128 ms margin. Legacy main-loop collection keeps 1.024 s.
+// Keep 1.024 s of audio for the common 0.64 s window and scheduling margin.
 constexpr size_t AUDIO_RING_CAPACITY =
-    CONTINUOUS_VIBRATION_ENABLED ? 12288 : 16384;
+    16384;
 
 // Continuous I2S reader consumes small blocks to keep DMA backlog low.
 // 128 samples = 8 ms at 16 kHz.
@@ -431,9 +551,22 @@ double vibFFTImag[VIB_SAMPLES];
 // Acoustic Continuous Ring + Analysis Buffers
 // =====================================================
 
-int32_t audioRing[
-    AUDIO_RING_CAPACITY
-];
+int32_t* audioRing = nullptr;
+constexpr size_t DIAGNOSTIC_CANARY_BYTES = 16;
+constexpr uint8_t DIAGNOSTIC_CANARY_HEAD = 0xA5;
+constexpr uint8_t DIAGNOSTIC_CANARY_TAIL = 0x5A;
+uint8_t* audioRingAllocation = nullptr;
+
+bool checkAudioRingCanary()
+{
+    if (!audioRingAllocation) return false;
+    const size_t payloadBytes = sizeof(int32_t) * AUDIO_RING_CAPACITY;
+    for (size_t i = 0; i < DIAGNOSTIC_CANARY_BYTES; ++i)
+        if (audioRingAllocation[i] != DIAGNOSTIC_CANARY_HEAD ||
+            audioRingAllocation[DIAGNOSTIC_CANARY_BYTES + payloadBytes + i] != DIAGNOSTIC_CANARY_TAIL)
+            return false;
+    return true;
+}
 
 int32_t commonAudioWindow[
     COMMON_AUDIO_SAMPLES
@@ -660,6 +793,11 @@ Preferences preferences;
 uint32_t telemetrySequence =
     0;
 
+QueueHandle_t telemetryTransmitQueue = nullptr;
+WiFiClientSecure telemetrySecureClient;
+BackendHttp telemetryHttp;
+bool telemetryHttpConfigured = false;
+
 // True only when the current sequence floor is known durable in NVS.
 // A packet is never created from a sequence that failed persistence.
 bool sequencePersistenceReady =
@@ -715,9 +853,13 @@ uint64_t healthUptimeMs();
 int64_t currentHealthEpochMs();
 bool observeSensorFault(DeviceHealth::Fault fault, bool active, uint64_t observedMs);
 void serviceDeviceHealth();
+void serviceCommunicationQuality();
+void serviceRemoteConfiguration();
+void serviceEdgeAnalysis();
 void serviceSensors();
 bool initializeDeviceHealth();
 void queueAudioFault(DeviceHealth::Fault fault, uint64_t observedMs);
+void serviceNetworkAuxiliary(bool force = false);
 
 // =====================================================
 // ADXL345
@@ -1001,6 +1143,7 @@ double calculateMean(
     uint16_t count
 )
 {
+    if (!samples || count == 0) return 0.0;
     double sum =
         0.0;
 
@@ -1026,6 +1169,7 @@ double calculateRms(
     double mean
 )
 {
+    if (!samples || count == 0) return 0.0;
     double sumSquares =
         0.0;
 
@@ -2111,7 +2255,18 @@ bool beginBackendHttp(
     const char* url
 )
 {
+    // Runtime HTTPS is owned by the unified network task.  Setup runs before
+    // that task exists and is the only permitted bootstrap exception.
+    if (networkTaskHandle != nullptr && xTaskGetCurrentTaskHandle() != networkTaskHandle) {
+        Serial.println("[HTTP] rejected TLS request outside networkTask");
+        return false;
+    }
     if (!http.acquire()) return false;
+    auto fail = [&http]() { http.end(); return false; };
+    if (http.lastGateWaitMs > 0) {
+        Serial.printf("[HTTP-GATE] wait_ms=%lu result=acquired\n",
+                      static_cast<unsigned long>(http.lastGateWaitMs));
+    }
     if (
         !FirmwareLogic::isBackendTransportAllowed(
             url,
@@ -2124,7 +2279,7 @@ bool beginBackendHttp(
             url != nullptr ? url : "(null)"
         );
 
-        return false;
+        return fail();
     }
 
     const String target =
@@ -2145,17 +2300,16 @@ bool beginBackendHttp(
                 "[SECURITY] HTTPS requires BACKEND_CA_CERT_VALUE; refusing insecure TLS."
             );
 
-            return false;
+            return fail();
         }
 
         secureClient.setCACert(
             BACKEND_CA_CERT
         );
 
-        return http.begin(
-            secureClient,
-            target
-        );
+        const bool started = http.begin(secureClient, target);
+        if (!started) return fail();
+        return true;
     }
 
     // Development escape hatch only. The committed example/default is false.
@@ -2164,9 +2318,16 @@ bool beginBackendHttp(
         "[SECURITY][DEV-ONLY] Plain HTTP explicitly enabled; Bearer token/ACK integrity are NOT protected."
     );
 
-    return http.begin(
-        target
-    );
+    const bool started = http.begin(target);
+    if (!started) return fail();
+    return true;
+}
+
+void configureBackendTimeouts(BackendHttp& http, WiFiClientSecure& secureClient)
+{
+    secureClient.setHandshakeTimeout(3);
+    http.setConnectTimeout(1500);
+    http.setTimeout(1500);
 }
 
 bool syncTimeFromBackend()
@@ -2187,13 +2348,7 @@ bool syncTimeFromBackend()
     BackendHttp http;
 
 
-    http.setConnectTimeout(
-        3000
-    );
-
-    http.setTimeout(
-        3000
-    );
+    configureBackendTimeouts(http, secureClient);
 
     if (
         !beginBackendHttp(
@@ -2896,6 +3051,7 @@ uint64_t ringOffsetForOrdinal(
 
 bool ensureRingFile()
 {
+    LittleFsLock fsLock;
     if (
         LittleFS.exists(
             RING_FILE
@@ -3023,6 +3179,9 @@ FirmwareLogic::RingReadClass readRingRecord(
     BinaryTelemetryRecord& record
 )
 {
+    // Keep every ring-file caller safe; recursive mutex permits callers that
+    // already hold the durable-filesystem lock.
+    LittleFsLock fsLock;
     if (
         TEST_FORCE_RING_READ_IO_FAIL
     )
@@ -3100,6 +3259,9 @@ bool writeRingRecord(
     BinaryTelemetryRecord record
 )
 {
+    // Low-level ring writes must be protected even when called outside the
+    // normal enqueue path.
+    LittleFsLock fsLock;
     if (
         TEST_FORCE_RING_WRITE_FAIL
     )
@@ -3122,6 +3284,36 @@ bool writeRingRecord(
             record
         );
 
+    static uint32_t lastRingWriteLogMs = 0;
+    const uint32_t nowMs = millis();
+    if (lastRingWriteLogMs == 0 || nowMs - lastRingWriteLogMs >= 1000U)
+    {
+        lastRingWriteLogMs = nowMs;
+        Serial.printf("[RING-APPEND] task=%s seq=%lu ordinal=%llu queue=%u raw_pending=%s\n",
+                      pcTaskGetName(nullptr),
+                      static_cast<unsigned long>(record.sequence),
+                      static_cast<unsigned long long>(record.ordinal),
+                      static_cast<unsigned>(queueCount),
+                      ContinuousVibration::rawQueueIsEmpty() ? "no" : "yes");
+    }
+
+    // Sample complete file-operation boundaries. The line before a failing
+    // LittleFS call identifies the last reached stage without replay floods.
+    const bool traceRingOperation =
+        record.ordinal <= 4ULL || (record.ordinal % 64ULL) == 0ULL;
+    const auto traceRingStage = [&](const char* stage) {
+        if (!traceRingOperation) return;
+        Serial.printf("[RING-STEP] stage=%s seq=%lu ordinal=%llu slot=%lu task=%s stack_hw=%u\n",
+            stage,
+            static_cast<unsigned long>(record.sequence),
+            static_cast<unsigned long long>(record.ordinal),
+            static_cast<unsigned long>(ringSlotFromOrdinal(record.ordinal)),
+            pcTaskGetName(nullptr),
+            static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+        logStorageMemoryDiagnostic(stage);
+    };
+
+    traceRingStage("ring_open_before");
     File file =
         LittleFS.open(
             RING_FILE,
@@ -3132,6 +3324,9 @@ bool writeRingRecord(
     {
         return false;
     }
+
+    traceRingStage("ring_open_after");
+    traceRingStage("ring_seek_before");
 
     if (
         !file.seek(
@@ -3145,6 +3340,9 @@ bool writeRingRecord(
         return false;
     }
 
+    traceRingStage("ring_seek_after");
+    traceRingStage("ring_write_before");
+
     size_t bytes =
         file.write(
             reinterpret_cast<const uint8_t*>(
@@ -3153,8 +3351,57 @@ bool writeRingRecord(
             sizeof(record)
         );
 
+    traceRingStage("ring_write_after");
+
+    // Sample the potentially expensive flush path without flooding the serial
+    // monitor. A pre-flush line remains available if flush triggers a reset.
+    const bool logFlushDiagnostic =
+        record.ordinal <= 4ULL ||
+        (record.ordinal % 64ULL) == 0ULL;
+    const uint64_t totalBytes =
+        LittleFS.totalBytes();
+    const uint64_t usedBytes =
+        LittleFS.usedBytes();
+    const uint64_t freeBytes =
+        totalBytes >= usedBytes ? totalBytes - usedBytes : 0ULL;
+    const uint32_t physicalSlot =
+        ringSlotFromOrdinal(record.ordinal);
+
+    if (logFlushDiagnostic)
+    {
+        Serial.printf(
+            "[RING-FLUSH] before seq=%lu ordinal=%llu slot=%lu file=%llu used=%llu free=%llu stack_hw=%u\n",
+            static_cast<unsigned long>(record.sequence),
+            static_cast<unsigned long long>(record.ordinal),
+            static_cast<unsigned long>(physicalSlot),
+            static_cast<unsigned long long>(file.size()),
+            static_cast<unsigned long long>(usedBytes),
+            static_cast<unsigned long long>(freeBytes),
+            static_cast<unsigned int>(uxTaskGetStackHighWaterMark(nullptr))
+        );
+        logStorageMemoryDiagnostic("ring_flush_before");
+    }
+
+    traceRingStage("ring_flush_before");
     file.flush();
+    traceRingStage("ring_flush_after");
+
+    if (logFlushDiagnostic)
+    {
+        Serial.printf(
+            "[RING-FLUSH] after seq=%lu ordinal=%llu slot=%lu file=%llu stack_hw=%u\n",
+            static_cast<unsigned long>(record.sequence),
+            static_cast<unsigned long long>(record.ordinal),
+            static_cast<unsigned long>(physicalSlot),
+            static_cast<unsigned long long>(file.size()),
+            static_cast<unsigned int>(uxTaskGetStackHighWaterMark(nullptr))
+        );
+        logStorageMemoryDiagnostic("ring_flush_after");
+    }
+
+    traceRingStage("ring_close_before");
     file.close();
+    traceRingStage("ring_close_after");
 
     if (
         bytes !=
@@ -3183,6 +3430,7 @@ bool invalidateRingRecord(
     uint64_t ordinal
 )
 {
+    LittleFsLock fsLock;
     File file =
         LittleFS.open(
             RING_FILE,
@@ -3898,6 +4146,7 @@ bool consumeHeadOrdinal(
     bool forceCommit
 )
 {
+    LittleFsLock fsLock;
     if (
         queueIsEmpty() ||
         ordinal != ringHeadOrdinal
@@ -3952,6 +4201,7 @@ QueueReadResult readOldestPersistent(
     BinaryTelemetryRecord& rawRecord
 )
 {
+    LittleFsLock fsLock;
     while (
         !queueIsEmpty()
     )
@@ -4072,6 +4322,7 @@ bool enqueuePersistent(
     const TelemetryPacket& packet
 )
 {
+    LittleFsLock fsLock;
     bool queueWasFull =
         queueIsFull();
 
@@ -4263,6 +4514,7 @@ bool enqueuePersistent(
 
 bool restoreQueueFromFlash()
 {
+    LittleFsLock fsLock;
     queueCount = 0;
     ringHeadOrdinal = 0;
     ringNextOrdinal = 1;
@@ -4888,34 +5140,25 @@ bool fileExistsQuiet(
         return false;
     }
 
-    File entry =
-        directory.openNextFile();
-
-    while (entry)
+    // Scope each directory entry to one open/close lifecycle. Reassigning a
+    // previously closed File can trip LittleFS lfs_file_close assertions.
+    while (true)
     {
-        if (
-            !entry.isDirectory()
-        )
+        File entry = directory.openNextFile();
+        if (!entry) break;
+
+        bool matched = false;
+        if (!entry.isDirectory())
         {
-            const String entryName =
-                baseNameOfPath(
-                    String(entry.name())
-                );
-
-            if (
-                entryName ==
-                expectedName
-            )
-            {
-                entry.close();
-                directory.close();
-                return true;
-            }
+            matched = baseNameOfPath(String(entry.name())) == expectedName;
         }
-
         entry.close();
-        entry =
-            directory.openNextFile();
+
+        if (matched)
+        {
+            directory.close();
+            return true;
+        }
     }
 
     directory.close();
@@ -5022,6 +5265,7 @@ void sortArchiveCandidatesAscending(
 
 bool ensureIsolationArchiveCapacity()
 {
+    LittleFsLock fsLock;
     File directory =
         LittleFS.open(
             REJECTED_DIR
@@ -5060,11 +5304,11 @@ bool ensureIsolationArchiveCapacity()
     // Scan exactly once. Removing files during traversal can invalidate
     // directory iteration on an embedded filesystem, so removals happen
     // only after the directory handle is closed.
-    File entry =
-        directory.openNextFile();
-
-    while (entry)
+    while (true)
     {
+        File entry = directory.openNextFile();
+        if (!entry) break;
+
         if (
             !entry.isDirectory()
         )
@@ -5105,8 +5349,6 @@ bool ensureIsolationArchiveCapacity()
         }
 
         entry.close();
-        entry =
-            directory.openNextFile();
     }
 
     directory.close();
@@ -5285,6 +5527,7 @@ bool writeIsolationEnvelopeAtomic(
     const BinaryTelemetryRecord* unresolvedRecord
 )
 {
+    LittleFsLock fsLock;
     if (
         TEST_FORCE_ISOLATION_WRITE_FAIL
     )
@@ -5602,10 +5845,26 @@ bool moveQueuedPacketToRejected(
 
 PostOutcome postPacket(
     const TelemetryPacket& packet,
-    bool replay = false
+    bool replay,
+    WiFiClientSecure& secureClient,
+    BackendHttp& http
 )
 {
     PostOutcome outcome;
+    const uint64_t diagnosticStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+    const String diagnosticUrl = []() {
+        String value(INGEST_URL);
+        const int query = value.indexOf('?');
+        if (query >= 0) value.remove(query);
+        return value;
+    }();
+    const char* caState = BACKEND_CA_CERT != nullptr && BACKEND_CA_CERT[0] != '\0' ? "present" : "missing";
+    const auto logTransport = [&](const char* stage, bool beginResult, int status) {
+        Serial.printf("[TELEMETRY-DIAG] sequence=%lu replay=%s url=%s wifi=%d ca=%s begin=%s stage=%s status=%d elapsed=%llu ms\n",
+            static_cast<unsigned long>(packet.sequence), replay ? "yes" : "no", diagnosticUrl.c_str(),
+            static_cast<int>(WiFi.status()), caState, beginResult ? "ok" : "fail", stage, status,
+            static_cast<unsigned long long>(static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - diagnosticStartedMs));
+    };
 
     if (
         WiFi.status() !=
@@ -5621,11 +5880,17 @@ PostOutcome postPacket(
         outcome.response =
             "wifi-disconnected";
 
+        logTransport("pre-post-wifi", false, outcome.statusCode);
         return outcome;
     }
 
-    WiFiClientSecure secureClient;
-    BackendHttp http;
+    if (!ContinuousVibration::tryReserveTelemetryNetwork()) {
+        outcome.result = PostResult::RETRYABLE;
+        outcome.statusCode = -1;
+        outcome.response = "network-reserved";
+        logTransport("network-reserved", false, outcome.statusCode);
+        return outcome;
+    }
 
     secureClient.setHandshakeTimeout(10);
     http.setConnectTimeout(
@@ -5636,6 +5901,7 @@ PostOutcome postPacket(
         10000
     );
 
+    HttpDiag httpDiag;
     if (
         !beginBackendHttp(
             http,
@@ -5655,8 +5921,17 @@ PostOutcome postPacket(
 
         qualityCollector.attempt(packet.sequence, replay,
             CommunicationQuality::Outcome::CONFIGURATION_FAILURE, 0);
+        logTransport("pre-post-init", false, outcome.statusCode);
+        logHttpDiag("telemetry", INGEST_URL, false, httpDiag, outcome.statusCode, 0, "begin");
+        ContinuousVibration::releaseTelemetryNetwork();
         return outcome;
     }
+
+    const char* telemetryHeaders[] = {"Connection", "Keep-Alive", "Content-Length"};
+    http.collectHeaders(telemetryHeaders, 3);
+    Serial.printf("[TELEMETRY-KEEPALIVE] sequence=%lu gate_wait_ms=%lu\n",
+                  static_cast<unsigned long>(packet.sequence),
+                  static_cast<unsigned long>(http.lastGateWaitMs));
 
     http.addHeader(
         "Content-Type",
@@ -5691,21 +5966,25 @@ PostOutcome postPacket(
         )
     );
 
-    const uint64_t qualityStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+    const uint64_t requestStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
     const int statusCode =
         http.POST(
             packet.payload
         );
+    httpDiag.requestMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - requestStartedMs;
 
     outcome.statusCode =
         statusCode;
+
+    logTransport(statusCode == -1 ? "post-status-minus-one" : "post", true, statusCode);
 
     if (
         statusCode > 0
     )
     {
-        outcome.response =
-            http.getString();
+        const uint64_t bodyStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+        outcome.response = http.getString();
+        httpDiag.bodyMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - bodyStartedMs;
     }
     else
     {
@@ -5728,6 +6007,14 @@ PostOutcome postPacket(
         );
     }
 
+    logHttpDiag("telemetry", INGEST_URL, true, httpDiag, statusCode,
+                outcome.response.length(), statusCode > 0 ? "none" : "post");
+    Serial.printf("[TELEMETRY-KEEPALIVE] sequence=%lu connection=%s keep_alive=%s content_length=%s\n",
+                  static_cast<unsigned long>(packet.sequence),
+                  http.hasHeader("Connection") ? http.header("Connection").c_str() : "missing",
+                  http.hasHeader("Keep-Alive") ? http.header("Keep-Alive").c_str() : "missing",
+                  http.hasHeader("Content-Length") ? http.header("Content-Length").c_str() : "missing");
+
     outcome.result = classifyHttpOutcome(packet, statusCode, outcome.response);
     using QualityOutcome = CommunicationQuality::Outcome;
     const QualityOutcome qualityOutcome = outcome.result == PostResult::SUCCESS ? QualityOutcome::ACK :
@@ -5735,7 +6022,7 @@ PostOutcome postPacket(
         outcome.result == PostResult::CONFIGURATION_ERROR ? QualityOutcome::CONFIGURATION_FAILURE :
         statusCode <= 0 ? QualityOutcome::TRANSPORT_FAILURE : QualityOutcome::RETRYABLE_RESPONSE;
     qualityCollector.attempt(packet.sequence, replay, qualityOutcome,
-        static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - qualityStartedMs);
+        static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - diagnosticStartedMs);
 
     Serial.printf(
         "HTTP     : %d\n",
@@ -5752,15 +6039,23 @@ PostOutcome postPacket(
     }
 
     http.end();
+    ContinuousVibration::releaseTelemetryNetwork();
 
     return outcome;
+}
+
+PostOutcome postPacket(const TelemetryPacket& packet, bool replay = false)
+{
+    WiFiClientSecure secureClient;
+    BackendHttp http;
+    return postPacket(packet, replay, secureClient, http);
 }
 
 // =====================================================
 // P1 + P3: Replay
 // =====================================================
 
-void replayQueueBatch()
+void replayQueueBatch(size_t maxRecords = SIZE_MAX)
 {
     if (
         queueIsEmpty() ||
@@ -5780,14 +6075,27 @@ void replayQueueBatch()
         )
     );
 
+    // replayQueueBatch is called only by the unified Network Task. Keep the
+    // ingest client alive between records so replay does not renegotiate TLS.
+    if (!telemetryHttpConfigured) {
+        telemetryHttp.setReuse(true);
+        telemetryHttpConfigured = true;
+    }
+    static uint32_t replayRetryNotBefore = 0;
+    static uint32_t replayRetryDelayMs = 250;
+    if (static_cast<int32_t>(millis() - replayRetryNotBefore) < 0) return;
+    ContinuousVibration::telemetryReplayRequested.store(true, std::memory_order_release);
+
     size_t consumedThisBatch =
         0;
 
-    const size_t replayLimit =
+    const size_t replayLimit = std::min(
         FirmwareLogic::calculateReplayBatchSize(
             queueCount,
             REPLAY_MAX_RECORDS_PER_LOOP
-        );
+        ),
+        maxRecords
+    );
 
     while (
         !queueIsEmpty() &&
@@ -5814,7 +6122,7 @@ void replayQueueBatch()
         )
         {
             commitConsumedWatermark();
-            return;
+            goto replay_batch_done;
         }
 
         if (
@@ -5828,7 +6136,9 @@ void replayQueueBatch()
             );
 
             commitConsumedWatermark();
-            return;
+            replayRetryNotBefore = millis() + replayRetryDelayMs;
+            replayRetryDelayMs = std::min<std::uint32_t>(5000U, replayRetryDelayMs * 2U);
+            goto replay_batch_done;
         }
 
         if (
@@ -5841,7 +6151,7 @@ void replayQueueBatch()
             );
 
             commitConsumedWatermark();
-            return;
+            goto replay_batch_done;
         }
 
         if (
@@ -5867,7 +6177,7 @@ void replayQueueBatch()
                 );
 
                 commitConsumedWatermark();
-                return;
+                goto replay_batch_done;
             }
 
             if (
@@ -5880,7 +6190,7 @@ void replayQueueBatch()
             )
             {
                 commitConsumedWatermark();
-                return;
+                goto replay_batch_done;
             }
 
             consumedThisBatch++;
@@ -5910,7 +6220,7 @@ void replayQueueBatch()
                 );
 
                 commitConsumedWatermark();
-                return;
+                goto replay_batch_done;
             }
 
             if (
@@ -5923,7 +6233,7 @@ void replayQueueBatch()
             )
             {
                 commitConsumedWatermark();
-                return;
+                goto replay_batch_done;
             }
 
             consumedThisBatch++;
@@ -5939,7 +6249,7 @@ void replayQueueBatch()
             // The next health transition must commit before this later point.
             // Re-evaluate for EVERY head, not just once per replay batch.
             commitConsumedWatermark();
-            return;
+            goto replay_batch_done;
         }
 
         const uint32_t sequence =
@@ -5958,7 +6268,9 @@ void replayQueueBatch()
         const PostOutcome outcome =
             postPacket(
                 packet,
-                true
+                true,
+                telemetrySecureClient,
+                telemetryHttp
             );
 
         if (
@@ -5985,10 +6297,12 @@ void replayQueueBatch()
             )
             {
                 commitConsumedWatermark();
-                return;
+                goto replay_batch_done;
             }
 
             consumedThisBatch++;
+            replayRetryDelayMs = 250;
+            replayRetryNotBefore = 0;
             delay(100);
             continue;
         }
@@ -6006,7 +6320,9 @@ void replayQueueBatch()
             );
 
             commitConsumedWatermark();
-            return;
+            replayRetryNotBefore = millis() + replayRetryDelayMs;
+            replayRetryDelayMs = std::min<std::uint32_t>(5000U, replayRetryDelayMs * 2U);
+            goto replay_batch_done;
         }
 
         if (
@@ -6023,7 +6339,9 @@ void replayQueueBatch()
             );
 
             commitConsumedWatermark();
-            return;
+            replayRetryNotBefore = millis() + replayRetryDelayMs;
+            replayRetryDelayMs = std::min<std::uint32_t>(5000U, replayRetryDelayMs * 2U);
+            goto replay_batch_done;
         }
 
         if (
@@ -6053,7 +6371,7 @@ void replayQueueBatch()
                 );
 
                 commitConsumedWatermark();
-                return;
+                goto replay_batch_done;
             }
 
             if (
@@ -6068,7 +6386,7 @@ void replayQueueBatch()
             )
             {
                 commitConsumedWatermark();
-                return;
+                goto replay_batch_done;
             }
 
             consumedThisBatch++;
@@ -6083,7 +6401,7 @@ void replayQueueBatch()
             "[BUFFER] Persistent Replay Completed."
         );
 
-        return;
+        goto replay_batch_done;
     }
 
     Serial.printf(
@@ -6095,6 +6413,9 @@ void replayQueueBatch()
             queueCount
         )
     );
+
+replay_batch_done:
+    ContinuousVibration::telemetryReplayRequested.store(false, std::memory_order_release);
 }
 
 // =====================================================
@@ -6207,6 +6528,7 @@ bool createPacket(
 
 bool initPersistentStorage()
 {
+    LittleFsLock fsLock;
     Serial.println(
         "[FLASH] Mounting LittleFS without automatic format..."
     );
@@ -6358,6 +6680,7 @@ String analysisPath(unsigned slot) { return String("/analysis-") + slot + ".bin"
 
 bool readAnalysis(unsigned slot, AnalysisHeader& header, std::string& body)
 {
+    LittleFsLock fsLock;
     File file = LittleFS.open(analysisPath(slot), "r");
     if (!file) return false;
     const bool headerValid =
@@ -6367,17 +6690,46 @@ bool readAnalysis(unsigned slot, AnalysisHeader& header, std::string& body)
         file.size() == sizeof(header) + header.bytes;
     if (!headerValid)
     {
+        file.close();
         return false;
     }
     body.resize(header.bytes);
     const bool valid =
         file.read(reinterpret_cast<uint8_t*>(&body[0]), header.bytes) == header.bytes &&
         EdgeAnalysis::checksum(body.data(), body.size()) == header.crc;
+    file.close();
     return valid;
+}
+
+void serviceTelemetryNetworkOnce()
+{
+    TelemetryPacket* packet = nullptr;
+    if (xQueueReceive(telemetryTransmitQueue, &packet, 0) != pdTRUE || packet == nullptr)
+        return;
+
+    if (!telemetryHttpConfigured) {
+        telemetryHttp.setReuse(true);
+        telemetryHttpConfigured = true;
+    }
+    const PostOutcome outcome = postPacket(*packet, false, telemetrySecureClient, telemetryHttp);
+    if (outcome.result == PostResult::SUCCESS)
+    {
+        Serial.printf("[TELEMETRY-TASK] Sequence %lu completed.\n",
+                      static_cast<unsigned long>(packet->sequence));
+    }
+    else
+    {
+        Serial.printf("[TELEMETRY-TASK] Sequence %lu deferred; preserving (HTTP %d).\n",
+                      static_cast<unsigned long>(packet->sequence), outcome.statusCode);
+        if (!enqueuePersistent(*packet))
+            Serial.println("[CRITICAL] Telemetry task persistence failed.");
+    }
+    delete packet;
 }
 
 void preserveAnalysis(const TelemetryPacket& packet)
 {
+    LittleFsLock fsLock;
 #if CONTINUOUS_VIBRATION_ENABLED
     // Legacy raw arrays belong to the old on-demand collector, not this stream.
     // Do not upload stale arrays as a newly measured waveform.
@@ -6433,38 +6785,51 @@ void serviceEdgeAnalysis()
     const String endpoint = ingest.substring(0, ingest.length()-suffix.length()) + "/api/devices/" + DEVICE_ID + "/analysis";
     analysisAttempted = true; analysisLastAttempt = millis();
     unsigned head = ANALYSIS_SLOTS; AnalysisHeader selected; std::string body;
-    for (unsigned i=0; i<ANALYSIS_SLOTS; ++i) {
-        if (!LittleFS.exists(analysisPath(i))) continue;
-        AnalysisHeader header; std::string candidate;
-        if (!readAnalysis(i,header,candidate)) {
-            analysisStorageUsable = false;
-            Serial.println("[ANALYSIS] Corrupt/read-failed capture retained; channel disabled.");
-            return;
+    {
+        LittleFsLock fsLock;
+        for (unsigned i=0; i<ANALYSIS_SLOTS; ++i) {
+            if (!LittleFS.exists(analysisPath(i))) continue;
+            AnalysisHeader header; std::string candidate;
+            if (!readAnalysis(i,header,candidate)) {
+                analysisStorageUsable = false;
+                Serial.println("[ANALYSIS] Corrupt/read-failed capture retained; channel disabled.");
+                return;
+            }
+            if (head == ANALYSIS_SLOTS || header.sequence < selected.sequence) {head=i; selected=header; body=std::move(candidate);}
         }
-        if (head == ANALYSIS_SLOTS || header.sequence < selected.sequence) {head=i; selected=header; body=std::move(candidate);}
     }
     WiFiClientSecure secure; BackendHttp http;
-    secure.setHandshakeTimeout(3); http.setConnectTimeout(1500); http.setTimeout(1500);
+    configureBackendTimeouts(http, secure);
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     // Drain exactly one saved frame before polling a new capture request.
-    if (!beginBackendHttp(http,secure,(endpoint+(head==ANALYSIS_SLOTS?"/pending":"")).c_str())) return;
+    const String analysisUrl = endpoint+(head==ANALYSIS_SLOTS?"/pending":"");
+    HttpDiag httpDiag;
+    if (!beginBackendHttp(http,secure,analysisUrl.c_str())) { logHttpDiag("analysis", analysisUrl.c_str(), false, httpDiag, -1, 0, "begin"); return; }
     http.addHeader("Authorization", String("Bearer ") + INGEST_TOKEN);
     int status;
+    const uint64_t requestStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
     if (head == ANALYSIS_SLOTS) status=http.GET();
     else {
         http.addHeader("Content-Type","application/json");
         status=http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())),body.size());
+    httpDiag.requestMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - requestStartedMs;
     }
     const int length=http.getSize(); String response;
-    if (length>=0 && length<=2048) response=http.getString();
+    if (length>=0 && length<=2048) { const uint64_t bodyStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL; response=http.getString(); httpDiag.bodyMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - bodyStartedMs; }
+    logHttpDiag("analysis", analysisUrl.c_str(), true, httpDiag, status, response.length(), status > 0 ? "none" : "request");
+    // Finish the HTTP response and release its client before mutating the
+    // durable analysis outbox.
+    http.end();
     if (length==static_cast<int>(response.length())) {
         if (head != ANALYSIS_SLOTS) {
-            if (EdgeAnalysis::accepted(status,response.c_str(),selected.sequence)) LittleFS.remove(analysisPath(head));
+            if (EdgeAnalysis::accepted(status,response.c_str(),selected.sequence)) {
+                LittleFsLock fsLock;
+                LittleFS.remove(analysisPath(head));
+            }
         } else if (status==200) {
             analysisRequest.load(response.c_str(), DEVICE_ID, SITE_ID, ASSET_ID);
         }
     }
-    http.end();
 }
 
 void activateRemoteConfiguration()
@@ -6541,12 +6906,11 @@ void serviceRemoteConfiguration()
     const String endpoint = String(DEVICE_CONFIG_URL) + (reporting ? "/result" : "/pending");
     WiFiClientSecure secureClient;
     BackendHttp http;
-    secureClient.setHandshakeTimeout(3);
-    http.setConnectTimeout(1500);
-    http.setTimeout(1500);
+    configureBackendTimeouts(http, secureClient);
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     bool success = false;
     int status = 0;
+    HttpDiag httpDiag;
     if (beginBackendHttp(http, secureClient, endpoint.c_str()))
     {
         http.addHeader("Authorization", String("Bearer ") + DEVICE_CONFIG_TOKEN);
@@ -6554,14 +6918,19 @@ void serviceRemoteConfiguration()
         {
             http.addHeader("Content-Type", "application/json");
             const std::string body = RemoteConfig::resultPayload(pendingConfigResult);
+            const uint64_t requestStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
             status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
+            httpDiag.requestMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - requestStartedMs;
         }
-        else status = http.GET();
+        else { const uint64_t requestStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL; status = http.GET(); httpDiag.requestMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - requestStartedMs; }
         // The backend sends Content-Length. Refuse unbounded/chunked responses.
         String response;
         const int length = http.getSize();
-        if (status == 200 && length >= 0 && length <= static_cast<int>(RemoteConfig::MAX_RESPONSE_BYTES))
+        if (status == 200 && length >= 0 && length <= static_cast<int>(RemoteConfig::MAX_RESPONSE_BYTES)) {
+            const uint64_t bodyStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
             response = http.getString();
+            httpDiag.bodyMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - bodyStartedMs;
+        }
         if (reporting)
         {
             success = length == static_cast<int>(response.length()) &&
@@ -6579,8 +6948,10 @@ void serviceRemoteConfiguration()
             activateRemoteConfiguration(); // Changed only after verified persistence.
             success = true;
         }
+        logHttpDiag("config", endpoint.c_str(), true, httpDiag, status, response.length(), status > 0 ? "none" : "request");
         http.end();
     }
+    else logHttpDiag("config", endpoint.c_str(), false, httpDiag, -1, 0, "begin");
     // At most one bounded request per service call. No redirects, arbitrary
     // commands, network changes, queue clearing, or busy retry loop.
     remoteConfigSchedule.completed(millis(), success, pendingConfigResult.status != RemoteConfig::Status::NONE);
@@ -6672,21 +7043,23 @@ void serviceCommunicationQuality()
     }
     WiFiClientSecure secureClient;
     BackendHttp http;
-    secureClient.setHandshakeTimeout(3);
-    http.setConnectTimeout(1500);
-    http.setTimeout(1500);
+    configureBackendTimeouts(http, secureClient);
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     bool success = false;
     int status = 0;
+    HttpDiag httpDiag;
     if (beginBackendHttp(http, secureClient, DEVICE_QUALITY_URL))
     {
         http.addHeader("Authorization", String("Bearer ") + DEVICE_QUALITY_TOKEN);
         http.addHeader("Content-Type", "application/json");
         const std::string body = CommunicationQuality::payload(qualityOutbox.window());
+        const uint64_t requestStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
         status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
+        httpDiag.requestMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - requestStartedMs;
         String response;
         const int length = http.getSize();
-        if ((status == 200 || status == 201) && length >= 0 && length <= 1024) response = http.getString();
+        if ((status == 200 || status == 201) && length >= 0 && length <= 1024) { const uint64_t bodyStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL; response = http.getString(); httpDiag.bodyMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - bodyStartedMs; }
+        logHttpDiag("quality", DEVICE_QUALITY_URL, true, httpDiag, status, response.length(), status > 0 ? "none" : "post");
         success = length == static_cast<int>(response.length()) &&
             qualityOutbox.acknowledge(status, response.c_str(), eraseQualityWindow);
         http.end();
@@ -6823,24 +7196,73 @@ void serviceDeviceHealth()
     bool accepted = false;
     if (!body.empty())
     {
-        WiFiClientSecure secureClient;
-        BackendHttp http;
-        secureClient.setHandshakeTimeout(3);
-        http.setConnectTimeout(1500);
-        http.setTimeout(1500);
-        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-        if (beginBackendHttp(http, secureClient, DEVICE_HEALTH_URL))
+        static WiFiClientSecure secureClient;
+        static BackendHttp http;
+        static bool httpConfigured = false;
+        if (!httpConfigured)
         {
+            // Keep the health client's TLS connection reusable. HTTPClient
+            // remains the sole owner of socket teardown via end().
+            http.setReuse(true);
+            httpConfigured = true;
+        }
+        HttpDiag httpDiag;
+        configureBackendTimeouts(http, secureClient);
+        // Health may perform a fresh TLS handshake on the hotspot. Keep its
+        // longer timeout bounded to this auxiliary task; acquisition remains
+        // independent and the handoff reservation is finite below.
+        secureClient.setHandshakeTimeout(10);
+        http.setConnectTimeout(5000);
+        http.setTimeout(5000);
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        {
+            ContinuousVibration::healthNetworkRequested.store(true, std::memory_order_release);
+            bool healthReserved = false;
+            const uint32_t handoffStarted = millis();
+            do {
+                if (ContinuousVibration::tryReserveHealthNetwork()) {
+                    healthReserved = true;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+            } while (millis() - handoffStarted < 5500U);
+            if (!healthReserved) {
+                ContinuousVibration::healthNetworkRequested.store(false, std::memory_order_release);
+                Serial.println("[HEALTH] handoff timeout after 5500 ms; journal retained");
+                healthSchedule.completed(millis(), false);
+                return;
+            }
+            ContinuousVibration::healthNetworkRequested.store(false, std::memory_order_release);
+            Serial.printf("[HEALTH] handoff acquired after %lu ms\n",
+                          static_cast<unsigned long>(millis() - handoffStarted));
+            const bool reuseCandidate = secureClient.connected();
+            if (beginBackendHttp(http, secureClient, DEVICE_HEALTH_URL))
+            {
             http.addHeader("Content-Type", "application/json");
             http.addHeader("Authorization", String("Bearer ") + DEVICE_HEALTH_TOKEN);
+            const uint64_t requestStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
             const int status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
-            const String response = status == 200 ? http.getString() : String();
+            httpDiag.requestMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - requestStartedMs;
+            String response;
+            if (status == 200) { const uint64_t bodyStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL; response = http.getString(); httpDiag.bodyMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - bodyStartedMs; }
+            logHttpDiag("health", DEVICE_HEALTH_URL, true, httpDiag, status, response.length(), status > 0 ? "none" : "post");
             accepted = DeviceHealth::accepted(status, response.c_str(), DEVICE_ID, epochMs);
-            Serial.printf("[HEALTH] HTTP %d, confirmed=%s, pending(before ACK)=%u\n", status,
-                          accepted ? "yes" : "no", static_cast<unsigned>(healthJournal.count));
+            Serial.printf("[HEALTH] HTTP %d, confirmed=%s, reuse_candidate=%s, pending(before ACK)=%u\n", status,
+                          accepted ? "yes" : "no", reuseCandidate ? "yes" : "no",
+                          static_cast<unsigned>(healthJournal.count));
             http.end();
+            ContinuousVibration::releaseHealthNetwork();
+            }
+            else {
+            logHttpDiag("health", DEVICE_HEALTH_URL, false, httpDiag, -1, 0, "begin");
+            Serial.printf("[HEALTH] HTTP -1, confirmed=no, reuse_candidate=%s, fail_stage=begin\n",
+                          reuseCandidate ? "yes" : "no");
+            ContinuousVibration::releaseHealthNetwork();
+            }
         }
     }
+        // Empty health payload is an intentional no-op; there is no HTTP
+        // request to measure in this path.
     if (accepted && (order.transition
 #if RAW_VIBRATION_ENABLED
                      || healthJournal.count != 0
@@ -6860,6 +7282,36 @@ void serviceDeviceHealth()
     }
     healthSchedule.completed(millis(), accepted);
     if (accepted) lastHealthMetrics = metrics;
+}
+
+void serviceNetworkAuxiliary(bool force)
+{
+    // The Raw network task is the single owner of all backend HTTP clients.
+    // Normally do not start auxiliary work while capture has anything waiting;
+    // the bounded forced turn is called only after an in-flight Raw request.
+    if (ContinuousVibration::priorityRawPending()) return;
+    if (!force && !ContinuousVibration::rawQueueIsEmpty()) return;
+    serviceDeviceHealth();
+    if (ContinuousVibration::priorityRawPending()) return;
+    if (!force && !ContinuousVibration::rawQueueIsEmpty()) return;
+
+    serviceCommunicationQuality();
+    if (ContinuousVibration::priorityRawPending()) return;
+    if (!force && !ContinuousVibration::rawQueueIsEmpty()) return;
+    serviceRemoteConfiguration();
+    if (ContinuousVibration::priorityRawPending()) return;
+    if (!force && !ContinuousVibration::rawQueueIsEmpty()) return;
+    serviceEdgeAnalysis();
+    if (ContinuousVibration::priorityRawPending()) return;
+    if (!force && !ContinuousVibration::rawQueueIsEmpty()) return;
+
+    if (!queueIsEmpty()) {
+        ContinuousVibration::telemetryReplayRequested.store(true, std::memory_order_release);
+        replayQueueBatch(1);
+        ContinuousVibration::telemetryReplayRequested.store(false, std::memory_order_release);
+    }
+    if (ContinuousVibration::rawQueueIsEmpty() && !ContinuousVibration::priorityRawPending())
+        serviceTelemetryNetworkOnce();
 }
 
 void setup()
@@ -6896,6 +7348,8 @@ void setup()
     Serial.println(
         "=============================================================="
     );
+
+    initializeAdaptiveTransmission();
 
     if (
         !preferences.begin(
@@ -6939,6 +7393,13 @@ void setup()
         {
             delay(1000);
         }
+    }
+
+    littleFsMutex = xSemaphoreCreateRecursiveMutex();
+    if (littleFsMutex == nullptr)
+    {
+        Serial.println("[FATAL] LittleFS mutex creation failed.");
+        while (true) delay(1000);
     }
 
     if (
@@ -6995,13 +7456,32 @@ void setup()
     audioRingMutex =
         xSemaphoreCreateMutex();
 
+    const size_t audioRingBytes = sizeof(int32_t) * AUDIO_RING_CAPACITY;
+    audioRingAllocation = static_cast<uint8_t*>(heap_caps_malloc(
+        audioRingBytes + DIAGNOSTIC_CANARY_BYTES * 2,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+    ));
+    if (!audioRingAllocation) audioRingAllocation = static_cast<uint8_t*>(heap_caps_malloc(
+        audioRingBytes + DIAGNOSTIC_CANARY_BYTES * 2,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+    ));
+    if (audioRingAllocation) {
+        std::memset(audioRingAllocation, DIAGNOSTIC_CANARY_HEAD, DIAGNOSTIC_CANARY_BYTES);
+        std::memset(audioRingAllocation + DIAGNOSTIC_CANARY_BYTES + audioRingBytes,
+                    DIAGNOSTIC_CANARY_TAIL, DIAGNOSTIC_CANARY_BYTES);
+        audioRing = reinterpret_cast<int32_t*>(audioRingAllocation + DIAGNOSTIC_CANARY_BYTES);
+    }
+
     sensorObservations = xQueueCreate(32, sizeof(SensorObservation));
+    // Small bounded async outbox; failed sends still go to LittleFS.
+    telemetryTransmitQueue = xQueueCreate(4, sizeof(TelemetryPacket*));
 
     if (
         vibrationResultMutex ==
             nullptr ||
         audioRingMutex ==
-            nullptr || sensorObservations == nullptr
+            nullptr || sensorObservations == nullptr ||
+            telemetryTransmitQueue == nullptr || audioRing == nullptr
     )
     {
         Serial.println(
@@ -7132,6 +7612,10 @@ void setup()
 
 void loop()
 {
+    static uint32_t nextMeasurementAt = 0;
+    const auto deferMeasurement = [&](uint32_t intervalMs) {
+        nextMeasurementAt = millis() + intervalMs;
+    };
     // =================================================
     // P4: Wi-Fi service never waits for connection.
     // =================================================
@@ -7167,23 +7651,19 @@ void loop()
         persistCurrentSessionTimeAnchor();
     }
 
-    serviceCommunicationQuality();
-    serviceRemoteConfiguration();
-    serviceEdgeAnalysis();
     serviceSensors();
-    serviceDeviceHealth(); // Metrics only while an older telemetry head exists.
 
-    // Replay only a bounded slice of old data before each fresh
-    // measurement. This prevents a full 24-hour backlog from starving
-    // synchronized sensor acquisition while preserving FIFO order.
-    if (
-        WiFi.status() ==
-            WL_CONNECTED &&
-        !queueIsEmpty()
-    )
+    // The binary ring is preallocated and its durable append can monopolize
+    // LittleFS for seconds. While an older telemetry backlog exists, let the
+    // network task drain it instead of creating another ring append from the
+    // loop; raw capture/spool remains independent and keeps its priority.
+    if (!queueIsEmpty())
     {
-        replayQueueBatch();
+        deferMeasurement(200);
+        return;
     }
+
+    if (static_cast<int32_t>(millis() - nextMeasurementAt) < 0) return;
 
     // A missing absolute clock no longer blocks sensing. createPacket()
     // will mark the fresh record as unresolved and the binary ring will
@@ -7195,7 +7675,7 @@ void loop()
 
     if ((!CONTINUOUS_VIBRATION_ENABLED && !adxlRetry.ready()) || !audioReady.load())
     {
-        delay(200); // Wi-Fi, health reporting and bounded replay remain alive.
+        deferMeasurement(200); // Wi-Fi, health reporting and bounded replay remain alive.
         return;
     }
 
@@ -7205,13 +7685,14 @@ void loop()
     if (timeReady && currentHealthEpochMs() / 1000LL * 1000LL <=
         DeviceHealth::acknowledgedBoundary(healthJournal))
     {
-        delay(200);
+        deferMeasurement(200);
         return;
     }
 
     VibrationFeatures vib;
     AcousticFeatures audio;
     const uint32_t acquisitionAudioGeneration = audioErrorGeneration.load();
+    const uint64_t measurementStartedMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
 
     if (
         !acquireSynchronizedFeatures(
@@ -7224,14 +7705,12 @@ void loop()
             "[SENSOR] Synchronized acquisition failed."
         );
         serviceSensors();
-        serviceDeviceHealth();
-
-        delay(
-            MEASUREMENT_INTERVAL_MS
-        );
+        deferMeasurement(MEASUREMENT_INTERVAL_MS);
 
         return;
     }
+    Serial.printf("[MEASUREMENT] elapsed=%llu ms\n",
+                  static_cast<unsigned long long>(static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL - measurementStartedMs));
 
     if (
         !isfinite(
@@ -7252,11 +7731,7 @@ void loop()
             "[SENSOR] Invalid NaN/Inf measurement."
         );
         observeSensorFault(DeviceHealth::Fault::INVALID_FEATURES, true, healthUptimeMs());
-        serviceDeviceHealth();
-
-        delay(
-            MEASUREMENT_INTERVAL_MS
-        );
+        deferMeasurement(MEASUREMENT_INTERVAL_MS);
 
         return;
     }
@@ -7266,8 +7741,7 @@ void loop()
     if (!audioReady.load() || acquisitionAudioGeneration != audioErrorGeneration.load())
     {
         serviceSensors();
-        serviceDeviceHealth();
-        delay(MEASUREMENT_INTERVAL_MS);
+        deferMeasurement(MEASUREMENT_INTERVAL_MS);
         return;
     }
     for (size_t code = 0; code < DeviceHealth::FAULT_COUNT; ++code)
@@ -7296,9 +7770,7 @@ void loop()
             "[PACKET] Creation failed."
         );
 
-        delay(
-            MEASUREMENT_INTERVAL_MS
-        );
+        deferMeasurement(MEASUREMENT_INTERVAL_MS);
 
         return;
     }
@@ -7340,9 +7812,7 @@ void loop()
             );
         }
 
-        delay(
-            MEASUREMENT_INTERVAL_MS
-        );
+        deferMeasurement(MEASUREMENT_INTERVAL_MS);
 
         return;
     }
@@ -7356,7 +7826,7 @@ void loop()
     // telemetry. Therefore catch-up and acquisition are interleaved
     // without reordering packets.
     if (
-        !queueIsEmpty() || healthJournal.count != 0
+        !queueIsEmpty()
     )
     {
         if (
@@ -7370,9 +7840,7 @@ void loop()
             );
         }
 
-        delay(
-            MEASUREMENT_INTERVAL_MS
-        );
+        deferMeasurement(MEASUREMENT_INTERVAL_MS);
 
         return;
     }
@@ -7408,6 +7876,23 @@ void loop()
 
         return;
     }
+
+    TelemetryPacket* queuedPacket = new (std::nothrow) TelemetryPacket(packet);
+    if (queuedPacket != nullptr &&
+        xQueueSend(telemetryTransmitQueue, &queuedPacket, 0) == pdTRUE)
+    {
+        Serial.printf("[TELEMETRY-TASK] Sequence %lu queued.\n",
+                      static_cast<unsigned long>(packet.sequence));
+        deferMeasurement(MEASUREMENT_INTERVAL_MS);
+        return;
+    }
+    delete queuedPacket;
+    Serial.printf("[TELEMETRY-TASK] Queue unavailable; preserving Sequence %lu.\n",
+                  static_cast<unsigned long>(packet.sequence));
+    if (!enqueuePersistent(packet))
+        Serial.println("[CRITICAL] Telemetry queue persistence failed.");
+    deferMeasurement(MEASUREMENT_INTERVAL_MS);
+    return;
 
     PostOutcome outcome =
         postPacket(
@@ -7466,9 +7951,7 @@ void loop()
                 "[CRITICAL] Rejected packet could not be made durable in the ring; isolation replacement was not attempted."
             );
 
-            delay(
-                MEASUREMENT_INTERVAL_MS
-            );
+            deferMeasurement(MEASUREMENT_INTERVAL_MS);
 
             return;
         }
@@ -7495,9 +7978,7 @@ void loop()
                 "[REJECT] Isolation replacement incomplete; durable ring source remains queued for reboot/retry."
             );
 
-            delay(
-                MEASUREMENT_INTERVAL_MS
-            );
+            deferMeasurement(MEASUREMENT_INTERVAL_MS);
 
             return;
         }
@@ -7518,9 +7999,7 @@ void loop()
             );
         }
 
-        delay(
-            MEASUREMENT_INTERVAL_MS
-        );
+        deferMeasurement(MEASUREMENT_INTERVAL_MS);
 
         return;
     }
@@ -7577,7 +8056,5 @@ void loop()
         );
     }
 
-    delay(
-        MEASUREMENT_INTERVAL_MS
-    );
+        deferMeasurement(MEASUREMENT_INTERVAL_MS);
 }

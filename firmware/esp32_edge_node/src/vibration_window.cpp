@@ -41,6 +41,7 @@ const char* qualityName(Quality quality) {
 Features extract(const Raw& raw, Workspace& w) {
     Features out;
     out.index=raw.index; out.startUs=raw.startUs; out.count=raw.count; out.quality=raw.quality;
+    if (raw.count == 0) { out.quality=Quality::SampleGap; return out; }
     if (out.quality!=Quality::Valid) return out;
     if (raw.count!=Samples) {out.quality=Quality::SampleGap; return out;}
     for (unsigned axis=0; axis<3; ++axis) {

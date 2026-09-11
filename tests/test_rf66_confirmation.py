@@ -100,10 +100,12 @@ class ConfirmationTest(RpmSetup):
             self.send(self.window(0, samples=None))
         self.assertEqual(self.step(2)["confirmation"]["decision"], 1)
         self.step(4)
-        with self.assertRaises(ApiError) as rejected:
-            self.send(self.window(3))
-        self.assertEqual(rejected.exception.status, 409)
-        self.assertFalse(self.store.tick())
+        result, status = self.send(self.window(3))
+        self.assertEqual((result["accepted"], status), (1, 202))
+        self.assertTrue(self.store.tick())
+        analysis = self.store.list_device(self.admin, DEVICE)["items"][0]["analysis"]
+        self.assertEqual(analysis["confirmation"]["resetReason"], "WINDOW_GAP")
+        self.assertEqual(analysis["confirmation"]["validWindows"], 1)
 
     def test_clipped_and_constant_raw_data_reset_even_if_marked_valid(self):
         index = 0

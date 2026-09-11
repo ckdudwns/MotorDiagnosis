@@ -105,6 +105,8 @@ Features summarize(const float* samples, std::size_t count, std::size_t block) {
         mean+=samples[i]; square+=static_cast<double>(samples[i])*samples[i];
         out.peak=std::max(out.peak,std::abs(static_cast<double>(samples[i])));
     }
+    // count is validated above; keep the guard local to the divisions too.
+    if (!count) return Features{};
     mean/=count; out.rms=std::sqrt(square/count);
     double variance=0, fourth=0;
     for(std::size_t i=0;i<count;++i) {const double d=samples[i]-mean; variance+=d*d; fourth+=d*d*d*d;}
@@ -117,7 +119,9 @@ Features summarize(const float* samples, std::size_t count, std::size_t block) {
         fft(spectrum);
         for(std::size_t k=1;k<=block/2;++k) {
             const auto band=k<block/16?0:k<block/8?1:2;
-            out.bandEnergy[band]+=std::norm(spectrum[k])*(k==block/2?1:2)/(block*block)/(count/block);
+            const std::size_t blockCount = count / block;
+            if (!blockCount) return Features{};
+            out.bandEnergy[band]+=std::norm(spectrum[k])*(k==block/2?1:2)/(block*block)/blockCount;
         }
     }
     out.valid=true; return out;

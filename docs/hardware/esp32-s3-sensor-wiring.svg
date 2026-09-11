@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820">
+  <style>
+    .box{fill:#f8fafc;stroke:#1e293b;stroke-width:3;rx:16}
+    .title{font:700 26px Arial;fill:#0f172a}.label{font:600 20px Arial;fill:#0f172a}
+    .pin{font:18px Arial;fill:#334155}.note{font:16px Arial;fill:#475569}
+    .spi{stroke:#2563eb;stroke-width:6;fill:none}.i2s{stroke:#16a34a;stroke-width:6;fill:none}
+    .power{stroke:#dc2626;stroke-width:6;fill:none}.gnd{stroke:#64748b;stroke-width:6;fill:none}
+    .j-spi{fill:#2563eb;stroke:#fff;stroke-width:3}.j-i2s{fill:#16a34a;stroke:#fff;stroke-width:3}
+    .j-power{fill:#dc2626;stroke:#fff;stroke-width:3}.j-gnd{fill:#64748b;stroke:#fff;stroke-width:3}
+  </style>
+  <rect width="1400" height="820" fill="#ffffff"/>
+  <text x="700" y="48" text-anchor="middle" class="title">MotorDiagnosis ESP32-S3 Sensor Wiring</text>
+  <text x="700" y="78" text-anchor="middle" class="note">Source: firmware/esp32_edge_node/src/main.cpp · N8 / PSRAM configuration</text>
+
+  <rect x="500" y="125" width="400" height="570" class="box"/>
+  <text x="700" y="165" text-anchor="middle" class="title">ESP32-S3 DevKitC-1</text>
+  <text x="700" y="195" text-anchor="middle" class="note">GPIO numbers are firmware-defined</text>
+  <text x="530" y="250" class="label">SPI (ADXL345)</text>
+  <text x="530" y="280" class="pin">GPIO10  CS</text><text x="530" y="310" class="pin">GPIO11  MOSI</text>
+  <text x="530" y="340" class="pin">GPIO12  SCK</text><text x="530" y="370" class="pin">GPIO13  MISO</text>
+  <text x="530" y="435" class="label">I2S (INMP441)</text>
+  <text x="530" y="465" class="pin">GPIO4   SCK / BCLK</text><text x="530" y="495" class="pin">GPIO5   WS / LRCLK</text>
+  <text x="530" y="525" class="pin">GPIO6   SD / DATA</text>
+  <text x="530" y="590" class="label">Common</text><text x="530" y="620" class="pin">3V3 and GND</text>
+
+  <rect x="80" y="220" width="270" height="270" class="box"/>
+  <text x="215" y="265" text-anchor="middle" class="title">ADXL345</text>
+  <text x="110" y="315" class="pin">CS</text><text x="110" y="355" class="pin">MOSI / SDA</text>
+  <text x="110" y="395" class="pin">SCK</text><text x="110" y="435" class="pin">MISO / SDO</text>
+  <text x="110" y="475" class="pin">VCC · GND</text>
+
+  <rect x="1050" y="220" width="270" height="270" class="box"/>
+  <text x="1185" y="265" text-anchor="middle" class="title">INMP441</text>
+  <text x="1080" y="315" class="pin">SCK / BCLK</text><text x="1080" y="355" class="pin">WS / LRCLK</text>
+  <text x="1080" y="395" class="pin">SD</text><text x="1080" y="435" class="pin">L/R → GND</text>
+  <text x="1080" y="475" class="pin">3V3 · GND</text>
+
+  <path d="M350 315 H450 V280 H500" class="spi"/><path d="M350 355 H430 V310 H500" class="spi"/>
+  <path d="M350 395 H410 V340 H500" class="spi"/><path d="M350 435 H390 V370 H500" class="spi"/>
+  <path d="M900 465 H970 V315 H1050" class="i2s"/><path d="M900 495 H990 V355 H1050" class="i2s"/>
+  <path d="M900 525 H1010 V395 H1050" class="i2s"/>
+  <path d="M250 475 V560 H480" class="power"/><path d="M1185 475 V560 H920" class="power"/>
+  <path d="M215 500 V650 H480" class="gnd"/><path d="M1185 500 V650 H920" class="gnd"/>
+  <!-- labels sit directly beside the corresponding wire -->
+  <g class="pin" font-size="16" font-weight="700">
+    <text x="365" y="308">CS → GPIO10</text><text x="365" y="348">MOSI → GPIO11</text>
+    <text x="365" y="388">SCK → GPIO12</text><text x="365" y="428">MISO → GPIO13</text>
+    <text x="912" y="458">SCK/BCLK → GPIO4</text><text x="912" y="488">WS/LRCLK → GPIO5</text>
+    <text x="912" y="518">SD/DATA → GPIO6</text>
+    <text x="270" y="552">VCC → 3V3</text><text x="270" y="642">GND → GND</text>
+    <text x="1020" y="552">3V3 → 3V3</text><text x="1020" y="642">GND → GND</text>
+  </g>
+  <!-- explicit connection nodes: every endpoint and branch is marked -->
+  <g class="j-spi"><circle cx="350" cy="315" r="8"/><circle cx="350" cy="355" r="8"/><circle cx="350" cy="395" r="8"/><circle cx="350" cy="435" r="8"/><circle cx="500" cy="280" r="8"/><circle cx="500" cy="310" r="8"/><circle cx="500" cy="340" r="8"/><circle cx="500" cy="370" r="8"/></g>
+  <g class="j-i2s"><circle cx="900" cy="465" r="8"/><circle cx="900" cy="495" r="8"/><circle cx="900" cy="525" r="8"/><circle cx="1050" cy="315" r="8"/><circle cx="1050" cy="355" r="8"/><circle cx="1050" cy="395" r="8"/></g>
+  <g class="j-power"><circle cx="250" cy="475" r="8"/><circle cx="1185" cy="475" r="8"/><circle cx="480" cy="560" r="8"/><circle cx="920" cy="560" r="8"/></g>
+  <g class="j-gnd"><circle cx="215" cy="500" r="8"/><circle cx="1185" cy="500" r="8"/><circle cx="480" cy="650" r="8"/><circle cx="920" cy="650" r="8"/></g>
+  <rect x="475" y="790" width="18" height="6" fill="#2563eb"/><text x="500" y="797" class="note">SPI</text>
+  <rect x="560" y="790" width="18" height="6" fill="#16a34a"/><text x="585" y="797" class="note">I2S</text>
+  <rect x="640" y="790" width="18" height="6" fill="#dc2626"/><text x="665" y="797" class="note">3V3</text>
+  <rect x="735" y="790" width="18" height="6" fill="#64748b"/><text x="760" y="797" class="note">GND</text>
+  <text x="700" y="750" text-anchor="middle" class="note">주의: 센서 모듈의 VCC 허용전압을 실제 보드 사양으로 확인 후 3V3에 연결하세요. 모든 GND는 공통입니다.</text>
+</svg>

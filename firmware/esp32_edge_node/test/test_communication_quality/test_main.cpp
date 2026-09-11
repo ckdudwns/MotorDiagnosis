@@ -22,6 +22,34 @@ std::string ack(const Window& window, bool duplicate = false, const char* dispos
     doc["duplicate"] = duplicate; doc["disposition"] = disposition;
     std::string result; serializeJson(doc, result); return result;
 }
+struct DropEvidence {
+    unsigned events = 0, unique = 0, actual = 0;
+    std::uint32_t lastIndex = 0;
+    char lastBoot[33] = {};
+    bool hasLast = false;
+};
+void pendingFull(DropEvidence& evidence, const char* bootId, std::uint32_t index, bool owned) {
+    ++evidence.events;
+    if (!evidence.hasLast || evidence.lastIndex != index ||
+        std::strcmp(evidence.lastBoot, bootId) != 0) {
+        ++evidence.unique; evidence.lastIndex = index;
+        std::strncpy(evidence.lastBoot, bootId, sizeof(evidence.lastBoot) - 1);
+        evidence.hasLast = true;
+    }
+    if (!owned) ++evidence.actual;
+}
+void testDropClassificationSeparatesPressureFromOwnershipLoss() {
+    DropEvidence evidence;
+    pendingFull(evidence, BOOT, 7, true);
+    pendingFull(evidence, BOOT, 7, true);
+    pendingFull(evidence, BOOT, 7, true);
+    TEST_ASSERT_EQUAL_UINT(3, evidence.events);
+    TEST_ASSERT_EQUAL_UINT(1, evidence.unique);
+    TEST_ASSERT_EQUAL_UINT(0, evidence.actual);
+    pendingFull(evidence, BOOT, 8, false);
+    TEST_ASSERT_EQUAL_UINT(2, evidence.unique);
+    TEST_ASSERT_EQUAL_UINT(1, evidence.actual);
+}
 struct Storage { Window value; bool writeSuccess = true, eraseSuccess = true, present = false; unsigned writes = 0, erases = 0; };
 bool persist(const Window& window, void* raw) {
     auto& storage = *static_cast<Storage*>(raw);
@@ -224,6 +252,7 @@ int main(int argc, char** argv) {
     }
     UNITY_BEGIN();
     RUN_TEST(testNoClockOrScopeCannotCreateInventedWindow);
+    RUN_TEST(testDropClassificationSeparatesPressureFromOwnershipLoss);
     RUN_TEST(testMonotonicMinuteIncludesTrueStopAndIdleSamples);
     RUN_TEST(testAttemptsAndFailureCategoriesAreMutuallyExclusive);
     RUN_TEST(testFirstReplayIsNotAutomaticallyARepeatedAttempt);

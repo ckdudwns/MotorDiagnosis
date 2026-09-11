@@ -193,18 +193,45 @@ class VibrationWindowStore:
                     context = json.dumps([window[k] for k in ("siteId", "assetId", "profileId")])
                     stream = self.db.execute(
                         "SELECT * FROM window_streams WHERE device=? AND boot=?", (device_id, boot)).fetchone()
-                    if stream and (stream["context"] != context or index <= stream["idx"] or window["startUptimeUs"] <= stream["uptime"]):
+                    if stream and stream["context"] != context:
+                        reject("Stream context changed or expired/out-of-order window", 409, "WINDOW_SEQUENCE_CONFLICT")
+                    lower = upper = None
+                    if self.storage_kind == "raw-counts":
+                        lower = self.db.execute(
+                            "SELECT idx,body FROM vibration_windows WHERE device=? AND boot=? AND idx<? ORDER BY idx DESC LIMIT 1",
+                            (device_id, boot, index)).fetchone()
+                        upper = self.db.execute(
+                            "SELECT idx,body FROM vibration_windows WHERE device=? AND boot=? AND idx>? ORDER BY idx LIMIT 1",
+                            (device_id, boot, index)).fetchone()
+                        lower_uptime = json.loads(lower["body"])["startUptimeUs"] if lower else None
+                        upper_uptime = json.loads(upper["body"])["startUptimeUs"] if upper else None
+                        if stream and index == stream["idx"]:
+                            reject("Stream context changed or expired/out-of-order window", 409, "WINDOW_SEQUENCE_CONFLICT")
+                        previous_uptime = lower_uptime
+                        next_uptime = upper_uptime
+                        if stream and index > stream["idx"] and previous_uptime is None:
+                            previous_uptime = stream["uptime"]
+                        if stream and index < stream["idx"] and next_uptime is None:
+                            next_uptime = stream["uptime"]
+                        if ((previous_uptime is not None and window["startUptimeUs"] <= previous_uptime)
+                                or (next_uptime is not None and window["startUptimeUs"] >= next_uptime)):
+                            reject("Stream context changed or expired/out-of-order window", 409, "WINDOW_SEQUENCE_CONFLICT")
+                    elif stream and (index <= stream["idx"] or window["startUptimeUs"] <= stream["uptime"]):
                         reject("Stream context changed or expired/out-of-order window", 409, "WINDOW_SEQUENCE_CONFLICT")
                     if not stream and self.db.execute("SELECT count(*) FROM window_streams").fetchone()[0] >= MAX_STREAMS:
                         reject("Stream identity capacity reached", 503, "WINDOW_BACKPRESSURE")
-                    gap = index - stream["idx"] - 1 if stream else index
+                    if self.storage_kind == "raw-counts":
+                        gap = index - lower["idx"] - 1 if lower else index
+                    else:
+                        gap = index - stream["idx"] - 1 if stream else index
                     self.validate_stream_clock(window, captured)
                     self.db.execute(
                         "INSERT INTO vibration_windows(device,site,asset,boot,idx,captured,digest,body,gap,status) VALUES(?,?,?,?,?,?,?,?,?,'queued')",
                         (device_id, window["siteId"], window["assetId"], boot, index, captured, digest, body, gap))
                     self.db.execute("INSERT OR IGNORE INTO window_identities VALUES(?)", (device_id,))
-                    self.db.execute("INSERT OR REPLACE INTO window_streams VALUES(?,?,?,?,?)",
-                                    (device_id, boot, context, index, window["startUptimeUs"]))
+                    if not stream or index > stream["idx"]:
+                        self.db.execute("INSERT OR REPLACE INTO window_streams VALUES(?,?,?,?,?)",
+                                        (device_id, boot, context, index, window["startUptimeUs"]))
                     accepted += 1
                 ack.append({"bootId": boot, "windowIndex": index, "digest": digest})
         return {"deviceId": device_id, "accepted": accepted, "acknowledged": ack}, 202 if accepted else 200

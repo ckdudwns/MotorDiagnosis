@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <ctime>
 #include <cstring>
@@ -9,6 +11,7 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include <HTTPClient.h>
+#include <mbedtls/sha256.h>
 #include <WiFiClientSecure.h>
 
 #include "config/app_config.h"
@@ -60,14 +63,18 @@ StaticQueue_t candidateQueueControl;
 
 char bootId[33] = {};
 uint32_t nextWindowIndex = 0;
+uint32_t nextReportIndex = 0;
 
 struct PeriodicSlot {
     bool initialized = false;
     bool hasValid = false;
     bool suppressed = false;
-    uint64_t summaryAtUs = 0;
-    uint32_t summarySequence = 0;
-    uint32_t lastWindowIndex = 0;
+    uint64_t periodicSlotEpochUs = 0;
+    uint32_t lastMeasuredWindowIndex = 0;
+    uint64_t lastMeasuredAtEpochUs = 0;
+    bool lastMeasuredAtValid = false;
+    uint8_t anomalyCount = 0;
+    uint8_t normalCount = 0;
     char invalidReason[48] = "no_valid_window";
     TransmissionCandidate latest;
 };
@@ -104,9 +111,9 @@ void preparePendingMetadata(PendingWindow& pending, uint32_t index,
     uint64_t measuredEpochUs, bool timestampValid) {
     TelemetryMetadata& metadata = pending.metadata;
     metadata = TelemetryMetadata{};
-    metadata.schemaVersion = 1;
+    metadata.schemaVersion = 2;
     fillIdentity(metadata);
-    metadata.windowIndex = index;
+    metadata.measuredWindowIndex = index;
     metadata.windowMeasuredUptimeUs = measuredUptimeUs;
     metadata.startUptimeUs = startUptimeUs;
     metadata.sampleCount = pending.stats.sampleCount;
@@ -115,9 +122,7 @@ void preparePendingMetadata(PendingWindow& pending, uint32_t index,
     copyText(metadata.reason, "none");
     if (timestampValid) {
         metadata.windowMeasuredAtEpochUs = measuredEpochUs;
-        metadata.summaryAtEpochUs = measuredEpochUs;
         metadata.windowMeasuredAtValid = 1;
-        metadata.summaryAtValid = 1;
     }
 }
 
@@ -126,7 +131,6 @@ void setInvalidReason(TelemetryMetadata& metadata, const char* reason) {
     copyText(metadata.reason, reason);
     metadata.featuresValid = 0;
     metadata.sampleCount = 0;
-    metadata.windowMeasuredAtValid = 0;
 }
 
 const char* candidateType(CandidateReason reason) {
@@ -136,12 +140,10 @@ const char* candidateType(CandidateReason reason) {
                                                   : "periodic";
 }
 
-void resetPeriodicSlot(uint64_t summaryAtUs) {
-    const uint32_t sequence = periodicSlot.summarySequence;
+void resetPeriodicSlot(uint64_t periodicSlotEpochUs) {
     periodicSlot = PeriodicSlot{};
     periodicSlot.initialized = true;
-    periodicSlot.summaryAtUs = summaryAtUs;
-    periodicSlot.summarySequence = sequence;
+    periodicSlot.periodicSlotEpochUs = periodicSlotEpochUs;
     copyText(periodicSlot.invalidReason, "no_valid_window");
 }
 
@@ -154,18 +156,20 @@ void emitPeriodicSlot() {
     if (!periodicSlot.hasValid) {
         value = TransmissionCandidate{};
         TelemetryMetadata& metadata = value.window.metadata;
-        metadata.schemaVersion = 1;
+        metadata.schemaVersion = 2;
         fillIdentity(metadata);
-        metadata.windowIndex = periodicSlot.lastWindowIndex;
-        metadata.summaryAtEpochUs = periodicSlot.summaryAtUs;
-        metadata.summaryAtValid = 1;
+        metadata.measuredWindowIndex = periodicSlot.lastMeasuredWindowIndex;
+        metadata.windowMeasuredAtEpochUs = periodicSlot.lastMeasuredAtEpochUs;
+        metadata.windowMeasuredAtValid = periodicSlot.lastMeasuredAtValid;
+        metadata.anomalyCount = periodicSlot.anomalyCount;
+        metadata.normalCount = periodicSlot.normalCount;
         setInvalidReason(metadata, periodicSlot.invalidReason);
         value.reason = CandidateReason::periodic;
     }
 
-    value.window.metadata.summaryAtEpochUs = periodicSlot.summaryAtUs;
-    value.window.metadata.summaryAtValid = 1;
-    value.window.metadata.summarySequence = periodicSlot.summarySequence;
+    value.window.metadata.periodicSlotEpochUs = periodicSlot.periodicSlotEpochUs;
+    value.window.metadata.periodicSlotEpochValid = 1;
+    value.window.metadata.windowIndex = nextReportIndex++;
     if (periodicSlot.hasValid) {
         copyText(value.window.metadata.reason, "none");
     }
@@ -179,10 +183,9 @@ void advancePeriodicSlot(uint64_t measuredEpochUs) {
         resetPeriodicSlot(slotUs);
         return;
     }
-    while (periodicSlot.summaryAtUs < slotUs) {
+    while (periodicSlot.periodicSlotEpochUs < slotUs) {
         emitPeriodicSlot();
-        ++periodicSlot.summarySequence;
-        resetPeriodicSlot(periodicSlot.summaryAtUs + kPeriodicIntervalUs);
+        resetPeriodicSlot(periodicSlot.periodicSlotEpochUs + kPeriodicIntervalUs);
     }
 }
 
@@ -190,7 +193,13 @@ void noteValidPeriodic(const TransmissionCandidate& value,
                        uint64_t measuredEpochUs,
                        const TransmissionPolicyDecision& decision) {
     advancePeriodicSlot(measuredEpochUs);
-    periodicSlot.lastWindowIndex = value.window.metadata.windowIndex;
+    periodicSlot.lastMeasuredWindowIndex =
+        value.window.metadata.measuredWindowIndex;
+    periodicSlot.lastMeasuredAtEpochUs =
+        value.window.metadata.windowMeasuredAtEpochUs;
+    periodicSlot.lastMeasuredAtValid = value.window.metadata.windowMeasuredAtValid;
+    periodicSlot.anomalyCount = decision.anomalyCount;
+    periodicSlot.normalCount = decision.normalCount;
     if (decision.state != TransmissionPolicyState::normal ||
         decision.action != TransmissionPolicyAction::discard) {
         periodicSlot.suppressed = true;
@@ -202,9 +211,13 @@ void noteValidPeriodic(const TransmissionCandidate& value,
 
 void noteInvalidPeriodic(uint64_t measuredEpochUs, uint32_t windowIndex,
                          const char* reason,
-                         const TransmissionPolicyDecision& decision) {
+    const TransmissionPolicyDecision& decision) {
     advancePeriodicSlot(measuredEpochUs);
-    periodicSlot.lastWindowIndex = windowIndex;
+    periodicSlot.lastMeasuredWindowIndex = windowIndex;
+    periodicSlot.lastMeasuredAtEpochUs = measuredEpochUs;
+    periodicSlot.lastMeasuredAtValid = true;
+    periodicSlot.anomalyCount = decision.anomalyCount;
+    periodicSlot.normalCount = decision.normalCount;
     copyText(periodicSlot.invalidReason, reason);
     if (decision.state == TransmissionPolicyState::anomalyActive) {
         periodicSlot.suppressed = true;
@@ -226,54 +239,123 @@ bool formatTimestamp(uint64_t epochUs, char (&output)[40]) {
     return true;
 }
 
+void appendUint64(String& output, uint64_t value) {
+    char number[24] = {};
+    snprintf(number, sizeof(number), "%llu",
+             static_cast<unsigned long long>(value));
+    output += number;
+}
+
+struct WireFeatureValue {
+    char text[24] = {};
+    double value = 0.0;
+};
+
+bool encodeFeatureValues(const VibrationFeatures& features,
+                         WireFeatureValue (&encoded)[9]) {
+    const float sourceValues[9] = {
+        features.cfA1, features.cfA2, features.cfA3,
+        features.skewnessA1, features.skewnessA2, features.skewnessA3,
+        features.kurtosisA1, features.kurtosisA2, features.kurtosisA3,
+    };
+    for (size_t index = 0; index < 9; ++index) {
+        if (!isfinite(sourceValues[index])) {
+            return false;
+        }
+        snprintf(encoded[index].text, sizeof(encoded[index].text), "%.6f",
+                 static_cast<double>(sourceValues[index]));
+        encoded[index].value = strtod(encoded[index].text, nullptr);
+        if (!isfinite(encoded[index].value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool calculateFeatureDigest(const WireFeatureValue* values, size_t count,
+                            char (&output)[65]) {
+    static_assert(sizeof(double) == 8,
+                  "The feature digest requires 8-byte doubles.");
+    mbedtls_sha256_context context;
+    mbedtls_sha256_init(&context);
+    if (mbedtls_sha256_starts_ret(&context, 0) != 0) {
+        mbedtls_sha256_free(&context);
+        return false;
+    }
+    for (size_t index = 0; index < count; ++index) {
+        if (mbedtls_sha256_update_ret(
+                &context,
+                reinterpret_cast<const unsigned char*>(&values[index].value),
+                sizeof(values[index].value)) != 0) {
+            mbedtls_sha256_free(&context);
+            return false;
+        }
+    }
+    unsigned char digest[32] = {};
+    const int result = mbedtls_sha256_finish_ret(&context, digest);
+    mbedtls_sha256_free(&context);
+    if (result != 0) {
+        return false;
+    }
+    for (size_t index = 0; index < sizeof(digest); ++index) {
+        snprintf(output + index * 2, 3, "%02x", digest[index]);
+    }
+    output[64] = '\0';
+    return true;
+}
+
 bool buildUploadPayload(const PendingWindow& pending, CandidateReason reason,
-                        String& payload) {
-    if (!pending.metadata.summaryAtValid ||
+                        String& payload, char (&featureDigest)[65]) {
+    const bool periodic = reason == CandidateReason::periodic;
+    if (!pending.metadata.windowMeasuredAtValid ||
+        (periodic && !pending.metadata.periodicSlotEpochValid) ||
         (pending.metadata.featuresValid && !pending.stats.featuresValid)) {
         return false;
     }
 
-    char summaryAt[40] = {};
-    if (!formatTimestamp(pending.metadata.summaryAtEpochUs, summaryAt)) {
+    char timestamp[40] = {};
+    if (!formatTimestamp(pending.metadata.windowMeasuredAtEpochUs, timestamp)) {
         return false;
     }
-    payload.reserve(900);
-    payload = "{\"schemaVersion\":";
+
+    WireFeatureValue encoded[9] = {};
+    size_t encodedCount = 0;
+    if (pending.metadata.featuresValid) {
+        if (!encodeFeatureValues(pending.stats.features, encoded)) {
+            return false;
+        }
+        encodedCount = 9;
+    }
+    if (!calculateFeatureDigest(encoded, encodedCount, featureDigest)) {
+        return false;
+    }
+
+    payload.reserve(1200);
+    payload = "{\"window\":{\"schemaVersion\":";
     payload += String(pending.metadata.schemaVersion);
-    payload += ",\"siteId\":\"";
+    payload += ",\"deviceId\":\"";
+    payload += pending.metadata.deviceId;
+    payload += "\",\"siteId\":\"";
     payload += pending.metadata.siteId;
     payload += "\",\"assetId\":\"";
     payload += pending.metadata.assetId;
-    payload += "\",\"deviceId\":\"";
-    payload += pending.metadata.deviceId;
     payload += "\",\"sensorId\":\"";
     payload += pending.metadata.sensorId;
     payload += "\",\"bootId\":\"";
     payload += pending.metadata.bootId;
     payload += "\",\"windowIndex\":";
     payload += String(pending.metadata.windowIndex);
-    payload += ",\"recordType\":\"";
-    payload += candidateType(reason);
-    payload += "\",\"summaryAt\":\"";
-    payload += summaryAt;
-    payload += "\"";
-    if (reason == CandidateReason::periodic) {
-        payload += ",\"summarySequence\":";
-        payload += String(pending.metadata.summarySequence);
-    }
-    payload += ",\"windowMeasuredAt\":";
-    if (pending.metadata.windowMeasuredAtValid) {
-        char measuredAt[40] = {};
-        if (!formatTimestamp(pending.metadata.windowMeasuredAtEpochUs,
-                             measuredAt)) {
-            return false;
-        }
-        payload += "\"";
-        payload += measuredAt;
-        payload += "\"";
-    } else {
-        payload += "null";
-    }
+    payload += ",\"timestamp\":\"";
+    payload += timestamp;
+    payload += "\",\"startUptimeUs\":";
+    appendUint64(payload, pending.metadata.startUptimeUs);
+    payload += ",\"sampleRateHz\":";
+    payload += String(app::kVibrationSampleRateHz);
+    payload += ",\"sampleCount\":";
+    payload += String(pending.metadata.sampleCount);
+    payload += ",\"profileId\":\"";
+    payload += app::kFeatureProfileId;
+    payload += "\",\"axes\":[\"X\",\"Y\",\"Z\"],\"unit\":\"dimensionless\"";
     payload += ",\"quality\":\"";
     payload += pending.metadata.quality;
     payload += "\",\"reason\":";
@@ -285,98 +367,195 @@ bool buildUploadPayload(const PendingWindow& pending, CandidateReason reason,
         payload += "\"";
     }
     payload += ",\"features\":";
-    if (!pending.metadata.featuresValid) {
+    if (encodedCount == 0) {
         payload += "null";
     } else {
-        const VibrationFeatures& f = pending.stats.features;
         payload += "{\"cf_a_1\":";
-        payload += String(f.cfA1, 6);
+        payload += encoded[0].text;
         payload += ",\"cf_a_2\":";
-        payload += String(f.cfA2, 6);
+        payload += encoded[1].text;
         payload += ",\"cf_a_3\":";
-        payload += String(f.cfA3, 6);
+        payload += encoded[2].text;
         payload += ",\"sk_a_1\":";
-        payload += String(f.skewnessA1, 6);
+        payload += encoded[3].text;
         payload += ",\"sk_a_2\":";
-        payload += String(f.skewnessA2, 6);
+        payload += encoded[4].text;
         payload += ",\"sk_a_3\":";
-        payload += String(f.skewnessA3, 6);
+        payload += encoded[5].text;
         payload += ",\"ku_a_1\":";
-        payload += String(f.kurtosisA1, 6);
+        payload += encoded[6].text;
         payload += ",\"ku_a_2\":";
-        payload += String(f.kurtosisA2, 6);
+        payload += encoded[7].text;
         payload += ",\"ku_a_3\":";
-        payload += String(f.kurtosisA3, 6);
+        payload += encoded[8].text;
         payload += "}";
     }
-    payload += "}";
+    payload += ",\"integrity\":{\"algorithm\":\"sha256\",\"digest\":\"";
+    payload += featureDigest;
+    payload += "\"},\"periodicSlotEpoch\":";
+    if (periodic) {
+        appendUint64(payload, pending.metadata.periodicSlotEpochUs / 1000000ULL);
+    } else {
+        payload += "null";
+    }
+    payload += "},\"transmission\":{\"policyId\":\"";
+    payload += app::kPolicyId;
+    payload += "\",\"eventType\":\"";
+    payload += candidateType(reason);
+    payload += "\",\"state\":\"";
+    payload += (reason == CandidateReason::anomalyStart ||
+                        reason == CandidateReason::anomalyActive
+                    ? "ANOMALY_ACTIVE"
+                    : "NORMAL");
+    payload += "\",\"anomalyCount\":";
+    payload += String(pending.metadata.anomalyCount);
+    payload += ",\"normalCount\":";
+    payload += String(pending.metadata.normalCount);
+    payload += "}}";
     return true;
 }
 
-bool ackMatches(const String& response, const PendingWindow& pending,
-                CandidateReason reason) {
-    const int arrayStart = response.indexOf("\"acknowledged\"");
-    if (arrayStart < 0) {
+bool matchStringField(const String& response, const char* key,
+                      const char* expected, int begin, int end) {
+    String quotedKey = "\"";
+    quotedKey += key;
+    quotedKey += "\"";
+    const int keyStart = response.indexOf(quotedKey, begin);
+    if (keyStart < begin || keyStart >= end) {
         return false;
     }
-    const int arrayEnd = response.indexOf(']', arrayStart);
-    const int objectStart = response.indexOf('{', arrayStart);
-    if (arrayEnd < 0 || objectStart < 0 || objectStart > arrayEnd) {
+    const int colon = response.indexOf(':', keyStart + quotedKey.length());
+    if (colon < 0 || colon >= end) {
         return false;
     }
+    int valueStart = colon + 1;
+    while (valueStart < end && (response.charAt(valueStart) == ' ' ||
+                                response.charAt(valueStart) == '\n' ||
+                                response.charAt(valueStart) == '\r' ||
+                                response.charAt(valueStart) == '\t')) {
+        ++valueStart;
+    }
+    if (valueStart >= end || response.charAt(valueStart) != '"') {
+        return false;
+    }
+    const int valueEnd = response.indexOf('"', valueStart + 1);
+    if (valueEnd < 0 || valueEnd > end) {
+        return false;
+    }
+    const size_t length = static_cast<size_t>(valueEnd - valueStart - 1);
+    return length == strlen(expected) &&
+           strncmp(response.c_str() + valueStart + 1, expected, length) == 0;
+}
 
-    const int bootKey = response.indexOf("\"bootId\"", objectStart);
-    const bool periodic = reason == CandidateReason::periodic;
-    const int indexKey = response.indexOf(
-        periodic ? "\"summarySequence\"" : "\"windowIndex\"",
-        objectStart);
-    const int objectEnd = response.indexOf('}', objectStart);
-    if (bootKey < objectStart || bootKey > objectEnd ||
-        indexKey < objectStart || indexKey > objectEnd) {
+bool matchUnsignedField(const String& response, const char* key,
+                        uint32_t expected, int begin, int end) {
+    String quotedKey = "\"";
+    quotedKey += key;
+    quotedKey += "\"";
+    const int keyStart = response.indexOf(quotedKey, begin);
+    if (keyStart < begin || keyStart >= end) {
         return false;
     }
-
-    const int bootColon = response.indexOf(':', bootKey);
-    const int bootStart = response.indexOf('"', bootColon + 1);
-    const int bootEnd = response.indexOf('"', bootStart + 1);
-    if (bootColon < 0 || bootStart < 0 || bootEnd < 0 ||
-        bootEnd > objectEnd) {
+    const int colon = response.indexOf(':', keyStart + quotedKey.length());
+    if (colon < 0 || colon >= end) {
         return false;
     }
-    const size_t bootLength = static_cast<size_t>(bootEnd - bootStart - 1);
-    if (bootLength != strlen(pending.metadata.bootId) ||
-        strncmp(response.c_str() + bootStart + 1, pending.metadata.bootId,
-                bootLength) != 0) {
-        return false;
-    }
-
-    const int indexColon = response.indexOf(':', indexKey);
-    if (indexColon < 0) {
-        return false;
-    }
-    int digit = indexColon + 1;
-    while (digit < objectEnd && response.charAt(digit) == ' ') {
+    int digit = colon + 1;
+    while (digit < end && (response.charAt(digit) == ' ' ||
+                           response.charAt(digit) == '\n' ||
+                           response.charAt(digit) == '\r' ||
+                           response.charAt(digit) == '\t')) {
         ++digit;
     }
-    if (digit >= objectEnd || response.charAt(digit) < '0' ||
+    if (digit >= end || response.charAt(digit) < '0' ||
         response.charAt(digit) > '9') {
         return false;
     }
-
-    uint32_t windowIndex = 0;
-    while (digit < objectEnd && response.charAt(digit) >= '0' &&
+    uint32_t value = 0;
+    while (digit < end && response.charAt(digit) >= '0' &&
            response.charAt(digit) <= '9') {
-        const uint32_t nextValue =
-            windowIndex * 10U +
-            static_cast<uint32_t>(response.charAt(digit) - '0');
-        if (nextValue < windowIndex) {
+        const uint32_t next = value * 10U +
+                              static_cast<uint32_t>(response.charAt(digit) - '0');
+        if (next < value) {
             return false;
         }
-        windowIndex = nextValue;
+        value = next;
         ++digit;
     }
-    return windowIndex == (periodic ? pending.metadata.summarySequence
-                                    : pending.metadata.windowIndex);
+    return value == expected;
+}
+
+bool matchBoolField(const String& response, const char* key, bool expected,
+                    int begin, int end) {
+    String quotedKey = "\"";
+    quotedKey += key;
+    quotedKey += "\"";
+    const int keyStart = response.indexOf(quotedKey, begin);
+    if (keyStart < begin || keyStart >= end) {
+        return false;
+    }
+    const int colon = response.indexOf(':', keyStart + quotedKey.length());
+    if (colon < 0 || colon >= end) {
+        return false;
+    }
+    int valueStart = colon + 1;
+    while (valueStart < end && (response.charAt(valueStart) == ' ' ||
+                                response.charAt(valueStart) == '\n' ||
+                                response.charAt(valueStart) == '\r' ||
+                                response.charAt(valueStart) == '\t')) {
+        ++valueStart;
+    }
+    const char* literal = expected ? "true" : "false";
+    const size_t length = strlen(literal);
+    return valueStart >= 0 && valueStart + length <= static_cast<size_t>(end) &&
+           response.substring(valueStart, valueStart + length) == literal;
+}
+
+bool ackMatches(const String& response, const PendingWindow& pending,
+                CandidateReason reason, const char* featureDigest,
+                int statusCode) {
+    const int acknowledgedKey = response.indexOf("\"acknowledged\"");
+    if (acknowledgedKey < 0) {
+        return false;
+    }
+    const int arrayStart = response.indexOf('[', acknowledgedKey);
+    const int arrayEnd = response.indexOf(']', arrayStart);
+    const int objectStart = response.indexOf('{', arrayStart);
+    const int objectEnd = response.indexOf('}', objectStart);
+    if (arrayStart < 0 || arrayEnd < 0 ||
+        objectStart < arrayStart || objectStart > arrayEnd || objectEnd < 0 ||
+        objectEnd > arrayEnd) {
+        return false;
+    }
+
+    const bool newRecord = statusCode == 202 &&
+                           matchUnsignedField(response, "accepted", 1, 0,
+                                               acknowledgedKey) &&
+                           matchBoolField(response, "duplicate", false, 0,
+                                          acknowledgedKey);
+    const bool duplicateRecord = statusCode == 200 &&
+                                 matchUnsignedField(response, "accepted", 0,
+                                                    0, acknowledgedKey) &&
+                                 matchBoolField(response, "duplicate", true, 0,
+                                                acknowledgedKey);
+    return (newRecord || duplicateRecord) &&
+           matchStringField(response, "deviceId", pending.metadata.deviceId, 0,
+                            acknowledgedKey) &&
+           matchStringField(response, "policyId", app::kPolicyId, 0,
+                            acknowledgedKey) &&
+           matchStringField(response, "sensorId", pending.metadata.sensorId,
+                            objectStart, objectEnd) &&
+           matchStringField(response, "bootId", pending.metadata.bootId,
+                            objectStart, objectEnd) &&
+           matchUnsignedField(response, "windowIndex",
+                              pending.metadata.windowIndex, objectStart,
+                              objectEnd) &&
+           matchStringField(response, "eventType", candidateType(reason),
+                            objectStart, objectEnd) &&
+           matchStringField(response, "featureDigest", featureDigest,
+                            objectStart, objectEnd) &&
+           matchBoolField(response, "durablyStored", true, objectStart,
+                          objectEnd);
 }
 
 bool enqueueCandidate(const TransmissionCandidate& value) {
@@ -409,9 +588,7 @@ void flushPendingNtpCandidate() {
 
     pendingNtpCandidate.window.metadata.windowMeasuredAtEpochUs =
         timestampEpochUs;
-    pendingNtpCandidate.window.metadata.summaryAtEpochUs = timestampEpochUs;
     pendingNtpCandidate.window.metadata.windowMeasuredAtValid = 1;
-    pendingNtpCandidate.window.metadata.summaryAtValid = 1;
     if (!enqueueCandidate(pendingNtpCandidate)) {
         return;
     }
@@ -451,17 +628,17 @@ CandidateReason candidateReasonFromAction(TransmissionPolicyAction action) {
     return CandidateReason::periodic;
 }
 
-void setCandidateReason(TelemetryMetadata& metadata, CandidateReason reason) {
-    if (reason == CandidateReason::anomalyStart) {
-        copyText(metadata.reason,
-                 "resultant_rms_or_strongest_peak_threshold");
-    } else if (reason == CandidateReason::anomalyActive) {
-        copyText(metadata.reason, "anomaly_active");
-    } else if (reason == CandidateReason::recovery) {
-        copyText(metadata.reason, "recovery");
-    } else {
-        copyText(metadata.reason, "none");
+void applyPolicyMetadata(TelemetryMetadata& metadata,
+                         const TransmissionPolicyDecision& decision) {
+    metadata.anomalyCount = decision.anomalyCount;
+    metadata.normalCount = decision.normalCount;
+    if (decision.action == TransmissionPolicyAction::recovery) {
+        metadata.normalCount = app::kRecoveryConsecutiveWindows;
     }
+}
+
+void assignReportIndex(TransmissionCandidate& value) {
+    value.window.metadata.windowIndex = nextReportIndex++;
 }
 
 const char* invalidReason(CaptureQuality quality) {
@@ -516,8 +693,9 @@ void uploadTask(void*) {
         }
 
         String payload;
+        char featureDigest[65] = {};
         if (!buildUploadPayload(*psramUploadWindow, retryFile.reason,
-                                payload)) {
+                                payload, featureDigest)) {
             Serial.print("[UPLOAD] payload_build_failed path=");
             Serial.println(retryFile.path);
             windowStore.releaseCandidate(retryFile);
@@ -545,8 +723,8 @@ void uploadTask(void*) {
         const uint32_t requestUs = micros() - requestStartedAt;
 
         const bool acknowledged =
-            (statusCode == 200 || statusCode == 202) &&
-            ackMatches(response, *psramUploadWindow, retryFile.reason);
+            ackMatches(response, *psramUploadWindow, retryFile.reason,
+                       featureDigest, statusCode);
         const char* candidateReason =
             retryFile.reason == CandidateReason::recovery ? "recovery"
             : retryFile.reason == CandidateReason::anomalyStart ? "anomaly_start"
@@ -630,22 +808,22 @@ void sensorTask(void*) {
         }
 
         const uint32_t windowIndex = nextWindowIndex++;
-        uint64_t captureEndEpochUs = 0;
-        const bool captureEndTimeValid =
-            wifiTime.utcAtUptimeUs(captureEndUs, captureEndEpochUs);
+        uint64_t captureStartEpochUs = 0;
+        const bool captureStartTimeValid =
+            wifiTime.utcAtUptimeUs(captureStartUs, captureStartEpochUs);
 
         if (!captureResult.ok()) {
             printCaptureResult(captureResult, window);
             TransmissionPolicyInput policyInput;
             policyInput.valid = false;
-            policyInput.utcValid = captureEndTimeValid;
-            policyInput.utcUs = captureEndEpochUs;
+            policyInput.utcValid = captureStartTimeValid;
+            policyInput.utcUs = captureStartEpochUs;
             policyInput.uptimeUs = captureEndUs;
             const TransmissionPolicyDecision policyDecision =
                 transmissionPolicy.evaluate(policyInput);
             printPolicyDecision(policyDecision, windowIndex);
-            if (captureEndTimeValid) {
-                noteInvalidPeriodic(captureEndEpochUs, windowIndex,
+            if (captureStartTimeValid) {
+                noteInvalidPeriodic(captureStartEpochUs, windowIndex,
                                     invalidReason(captureResult.quality),
                                     policyDecision);
             }
@@ -662,28 +840,29 @@ void sensorTask(void*) {
         candidate = TransmissionCandidate{};
         candidate.window.stats = stats;
         preparePendingMetadata(candidate.window, windowIndex, captureStartUs,
-                               captureEndUs, captureEndEpochUs,
-                               captureEndTimeValid);
+                               captureStartUs, captureStartEpochUs,
+                               captureStartTimeValid);
         TransmissionPolicyInput policyInput;
         policyInput.valid = true;
         policyInput.stats = stats;
-        policyInput.utcValid = captureEndTimeValid;
-        policyInput.utcUs = captureEndEpochUs;
+        policyInput.utcValid = captureStartTimeValid;
+        policyInput.utcUs = captureStartEpochUs;
         policyInput.uptimeUs = captureEndUs;
         const TransmissionPolicyDecision policyDecision =
             transmissionPolicy.evaluate(policyInput);
+        applyPolicyMetadata(candidate.window.metadata, policyDecision);
 
         printCaptureResult(captureResult, window);
         printPolicyDecision(policyDecision, windowIndex);
-        if (captureEndTimeValid) {
-            noteValidPeriodic(candidate, captureEndEpochUs, policyDecision);
+        if (captureStartTimeValid) {
+            noteValidPeriodic(candidate, captureStartEpochUs, policyDecision);
         }
         flushPendingNtpCandidate();
         if (policyDecision.action != TransmissionPolicyAction::discard) {
             candidate.reason =
                 candidateReasonFromAction(policyDecision.action);
-            setCandidateReason(candidate.window.metadata, candidate.reason);
-            if (!candidate.window.metadata.summaryAtValid) {
+            assignReportIndex(candidate);
+            if (!candidate.window.metadata.windowMeasuredAtValid) {
                 if (!pendingNtpCandidateValid) {
                     pendingNtpCandidate = candidate;
                     pendingNtpCandidateValid = true;

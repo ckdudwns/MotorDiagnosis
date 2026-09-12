@@ -16,6 +16,8 @@ constexpr char kDeviceId[] = "DEV-01-MOT-02";
 constexpr char kSiteId[] = "SITE-01";
 constexpr char kAssetId[] = "SITE-01-MOT-02";
 constexpr char kSensorId[] = "SENSOR-02";
+constexpr char kFeatureProfileId[] = "adxl345-ac-cf-sk-ku-v1";
+constexpr char kPolicyId[] = "edge-feature-snapshot-v1";
 
 constexpr uint32_t kWindowCaptureTimeoutMs = 5000;
 // Test-only policy knobs. Replace with calibrated motor thresholds later.

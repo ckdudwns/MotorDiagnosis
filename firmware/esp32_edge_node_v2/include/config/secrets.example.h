@@ -5,7 +5,7 @@
 #define WIFI_PASSWORD_VALUE "YOUR_WIFI_PASSWORD"
 
 #define INGEST_URL_VALUE \
-    "https://example.invalid/api/devices/YOUR_DEVICE_ID/periodic-snapshots"
+    "https://motordiagnosis-api.duckdns.org/api/devices/DEV-01-MOT-02/periodic-snapshots"
 #define HEALTH_URL_VALUE "https://example.invalid/api/health"
 #define DEVICE_HEALTH_URL_VALUE \
     "https://example.invalid/api/devices/YOUR_DEVICE_ID/health"

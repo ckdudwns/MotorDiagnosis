@@ -13,7 +13,7 @@ namespace {
 
 constexpr char kRetryDirectory[] = "/retry";
 constexpr uint32_t kFeatureRecordMagic = 0x4D324654;
-constexpr uint16_t kFeatureRecordVersion = 1;
+constexpr uint16_t kFeatureRecordVersion = 2;
 constexpr size_t kRecordWriteBudgetBytes = 1024;
 constexpr size_t kProtectedReserveBytes = kRecordWriteBudgetBytes * 2;
 
@@ -402,7 +402,9 @@ WindowWriteResult LittleFsWindowStore::saveCandidate(
         candidate.window.metadata.featuresValid == 0 &&
         strcmp(candidate.window.metadata.quality, "invalid") == 0;
     if ((!validCandidate && !invalidPeriodic) ||
-        !candidate.window.metadata.summaryAtValid) {
+        !candidate.window.metadata.windowMeasuredAtValid ||
+        (candidate.reason == CandidateReason::periodic &&
+         !candidate.window.metadata.periodicSlotEpochValid)) {
         return result;
     }
 

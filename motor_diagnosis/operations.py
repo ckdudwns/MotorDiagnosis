@@ -32,8 +32,10 @@ DB_DEFAULTS = {
     "COMMUNICATION_QUALITY_DB_PATH": "output/communication-quality.sqlite3",
     "SHADOW_MODEL_DB_PATH": "output/model-inference.sqlite3",
 }
-FILE_KEYS = ("AUTH_USERS_FILE", "INGEST_TOKENS_FILE", "RF66_MODEL_ARTIFACT", "SHADOW_MODEL_ARTIFACT")
-SAFE_ENV = {*DB_DEFAULTS, *FILE_KEYS, "RF66_MODEL_CHECKSUM", "RF66_EVENT_MODE", "SHADOW_MODEL_CHECKSUM", "SNAPSHOT_EVENT_MODE"}
+FILE_KEYS = ("AUTH_USERS_FILE", "INGEST_TOKENS_FILE", "RF66_MODEL_ARTIFACT", "SHADOW_MODEL_ARTIFACT", "PUMP_EVENT_VERIFIER_ARTIFACT")
+SAFE_ENV = {*DB_DEFAULTS, *FILE_KEYS, "RF66_MODEL_CHECKSUM", "RF66_EVENT_MODE", "SHADOW_MODEL_CHECKSUM", "SNAPSHOT_EVENT_MODE",
+            "PUMP_EVENT_VERIFIER_CHECKSUM", "PUMP_EVENT_VERIFIER_STREAM", "PUMP_EVENT_VERIFIER_DEVICE_ID",
+            "PUMP_EVENT_VERIFIER_SITE_ID", "PUMP_EVENT_VERIFIER_ASSET_ID", "PUMP_EVENT_VERIFIER_SENSOR_ID"}
 GiB = 1024 ** 3
 
 
@@ -189,7 +191,8 @@ def make_backup(project, env, info, destination, *, stopped):
     manifest = {"formatVersion": 2, "createdAt": stamp(), "complete": True,
                 "consistency": "service_stopped", "project": str(project),
                 "serviceUser": info.get("User"), "eventMode": env.get("RF66_EVENT_MODE", "shadow"),
-                "modelChecksum": env.get("RF66_MODEL_CHECKSUM"), "files": [], "absentOptional": absent}
+                "modelChecksum": env.get("RF66_MODEL_CHECKSUM"), "files": [], "absentOptional": absent,
+                "pumpVerifier": {k: env[k] for k in SAFE_ENV if k.startswith("PUMP_EVENT_VERIFIER_") and k in env}}
     try:
         manifest["commit"] = run("git", "-c", f"safe.directory={project}", "-C", str(project), "rev-parse", "HEAD")
     except (OSError, subprocess.SubprocessError):
@@ -214,6 +217,9 @@ def make_backup(project, env, info, destination, *, stopped):
             # sha tracks the entire backup ZIP; the configured checksum pins
             # model/candidate.joblib inside it. Never deserialize for maintenance.
             read_package_files(output, env.get("RF66_MODEL_CHECKSUM"))
+        if key == "PUMP_EVENT_VERIFIER_ARTIFACT":
+            from .pump_event_model import read_artifact
+            read_artifact(output, env.get("PUMP_EVENT_VERIFIER_CHECKSUM"))
         manifest["files"].append({"key": key, "file": output.name, "kind": kind,
                                   "originalPath": str(path), "bytes": output.stat().st_size, "sha256": sha})
     write_json(folder / "manifest.json", manifest)  # completion marker LAST
@@ -283,6 +289,8 @@ def verify_backup(folder):
         raise ValueError("Incomplete/duplicate database set")
     if manifest.get("modelChecksum") and "RF66_MODEL_ARTIFACT" not in keys:
         raise ValueError("RF66 model is missing from backup")
+    if manifest.get("pumpVerifier") and "PUMP_EVENT_VERIFIER_ARTIFACT" not in keys:
+        raise ValueError("Pump verifier model is missing from backup")
     for item in files:
         if not re.fullmatch(r"[A-Z0-9_]+\.(sqlite3|bin)", item["file"]):
             raise ValueError("Invalid backup member name")
@@ -295,6 +303,9 @@ def verify_backup(folder):
             check_database(path)
         if item["key"] == "RF66_MODEL_ARTIFACT":
             read_package_files(path, manifest.get("modelChecksum"))
+        if item["key"] == "PUMP_EVENT_VERIFIER_ARTIFACT":
+            from .pump_event_model import read_artifact
+            read_artifact(path, manifest.get("pumpVerifier", {}).get("PUMP_EVENT_VERIFIER_CHECKSUM"))
     return manifest
 
 
@@ -432,6 +443,10 @@ def inspect(project, env, device, *, now=None):
                         item["latest"]["inputPreparation"] = analysis.get("inputPreparation")
                         item["latest"]["inference"] = analysis.get("inference")
                         item["latest"]["reason"] = analysis.get("reason")
+                        window = json.loads(row[6])["window"]
+                        if "sensorId" in window:
+                            item["latest"].update(sensorId=window["sensorId"], historySequence=window.get("historySequence"),
+                                                  modelEvidence=analysis.get("evidence"))
                         if not -5 <= now-row[0] <= snapshot_interval_seconds(transmission) + 60:
                             issue("warning", "PERIODIC_SNAPSHOT_INPUT_STALE_OR_FUTURE")
                         if row[5] == "unavailable":

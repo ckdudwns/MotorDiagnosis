@@ -1847,7 +1847,7 @@ def create_server(
     server.periodic_snapshots = None
     try:
         # Only an explicitly supplied, scoped adapter can infer new snapshots.
-        # app.py intentionally supplies none until a replacement model is agreed.
+        # app.py supplies the JSON verifier only with a complete explicit binding.
         server.periodic_snapshots = PeriodicSnapshotStore(snapshot_database, model=snapshot_model, event_mode=snapshot_event_mode)
         # Identity protection must survive disabling/replacing the ML runtime.
         server.model_history = ModelHistoryGuard(model_database)

@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Preserve the exact bytes used by the pinned model artifact checksums.
+models/pump-event-verifier/*.json -text

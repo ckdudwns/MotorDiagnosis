@@ -7,6 +7,7 @@ import threading
 
 from motor_diagnosis.server import create_server
 from motor_diagnosis.alerts import configured_adapters
+from motor_diagnosis.pump_event_model import configured_model
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PORT", "8787"))
@@ -26,6 +27,7 @@ def main() -> None:
         raw_window_database=os.environ.get("RAW_VIBRATION_WINDOW_DB_PATH", "output/raw-vibration-windows.sqlite3"),
         snapshot_database=os.environ.get("PERIODIC_SNAPSHOT_DB_PATH", "output/periodic-snapshots.sqlite3"),
         snapshot_event_mode=os.environ.get("SNAPSHOT_EVENT_MODE", "events"),
+        snapshot_model=configured_model(),
         window_model_variant=os.environ.get("WINDOW_MODEL_VARIANT") or None,
         model_candidate=os.environ.get("SHADOW_MODEL_CANDIDATE", "lstm_autoencoder"),
         model_checksum=os.environ.get("SHADOW_MODEL_CHECKSUM"),

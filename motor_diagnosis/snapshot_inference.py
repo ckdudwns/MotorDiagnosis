@@ -127,11 +127,17 @@ class SnapshotInference:
                         raise ValueError("Prepared input or binding mismatch")
                     context = {k: window[k] for k in ("deviceId", "siteId", "assetId", "bootId",
                                "windowIndex", "timestamp", "startUptimeUs")}
+                    context["historySequence"] = window.get("historySequence")
+                    context["sensorId"] = window.get("sensorId")
                 except (data.ApiError, ValueError, TypeError, KeyError, OverflowError):
                     outcome["reason"] = "SNAPSHOT_INPUT_INTEGRITY_FAILED"
                 else:
                     try:
-                        outcome = self.model.evaluate(prepared, context)
+                        if getattr(self.model, "requires_history", False):
+                            history = self._history(row)
+                            outcome = self.model.evaluate_history(prepared, context, history)
+                        else:
+                            outcome = self.model.evaluate(prepared, context)
                     except ValueError:
                         outcome["reason"] = "MODEL_OUTPUT_INVALID"
                     except Exception:
@@ -141,6 +147,41 @@ class SnapshotInference:
             return True
         finally:
             self.gate.release()
+
+    def _history(self, current):
+        """Only originals available at receipt, strictly before this measurement.
+
+        Invalid rows are NOT filtered out: they break the history. Extra event
+        reports do not occupy 25-second history slots. No arrival-order sequence
+        or interpolation is manufactured. Stored input is checked again.
+        """
+        from .periodic_snapshots import canonical, normalize_window
+        from .transmission_policy import validate_snapshot
+        from .pump_summary import POLICY_ID, PROFILE_ID, FEATURES
+        with self.store.lock:
+            rows = self.store.db.execute("""SELECT * FROM periodic_snapshots
+                WHERE device=? AND site=? AND asset=? AND boot=? AND sensor=? AND captured<? AND ordinal<?
+                AND json_extract(body,'$.window.profileId')=?
+                AND json_extract(body,'$.transmission.policyId')=?
+                AND json_extract(body,'$.transmission.reason')='history_periodic'
+                ORDER BY captured DESC,ordinal DESC LIMIT 24""",
+                (current["device"], current["site"], current["asset"], current["boot"],
+                 current["sensor"], current["captured"], current["ordinal"], PROFILE_ID, POLICY_ID)).fetchall()
+        history = []
+        for row in reversed(rows):
+            payload = json.loads(row["body"])
+            if hashlib.sha256(canonical(payload).encode()).hexdigest() != row["digest"]:
+                raise ValueError("History digest mismatch")
+            w = validate_snapshot(payload)
+            captured = normalize_window(w, check_time_bounds=False)
+            if (w["quality"] != row["quality"] or captured != row["captured"] or w["sensorId"] != row["sensor"]
+                    or w["windowIndex"] != row["idx"] or w["startUptimeUs"] != row["uptime"]
+                    or any(w[k] != row[column] for k, column in
+                           (("deviceId", "device"), ("siteId", "site"), ("assetId", "asset"), ("bootId", "boot")))):
+                raise ValueError("History metadata mismatch")
+            history.append({"window": w, "captured": captured, "ordinal": row["ordinal"], "digest": row["digest"],
+                            "values": [w["features"][k] for k in FEATURES] if w["quality"] == "valid" else None})
+        return history
 
     def close(self):
         if self.worker is not None and self.worker.ident is not None:

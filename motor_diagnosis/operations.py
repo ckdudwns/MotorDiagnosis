@@ -28,6 +28,7 @@ DB_DEFAULTS = {
     "ANALYSIS_DB_PATH": "output/analysis.sqlite3",
     "VIBRATION_WINDOW_DB_PATH": "output/vibration-windows.sqlite3",
     "RAW_VIBRATION_WINDOW_DB_PATH": "output/raw-vibration-windows.sqlite3",
+    "PERIODIC_SNAPSHOT_DB_PATH": "output/periodic-snapshots.sqlite3",
     "COMMUNICATION_QUALITY_DB_PATH": "output/communication-quality.sqlite3",
     "SHADOW_MODEL_DB_PATH": "output/model-inference.sqlite3",
 }
@@ -185,7 +186,7 @@ def make_backup(project, env, info, destination, *, stopped):
         raise ValueError("Insufficient backup free space (copy size plus 2 GiB reserve)")
     folder = destination / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:12])
     private_directory(folder, fresh=True)
-    manifest = {"formatVersion": 1, "createdAt": stamp(), "complete": True,
+    manifest = {"formatVersion": 2, "createdAt": stamp(), "complete": True,
                 "consistency": "service_stopped", "project": str(project),
                 "serviceUser": info.get("User"), "eventMode": env.get("RF66_EVENT_MODE", "shadow"),
                 "modelChecksum": env.get("RF66_MODEL_CHECKSUM"), "files": [], "absentOptional": absent}
@@ -268,13 +269,16 @@ def resume_backup(project, service):
 def verify_backup(folder):
     regular(folder / "manifest.json")
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-    if (manifest.get("formatVersion") != 1 or manifest.get("complete") is not True
+    if (manifest.get("formatVersion") not in (1, 2) or manifest.get("complete") is not True
             or manifest.get("consistency") != "service_stopped"):
         raise ValueError("Incomplete/unsupported backup")
     files = manifest.get("files", [])
     keys = [item["key"] for item in files]
     names = [item["file"] for item in files]
     required = (set(DB_DEFAULTS) - {"SHADOW_MODEL_DB_PATH"}) | {"AUTH_USERS_FILE"}
+    if manifest["formatVersion"] == 1:
+        # Backups created before the periodic inbox must remain restorable.
+        required.discard("PERIODIC_SNAPSHOT_DB_PATH")
     if not required <= set(keys) or len(keys) != len(set(keys)) or len(names) != len(set(names)):
         raise ValueError("Incomplete/duplicate database set")
     if manifest.get("modelChecksum") and "RF66_MODEL_ARTIFACT" not in keys:
@@ -383,6 +387,22 @@ def inspect(project, env, device, *, now=None):
                                 issue("warning", "RF66_INCIDENT_CAPACITY")
                             if item["unprojectedIncidents"]:
                                 issue("warning", "RF66_EVENT_PROJECTION_PENDING")
+                elif key == "PERIODIC_SNAPSHOT_DB_PATH":
+                    from .periodic_snapshots import MAX_ROWS
+                    item["statuses"] = dict(db.execute("SELECT status,count(*) FROM periodic_snapshots GROUP BY status"))
+                    item["rows"] = sum(item["statuses"].values())
+                    item["rowLimit"] = MAX_ROWS
+                    item["processingEnabled"] = False
+                    item["stage"] = "ingest_only"
+                    # Queued rows are intentional in stage 1, not a failed worker.
+                    oldest = db.execute("SELECT min(received) FROM periodic_snapshots WHERE status='queued'").fetchone()[0]
+                    item["oldestPendingAgeSec"] = None if oldest is None else now-oldest
+                    if item["rows"] >= MAX_ROWS * .9:
+                        issue("warning", key + ":ROW_CAPACITY")
+                    row = db.execute("""SELECT captured,received,boot,idx,quality,status FROM periodic_snapshots
+                        WHERE device=? ORDER BY captured DESC,late ASC,ordinal DESC LIMIT 1""", (device,)).fetchone()
+                    if row:
+                        item["latest"] = dict(zip(("captured", "receivedAtEpoch", "bootId", "index", "quality", "status"), row))
                 elif key == "ALERT_DB_PATH":
                     item["statuses"] = dict(db.execute("SELECT status,count(*) FROM alert_deliveries GROUP BY status"))
                     old = db.execute("SELECT count(*) FROM alert_deliveries WHERE status IN ('pending','sending') AND due_at<?", (now-120,)).fetchone()[0]

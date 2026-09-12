@@ -9,6 +9,7 @@ import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -116,6 +117,7 @@ from .edge_analysis import AnalysisStore
 from .model_inference import ModelInferenceStore
 from .vibration_windows import VibrationWindowStore
 from .raw_vibration import RawVibrationStore
+from .periodic_snapshots import PeriodicSnapshotStore
 from .model_history import ModelHistoryGuard
 from .model_registry import create_baseline_version, create_model_version, versions_for
 from .ai_results import submit_result, review_model
@@ -242,6 +244,10 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
         user = self.require_user()
+        if (len(segments) == 4 and segments[:2] == ["api", "devices"]
+                and segments[3] == "periodic-snapshots"):
+            self.send_json(self.server.periodic_snapshots.list_device(user, segments[2]))
+            return
         if (len(segments) == 4 and segments[:2] == ["api", "devices"]
                 and segments[3] in {"vibration-windows", "raw-vibration-windows"}):
             store = self.server.raw_vibration if segments[3] == "raw-vibration-windows" else self.server.vibration_windows
@@ -766,6 +772,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 and segments[3] in {"vibration-windows", "raw-vibration-windows"}):
             store = self.server.raw_vibration if segments[3] == "raw-vibration-windows" else self.server.vibration_windows
             result, status = store.ingest(
+                telemetry_principal_for_token(self.bearer_token()), segments[2], payload
+            )
+            self.send_json(result, status=status)
+            return
+        if (len(segments) == 4 and segments[:2] == ["api", "devices"]
+                and segments[3] == "periodic-snapshots"):
+            result, status = self.server.periodic_snapshots.ingest(
                 telemetry_principal_for_token(self.bearer_token()), segments[2], payload
             )
             self.send_json(result, status=status)
@@ -1763,6 +1776,8 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
             self.vibration_windows.close()
         if getattr(self, "raw_vibration", None) is not None:
             self.raw_vibration.close()
+        if getattr(self, "periodic_snapshots", None) is not None:
+            self.periodic_snapshots.close()
         if getattr(self, "model_inference", None) is not None:
             self.model_inference.close()
         if getattr(self, "model_history", None) is not None:
@@ -1792,6 +1807,7 @@ def create_server(
     model_preprocessing_profile=None,
     window_database=":memory:",
     raw_window_database=":memory:",
+    snapshot_database=":memory:",
     window_model_variant=None,
     rf66_artifact=None,
     rf66_checksum=None,
@@ -1800,6 +1816,12 @@ def create_server(
     # Fail closed before opening sockets or persistent databases in production.
     authentication_users()
     validate_ingest_auth()
+    if snapshot_database != ":memory:":
+        snapshot_path = Path(snapshot_database).resolve()
+        other_paths = (state_database, alert_database, communication_database,
+                       analysis_database, model_database, window_database, raw_window_database)
+        if any(p and str(p) != ":memory:" and Path(p).resolve() == snapshot_path for p in other_paths):
+            raise ValueError("Periodic snapshots require a separate database file")
     if demo_enabled is None:
         demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
     configure_runtime_state(state_database)
@@ -1816,7 +1838,10 @@ def create_server(
     server.model_history = None
     server.vibration_windows = None
     server.raw_vibration = None
+    server.periodic_snapshots = None
     try:
+        # This inbox deliberately has no worker until the new model is integrated.
+        server.periodic_snapshots = PeriodicSnapshotStore(snapshot_database)
         # Identity protection must survive disabling/replacing the ML runtime.
         server.model_history = ModelHistoryGuard(model_database)
         checkpoint = None

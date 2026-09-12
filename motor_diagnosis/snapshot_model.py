@@ -36,7 +36,9 @@ class SnapshotModelAdapter:
         if not isinstance(metadata, dict) or set(metadata) != required:
             raise ValueError("Explicit snapshot model metadata is required")
         from .pump_summary import INPUT_CONTRACT as HISTORY_INPUT
-        contracts = {CONTRACT_ID: INPUT_CONTRACT, "history-event-verifier-v1": HISTORY_INPUT}
+        from .edge_feature_snapshots import INPUT_CONTRACT as FEATURE_INPUT, CONTRACT_ID as FEATURE_CONTRACT
+        contracts = {CONTRACT_ID: INPUT_CONTRACT, "history-event-verifier-v1": HISTORY_INPUT,
+                     FEATURE_CONTRACT: FEATURE_INPUT}
         if (not isinstance(metadata["contractId"], str) or metadata["contractId"] not in contracts
                 or metadata["inputContract"] != contracts[metadata["contractId"]]):
             raise ValueError("Unsupported single-snapshot model input contract")
@@ -45,7 +47,7 @@ class SnapshotModelAdapter:
                 raise ValueError("Invalid snapshot model " + key)
         scope = metadata["scope"]
         scope_keys = {"deviceId", "siteId", "assetId"}
-        if metadata["contractId"] == "history-event-verifier-v1":
+        if metadata["contractId"] in ("history-event-verifier-v1", FEATURE_CONTRACT):
             scope_keys.add("sensorId")
         if (not isinstance(scope, dict) or set(scope) != scope_keys
                 or any(not isinstance(v, str) or not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{0,99}", v) for v in scope.values())):
@@ -66,10 +68,12 @@ class SnapshotModelAdapter:
         return copy.deepcopy(self._metadata)
 
     def matches(self, window):
-        return all(window.get(k) == v for k, v in self._metadata["scope"].items())
+        return (window.get("profileId") == self._metadata["inputContract"]["sourceProfileId"]
+                and all(window.get(k) == v for k, v in self._metadata["scope"].items()))
 
     def evaluate(self, prepared, context):
-        if {k: prepared.get(k) for k in INPUT_CONTRACT} != INPUT_CONTRACT:
+        contract = self._metadata["inputContract"]
+        if {k: prepared.get(k) for k in contract} != contract:
             raise ValueError("Prepared input does not match the declared adapter contract")
         output = self._predict(copy.deepcopy(prepared), copy.deepcopy(context))
         if not isinstance(output, dict):

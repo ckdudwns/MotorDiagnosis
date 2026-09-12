@@ -444,12 +444,18 @@ def inspect(project, env, device, *, now=None):
                         item["latest"]["inference"] = analysis.get("inference")
                         item["latest"]["reason"] = analysis.get("reason")
                         window = json.loads(row[6])["window"]
+                        if window.get("profileId") == "adxl345-ac-cf-sk-ku-v1":
+                            item["latest"].update(profileId=window["profileId"], eventType=transmission["eventType"],
+                                qualityReason=window["reason"], periodicSlotEpoch=window["periodicSlotEpoch"],
+                                modelCompatibility=analysis.get("modelCompatibility"))
+                            if analysis.get("reason") == "MODEL_INPUT_CONTRACT_MISMATCH":
+                                issue("warning", "PERIODIC_SNAPSHOT_MODEL_INPUT_CONTRACT_MISMATCH")
                         if "sensorId" in window:
                             item["latest"].update(sensorId=window["sensorId"], historySequence=window.get("historySequence"),
                                                   modelEvidence=analysis.get("evidence"))
                         if not -5 <= now-row[0] <= snapshot_interval_seconds(transmission) + 60:
                             issue("warning", "PERIODIC_SNAPSHOT_INPUT_STALE_OR_FUTURE")
-                        if row[5] == "unavailable":
+                        if row[5] == "unavailable" and analysis.get("reason") != "MODEL_INPUT_CONTRACT_MISMATCH":
                             issue("warning", "PERIODIC_SNAPSHOT_INFERENCE_UNAVAILABLE" if analysis.get("inference")
                                   else "PERIODIC_SNAPSHOT_INPUT_UNAVAILABLE")
                     else:

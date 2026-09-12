@@ -50,7 +50,12 @@ def validate_snapshot(payload):
     if not isinstance(info, dict):
         reject("Invalid transmission metadata", code="INVALID_PERIODIC_SNAPSHOT")
     from .pump_summary import POLICY_ID as HISTORY_POLICY, PROFILE_ID as SUMMARY_PROFILE, validate_delivery
-    if info.get("policyId") == HISTORY_POLICY:
+    from . import edge_feature_snapshots as features
+    if info.get("policyId") == features.POLICY_ID:
+        features.validate_delivery(info, window)
+    elif window.get("profileId") == features.PROFILE_ID:
+        reject("ADXL features require edge-feature-snapshot-v1", code="INVALID_PERIODIC_SNAPSHOT")
+    elif info.get("policyId") == HISTORY_POLICY:
         validate_delivery(info, window)
     elif window.get("profileId") == SUMMARY_PROFILE:
         reject("Source summaries require pump-verifier-history-v1", code="INVALID_PERIODIC_SNAPSHOT")
@@ -101,6 +106,10 @@ def _validate_edge_snapshot(info, window):
 def snapshot_interval_seconds(info):
     """Expected next periodic report, not delivery latency or event delay (0)."""
     from .pump_summary import POLICY_ID as HISTORY_POLICY
+    from .edge_feature_snapshots import POLICY_ID as FEATURE_POLICY
+    if info.get("policyId") == FEATURE_POLICY:
+        # Maximum scheduled normal gap; the complete 25/25/10 cycle is metadata.
+        return 10 if info.get("state") == "ANOMALY_ACTIVE" else 25
     if info.get("policyId") == HISTORY_POLICY:
         return 10 if info.get("state") == "ANOMALY_ACTIVE" else 25
     if info.get("policyId") == EDGE_SNAPSHOT_POLICY_ID and info.get("state") == "ANOMALY_ACTIVE":
@@ -109,7 +118,9 @@ def snapshot_interval_seconds(info):
 
 
 def snapshot_policy_metadata():
+    from .edge_feature_snapshots import policy_metadata
     return [
+        policy_metadata(),
         {"policyId": "pump-verifier-history-v1", "historyIntervalSec": 25,
          "normalIntervalSec": 25, "anomalyIntervalSec": 10, "historyRows": 24,
          "historySchedule": "fixed_acquisition_grid", "immediateReportsAdvanceHistory": False,

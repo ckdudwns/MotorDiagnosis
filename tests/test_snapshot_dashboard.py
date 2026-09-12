@@ -1,4 +1,5 @@
 """Render actual persisted snapshot responses with the shipped browser script."""
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -11,12 +12,54 @@ from motor_diagnosis.periodic_snapshots import PeriodicSnapshotStore
 from motor_diagnosis import data
 from motor_diagnosis.alerts import AlertService
 from motor_diagnosis.snapshot_model import SnapshotModelAdapter
+from motor_diagnosis.pump_event_model import PumpEventModel
 from tests.test_measured_rpm import RpmSetup
 from tests import test_periodic_snapshots as fixtures
+from tests import test_edge_feature_snapshots as feature_fixtures
+from tests import test_pump_event_model as pump_fixtures
 from tests.test_snapshot_inference import metadata
 
 
 class SnapshotDashboardTest(RpmSetup):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the shipped UI")
+    def test_feature_store_compatibility_and_alert_flags_render_in_all_modes(self):
+        self.base = int(datetime.now(timezone.utc).timestamp() - 120) // 60 * 60
+        cases = []
+        for mode in ("shadow", "events", "alerts"):
+            for compatibility in ("input_contract_mismatch", "scope_mismatch", "not_configured", "ready"):
+                with self.subTest(mode=mode, compatibility=compatibility):
+                    model = None
+                    if compatibility in ("input_contract_mismatch", "scope_mismatch"):
+                        model = PumpEventModel(pump_fixtures.ARTIFACT, pump_fixtures.CHECKSUM,
+                                               pump_fixtures.STREAM, pump_fixtures.SCOPE)
+                    elif compatibility == "ready":
+                        model = SnapshotModelAdapter(feature_fixtures.model_metadata(), lambda *_: {"score": .8})
+                    with closing(PeriodicSnapshotStore(model=model, event_mode=mode)) as store:
+                        request = feature_fixtures.EdgeFeatureSnapshotTest.payload(self)
+                        if compatibility == "scope_mismatch":
+                            request["window"]["sensorId"] = "SENSOR-03"
+                        ack, status = store.ingest(self.principal, pump_fixtures.DEVICE, request)
+                        self.assertEqual(status, 202)
+                        self.assertTrue(ack["acknowledged"][0]["durablyStored"])
+                        store.tick()
+                        store.inference.tick()
+                        response = store.list_device(self.admin, pump_fixtures.DEVICE)
+                        self.assertEqual(response["modelCompatibility"]["status"], compatibility)
+                        self.assertEqual(response["inferenceEnabled"], compatibility == "ready")
+                        self.assertEqual(response["affectsAlerts"], compatibility == "ready" and mode == "alerts")
+                        self.assertEqual(response["items"][0]["receivedAt"], ack["acknowledged"][0]["receivedAt"])
+                        if compatibility != "ready":
+                            self.assertIsNone(response["items"][0]["analysis"]["verdict"])
+                            self.assertEqual(store.db.execute("SELECT count(*) FROM snapshot_inference_jobs").fetchone()[0], 0)
+                            self.assertEqual(store.db.execute("SELECT count(*) FROM snapshot_incidents").fetchone()[0], 0)
+                        cases.append({"response": response, "compatibility": compatibility})
+        result = subprocess.run(
+            [shutil.which("node"), "tests/snapshot_feature_dashboard_fixture.mjs"],
+            cwd=Path(__file__).resolve().parents[1], input=json.dumps(cases),
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_server_query_clock_advances_without_rewriting_receipt(self):
         self.started = datetime.now(timezone.utc) - timedelta(hours=1)
         with tempfile.TemporaryDirectory() as folder:

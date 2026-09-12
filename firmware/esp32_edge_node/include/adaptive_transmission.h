@@ -5,12 +5,13 @@
 
 namespace AdaptiveTransmission {
 constexpr std::uint32_t NormalIntervalMs = 300000;
+constexpr std::uint32_t ActiveIntervalMs = 10000;
 constexpr unsigned BatchSize = 4;
 constexpr unsigned PreContext = 3;
-enum class Reason : std::uint8_t { None, Low, High, Severe, Quality, BaselineMissing, StoragePressure, RecoveryHold };
+enum class Reason : std::uint8_t { None, Low, High, Severe, Quality, BaselineMissing, StoragePressure, RecoveryHold, Recovery };
 inline const char* reasonName(Reason r) {
     const char* names[] = {"none", "rms_low", "rms_high", "severe", "quality",
-                          "baseline_missing", "storage_pressure", "recovery_hold"};
+                          "baseline_missing", "storage_pressure", "recovery_hold", "recovery"};
     return names[static_cast<unsigned>(r)];
 }
 struct Config {
@@ -26,23 +27,24 @@ struct Config {
 };
 class Detector {
     Config config_;
-    unsigned lows_=0, highs_=0;
+    unsigned abnormalCount_=0, normalCount_=0;
     std::uint32_t lastIndex_=0;
-    std::uint64_t lastStart_=0, stableStart_=0;
-    bool seen_=false, stable_=false, active_=false;
+    std::uint64_t lastStart_=0, lastSentStart_=0;
+    bool seen_=false, active_=false, sent_=false, shouldTransmit_=false;
     Reason reason_=Reason::BaselineMissing;
-    static unsigned hits(unsigned bits) { return (bits&1U)+((bits>>1U)&1U)+((bits>>2U)&1U); }
 public:
     explicit Detector(Config config={}) : config_(config) {}
     bool configured() const { return config_.valid(); }
     bool active() const { return active_; }
+    bool shouldTransmit() const { return shouldTransmit_; }
     Reason reason() const { return reason_; }
     Reason update(const VibrationWindow::Features& f) {
         const bool continuous=seen_ && f.index==lastIndex_+1 && f.startUs>=lastStart_ &&
             f.startUs-lastStart_>=630000 && f.startUs-lastStart_<=670000;
         const bool broken=seen_ && !continuous;
-        if (!continuous) {lows_=highs_=0; stable_=false;}
+        if (!continuous) {abnormalCount_=normalCount_=0;}
         seen_=true; lastIndex_=f.index; lastStart_=f.startUs;
+        shouldTransmit_=false;
         double sum=0, peak=0;
         bool finite=true;
         for (unsigned a=0;a<3;++a) {
@@ -53,25 +55,44 @@ public:
         const double rms=std::sqrt(sum);
         Reason trigger=Reason::None;
         if (broken || f.quality!=VibrationWindow::Quality::Valid || f.count!=512 || !finite || !std::isfinite(rms)) {
-            lows_=highs_=0; trigger=Reason::Quality;
+            abnormalCount_=normalCount_=0; trigger=Reason::Quality;
         } else if (!configured()) trigger=Reason::BaselineMissing;
         else {
-            lows_=((lows_<<1U)|(rms<config_.low))&7U;
-            highs_=((highs_<<1U)|(rms>config_.high))&7U;
+            const bool abnormal=rms<config_.low || rms>config_.high;
             if (rms<config_.severeLow || rms>config_.severeHigh || peak>config_.severePeak) trigger=Reason::Severe;
-            else if (hits(lows_)>=2) trigger=Reason::Low;
-            else if (hits(highs_)>=2) trigger=Reason::High;
-            // One unconfirmed deviation must not count towards stable recovery.
-            if (rms<config_.low || rms>config_.high) stable_=false;
+            else if (abnormal) {
+                normalCount_=0;
+                if (!active_ && ++abnormalCount_>=3) trigger=rms<config_.low?Reason::Low:Reason::High;
+            } else {
+                abnormalCount_=0;
+            }
         }
-        if (trigger!=Reason::None) {active_=true; stable_=false; reason_=trigger;}
-        else if (active_) {
+        if (trigger!=Reason::None) {
+            const bool wasActive=active_;
+            active_=true; normalCount_=0; reason_=trigger;
+            if (!wasActive) {shouldTransmit_=true; lastSentStart_=f.startUs; sent_=true;}
+            else if (f.startUs-lastSentStart_>=std::uint64_t(ActiveIntervalMs)*1000) {
+                shouldTransmit_=true; lastSentStart_=f.startUs; sent_=true;
+            }
+        } else if (active_) {
             const bool normal=rms>=config_.low && rms<=config_.high;
-            if (normal && !stable_) {stable_=true; stableStart_=f.startUs;}
-            if (normal && stable_ && f.startUs-stableStart_>=std::uint64_t(config_.recoveryMs)*1000) {
-                active_=false; reason_=Reason::None;
-            } else reason_=Reason::RecoveryHold;
-        } else reason_=Reason::None;
+            if (normal) ++normalCount_; else normalCount_=0;
+            if (normalCount_>=5) {
+                active_=false; reason_=Reason::Recovery;
+                shouldTransmit_=true; lastSentStart_=f.startUs; sent_=true;
+            } else {
+                reason_=Reason::RecoveryHold;
+                if (f.startUs-lastSentStart_>=std::uint64_t(ActiveIntervalMs)*1000) {
+                    shouldTransmit_=true; lastSentStart_=f.startUs; sent_=true;
+                }
+            }
+        } else {
+            reason_=Reason::None;
+            if (!sent_) {lastSentStart_=f.startUs; sent_=true;}
+            else if (f.startUs-lastSentStart_>=std::uint64_t(NormalIntervalMs)*1000) {
+                shouldTransmit_=true; lastSentStart_=f.startUs;
+            }
+        }
         return reason_;
     }
 };

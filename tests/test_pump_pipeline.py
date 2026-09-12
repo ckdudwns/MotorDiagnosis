@@ -9,6 +9,8 @@ from zipfile import ZipFile
 import numpy as np
 
 from ai.ai2.pump_pipeline import (
+    EXPECTED_INTERVAL_SEC,
+    FixedPumpAnalyzer,
     audit,
     experiment,
     fit_model,
@@ -17,6 +19,7 @@ from ai.ai2.pump_pipeline import (
     timestamp,
     read_workbook,
     replay_events,
+    replay_fixed_model,
 )
 
 
@@ -140,6 +143,70 @@ class PumpPipelineTest(unittest.TestCase):
         retained, matrix = temporal_windows(records)
         self.assertEqual([row[2] for row in retained], ["11", "23"])
         self.assertEqual(matrix.shape, (2, 4))
+
+    def fixed_model(self):
+        model, report, _ = experiment({"sensor": self.records()}, ["rms_a_1"])
+        model["evaluation"] = {
+            "trainBefore": report["trainBefore"],
+            "testFrom": report["testFrom"],
+        }
+        return model
+
+    def test_fixed_model_analyzes_one_new_row_and_scores_its_prior_forecast(self):
+        analyzer = FixedPumpAnalyzer(self.fixed_model())
+        rows = self.records(13)
+        for index, row in enumerate(rows):
+            result = analyzer.ingest(
+                "sensor",
+                row["createdAt"],
+                index,
+                [float(row["rms_a_1"])],
+                source_document_id=row["_document_id"],
+            )
+        self.assertEqual(result["status"], "analyzed")
+        self.assertIn("previousForecast", result)
+        self.assertEqual(result["nextForecast"]["horizonSec"], EXPECTED_INTERVAL_SEC)
+
+    def test_fixed_model_resets_on_non_five_second_gap_or_sequence_break(self):
+        analyzer = FixedPumpAnalyzer(self.fixed_model())
+        start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        for index in range(12):
+            analyzer.ingest(
+                "sensor",
+                (start + timedelta(seconds=5 * index)).isoformat(),
+                index,
+                [1.0],
+            )
+        bad_gap = analyzer.ingest(
+            "sensor", (start + timedelta(seconds=70)).isoformat(), 12, [1.0]
+        )
+        self.assertEqual(
+            bad_gap["historyResetReason"], "timestamp_or_sequence_discontinuity"
+        )
+        self.assertEqual(bad_gap["historyCount"], 1)
+        bad_sequence = analyzer.ingest(
+            "sensor", (start + timedelta(seconds=75)).isoformat(), 99, [1.0]
+        )
+        self.assertEqual(
+            bad_sequence["historyResetReason"], "timestamp_or_sequence_discontinuity"
+        )
+        invalid = analyzer.ingest(
+            "sensor",
+            (start + timedelta(seconds=80)).isoformat(),
+            100,
+            [1.0],
+            quality_ok=False,
+        )
+        self.assertEqual(invalid["historyResetReason"], "quality_invalid")
+
+    def test_replay_uses_fixed_artifact_without_refitting(self):
+        model = self.fixed_model()
+        original = repr(model)
+        replay, summary = replay_fixed_model(model, {"sensor": self.records()})
+        self.assertTrue(replay)
+        self.assertEqual(summary["mode"], "fixed_model_sequential_replay")
+        self.assertGreater(summary["forecastComparisons"], 0)
+        self.assertEqual(repr(model), original)
 
     def test_short_sensor_is_not_randomly_split(self):
         _, report, _ = experiment(

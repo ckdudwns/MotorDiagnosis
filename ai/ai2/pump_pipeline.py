@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -18,18 +19,18 @@ REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 LABELS = ("물 수위(L)", "슬러지 유무", "이벤트")
 VERSION = "pump-summary-experiment-v1"
 WINDOW_ROWS = 12
-MAX_GAP_SEC = 10
+EXPECTED_INTERVAL_SEC = 5
 
 
 def temporal_windows(records: list) -> tuple[list, np.ndarray]:
-    """Use past-only windows within one split; reset at acquisition gaps."""
+    """Use past-only, exactly five-second windows within one split."""
     history, retained, vectors = [], [], []
     previous = None
     for item in records:
         at, values, _ = item
         if (
             previous is not None
-            and not 0 < (at - previous).total_seconds() <= MAX_GAP_SEC
+            and (at - previous).total_seconds() != EXPECTED_INTERVAL_SEC
         ):
             history.clear()
         previous = at
@@ -50,6 +51,165 @@ def temporal_windows(records: list) -> tuple[list, np.ndarray]:
         )
         retained.append(item)
     return retained, np.array(vectors)
+
+
+def window_vector(history: list[np.ndarray]) -> np.ndarray:
+    """Build the serving vector using the same past-only transform as training."""
+    if len(history) != WINDOW_ROWS:
+        raise ValueError(f"Exactly {WINDOW_ROWS} observations are required")
+    window = np.array(history)
+    return np.concatenate(
+        (window[-1], window.mean(axis=0), window.std(axis=0), window[-1] - window[0])
+    )
+
+
+@dataclass
+class _RuntimeState:
+    history: list[tuple[datetime, int, np.ndarray]] = field(default_factory=list)
+    pending_forecast: dict | None = None
+
+
+class FixedPumpAnalyzer:
+    """Fixed-model, per-sensor sequential analysis for five-second summaries.
+
+    This object never changes model parameters.  A missing timestamp, sequence
+    discontinuity, invalid-quality measurement, or non-finite value clears only
+    that sensor's recent history; it is not converted into a pump fault.
+    """
+
+    def __init__(self, model: dict) -> None:
+        validate_model(model)
+        self.model = model
+        self.states: dict[str, _RuntimeState] = {}
+
+    def ingest(
+        self,
+        sensor_id: str,
+        measured_at: str | datetime,
+        sequence: int,
+        values: list[float] | np.ndarray,
+        *,
+        quality_ok: bool = True,
+        source_document_id: str | None = None,
+    ) -> dict:
+        """Add one real measurement and optionally return a next-5-second forecast."""
+        if not isinstance(sensor_id, str) or not sensor_id.strip():
+            raise ValueError("sensor_id must be a non-empty string")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise ValueError("sequence must be a non-negative integer")
+        at = timestamp(measured_at) if isinstance(measured_at, str) else measured_at
+        if not isinstance(at, datetime) or at.tzinfo is None:
+            raise ValueError("measured_at must include timezone")
+        at = at.astimezone(timezone.utc)
+        numeric = np.asarray(values, dtype=float)
+        if (
+            numeric.shape != (len(self.model["features"]),)
+            or not np.isfinite(numeric).all()
+        ):
+            raise ValueError("values must be finite and match the model feature order")
+        sensor_id = sensor_id.strip()
+        state = self.states.setdefault(sensor_id, _RuntimeState())
+        result = {
+            "sensorId": sensor_id,
+            "timestamp": at.isoformat(),
+            "sequence": sequence,
+            "sourceDocumentId": source_document_id,
+            "modelVersion": self.model["modelType"],
+            "status": "warming_up",
+        }
+        previous = state.history[-1] if state.history else None
+        continuous = (
+            previous is not None
+            and (at - previous[0]).total_seconds() == EXPECTED_INTERVAL_SEC
+            and sequence == previous[1] + 1
+        )
+        if not quality_ok or (previous is not None and not continuous):
+            state.history.clear()
+            state.pending_forecast = None
+            result["historyResetReason"] = (
+                "quality_invalid"
+                if not quality_ok
+                else "timestamp_or_sequence_discontinuity"
+            )
+        if not quality_ok:
+            return result
+        if (
+            state.pending_forecast
+            and state.pending_forecast["predictedFor"] == at.isoformat()
+        ):
+            predicted = np.array(state.pending_forecast["values"])
+            scale = np.array(state.pending_forecast["targetStd"])
+            error = np.abs(predicted - numeric)
+            result["previousForecast"] = {
+                "predictedFor": at.isoformat(),
+                "rawMae": float(np.mean(error)),
+                "standardizedMae": float(np.mean(error / scale)),
+            }
+            state.pending_forecast = None
+        state.history.append((at, sequence, numeric))
+        state.history = state.history[-WINDOW_ROWS:]
+        result["historyCount"] = len(state.history)
+        stream = self.model["streams"].get(sensor_id)
+        if stream is None:
+            result["status"] = "model_not_available_for_sensor"
+            return result
+        if len(state.history) < WINDOW_ROWS:
+            return result
+        vector = window_vector([item[2] for item in state.history])
+        robust, pca = predict(stream, vector.reshape(1, -1))
+        forecast = stream.get("forecast")
+        result.update(
+            {
+                "status": "analyzed",
+                "robustDeviation": float(robust[0]),
+                "pcaResidual": float(pca[0]),
+                "referenceExceeded": bool(robust[0] > stream["thresholds"][0]),
+                "anomalyScore": round(
+                    min(100.0, 75.0 * robust[0] / stream["thresholds"][0])
+                ),
+            }
+        )
+        if forecast is not None:
+            estimate = (vector - np.array(forecast["inputMean"])) / np.array(
+                forecast["inputStd"]
+            ) @ np.array(forecast["weights"]) * np.array(
+                forecast["targetStd"]
+            ) + np.array(
+                forecast["targetMean"]
+            )
+            predicted_at = (at + timedelta(seconds=EXPECTED_INTERVAL_SEC)).isoformat()
+            state.pending_forecast = {
+                "predictedFor": predicted_at,
+                "values": estimate.tolist(),
+                "targetStd": forecast["targetStd"],
+            }
+            result["nextForecast"] = {
+                "predictedFor": predicted_at,
+                "features": estimate.tolist(),
+                "horizonSec": EXPECTED_INTERVAL_SEC,
+            }
+        return result
+
+
+def validate_model(model: dict) -> None:
+    """Reject malformed fixed artifacts before serving any measurement."""
+    if not isinstance(model, dict) or model.get("modelType") != VERSION:
+        raise ValueError("Unsupported pump model artifact")
+    if (
+        model.get("windowRows") != WINDOW_ROWS
+        or model.get("intervalSec") != EXPECTED_INTERVAL_SEC
+    ):
+        raise ValueError("Model does not use the required 12-row, five-second contract")
+    features, streams = model.get("features"), model.get("streams")
+    if not isinstance(features, list) or not features or not isinstance(streams, dict):
+        raise ValueError("Model is missing features or sensor streams")
+
+
+def load_model(path: Path) -> dict:
+    """Load a saved, immutable model artifact; this function never fits a model."""
+    model = json.loads(path.read_text(encoding="utf-8"))
+    validate_model(model)
+    return model
 
 
 def timestamp(value: str) -> datetime:
@@ -329,7 +489,7 @@ def experiment(sheets: dict, features: list[str]) -> tuple[dict, dict, list[dict
         raise ValueError("Sensors have no overlapping observation period")
     cut1, cut2 = first + (last - first) * 0.6, first + (last - first) * 0.8
     artifacts = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "modelType": VERSION,
         "features": features,
         "mode": "offline_experiment",
@@ -337,7 +497,7 @@ def experiment(sheets: dict, features: list[str]) -> tuple[dict, dict, list[dict
         "unit": "unverified_source_values",
         "streams": {},
         "windowRows": WINDOW_ROWS,
-        "maxGapSec": MAX_GAP_SEC,
+        "intervalSec": EXPECTED_INTERVAL_SEC,
         "derivedFeatures": [
             name + ":" + statistic
             for statistic in ("last", "mean", "std", "delta")
@@ -423,6 +583,69 @@ def experiment(sheets: dict, features: list[str]) -> tuple[dict, dict, list[dict
     )
 
 
+def replay_fixed_model(
+    model: dict, sheets: dict[str, list[dict[str, str]]]
+) -> tuple[list[dict], dict]:
+    """Sequentially replay a workbook through an already trained artifact.
+
+    The source workbook is never used for fitting.  Rows before ``testFrom`` are
+    allowed only to warm the 12-row history; reported forecast comparisons begin
+    at the fixed artifact's forward-test boundary.
+    """
+    validate_model(model)
+    test_from = timestamp(model["evaluation"]["testFrom"])
+    analyzer = FixedPumpAnalyzer(model)
+    output, errors = [], []
+    for sensor_id, rows in sheets.items():
+        if sensor_id not in model["streams"]:
+            continue
+        prepared = []
+        for ordinal, row in enumerate(rows):
+            try:
+                at = timestamp(row["createdAt"])
+                values = [float(row[name]) for name in model["features"]]
+                if not np.isfinite(values).all():
+                    raise ValueError("non-finite values")
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
+                errors.append(
+                    {"sensorId": sensor_id, "row": ordinal + 2, "error": str(error)}
+                )
+                continue
+            prepared.append((at, values, row.get("_document_id")))
+        # The supplied export's ``cnt`` is not a telemetry sequence (it repeats
+        # across five-second observations).  Offline replay therefore assigns an
+        # explicit replay-only order. Live adapters must pass device sequence.
+        for replay_sequence, (at, values, document_id) in enumerate(sorted(prepared)):
+            result = analyzer.ingest(
+                sensor_id,
+                at,
+                replay_sequence,
+                values,
+                source_document_id=document_id,
+            )
+            if at >= test_from:
+                result["sequenceSource"] = "replay_row_order"
+                output.append(result)
+    comparable = [
+        row["previousForecast"] for row in output if "previousForecast" in row
+    ]
+    summary = {
+        "schemaVersion": 1,
+        "mode": "fixed_model_sequential_replay",
+        "modelType": model["modelType"],
+        "testFrom": test_from.isoformat(),
+        "recordsReported": len(output),
+        "forecastComparisons": len(comparable),
+        "meanStandardizedMae": (
+            float(np.mean([row["standardizedMae"] for row in comparable]))
+            if comparable
+            else None
+        ),
+        "invalidRowsSkipped": errors,
+    }
+    return output, summary
+
+
 def replay_events(predictions: list[dict]) -> list[dict]:
     """Exercise existing lifecycle offline, keeping each sensor observation scoped.
 
@@ -443,7 +666,10 @@ def replay_events(predictions: list[dict]) -> list[dict]:
             "anomalyScore": row["anomalyScore"],
             "anomalyModel": VERSION,
         }
-        if sensor in previous and (at - previous[sensor]).total_seconds() > MAX_GAP_SEC:
+        if (
+            sensor in previous
+            and (at - previous[sensor]).total_seconds() != EXPECTED_INTERVAL_SEC
+        ):
             # Missing data breaks continuity, without manufacturing a sensor diagnosis.
             events.extend(
                 lifecycle.process_point(
@@ -473,14 +699,34 @@ def main() -> None:
         nargs="+",
         help="Explicit opt-in numeric columns with unverified units; never operational approval",
     )
+    parser.add_argument(
+        "--model",
+        type=Path,
+        help="Fixed model.json to replay; does not train or update the model",
+    )
     args = parser.parse_args()
     sheets = read_workbook(args.workbook)
     report = audit(sheets)
     report["sourceSha256"] = hashlib.sha256(args.workbook.read_bytes()).hexdigest()
     outputs = {"audit.json": report}
-    if args.exploratory_features:
+    if args.model and args.exploratory_features:
+        parser.error("--model and --exploratory-features cannot be used together")
+    if args.model:
+        model = load_model(args.model)
+        replay, replay_summary = replay_fixed_model(model, sheets)
+        outputs.update(
+            {
+                "replay.json": replay,
+                "replay-summary.json": replay_summary,
+            }
+        )
+    elif args.exploratory_features:
         model, metrics, predictions = experiment(sheets, args.exploratory_features)
         model["sourceSha256"] = report["sourceSha256"]
+        model["evaluation"] = {
+            "trainBefore": metrics["trainBefore"],
+            "testFrom": metrics["testFrom"],
+        }
         outputs.update(
             {
                 "model.json": model,

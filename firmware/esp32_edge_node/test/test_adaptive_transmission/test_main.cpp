@@ -15,11 +15,13 @@ void testBaselineMissingNeverEnablesFiveMinuteBlindWait() {
     Detector d; TEST_ASSERT_FALSE(d.configured());
     TEST_ASSERT_EQUAL_INT(int(Reason::BaselineMissing),int(d.update(frame(0)))); TEST_ASSERT_TRUE(d.active());
 }
-void testTwoOfThreeAndSingleDeviation() {
+void testThreeConsecutiveDeviationsEnterAndSingleDeviationDoesNot() {
     Detector d(config()); d.update(frame(0,1.4)); TEST_ASSERT_FALSE(d.active());
-    d.update(frame(1)); TEST_ASSERT_FALSE(d.active());
+    d.update(frame(1,1.4)); TEST_ASSERT_FALSE(d.active());
     TEST_ASSERT_EQUAL_INT(int(Reason::High),int(d.update(frame(2,1.4)))); TEST_ASSERT_TRUE(d.active());
+    TEST_ASSERT_TRUE(d.shouldTransmit()); // Immediate activation raw.
     Detector low(config()); low.update(frame(0,.6)); low.update(frame(1,.6));
+    TEST_ASSERT_FALSE(low.active()); low.update(frame(2,.6));
     TEST_ASSERT_EQUAL_INT(int(Reason::Low),int(low.reason()));
 }
 void testSevereAndQualityAreImmediateNotModelVerdicts() {
@@ -36,12 +38,23 @@ void testGapQualityAndRebootResetVoting() {
     Detector time(config()); time.update(frame(0,1.4)); auto f=frame(1,1.4); f.startUs=2000;
     time.update(f); TEST_ASSERT_EQUAL_INT(int(Reason::Quality),int(time.reason()));
 }
-void testRecoveryRequiresSustainedValidNormalWindows() {
+void testRecoveryRequiresFiveValidNormalWindows() {
     Detector d(config()); d.update(frame(0,2.1));
-    for (unsigned i=1;i<47;++i) {d.update(frame(i)); TEST_ASSERT_TRUE(d.active());}
-    d.update(frame(47)); TEST_ASSERT_FALSE(d.active());
+    for (unsigned i=1;i<5;++i) {d.update(frame(i)); TEST_ASSERT_TRUE(d.active());}
+    TEST_ASSERT_EQUAL_INT(int(Reason::Recovery),int(d.update(frame(5))));
+    TEST_ASSERT_FALSE(d.active()); TEST_ASSERT_TRUE(d.shouldTransmit()); // Confirmed recovery raw.
     d.update(frame(48,2.1)); d.update(frame(49)); d.update(frame(100));
     TEST_ASSERT_TRUE(d.active());
+}
+void testRawTransmissionCadenceDoesNotChangeWindowClassification() {
+    Detector d(config());
+    d.update(frame(0)); TEST_ASSERT_FALSE(d.shouldTransmit());
+    for (unsigned i=1;i<459;++i) {d.update(frame(i)); TEST_ASSERT_FALSE(d.shouldTransmit());}
+    d.update(frame(459)); TEST_ASSERT_TRUE(d.shouldTransmit()); // 5 minutes normal.
+    d.update(frame(460,1.4)); d.update(frame(461,1.4)); d.update(frame(462,1.4));
+    TEST_ASSERT_TRUE(d.active()); TEST_ASSERT_TRUE(d.shouldTransmit());
+    for (unsigned i=463;i<478;++i) {d.update(frame(i,1.4)); TEST_ASSERT_FALSE(d.shouldTransmit());}
+    d.update(frame(478,1.4)); TEST_ASSERT_TRUE(d.shouldTransmit()); // 10 seconds active.
 }
 void testCrcDetectsTornPayload() {
     char bytes[]="123456789"; TEST_ASSERT_EQUAL_HEX32(0xcbf43926U,crc32(bytes,9));
@@ -166,10 +179,11 @@ void testAckRequiresEveryImmutableIdentityAndSuccessfulStorageResponse() {
 int main() {
     UNITY_BEGIN();
     RUN_TEST(testBaselineMissingNeverEnablesFiveMinuteBlindWait);
-    RUN_TEST(testTwoOfThreeAndSingleDeviation);
+    RUN_TEST(testThreeConsecutiveDeviationsEnterAndSingleDeviationDoesNot);
     RUN_TEST(testSevereAndQualityAreImmediateNotModelVerdicts);
     RUN_TEST(testGapQualityAndRebootResetVoting);
-    RUN_TEST(testRecoveryRequiresSustainedValidNormalWindows);
+    RUN_TEST(testRecoveryRequiresFiveValidNormalWindows);
+    RUN_TEST(testRawTransmissionCadenceDoesNotChangeWindowClassification);
     RUN_TEST(testCrcDetectsTornPayload);
     RUN_TEST(testFiveMinuteSnapshotAndPriorityPreemption);
     RUN_TEST(testPressureTimerWrapAndUnresolvedOldBoot);

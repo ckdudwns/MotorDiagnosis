@@ -4,10 +4,12 @@ on:
   pull_request:
     paths:
       - "firmware/esp32_edge_node/**"
+      - "firmware/esp32_edge_node_v2/**"
       - ".github/workflows/firmware-ci.yml"
   push:
     paths:
       - "firmware/esp32_edge_node/**"
+      - "firmware/esp32_edge_node_v2/**"
       - ".github/workflows/firmware-ci.yml"
 
 jobs:
@@ -28,6 +30,9 @@ jobs:
 
       - name: Run native firmware logic tests
         run: pio test -d firmware/esp32_edge_node -e native
+
+      - name: Run native firmware logic tests (v2)
+        run: pio test -d firmware/esp32_edge_node_v2 -e native
 
       - name: Verify fail-safe source policies
         run: |
@@ -85,3 +90,34 @@ jobs:
 
       - name: Build opt-in adaptive HTTPS firmware
         run: pio run -d firmware/esp32_edge_node -e esp32-s3-devkitc-1-n8-adaptive
+
+      - name: Verify v2 fail-safe source policies
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path("firmware/esp32_edge_node_v2")
+          main = (root / "src/main.cpp").read_text(encoding="utf-8")
+          example = (root / "include/config/secrets.example.h").read_text(encoding="utf-8")
+
+          if re.search(r"LittleFS\.begin\s*\(\s*true\s*\)", (root / "src/storage/littlefs_window_store.cpp").read_text(encoding="utf-8")):
+              raise SystemExit("v2 must not format LittleFS automatically.")
+          if '#if __has_include("config/secrets.h")' not in main:
+              raise SystemExit("v2 secrets fallback is missing.")
+          if '#include "config/secrets.example.h"' not in main:
+              raise SystemExit("v2 secrets.example.h fallback is missing.")
+          if "setInsecure(" in main:
+              raise SystemExit("v2 must keep TLS certificate validation enabled.")
+          if 'ALLOW_INSECURE_HTTP_FOR_LOCAL_DEV_VALUE false' not in example:
+              raise SystemExit("v2 must deny plaintext HTTP by default.")
+          if "INGEST_URL_VALUE" not in example or "https://" not in example:
+              raise SystemExit("v2 example ingest URL must use HTTPS.")
+
+          print("v2 fail-safe source policy checks passed.")
+          PY
+
+      - name: Clean-checkout ESP32 v2 build without secrets.h
+        run: |
+          test ! -f firmware/esp32_edge_node_v2/include/config/secrets.h
+          pio run -d firmware/esp32_edge_node_v2 -e esp32-s3-devkitc-1-n16r8

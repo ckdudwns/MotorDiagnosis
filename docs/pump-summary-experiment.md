@@ -24,6 +24,13 @@ python -m unittest tests.test_pump_pipeline -v
 python -m black --check ai/ai2/pump_pipeline.py tests/test_pump_pipeline.py
 ```
 
+ESP32가 즉시 전송한 이상값을 별도로 확인하는 모델도 함께 학습하려면 아래처럼 실행한다.
+이는 추세 예측 모델과 별개의 `event-verifier-model.json`을 만든다.
+
+```bash
+python -m ai.ai2.pump_pipeline "../new data/multi_20260907_1433_20260910_1433.xlsx" --output output/pump/with-verifier --exploratory-features cf_a_1 cf_a_2 cf_a_3 sk_a_1 sk_a_2 sk_a_3 ku_a_1 ku_a_2 ku_a_3 --build-event-verifier
+```
+
 학습을 끝낸 뒤 새 파일을 **재학습하지 않고** 시간순으로 검증하려면 저장한
 `model.json`을 명시적으로 넘긴다. 이 명령은 모델 계수·임계값을 변경하지 않는다.
 
@@ -58,12 +65,12 @@ python -m ai.ai2.pump_pipeline "../new data/new_export.xlsx" --output output/pum
 새 엑셀을 `--model`로 재생해도 저장된 `model.json`을 다시 학습하거나 덮어쓰지 않는다.
 `FixedPumpAnalyzer`는 실제 수신 어댑터가 호출할 운영용 순차 분석기다. 센서별로 이전
 기록을 보관하므로 처음 13건 이후에는 새 측정값 **한 건**마다 5분 뒤의 9개 특징을
-예측한다. 매번 12건을 다시 전송할 필요는 없다.
+예측한다. 매번 13건을 다시 전송할 필요는 없다.
 
 입력은 같은 센서의 `createdAt`이 정확히 25초 차이이고, `sequence`가 정확히 1씩 증가하는
 최근 **13개 행**이다. 누락·재부팅에 따른 순번 불연속·품질 불량은 해당 센서 이력을 즉시
 끊고 다시 13건을 쌓는다. 실시간 수신 오차의 허용 범위는 현장 시계 자료를 받은 뒤 별도
-계약으로 정한다. 현재는 평가와 같은 엄격한 5초 계약을 사용한다.
+계약으로 정한다. 현재는 평가와 같은 엄격한 25초 계약을 사용한다.
 
 현재 제공된 엑셀의 `cnt`는 실제 telemetry sequence가 아니며 5초 행에서 반복된다. 따라서
 `--model` 엑셀 재생은 정렬된 행 순서로 만든 `replay_row_order`만 사용한다. 이 값은 운영
@@ -73,12 +80,28 @@ python -m ai.ai2.pump_pipeline "../new data/new_export.xlsx" --output output/pum
 36개 수치다. 새 실제값이 들어오면 직전 예측의 raw/표준화 MAE를 함께 반환한다. 이는
 다음 특징값 예측 오차이며 고장 발생 시각·고장 확률·RUL 예측값이 아니다.
 
+## 즉시 이상 확인 모델
+
+`PumpEventVerifier`는 추세 예측 모델과 독립된 두 번째 모델이다. ESP32가 엣지 이상
+조건을 만족해 Raw를 즉시 전송하면, 서버는 Raw에서 같은 9개 요약 특징을 계산하고 해당
+현재값 1개와 **직전 서버 기록 24개**를 이 모델에 전달한다. 기록 간격이 25초이면 현재
+이상값까지 포함한 비교 범위는 10분이다. 입력은 25개 시점 × 9개 특징, 총 225개 수치다.
+
+직전 24개는 현재 시각보다 과거여야 하고 `timestamp`, 연속된 `sequence`, 동일한 9개
+특징을 가져야 한다. 시간·순번이 하나라도 끊기면 보간하지 않고 `insufficient_history`를
+반환한다. 현재 이벤트의 품질이 유효하지 않으면 `likely_sensor_issue`를 반환한다.
+
+라벨이 없는 현재 단계의 출력은 `possible_anomaly`, `not_confirmed_by_baseline`,
+`likely_sensor_issue`, `insufficient_history`다. `possible_anomaly`는 실제 고장 확정이나
+고장 확률이 아니다. 정비 결과 라벨(`confirmed_anomaly`, `transient_false_alarm`,
+`sensor_issue`)이 쌓이면 같은 입력 형태의 지도 분류 모델로 교체한다.
+
 분할은 행을 무작위로 섞지 않는다. 두 센서가 함께 관측된 기간의 시작·종료 시각을 잡고,
 그 기간의 앞 60%는 학습, 다음 20%는 임계값과 Ridge 계수 선택, 마지막 20%부터는 시험으로
 사용한다. 센서 3처럼 이후 관측이 더 있으면 그 이후 행도 전진 시험에 포함한다. 따라서 학습에는
-조정·시험 행이 들어가지 않으며, 12행 창도 분할 경계를 넘겨 만들지 않는다.
+조정·시험 행이 들어가지 않으며, 13행 창도 분할 경계를 넘겨 만들지 않는다.
 
-운영 연결 때는 학습 시 만든 `model.json`을 읽는 별도 추론 함수가 최근 12개 행을 받아야 한다.
+운영 연결 때는 학습 시 만든 `model.json`을 읽는 별도 추론 함수가 최근 13개 행을 받아야 한다.
 그 함수의 결과는 실제값이 들어오기 전의 5분 뒤 특징 예상치이며, 고장 발생 시각·고장 확률·RUL
 예측값으로 표시하지 않는다.
 
@@ -91,6 +114,8 @@ python -m ai.ai2.pump_pipeline "../new data/new_export.xlsx" --output output/pum
 | evaluation.json | 분할·표본 수·시험 기준 초과 비율·예측 오차 |
 | predictions.json | 시험 구간의 센서별 편차와 실험용 점수 |
 | event-replay.json | 기존 AI2 lifecycle로 재생한 센서별 관측 이벤트 |
+| event-verifier-model.json | 즉시 이상값과 직전 24개 기록을 비교하는 독립 기준선 모델 |
+| event-verifier-evaluation.json | 라벨 없는 시간순 기준 초과율·분할 정보 |
 | replay.json | 고정 모델에 새 파일을 한 행씩 넣은 분석·직전 예측 오차 |
 | replay-summary.json | 재생 범위·비교 수·평균 오차·건너뛴 행 |
 

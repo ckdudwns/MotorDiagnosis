@@ -732,6 +732,11 @@ def main() -> None:
         type=Path,
         help="Fixed model.json to replay; does not train or update the model",
     )
+    parser.add_argument(
+        "--build-event-verifier",
+        action="store_true",
+        help="Also train the separate 24-history immediate-event novelty verifier",
+    )
     args = parser.parse_args()
     sheets = read_workbook(args.workbook)
     report = audit(sheets)
@@ -739,6 +744,8 @@ def main() -> None:
     outputs = {"audit.json": report}
     if args.model and args.exploratory_features:
         parser.error("--model and --exploratory-features cannot be used together")
+    if args.build_event_verifier and not args.exploratory_features:
+        parser.error("--build-event-verifier requires --exploratory-features")
     if args.model:
         model = load_model(args.model)
         replay, replay_summary = replay_fixed_model(model, sheets)
@@ -763,6 +770,15 @@ def main() -> None:
             }
         )
         outputs["event-replay.json"] = replay_events(predictions)
+        if args.build_event_verifier:
+            from ai.ai2.pump_event_verifier import train_event_verifier
+
+            verifier_model, verifier_evaluation = train_event_verifier(
+                sheets, args.exploratory_features
+            )
+            verifier_model["sourceSha256"] = report["sourceSha256"]
+            outputs["event-verifier-model.json"] = verifier_model
+            outputs["event-verifier-evaluation.json"] = verifier_evaluation
     args.output.mkdir(parents=True, exist_ok=False)
     for name, content in outputs.items():
         (args.output / name).write_text(

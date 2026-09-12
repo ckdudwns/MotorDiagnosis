@@ -802,6 +802,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(segments) == 4 and segments[:2] == ["api", "events"] and segments[3] == "rf66-resolve":
             self.send_json(self.server.raw_vibration.events.resolve(self.require_user(), segments[2], payload))
             return
+        if len(segments) == 4 and segments[:2] == ["api", "events"] and segments[3] == "snapshot-resolve":
+            self.send_json(self.server.periodic_snapshots.events.resolve(self.require_user(), segments[2], payload))
+            return
         if segments == ["api", "auth", "login"]:
             self.send_json(authenticate(payload))
             return
@@ -1745,6 +1748,10 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
         # One coordinator coalesces polling; ticks never overlap or accumulate.
         while not self._alert_stop.wait(0.5):
             # Retired RF66 incidents are history, not automatically projected or sent.
+            try:
+                self.periodic_snapshots.events.tick()
+            except Exception:
+                LOGGER.exception("Snapshot event processing failed; committed work retained for retry")
             if not self.auto_alerts:
                 continue
             try:
@@ -1806,6 +1813,7 @@ def create_server(
     raw_window_database=":memory:",
     snapshot_database=":memory:",
     snapshot_model=None,
+    snapshot_event_mode="events",
     window_model_variant=None,
     rf66_artifact=None,
     rf66_checksum=None,
@@ -1840,7 +1848,7 @@ def create_server(
     try:
         # Only an explicitly supplied, scoped adapter can infer new snapshots.
         # app.py intentionally supplies none until a replacement model is agreed.
-        server.periodic_snapshots = PeriodicSnapshotStore(snapshot_database, model=snapshot_model)
+        server.periodic_snapshots = PeriodicSnapshotStore(snapshot_database, model=snapshot_model, event_mode=snapshot_event_mode)
         # Identity protection must survive disabling/replacing the ML runtime.
         server.model_history = ModelHistoryGuard(model_database)
         checkpoint = None
@@ -1882,6 +1890,7 @@ def create_server(
             alert_database,
             adapters=alert_adapters,
             rf66_guard=server.raw_vibration.events.notification_allowed,
+            snapshot_guard=server.periodic_snapshots.events.notification_allowed,
         )
         if server.model_inference is not None:
             server.model_inference.start()

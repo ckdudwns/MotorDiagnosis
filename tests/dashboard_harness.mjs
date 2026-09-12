@@ -28,7 +28,7 @@ export function harness() {
   const get = id => {if (!elements.has(id)) elements.set(id,new Element(selectIds.has(id) ? 'select' : 'div')); return elements.get(id);};
   const context = vm.createContext({
     document:{body:new Element(),getElementById:get,createElement:tag => new Element(tag),addEventListener() {}},
-    URL, URLSearchParams, atob, Blob, crypto:{randomUUID}, setTimeout, console, setInterval:fn => intervals.push(fn), confirm:() => true, alert:message => {throw new Error(message);},
+    URL, URLSearchParams, atob, Blob, AbortController, crypto:{randomUUID}, setTimeout, clearTimeout, console, setInterval:fn => intervals.push(fn), confirm:() => true, alert:message => {throw new Error(message);},
     fetch:async (path,options = {}) => {
       requests.push({path,options});
       const body = await context.respond(path,options);

@@ -33,7 +33,7 @@ DB_DEFAULTS = {
     "SHADOW_MODEL_DB_PATH": "output/model-inference.sqlite3",
 }
 FILE_KEYS = ("AUTH_USERS_FILE", "INGEST_TOKENS_FILE", "RF66_MODEL_ARTIFACT", "SHADOW_MODEL_ARTIFACT")
-SAFE_ENV = {*DB_DEFAULTS, *FILE_KEYS, "RF66_MODEL_CHECKSUM", "RF66_EVENT_MODE", "SHADOW_MODEL_CHECKSUM"}
+SAFE_ENV = {*DB_DEFAULTS, *FILE_KEYS, "RF66_MODEL_CHECKSUM", "RF66_EVENT_MODE", "SHADOW_MODEL_CHECKSUM", "SNAPSHOT_EVENT_MODE"}
 GiB = 1024 ** 3
 
 
@@ -390,6 +390,16 @@ def inspect(project, env, device, *, now=None):
                     item["stage"] = "input_preparation"
                     item["modelStatus"] = "not_configured"
                     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    item["eventMode"] = env.get("SNAPSHOT_EVENT_MODE", "events")
+                    if "snapshot_incidents" in tables:
+                        from .snapshot_events import MAX_INCIDENTS
+                        item["incidents"] = dict(db.execute("SELECT status,count(*) FROM snapshot_incidents GROUP BY status"))
+                        item["unprojectedIncidents"] = db.execute("SELECT count(*) FROM snapshot_incidents WHERE projected<revision").fetchone()[0]
+                        item["eventJobs"] = dict(db.execute("SELECT status,count(*) FROM snapshot_event_jobs GROUP BY status"))
+                        if item["unprojectedIncidents"]:
+                            issue("warning", "PERIODIC_SNAPSHOT_EVENT_PROJECTION_PENDING")
+                        if sum(item["incidents"].values()) >= MAX_INCIDENTS * .9:
+                            issue("warning", "PERIODIC_SNAPSHOT_INCIDENT_CAPACITY")
                     if "snapshot_inference_jobs" in tables:
                         jobs = dict(db.execute("SELECT status,count(*) FROM snapshot_inference_jobs GROUP BY status"))
                         item["inferenceJobs"] = jobs

@@ -337,7 +337,7 @@ class SnapshotInferenceTest(RpmSetup):
                 before = [tuple(r) for r in store.db.execute("SELECT * FROM periodic_snapshots")]
                 store.db.executescript("DROP TABLE snapshot_inference_jobs; UPDATE periodic_snapshot_schema SET version=1;")
             with closing(PeriodicSnapshotStore(path, model=self.adapter())) as store:
-                self.assertEqual(store.db.execute("SELECT version FROM periodic_snapshot_schema").fetchone()[0], 2)
+                self.assertEqual(store.db.execute("SELECT version FROM periodic_snapshot_schema").fetchone()[0], 3)
                 self.assertEqual([tuple(r) for r in store.db.execute("SELECT * FROM periodic_snapshots")], before)
                 self.assertEqual(self.send(store)[0]["acknowledged"], ack["acknowledged"])
                 store.tick()

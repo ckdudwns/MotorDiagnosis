@@ -25,6 +25,7 @@ def main() -> None:
         window_database=os.environ.get("VIBRATION_WINDOW_DB_PATH", "output/vibration-windows.sqlite3"),
         raw_window_database=os.environ.get("RAW_VIBRATION_WINDOW_DB_PATH", "output/raw-vibration-windows.sqlite3"),
         snapshot_database=os.environ.get("PERIODIC_SNAPSHOT_DB_PATH", "output/periodic-snapshots.sqlite3"),
+        snapshot_event_mode=os.environ.get("SNAPSHOT_EVENT_MODE", "events"),
         window_model_variant=os.environ.get("WINDOW_MODEL_VARIANT") or None,
         model_candidate=os.environ.get("SHADOW_MODEL_CANDIDATE", "lstm_autoencoder"),
         model_checksum=os.environ.get("SHADOW_MODEL_CHECKSUM"),

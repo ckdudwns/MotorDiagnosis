@@ -164,7 +164,7 @@ class VerifierHistoryTest(RpmSetup):
         self.assertEqual(result["evidence"]["historySpanSec"], 575)
         view = self.store.list_device(self.admin, DEVICE)
         self.assertTrue(view["inferenceEnabled"])
-        self.assertEqual(view["preferredPolicyId"], POLICY_ID)
+        self.assertEqual(view["preferredPolicyId"], "edge-feature-snapshot-v1")
 
     def test_extra_event_reports_do_not_advance_or_pollute_history(self):
         self.history()

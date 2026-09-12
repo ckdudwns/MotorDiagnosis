@@ -87,12 +87,13 @@ class EdgeSnapshotTest(RpmSetup):
             self.assertEqual(result["latestTransmission"], self.payload(index, reason)["transmission"])
             self.assertEqual(result["boardStateSource"], "device_report")
 
-    def test_empty_listing_advertises_both_contracts_without_claiming_board_state(self):
+    def test_empty_listing_advertises_new_preferred_and_legacy_contracts_without_claiming_board_state(self):
         result = self.listing()
         self.assertIsNone(result["latestTransmission"])
-        self.assertEqual(result["preferredPolicyId"], EDGE_SNAPSHOT_POLICY_ID)
+        self.assertEqual(result["preferredPolicyId"], "edge-feature-snapshot-v1")
         policies = {p["policyId"]: p for p in result["transmissionPolicies"]}
         self.assertIn(SNAPSHOT_POLICY_ID, policies)
+        self.assertEqual(policies["edge-feature-snapshot-v1"]["normalUtcSeconds"], [0, 25, 50])
         edge = policies[EDGE_SNAPSHOT_POLICY_ID]
         self.assertEqual((edge["enterConsecutiveWindows"], edge["recoveryConsecutiveWindows"]), (3, 5))
         self.assertEqual((edge["normalIntervalSec"], edge["anomalyIntervalSec"]), (300, 10))

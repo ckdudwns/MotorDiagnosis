@@ -93,6 +93,50 @@ test('overview has an independent new panel and preserves historical RF66',()=>{
   h.run('setView("events")');assert.equal(h.get('snapshotPanel').hidden,true);
   assert.match(source,/새 단건 결과는 기존 통계 점수·RF66 과거 이력과 별개/);
 });
+
+function featureMetadata() {
+  return {...metadata(),contractId:'edge-feature-event-v1',scope:{...scope,sensorId:'SENSOR-02'},
+    inputContract:{adapterId:'adxl345-ac-nine-moments-v1',sourceProfileId:'adxl345-ac-cf-sk-ku-v1',
+      shape:[9],features:verifierMetadata().inputContract.features,unit:'dimensionless',axes:['X','Y','Z'],
+      sampleRateHz:800,sampleCount:512,sourceUnit:'g',meanRemoved:true,momentConvention:'population-pearson'}};
+}
+function featureRow(eventType='periodic') {
+  const row=item(),m=featureMetadata();
+  Object.assign(row.window,{schemaVersion:2,sensorId:'SENSOR-02',profileId:m.inputContract.sourceProfileId,
+    reason:null,features:Object.fromEntries(m.inputContract.features.map(k=>[k,2]))});
+  const [state,a,n]={periodic:['NORMAL',0,0],anomaly_start:['ANOMALY_ACTIVE',3,0],
+    anomaly_active:['ANOMALY_ACTIVE',4,0],recovery:['NORMAL',0,5]}[eventType];
+  row.transmission={policyId:'edge-feature-snapshot-v1',eventType,state,anomalyCount:a,normalCount:n};
+  return row;
+}
+test('feature-only schedule and board events render without raw or a fabricated prediction',async()=>{
+  for(const [event,label] of [['periodic','UTC 00·25·50초'],['anomaly_start','이상 진입 · 즉시 전송'],
+    ['anomaly_active','이상 유지 · 10초 전송 / 정기 중단'],['recovery','정상 복귀 · 즉시 전송']]) {
+    const h=fixture();h.context.reply=()=>result([featureRow(event)]);await load(h);
+    assert.ok(value(h).includes(label));assert.match(value(h),/모델 대기/);
+    assert.doesNotMatch(value(h),/전송 정책 확인 필요|모델 이상 후보|모델 정상 후보|warming_up/);
+  }
+  assert.match(source,/25·25·10초 간격/);
+});
+test('incompatible history model and invalid feature records have explicit non-normal reasons',async()=>{
+  const h=fixture(),row=featureRow();
+  row.analysis.status='unavailable';row.analysis.reason='MODEL_INPUT_CONTRACT_MISMATCH';
+  h.context.reply=()=>({...result([row],verifierMetadata()),
+    modelCompatibility:{status:'input_contract_mismatch',reason:'MODEL_INPUT_CONTRACT_MISMATCH'}});
+  await load(h);assert.match(value(h),/입력 규격 불일치/);assert.match(value(h),/판정 불가/);
+  assert.doesNotMatch(value(h),/이상 후보 · 학습 기준 초과|모델 정상 후보/);
+  row.window.quality='invalid';row.window.reason='timeout';row.window.features=null;row.analysis.reason='timeout';
+  await load(h);assert.match(value(h),/센서 수집 시간 초과/);
+});
+test('compatible future feature adapter requires sensor scope and finite measured features',async()=>{
+  const h=fixture(),row=featureRow('anomaly_start'),m=featureMetadata();
+  row.analysis=completed(.8,m).analysis;h.context.reply=()=>result([row],m);await load(h);
+  assert.match(value(h),/모델 이상 후보/);assert.doesNotMatch(value(h),/결과 형식 확인 필요/);
+  row.window.sensorId='SENSOR-03';await load(h);
+  assert.match(value(h),/결과 형식 확인 필요/);assert.doesNotMatch(value(h),/모델 이상 후보/);
+  row.window.sensorId='SENSOR-02';row.window.features.cf_a_1=null;await load(h);
+  assert.match(value(h),/결과 형식 확인 필요/);
+});
 test('snapshot event modes and processing are separate from immutable model results',async()=>{
   for (const [mode,label] of [['shadow','비교만'],['events','알림 꺼짐'],['alerts','알림 허용']]) {
     const h=fixture(),row=completed(1);row.eventProcessing={status:'processed',reason:null};

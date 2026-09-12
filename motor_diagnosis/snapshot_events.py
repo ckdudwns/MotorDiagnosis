@@ -52,7 +52,7 @@ class SnapshotEvents:
 
     def _latest(self, device):
         model = self.store.inference.model
-        if getattr(model, "requires_history", False):
+        if model is not None and "sensorId" in model.metadata()["scope"]:
             return self.store.db.execute("SELECT * FROM periodic_snapshots WHERE device=? AND sensor=? "
                 "ORDER BY captured DESC,late ASC,ordinal DESC LIMIT 1",
                 (device, model.metadata()["scope"]["sensorId"])).fetchone()

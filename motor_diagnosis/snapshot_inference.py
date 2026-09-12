@@ -129,6 +129,9 @@ class SnapshotInference:
                                "windowIndex", "timestamp", "startUptimeUs")}
                     context["historySequence"] = window.get("historySequence")
                     context["sensorId"] = window.get("sensorId")
+                    if window.get("profileId") == "adxl345-ac-cf-sk-ku-v1":
+                        context["eventType"] = payload["transmission"]["eventType"]
+                        context["periodicSlotEpoch"] = window["periodicSlotEpoch"]
                 except (data.ApiError, ValueError, TypeError, KeyError, OverflowError):
                     outcome["reason"] = "SNAPSHOT_INPUT_INTEGRITY_FAILED"
                 else:

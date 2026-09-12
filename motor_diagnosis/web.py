@@ -130,7 +130,7 @@ def render_page() -> str:
       <section class="grid">
         <article class="panel wide" id="snapshotPanel">
           <h2>단건 진동 수신 · 새 모델 판정</h2>
-          <p>새 이력 정책: 상태와 관계없이 25초마다 특징 9개 · 과거 24건 확보 후 검증. 이상 진입·정상 복귀 즉시, 이상 유지 중 10초 보고는 이력과 별도로 검증합니다. 이전 5분 단건 정책도 구분하여 표시합니다.</p>
+          <p>특징값 전용 정책: 평상시 매 분 UTC 00·25·50초(25·25·10초 간격)에 최근 유효 특징 9개를 전송합니다. 이상 진입·복귀 즉시, 이상 유지 중 10초마다 전송하며 정기 보고는 중단합니다. Raw는 보내지 않습니다. 보드 상태와 서버 모델 판정은 별개입니다.</p>
           <p>보드 상태는 장치가 보고한 값이며 서버 모델 판정과 다릅니다. 새 단건 결과는 기존 통계 점수·RF66 과거 이력과 별개입니다. 사건·알림은 아래 운영 모드에 따르며 교체 모델 미설정 시 생성하지 않습니다.</p>
           <p id="snapshotStatus" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
           <div id="snapshotRows"></div>
@@ -487,6 +487,7 @@ def render_page() -> str:
     const snapshotScope = (value, scope) => value && ["deviceId","siteId","assetId"].every(k => value[k] === scope[k]);
     const verifierFeatures = ["cf_a_1","cf_a_2","cf_a_3","sk_a_1","sk_a_2","sk_a_3","ku_a_1","ku_a_2","ku_a_3"];
     const isHistoryVerifier = model => model?.contractId === "history-event-verifier-v1";
+    const isEdgeFeatureModel = model => model?.contractId === "edge-feature-event-v1";
     function snapshotModelValid(model, scope) {
       const input = model?.inputContract;
       const common = snapshotScope(model?.scope, scope)
@@ -494,6 +495,13 @@ def render_page() -> str:
           typeof model[k] === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(model[k]))
         && snapshotNumber(model.threshold) && [">",">=","<","<="].includes(model.comparison);
       if (!common) return false;
+      if (isEdgeFeatureModel(model)) return typeof model.scope.sensorId === "string"
+        && /^[A-Z0-9][A-Z0-9._-]{0,99}$/.test(model.scope.sensorId)
+        && input?.adapterId === "adxl345-ac-nine-moments-v1" && input.sourceProfileId === "adxl345-ac-cf-sk-ku-v1"
+        && JSON.stringify(input.shape) === "[9]" && JSON.stringify(input.features) === JSON.stringify(verifierFeatures)
+        && JSON.stringify(input.axes) === '["X","Y","Z"]' && input.unit === "dimensionless"
+        && input.sourceUnit === "g" && input.sampleRateHz === 800 && input.sampleCount === 512
+        && input.meanRemoved === true && input.momentConvention === "population-pearson";
       if (isHistoryVerifier(model)) return model.modelId === "pump-event-verifier-v1"
         && typeof model.scope.sensorId === "string" && /^[A-Z0-9][A-Z0-9._-]{0,99}$/.test(model.scope.sensorId)
         && model.scoreType === "novelty_reference_ratio" && model.threshold === 1 && model.comparison === ">"
@@ -507,9 +515,10 @@ def render_page() -> str:
     }
     function snapshotCompleted(item) {
       const a = item.analysis, model = a?.inference?.model, w = item.window;
-      const inputValid = isHistoryVerifier(model) ? w.profileId === "pump-cf-sk-ku-summary-v1"
+      const inputValid = isHistoryVerifier(model) || isEdgeFeatureModel(model) ? w.profileId === model.inputContract?.sourceProfileId
         && w.sensorId === model.scope?.sensorId
         && w.features && Object.keys(w.features).length === 9 && verifierFeatures.every(k=>snapshotNumber(w.features[k]))
+        && (!isEdgeFeatureModel(model) || w.sampleCount === 512 && w.reason === null)
         : w.sampleCount === 512;
       if (a?.status !== "completed" || w.quality !== "valid" || !inputValid
           || !snapshotModelValid(model, w) || !snapshotNumber(a.score) || !snapshotNumber(a.threshold)
@@ -538,7 +547,11 @@ def render_page() -> str:
       return "판정 불가 · 결과 형식 확인 필요";
     }
     function snapshotReason(reason) {
-      const labels = {VERIFIER_REQUIRES_24_PRIOR_RECORDS:"25초 과거 이력 24건 확보 필요",
+      const labels = {MODEL_INPUT_CONTRACT_MISMATCH:"수신·특징 준비 가능 / 연결 모델과 입력 규격 불일치",
+        MODEL_SCOPE_MISMATCH:"수신 당시 해당 센서·장치에 모델 미배정",
+        insufficient_samples:"512개 미만 수집",timeout:"센서 수집 시간 초과",non_finite:"특징값 NaN·무한대",
+        zero_variance:"분산 0으로 특징 계산 불가",no_valid_window:"해당 구간에 유효 측정 없음",
+        VERIFIER_REQUIRES_24_PRIOR_RECORDS:"25초 과거 이력 24건 확보 필요",
         VERIFIER_HISTORY_DISCONTINUITY:"25초 이력 시각·순번 불연속",VERIFIER_HISTORY_UPTIME_DISCONTINUITY:"이력 uptime 불연속",
         VERIFIER_HISTORY_QUALITY_OR_SCOPE:"이력 품질 불량 또는 부팅·대상 변경",VERIFIER_EVENT_HISTORY_TOO_OLD:"마지막 이력과 현재 구간의 간격이 50초 초과 또는 시각 불일치",
         MODEL_NOT_CONFIGURED:"수신 당시 모델 미설정",INFERENCE_NOT_ENABLED:"입력 준비 전",
@@ -550,6 +563,20 @@ def render_page() -> str:
       return Object.hasOwn(labels, reason) ? labels[reason] + " (" + reason + ")" : (reason || "—");
     }
     function snapshotDelivery(info) {
+      if (info?.policyId === "edge-feature-snapshot-v1") {
+        const reports = {periodic:["NORMAL","UTC 00·25·50초 정기 전송 (25·25·10초)"],
+          anomaly_start:["ANOMALY_ACTIVE","이상 진입 · 즉시 전송"],
+          anomaly_active:["ANOMALY_ACTIVE","이상 유지 · 10초 전송 / 정기 중단"],
+          recovery:["NORMAL","정상 복귀 · 즉시 전송"]};
+        const r = Object.hasOwn(reports,info.eventType) ? reports[info.eventType] : null;
+        const a=info.anomalyCount,n=info.normalCount;
+        if (!r || info.state!==r[0] || ![a,n].every(v=>Number.isInteger(v)&&v>=0&&v<=2147483647)
+            || (a&&n) || (info.state==="NORMAL"&&a>=3) || (info.state==="ANOMALY_ACTIVE"&&n>=5)
+            || (info.eventType==="anomaly_start"&&(a!==3||n!==0)) || (info.eventType==="recovery"&&(n!==5||a!==0)))
+          return {state:"보고 형식 확인 필요",reason:"전송 정책 확인 필요",interval:null,counters:"미확인"};
+        return {state:info.state+" · 보드 보고",reason:r[1],interval:info.state==="NORMAL"?25:10,
+          counters:`이상 ${a}회 / 정상 ${n}회 (보드 보고)`};
+      }
       if (info?.policyId === "pump-verifier-history-v1") {
         const history = info.reason === "history_periodic";
         const expected = history ? [info.state,"periodic",25] : {
@@ -605,6 +632,7 @@ def render_page() -> str:
       const configured = document.createElement("p");
       configured.textContent = result.configuredModel ? "현재 연결 모델: " + snapshotModelText(result.configuredModel)
         : "현재 교체 모델 미설정 · 수신·입력 준비는 가능하며, 기존 RF66은 실행하지 않습니다.";
+      if (result.modelCompatibility?.reason) configured.textContent += " · " + snapshotReason(result.modelCompatibility.reason);
       const policy = document.createElement("p");
       policy.textContent = "단건 이벤트 운영 모드: " + ({shadow:"비교만 · 사건·알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 허용 (정책·입력 유효성 적용)"}[result.eventPolicy?.mode] || "미확인 (이전 서버)")
         + (isHistoryVerifier(result.configuredModel) ? " · 이력 검증 기준 초과로 발생 / 같은 모델 기준 미초과로 사건 해제 (장비 정상 확정 아님)"

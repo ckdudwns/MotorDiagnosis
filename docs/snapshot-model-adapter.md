@@ -2,6 +2,12 @@
 
 ## 현재 구현 범위
 
+최신 [특징값 전용 규격](edge-feature-snapshots.md)은 `edge-feature-event-v1` 어댑터 경계를 사용한다.
+`motor_diagnosis.edge_feature_snapshots.INPUT_CONTRACT`의 800Hz/512/XYZ/평균 제거/모집단 모멘트/특징 9개를
+그대로 선언하고 scope에 sensorId까지 지정해야 한다. 호환 학습 모델은 아직 기본 제공하지 않는다.
+기존 이력 모델을 설정한 채 새 특징을 보내면 저장·입력 준비 후 `MODEL_INPUT_CONTRACT_MISMATCH`이며,
+보드 상태로 대체 판정하거나 과거 24건을 임의로 합성하지 않는다.
+
 후속 구현에서 [펌프 이력 검증 JSON 로더](pump-event-verifier.md)를 추가했다. `app.py`는
 명시적인 7개 설정이 모두 있을 때 해당 모델을 전달한다. 설정이 없으면 `waiting_model`로 남는다.
 아래 계약은 기존 Raw 단건 어댑터 설명이며, 새 모델은 별도의 `history-event-verifier-v1` 및

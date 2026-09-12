@@ -1,6 +1,6 @@
 # EC2 운영 마무리
 
-단건 입력 준비(2단계)와 기존 RF66 연결 중지를 반영한 운영 도구다. 서버 코드 머지·적용 후
+단건 입력 준비·추론 연결부(3단계)와 기존 RF66 연결 중지를 반영한 운영 도구다. 서버 코드 머지·적용 후
 EC2에서 실행한다. `/usr/bin/python3`의 표준 라이브러리만 사용하며 모델이나
 실제 데이터를 읽기 위해 추가 패키지를 설치하지 않는다.
 
@@ -23,6 +23,9 @@ sudo /usr/bin/python3 -m motor_diagnosis.operations inspect --device DEV-01-MOT-
 - 디스크 80% 이상 경고, 90% 이상 또는 여유 2 GiB 미만 장애.
 - 단건 100,000건 / 기존 원시 300,000건 / 특징 500,000건 한도의 90% 이상 경고.
 - 새 단건 `queued`가 수신 후 120초를 넘으면 `PREPARATION_BACKLOG`. 입력 준비를 마친 `waiting_model`은 모델 미설정 상태이며 준비 지연이 아니다.
+- 모델을 명시적으로 배정한 `queued_inference` 작업이 120초를 넘으면 `INFERENCE_BACKLOG`. 모델 버전 교체로 기존 작업을 실행할 수 없는 경우도 포함한다.
+- 저장된 작업이 있는 DB만으로 현재 모델 설정을 단정하지 않는다. `modelStatus: runtime_not_observed`, `inferenceEnabled: null`이면 현재 설정은 인증된 단건 GET API로 확인한다.
+- 모델 처리 불가는 `PERIODIC_SNAPSHOT_INFERENCE_UNAVAILABLE`, 입력 불량은 `PERIODIC_SNAPSHOT_INPUT_UNAVAILABLE`로 구분한다. 교체 모델 없는 기본 실행은 이전처럼 `waiting_model`을 유지한다.
 - 새 단건 자료 없음·측정 시각 정지·상태별 주기(정상 300/이상 10초)+60초보다 오래된 입력·입력 불가를 구분.
 - 기존 RF66 원시 저장소는 `historicalOnly: true`, `processingEnabled: false`다. 오래된 RF66 입력·대기·미투영 사건은 현재 추론 장애 경고로 처리하지 않는다.
 - RF66 이벤트 9,000건 이상인 과거 저장 용량과 120초 이상 지난 알림 대기를 확인.
@@ -30,6 +33,8 @@ sudo /usr/bin/python3 -m motor_diagnosis.operations inspect --device DEV-01-MOT-
   마지막 수신 시각만으로 원시 입력 정상 여부를 판정하지 않는다.
 
 새 단건 원본·준비 결과와 중지된 기존 RF66 원본·결과는 자동 삭제하지 않는다.
+3단계 DB는 스키마 2이며 원본·추론 배정·완료 결과를 함께 백업한다. 첫 기동 전 이전 백업을 확보한다.
+스키마 1 전용 코드로 단순 다운그레이드하지 않는다. 실제 모델 연결 계약은 [단건 모델 어댑터](snapshot-model-adapter.md)를 따른다.
 `operations observe`도 `periodic-snapshots`의 순번/측정 시각 진행을 검사한다.
 RF66 모델 파일이 기존 백업 설정에 남아 있으면 파일 보존·해시 검증만 유지하며, 추론을 활성화하지 않는다.
 한 장치가 640ms마다 전송하면 하루 135,000건, 48시간 270,000건이다.

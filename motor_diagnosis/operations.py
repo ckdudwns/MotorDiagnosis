@@ -389,6 +389,20 @@ def inspect(project, env, device, *, now=None):
                     item["inferenceEnabled"] = False
                     item["stage"] = "input_preparation"
                     item["modelStatus"] = "not_configured"
+                    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    if "snapshot_inference_jobs" in tables:
+                        jobs = dict(db.execute("SELECT status,count(*) FROM snapshot_inference_jobs GROUP BY status"))
+                        item["inferenceJobs"] = jobs
+                        if jobs:
+                            # Persisted jobs are evidence of an assigned adapter,
+                            # not proof of this live process's current configuration.
+                            item.update(inferenceEnabled=None, modelStatus="runtime_not_observed", stage="inference")
+                        old_job = db.execute("""SELECT min(j.created) FROM snapshot_inference_jobs j
+                            JOIN periodic_snapshots w USING(ordinal)
+                            WHERE w.status='queued_inference' AND j.status IN ('queued','running')""").fetchone()[0]
+                        item["oldestInferencePendingAgeSec"] = None if old_job is None else now-old_job
+                        if old_job is not None and now-old_job > 120:
+                            issue("warning", key + ":INFERENCE_BACKLOG")
                     oldest = db.execute("SELECT min(received) FROM periodic_snapshots WHERE status='queued'").fetchone()[0]
                     item["oldestPendingAgeSec"] = None if oldest is None else now-oldest
                     if oldest is not None and now-oldest > 120:
@@ -406,10 +420,13 @@ def inspect(project, env, device, *, now=None):
                                               ordinal=row[7], ageSec=now-row[0])
                         analysis = json.loads(row[8]) if row[8] else {}
                         item["latest"]["inputPreparation"] = analysis.get("inputPreparation")
+                        item["latest"]["inference"] = analysis.get("inference")
+                        item["latest"]["reason"] = analysis.get("reason")
                         if not -5 <= now-row[0] <= snapshot_interval_seconds(transmission) + 60:
                             issue("warning", "PERIODIC_SNAPSHOT_INPUT_STALE_OR_FUTURE")
                         if row[5] == "unavailable":
-                            issue("warning", "PERIODIC_SNAPSHOT_INPUT_UNAVAILABLE")
+                            issue("warning", "PERIODIC_SNAPSHOT_INFERENCE_UNAVAILABLE" if analysis.get("inference")
+                                  else "PERIODIC_SNAPSHOT_INPUT_UNAVAILABLE")
                     else:
                         issue("warning", "PERIODIC_SNAPSHOT_INPUT_ABSENT")
                 elif key == "ALERT_DB_PATH":

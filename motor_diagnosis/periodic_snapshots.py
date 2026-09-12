@@ -17,6 +17,8 @@ import time
 from . import data, device_lifecycle
 from .raw_samples import PROFILE_ID as RAW_PROFILE, normalize as normalize_raw
 from .snapshot_input import ADAPTER_ID, prepare_input
+from .snapshot_inference import SnapshotInference
+from .snapshot_model import SnapshotModelAdapter
 from .transmission_policy import (
     EDGE_SNAPSHOT_POLICY_ID, snapshot_interval_seconds, snapshot_policy_metadata,
     validate_snapshot,
@@ -73,7 +75,9 @@ class PeriodicSnapshotStore:
     max_rows = MAX_ROWS
     max_streams = MAX_STREAMS
 
-    def __init__(self, database=":memory:"):
+    def __init__(self, database=":memory:", *, model=None):
+        if model is not None and not isinstance(model, SnapshotModelAdapter):
+            raise ValueError("Use an explicit SnapshotModelAdapter; legacy model objects are not supported")
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.worker = None
@@ -83,19 +87,20 @@ class PeriodicSnapshotStore:
         self.db.row_factory = sqlite3.Row
         try:
             tables = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            allowed = {"periodic_snapshot_schema", "snapshot_streams", "periodic_snapshots", "sqlite_sequence"}
+            allowed = {"periodic_snapshot_schema", "snapshot_streams", "periodic_snapshots",
+                       "snapshot_inference_jobs", "sqlite_sequence"}
             if tables and ("periodic_snapshot_schema" not in tables or not tables <= allowed):
                 raise ValueError("Periodic snapshots require a separate database file")
             if "periodic_snapshot_schema" in tables:
                 versions = self.db.execute("SELECT version FROM periodic_snapshot_schema").fetchall()
-                if len(versions) != 1 or versions[0][0] != 1:
+                if len(versions) != 1 or versions[0][0] not in (1, 2):
                     raise ValueError("Unsupported periodic snapshot schema")
             self.db.executescript("""
                 PRAGMA journal_mode=WAL;
                 PRAGMA synchronous=FULL;
                 BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS periodic_snapshot_schema(version INTEGER PRIMARY KEY);
-                INSERT OR IGNORE INTO periodic_snapshot_schema VALUES(1);
+                INSERT INTO periodic_snapshot_schema SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM periodic_snapshot_schema);
                 CREATE TABLE IF NOT EXISTS snapshot_streams(
                     device TEXT NOT NULL, boot TEXT NOT NULL, context TEXT NOT NULL,
                     anchor_uptime INTEGER NOT NULL, anchor_captured REAL NOT NULL,
@@ -111,11 +116,19 @@ class PeriodicSnapshotStore:
                 CREATE INDEX IF NOT EXISTS snapshot_queue ON periodic_snapshots(status,ordinal);
                 CREATE INDEX IF NOT EXISTS snapshot_latest
                     ON periodic_snapshots(device,site,asset,captured DESC,late ASC,ordinal DESC);
+                CREATE TABLE IF NOT EXISTS snapshot_inference_jobs(
+                    ordinal INTEGER PRIMARY KEY, binding TEXT NOT NULL, metadata TEXT NOT NULL,
+                    status TEXT NOT NULL, attempts INTEGER NOT NULL, created REAL NOT NULL,
+                    token TEXT, lease_until REAL, started REAL);
+                CREATE INDEX IF NOT EXISTS snapshot_inference_queue
+                    ON snapshot_inference_jobs(binding,status,ordinal);
+                UPDATE periodic_snapshot_schema SET version=2;
                 COMMIT;
             """)
         except Exception:
             self.db.close()
             raise
+        self.inference = SnapshotInference(self, model)
         device_lifecycle.register_history(self)
 
     def check_device_deletion(self, device_id):
@@ -209,6 +222,7 @@ class PeriodicSnapshotStore:
                          int(late), quality, status, result))
                     row = self.db.execute("SELECT * FROM periodic_snapshots WHERE ordinal=?",
                                           (inserted.lastrowid,)).fetchone()
+                    self.inference.enqueue(inserted.lastrowid, window)
                     accepted = 1
             # The context manager COMMIT above must succeed before an ACK exists.
         except sqlite3.Error as exc:
@@ -221,7 +235,7 @@ class PeriodicSnapshotStore:
                               "digest": row["digest"], "receivedAt": iso(row["received"])}],
             "duplicate": not bool(accepted), "lateArrival": bool(row["late"]),
             "processingStatus": row["status"], "processingEnabled": True,
-            "inferenceEnabled": False,
+            "inferenceEnabled": self.inference.model is not None and self.inference.model.matches(window),
         }, 202 if accepted else 200
 
     def start(self):
@@ -230,6 +244,7 @@ class PeriodicSnapshotStore:
                 return
             self.worker = threading.Thread(target=self._run, name="snapshot-input", daemon=True)
             self.worker.start()
+            self.inference.start()
 
     def _run(self):
         while not self.stop.is_set():
@@ -267,6 +282,12 @@ class PeriodicSnapshotStore:
                               else "INPUT_PREPARATION_FAILED"))
                 result["inputPreparation"]["status"] = "unavailable"
             result["preparedAt"] = iso(time.time())
+            job = self.db.execute("SELECT ordinal FROM snapshot_inference_jobs WHERE ordinal=?", (row["ordinal"],)).fetchone()
+            if job:
+                if result["status"] == "waiting_model":
+                    result.update(status="queued_inference", reason=None)
+                else:
+                    self.db.execute("UPDATE snapshot_inference_jobs SET status='unavailable' WHERE ordinal=?", (row["ordinal"],))
             self.db.execute("UPDATE periodic_snapshots SET status=?,result=? WHERE ordinal=? AND status='queued'",
                             (result["status"], json.dumps(result, allow_nan=False), row["ordinal"]))
         return True
@@ -286,7 +307,13 @@ class PeriodicSnapshotStore:
             statuses = dict(self.db.execute(
                 "SELECT status,count(*) FROM periodic_snapshots WHERE device=? AND site=? AND asset=? GROUP BY status",
                 scope))
+            jobs = {r["ordinal"]: dict(r) for r in self.db.execute("""SELECT j.* FROM snapshot_inference_jobs j
+                JOIN periodic_snapshots w USING(ordinal) WHERE w.device=? AND w.site=? AND w.asset=?
+                ORDER BY w.captured DESC,w.late ASC,w.ordinal DESC LIMIT ?""", (*scope, LIST_LIMIT))}
         latest_transmission = json.loads(rows[0]["body"])["transmission"] if rows else None
+        model = self.inference.model
+        configured = model.metadata() if model is not None and model.matches(
+            {"deviceId": device_id, "siteId": device["siteId"], "assetId": device["assetId"]}) else None
         return {
             "deviceId": device_id, "siteId": device["siteId"], "assetId": device["assetId"],
             "policyId": latest_transmission["policyId"] if latest_transmission else EDGE_SNAPSHOT_POLICY_ID,
@@ -295,13 +322,18 @@ class PeriodicSnapshotStore:
             "transmissionPolicies": snapshot_policy_metadata(),
             "latestTransmission": latest_transmission,
             "boardStateSource": "device_report", "boardStateVerifiedByServer": False,
-            "processingEnabled": True, "inferenceEnabled": False,
-            "stage": "input_preparation", "inputAdapterId": ADAPTER_ID,
-            "configuredModel": None, "modelStatus": "not_configured", "limit": LIST_LIMIT,
+            "processingEnabled": True, "inferenceEnabled": configured is not None,
+            "stage": "inference" if configured else "input_preparation", "inputAdapterId": ADAPTER_ID,
+            "configuredModel": configured, "modelStatus": "ready" if configured else "not_configured", "limit": LIST_LIMIT,
+            "affectsAlerts": False, "historyReprocessingEnabled": False,
             "statuses": statuses, "supportedProfileIds": [RAW_PROFILE],
             "items": [{**json.loads(row["body"]), "ordinal": row["ordinal"],
                        "digest": row["digest"], "receivedAt": iso(row["received"]),
                        "lateArrival": bool(row["late"]),
+                       "inferenceJob": ({"status": jobs[row["ordinal"]]["status"],
+                           "bindingId": jobs[row["ordinal"]]["binding"], "attempts": jobs[row["ordinal"]]["attempts"],
+                           "runtimeAvailable": configured is not None and model.binding_id == jobs[row["ordinal"]]["binding"]}
+                           if row["ordinal"] in jobs else None),
                        "analysis": json.loads(row["result"]) if row["result"] else {
                            "status": "queued", "reason": "INFERENCE_NOT_ENABLED",
                            "verdict": None, "affectsAlerts": False,
@@ -310,8 +342,9 @@ class PeriodicSnapshotStore:
 
     def close(self):
         self.stop.set()
-        if self.worker is not None:
+        if self.worker is not None and self.worker.ident is not None:
             self.worker.join()
+        self.inference.close()
         device_lifecycle.unregister_history(self)
         with self.lock:
             self.db.close()

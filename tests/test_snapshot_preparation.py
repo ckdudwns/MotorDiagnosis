@@ -149,7 +149,7 @@ class PreparationTest(RpmSetup):
                 store.close()
             store = PeriodicSnapshotStore(path)
             try:
-                self.assertEqual(store.db.execute("SELECT version FROM periodic_snapshot_schema").fetchone()[0], 1)
+                self.assertEqual(store.db.execute("SELECT version FROM periodic_snapshot_schema").fetchone()[0], 2)
                 self.assertTrue(store.tick())
                 prepared = store.list_device(self.admin, DEVICE)["items"][0]["analysis"]
             finally:

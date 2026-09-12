@@ -1805,6 +1805,7 @@ def create_server(
     window_database=":memory:",
     raw_window_database=":memory:",
     snapshot_database=":memory:",
+    snapshot_model=None,
     window_model_variant=None,
     rf66_artifact=None,
     rf66_checksum=None,
@@ -1837,8 +1838,9 @@ def create_server(
     server.raw_vibration = None
     server.periodic_snapshots = None
     try:
-        # Prepare raw input asynchronously; no model is selected by this worker.
-        server.periodic_snapshots = PeriodicSnapshotStore(snapshot_database)
+        # Only an explicitly supplied, scoped adapter can infer new snapshots.
+        # app.py intentionally supplies none until a replacement model is agreed.
+        server.periodic_snapshots = PeriodicSnapshotStore(snapshot_database, model=snapshot_model)
         # Identity protection must survive disabling/replacing the ML runtime.
         server.model_history = ModelHistoryGuard(model_database)
         checkpoint = None

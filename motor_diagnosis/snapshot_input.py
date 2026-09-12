@@ -6,7 +6,7 @@ ADAPTER_ID = "adxl345-xyz-g-unmodified-v1"
 
 def prepare_input(window):
     from . import edge_feature_snapshots as features
-    if window.get("profileId") == features.PROFILE_ID:
+    if window.get("profileId") in features.PROFILE_IDS:
         return features.prepare(window)
     from .pump_summary import PROFILE_ID, prepare
     if window.get("profileId") == PROFILE_ID:

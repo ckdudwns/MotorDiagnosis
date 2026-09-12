@@ -1,5 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 
-# Preserve the exact bytes used by the pinned model artifact checksums.
+# Model checksums pin exact bytes on Windows and Linux; never normalize endings.
 models/pump-event-verifier/*.json -text
+models/pump-forecast/model.json -text

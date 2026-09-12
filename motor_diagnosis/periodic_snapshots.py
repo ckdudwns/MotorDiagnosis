@@ -52,7 +52,7 @@ def canonical(payload):
 
 def normalize_window(window, *, check_time_bounds=True):
     """Verify wire bytes, not an RF66 feature vector or a JSON-file checksum."""
-    if window.get("profileId") == feature_snapshots.PROFILE_ID:
+    if window.get("profileId") in feature_snapshots.PROFILE_IDS:
         return feature_snapshots.normalize(window, check_time_bounds=check_time_bounds)
     if window.get("profileId") == SUMMARY_PROFILE:
         from .pump_summary import normalize
@@ -231,7 +231,7 @@ class PeriodicSnapshotStore:
                         reject("Same snapshot identity has different content", 409, "SNAPSHOT_CONFLICT")
                 else:
                     captured = normalize_window(window)
-                    if window.get("profileId") == feature_snapshots.PROFILE_ID and window["periodicSlotEpoch"] is not None:
+                    if window.get("profileId") in feature_snapshots.PROFILE_IDS and window["periodicSlotEpoch"] is not None:
                         conflict = self.db.execute("""SELECT 1 FROM periodic_snapshots
                             WHERE device=? AND sensor=? AND boot=?
                             AND json_extract(body,'$.window.periodicSlotEpoch')=? LIMIT 1""",
@@ -239,7 +239,7 @@ class PeriodicSnapshotStore:
                         if conflict:
                             reject("UTC slot already has a report; retry its original identity and content",
                                    409, "SNAPSHOT_SLOT_CONFLICT")
-                    if window.get("profileId") == SUMMARY_PROFILE and window.get("historySequence") is not None:
+                    if window.get("profileId") in (SUMMARY_PROFILE, feature_snapshots.HISTORY_PROFILE_ID) and window.get("historySequence") is not None:
                         # A retry uses the same window identity; a second distinct
                         # window cannot reuse a scheduled-history sequence.
                         conflict = self.db.execute("""SELECT 1 FROM periodic_snapshots
@@ -260,7 +260,7 @@ class PeriodicSnapshotStore:
                         "status": "unavailable", "reason": window.get("reason") or quality,
                         "verdict": None, "affectsAlerts": False,
                     })
-                    if window.get("profileId") == feature_snapshots.PROFILE_ID:
+                    if window.get("profileId") in feature_snapshots.PROFILE_IDS:
                         # Pin the receipt-time compatibility decision. A restart
                         # or later model assignment cannot silently rebind history.
                         saved = json.loads(result) if result else {}
@@ -284,7 +284,7 @@ class PeriodicSnapshotStore:
                                 "Snapshot not acknowledged; retry the unchanged request") from exc
         transmission = json.loads(row["body"])["transmission"]
         feature_ack = {}
-        if window.get("profileId") == feature_snapshots.PROFILE_ID:
+        if window.get("profileId") in feature_snapshots.PROFILE_IDS:
             feature_ack = {"eventType": transmission["eventType"], "durablyStored": True,
                            "featureDigest": window["integrity"]["digest"]}
         return {
@@ -304,7 +304,7 @@ class PeriodicSnapshotStore:
             status, reason = "not_configured", "MODEL_NOT_CONFIGURED"
         elif not all(window.get(k) == v for k, v in meta["scope"].items()):
             status, reason = "scope_mismatch", "MODEL_SCOPE_MISMATCH"
-        elif meta["inputContract"] != feature_snapshots.INPUT_CONTRACT or not model.matches(window):
+        elif meta["inputContract"] != feature_snapshots.input_contract(window["profileId"]) or not model.matches(window):
             status, reason = "input_contract_mismatch", "MODEL_INPUT_CONTRACT_MISMATCH"
         else:
             status, reason = "ready", None
@@ -407,7 +407,7 @@ class PeriodicSnapshotStore:
             model.metadata()["scope"].get(k) == v for k, v in current_scope.items()) else None
         latest_window = json.loads(rows[0]["body"])["window"] if rows else None
         compatibility = self._feature_compatibility(latest_window) if latest_window and latest_window.get(
-            "profileId") == feature_snapshots.PROFILE_ID else None
+            "profileId") in feature_snapshots.PROFILE_IDS else None
         usable = configured is not None and (compatibility is None or compatibility["status"] == "ready")
         adapter_id = feature_snapshots.ADAPTER_ID if compatibility else (
             configured["inputContract"]["adapterId"] if configured else ADAPTER_ID)
@@ -428,7 +428,7 @@ class PeriodicSnapshotStore:
             "modelCompatibility": compatibility, "limit": LIST_LIMIT,
             "affectsAlerts": usable and self.events.mode == "alerts", "historyReprocessingEnabled": False,
             "eventPolicy": self.events.metadata(),
-            "statuses": statuses, "supportedProfileIds": [feature_snapshots.PROFILE_ID, RAW_PROFILE, SUMMARY_PROFILE],
+            "statuses": statuses, "supportedProfileIds": [*feature_snapshots.PROFILE_IDS, RAW_PROFILE, SUMMARY_PROFILE],
             "items": [{**json.loads(row["body"]), "ordinal": row["ordinal"],
                        "digest": row["digest"], "receivedAt": iso(row["received"]),
                        "lateArrival": bool(row["late"]),

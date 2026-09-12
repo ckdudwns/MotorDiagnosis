@@ -21,6 +21,7 @@ import time
 import uuid
 
 from .rf66_package import read_package_files
+from .pump_model_settings import ENV_KEYS as DUAL_ENV_KEYS
 
 DB_DEFAULTS = {
     "STATE_DB_PATH": "output/runtime.sqlite3",
@@ -33,9 +34,11 @@ DB_DEFAULTS = {
     "SHADOW_MODEL_DB_PATH": "output/model-inference.sqlite3",
 }
 FILE_KEYS = ("AUTH_USERS_FILE", "INGEST_TOKENS_FILE", "RF66_MODEL_ARTIFACT", "SHADOW_MODEL_ARTIFACT", "PUMP_EVENT_VERIFIER_ARTIFACT")
+FILE_KEYS += ("PUMP_DUAL_EVENT_ARTIFACT", "PUMP_DUAL_FORECAST_ARTIFACT")
 SAFE_ENV = {*DB_DEFAULTS, *FILE_KEYS, "RF66_MODEL_CHECKSUM", "RF66_EVENT_MODE", "SHADOW_MODEL_CHECKSUM", "SNAPSHOT_EVENT_MODE",
             "PUMP_EVENT_VERIFIER_CHECKSUM", "PUMP_EVENT_VERIFIER_STREAM", "PUMP_EVENT_VERIFIER_DEVICE_ID",
             "PUMP_EVENT_VERIFIER_SITE_ID", "PUMP_EVENT_VERIFIER_ASSET_ID", "PUMP_EVENT_VERIFIER_SENSOR_ID"}
+SAFE_ENV.update(DUAL_ENV_KEYS)
 GiB = 1024 ** 3
 
 
@@ -142,6 +145,13 @@ def maintenance_lock(project):
 
 
 def inventory(project, env, info):
+    if any(env.get(k) for k in DUAL_ENV_KEYS):
+        from .pump_models import configured_model
+        checked = dict(env)
+        for key in ("PUMP_DUAL_EVENT_ARTIFACT", "PUMP_DUAL_FORECAST_ARTIFACT"):
+            if checked.get(key):
+                checked[key] = str(local_path(project, checked[key]))
+        configured_model(checked)  # Reject incomplete/mismatched pairs before stopping.
     if env.get("RF66_MODEL_CHECKSUM") and not env.get("RF66_MODEL_ARTIFACT"):
         raise ValueError("RF66 checksum requires a model artifact")
     files, absent, seen = [], [], set()
@@ -192,7 +202,8 @@ def make_backup(project, env, info, destination, *, stopped):
                 "consistency": "service_stopped", "project": str(project),
                 "serviceUser": info.get("User"), "eventMode": env.get("RF66_EVENT_MODE", "shadow"),
                 "modelChecksum": env.get("RF66_MODEL_CHECKSUM"), "files": [], "absentOptional": absent,
-                "pumpVerifier": {k: env[k] for k in SAFE_ENV if k.startswith("PUMP_EVENT_VERIFIER_") and k in env}}
+                "pumpVerifier": {k: env[k] for k in SAFE_ENV if k.startswith("PUMP_EVENT_VERIFIER_") and k in env},
+                "pumpDual": {k: env[k] for k in DUAL_ENV_KEYS if k in env}}
     try:
         manifest["commit"] = run("git", "-c", f"safe.directory={project}", "-C", str(project), "rev-parse", "HEAD")
     except (OSError, subprocess.SubprocessError):
@@ -220,6 +231,10 @@ def make_backup(project, env, info, destination, *, stopped):
         if key == "PUMP_EVENT_VERIFIER_ARTIFACT":
             from .pump_event_model import read_artifact
             read_artifact(output, env.get("PUMP_EVENT_VERIFIER_CHECKSUM"))
+        if key in ("PUMP_DUAL_EVENT_ARTIFACT", "PUMP_DUAL_FORECAST_ARTIFACT"):
+            from .pump_models import read_artifact, read_forecast
+            reader = read_artifact if key == "PUMP_DUAL_EVENT_ARTIFACT" else read_forecast
+            reader(output, env.get(key.replace("ARTIFACT", "CHECKSUM")))
         manifest["files"].append({"key": key, "file": output.name, "kind": kind,
                                   "originalPath": str(path), "bytes": output.stat().st_size, "sha256": sha})
     write_json(folder / "manifest.json", manifest)  # completion marker LAST
@@ -291,6 +306,10 @@ def verify_backup(folder):
         raise ValueError("RF66 model is missing from backup")
     if manifest.get("pumpVerifier") and "PUMP_EVENT_VERIFIER_ARTIFACT" not in keys:
         raise ValueError("Pump verifier model is missing from backup")
+    dual_keys = {"PUMP_DUAL_EVENT_ARTIFACT", "PUMP_DUAL_FORECAST_ARTIFACT"}
+    if (manifest.get("pumpDual") or dual_keys.intersection(keys)) and (
+            not dual_keys <= set(keys) or not manifest.get("pumpDual")):
+        raise ValueError("Dual model pair/configuration is missing from backup")
     for item in files:
         if not re.fullmatch(r"[A-Z0-9_]+\.(sqlite3|bin)", item["file"]):
             raise ValueError("Invalid backup member name")
@@ -306,6 +325,13 @@ def verify_backup(folder):
         if item["key"] == "PUMP_EVENT_VERIFIER_ARTIFACT":
             from .pump_event_model import read_artifact
             read_artifact(path, manifest.get("pumpVerifier", {}).get("PUMP_EVENT_VERIFIER_CHECKSUM"))
+    if manifest.get("pumpDual"):
+        from .pump_models import configured_model
+        env = dict(manifest["pumpDual"])
+        for item in files:
+            if item["key"] in dual_keys:
+                env[item["key"]] = str(folder / item["file"])
+        configured_model(env)
     return manifest
 
 
@@ -442,9 +468,10 @@ def inspect(project, env, device, *, now=None):
                         analysis = json.loads(row[8]) if row[8] else {}
                         item["latest"]["inputPreparation"] = analysis.get("inputPreparation")
                         item["latest"]["inference"] = analysis.get("inference")
+                        item["latest"]["forecast"] = analysis.get("forecast")
                         item["latest"]["reason"] = analysis.get("reason")
                         window = json.loads(row[6])["window"]
-                        if window.get("profileId") == "adxl345-ac-cf-sk-ku-v1":
+                        if window.get("profileId") in ("adxl345-ac-cf-sk-ku-v1", "adxl345-ac-cf-sk-ku-25s-v1"):
                             item["latest"].update(profileId=window["profileId"], eventType=transmission["eventType"],
                                 qualityReason=window["reason"], periodicSlotEpoch=window["periodicSlotEpoch"],
                                 modelCompatibility=analysis.get("modelCompatibility"))

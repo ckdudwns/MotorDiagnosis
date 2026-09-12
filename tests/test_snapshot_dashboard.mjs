@@ -87,6 +87,20 @@ test('verifier freshness uses 25 seconds and recovery notification is not a norm
   assert.doesNotMatch(text(h.get('notifications')),/정상 복귀/);
 });
 
+test('both history model contracts use reference-based open and clear notification labels',()=>{
+  for (const contractId of ['history-event-verifier-v1','edge-feature-history-model-v1']) {
+    for (const transition of ['open','closed']) {
+      const h=fixture();
+      h.context.event={source:'snapshot',snapshotTransition:transition,title:'이력 검증',
+        snapshotEvidence:{inference:{model:{...verifierMetadata(),contractId}}}};
+      h.run('renderNotifications([{event,deliveredAt:"2026-09-12T00:00:00Z"}])');
+      const content=text(h.get('notifications'));
+      assert.match(content,transition==='closed' ? /이력 모델 기준 미초과 · 사건 해제/ : /이력 모델 기준 초과 · 이상 후보/);
+      assert.doesNotMatch(content,/정상 복귀|단건 모델 이상 발생/);
+    }
+  }
+});
+
 test('overview has an independent new panel and preserves historical RF66',()=>{
   assert.match(source,/id="snapshotPanel"/); assert.match(source,/id="rf66Panel"/);
   assert.ok(!source.includes('.innerHTML'));

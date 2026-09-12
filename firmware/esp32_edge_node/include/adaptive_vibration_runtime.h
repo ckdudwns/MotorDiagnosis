@@ -30,7 +30,7 @@ std::uint32_t checksum(const Record& r) {return AdaptiveTransmission::crc32(&r,o
 bool valid(const Record& r) {
     return r.magic==Magic && r.version==1 && r.order && r.raw.count<=512 &&
         r.bootId[32]==0 && strlen(r.bootId)==32 && r.device[128]==0 && r.site[128]==0 &&
-        r.asset[128]==0 && r.baseline[64]==0 && static_cast<unsigned>(r.reason)<=7 && r.crc==checksum(r);
+        r.asset[128]==0 && r.baseline[64]==0 && static_cast<unsigned>(r.reason)<=8 && r.crc==checksum(r);
 }
 bool read(const String& name, Record& r) {
     File f=LittleFS.open(name,"r");
@@ -102,6 +102,11 @@ void submit(const Raw& raw, const Features& f) {
     Reason reason=detector.update(f);
     Frame frame{raw,reason,!wasActive && detector.active()};
     urgent.store(detector.active());
+    // The detector owns sampling policy: normal raw is retained once per five
+    // minutes, an activation/recovery sample is immediate, and active raw is
+    // retained at most once per ten seconds.  Every 0.66 s window is still
+    // measured and classified before this gate.
+    if (!detector.shouldTransmit()) return;
     if (xQueueSend(spoolQueue,&frame,0)!=pdTRUE) {++drops; storageFault.store(true);}
 }
 bool append(const Frame& frame) {

@@ -5,6 +5,23 @@ Branch: `feat/adaptive-https-transmission`
 Base: `348f1ce`  
 Initial verification was recorded before commit `5287cc7`. The PR44 follow-up below is a local change; no deployment, board upload or flash format was performed.
 
+## Current edge transmission state policy
+
+ADXL345 raw windows are measured and classified continuously, approximately once
+per 0.66 seconds. Measurement frequency is deliberately different from upload
+frequency: the device does not upload every raw window.
+
+| State | Transition and raw-upload rule |
+|---|---|
+| `NORMAL` | Enter `ANOMALY_ACTIVE` after **three consecutive** abnormal windows and upload that third raw window immediately. While normal, upload one current raw window every five minutes of measurement time. |
+| `ANOMALY_ACTIVE` | Continue judging every window, but upload one current raw window every ten seconds. Return to `NORMAL` after **five consecutive** normal windows and immediately upload the normal window that confirms recovery. |
+
+Window index/time discontinuity, FIFO-quality failure, missing baseline and severe
+limits are separate protective/quality conditions and remain immediate priority
+uploads. They are not pump-fault verdicts. `recoveryMs` remains accepted in the
+remote configuration for compatibility but is not used by this five-valid-window
+recovery policy.
+
 ## Results
 
 | Check | Result |
@@ -24,7 +41,9 @@ The Windows native tests were compiled with the already installed Zig C/C++ tool
 ## New coverage
 
 - Missing/invalid normal baseline keeps fast transfer, not a five-minute blind period.
-- 2-of-3 low/high RMS, immediate severe/quality conditions, discontinuity resets and sustained normal recovery.
+- Three consecutive low/high RMS windows, five consecutive normal recovery windows,
+  immediate severe/quality conditions, discontinuity resets, five-minute normal
+  raw cadence and ten-second active raw cadence.
 - Five-minute frozen drain cutoff, timer wrap, early storage-pressure drain and priority selection.
 - Failed/mismatched ACK cannot authorize deletion; exact per-window identity checks, status/count consistency and digest format.
 - Real local HTTP endpoint: four-window priority receipt → earlier four-window archive receipt → duplicate replay ACK.

@@ -712,8 +712,13 @@ def render_page() -> str:
             if (typeof id !== "string" || !id) throw new Error("장치 ID 확인 필요");
             const result = await snapshotApi(`/api/devices/${encodeURIComponent(id)}/periodic-snapshots`);
             if (!current()) return null;
+            // A configured model may be incompatible with the latest input. Receipt visibility
+            // is independent of inference/alert eligibility, but contradictory flags are invalid.
+            const modelUsable = Boolean(result?.configuredModel
+              && (result.modelCompatibility == null || result.modelCompatibility.status === "ready"));
             if (!snapshotScope(result,scope) || !Array.isArray(result.items) || !Object.hasOwn(result,"configuredModel")
-                || result.affectsAlerts !== Boolean(result.configuredModel && result.eventPolicy?.mode === "alerts")
+                || typeof result.inferenceEnabled !== "boolean" || result.inferenceEnabled !== modelUsable
+                || result.affectsAlerts !== (result.inferenceEnabled && result.eventPolicy?.mode === "alerts")
                 || result.items.some(item => !snapshotScope(item?.window,scope)
                   || !snapshotTime(item.window.timestamp) || !snapshotTime(item.receivedAt)))
               throw new Error("장치·설비 매핑 또는 결과 형식 불일치");

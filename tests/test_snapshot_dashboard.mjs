@@ -28,7 +28,8 @@ const completed = (score=0,model=metadata()) => {
     scoreType:model.scoreType,modelVersion:model.modelVersion,
     inference:{model,inputDigest:'a'.repeat(64),completedAt:at(3)}});
 };
-const result = (items=[],configuredModel=null) => ({...scope,queriedAt:at(4),configuredModel,items,affectsAlerts:false});
+const result = (items=[],configuredModel=null) => ({...scope,queriedAt:at(4),configuredModel,items,
+  inferenceEnabled:Boolean(configuredModel),affectsAlerts:false});
 function fixture() {
   const h = harness(); h.context.query={siteId:'S1',assetId:'A1'};
   h.context.devices=[{id:'D1',siteId:'S1',assetId:'A1'}];
@@ -122,11 +123,43 @@ test('incompatible history model and invalid feature records have explicit non-n
   const h=fixture(),row=featureRow();
   row.analysis.status='unavailable';row.analysis.reason='MODEL_INPUT_CONTRACT_MISMATCH';
   h.context.reply=()=>({...result([row],verifierMetadata()),
+    inferenceEnabled:false,
     modelCompatibility:{status:'input_contract_mismatch',reason:'MODEL_INPUT_CONTRACT_MISMATCH'}});
   await load(h);assert.match(value(h),/입력 규격 불일치/);assert.match(value(h),/판정 불가/);
   assert.doesNotMatch(value(h),/이상 후보 · 학습 기준 초과|모델 정상 후보/);
   row.window.quality='invalid';row.window.reason='timeout';row.window.features=null;row.analysis.reason='timeout';
   await load(h);assert.match(value(h),/센서 수집 시간 초과/);
+});
+test('alerts mode preserves received features when model input or sensor scope is incompatible',async()=>{
+  for (const [status,reason,label,sensor] of [
+    ['input_contract_mismatch','MODEL_INPUT_CONTRACT_MISMATCH','연결 모델과 입력 규격 불일치','SENSOR-02'],
+    ['scope_mismatch','MODEL_SCOPE_MISMATCH','수신 당시 해당 센서·장치에 모델 미배정','SENSOR-03']]) {
+    const h=fixture(),row=featureRow('anomaly_start');row.window.sensorId=sensor;
+    row.analysis.status=status==='scope_mismatch'?'waiting_model':'unavailable';row.analysis.reason=reason;
+    h.context.reply=()=>({...result([row],verifierMetadata()),eventPolicy:{mode:'alerts'},
+      inferenceEnabled:false,modelCompatibility:{status,reason}});
+    await load(h);
+    assert.match(h.get('snapshotStatus').textContent,/조회 완료/);
+    assert.ok(value(h).includes(label));assert.ok(value(h).includes(sensor));
+    assert.match(value(h),/이상 진입 · 즉시 전송|최근 측정 시각/);
+    assert.match(value(h),/해당 구간 서버 수신 시각/);assert.match(value(h),/valid/);
+    assert.doesNotMatch(value(h),/조회 실패|모델 정상 후보|모델 이상 후보|이상 후보 · 학습 기준 초과/);
+  }
+});
+test('snapshot inference and alert flags must agree with model compatibility',async()=>{
+  const incompatible=()=>({...result([featureRow()],verifierMetadata()),eventPolicy:{mode:'alerts'},
+    inferenceEnabled:false,modelCompatibility:{status:'input_contract_mismatch',reason:'MODEL_INPUT_CONTRACT_MISMATCH'}});
+  for (const mutate of [r=>delete r.inferenceEnabled,r=>r.inferenceEnabled='false',r=>r.inferenceEnabled=0,
+    r=>r.inferenceEnabled=null,r=>r.inferenceEnabled=true,r=>r.affectsAlerts=true]) {
+    const h=fixture(),r=incompatible();mutate(r);h.context.reply=()=>r;await load(h);
+    assert.match(value(h),/조회 실패/);assert.doesNotMatch(value(h),/모델 정상 후보|모델 이상 후보/);
+  }
+  for (const r of [
+    {...result([featureRow()]),eventPolicy:{mode:'alerts'},inferenceEnabled:true,affectsAlerts:true},
+    {...result([featureRow()],featureMetadata()),eventPolicy:{mode:'alerts'},inferenceEnabled:false},
+    {...result([featureRow()],featureMetadata()),eventPolicy:{mode:'alerts'},affectsAlerts:false}]) {
+    const h=fixture();h.context.reply=()=>r;await load(h);assert.match(value(h),/조회 실패/);
+  }
 });
 test('compatible future feature adapter requires sensor scope and finite measured features',async()=>{
   const h=fixture(),row=featureRow('anomaly_start'),m=featureMetadata();

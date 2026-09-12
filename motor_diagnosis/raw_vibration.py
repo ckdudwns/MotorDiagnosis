@@ -4,23 +4,18 @@ No research-package imports, pickle loaders, optional ML dependencies or model
 activation. All samples and units remain available for later reproducibility.
 """
 
-import base64
-import binascii
 import cmath
 import json
 import math
 import struct
 import time
 
-from .vibration_windows import KEYS, VibrationWindowStore, reject, validate_envelope
+from .vibration_windows import VibrationWindowStore, reject
+from .raw_samples import PROFILE_ID, ENCODING, G_PER_COUNT, RAW_KEYS, decode_samples, normalize
 from .window_features import FEATURE_NAMES
 from .rf66_timing import continuous_interval, interval_range_us
 
-PROFILE_ID = "adxl345-800hz-xyz-counts-v1"
 FEATURE_PROFILE = "mcc5-vibration-800hz-spectral66-v1"
-ENCODING = "base64-int16le-xyz"
-G_PER_COUNT = 0.0039
-RAW_KEYS = (KEYS - {"features"}) | {"encoding", "gPerCount", "samples"}
 FINE_BANDS = ((0, 25), (25, 50), (50, 75), (75, 100),
               (100, 150), (150, 200), (200, 275), (275, 350))
 EXTRA_NAMES = [
@@ -30,35 +25,6 @@ EXTRA_NAMES = [
                   "peak_power_fraction", "rolloff85_hz"])
 ] + ["correlation.XY", "correlation.XZ", "correlation.YZ"]
 NAMES = list(FEATURE_NAMES) + EXTRA_NAMES
-
-
-def decode_samples(payload):
-    value = payload["samples"]
-    if value is None and payload["quality"] != "valid":
-        return None
-    if not isinstance(value, str) or len(value) != 4 * ((payload["sampleCount"] * 6 + 2) // 3):
-        reject("Raw sample length must match sampleCount × XYZ × int16")
-    try:
-        body = base64.b64decode(value, validate=True)
-    except (ValueError, binascii.Error):
-        reject("Invalid raw base64")
-    if len(body) != payload["sampleCount"] * 6 or base64.b64encode(body).decode() != value:
-        reject("Use canonical base64 with exact interleaved XYZ bytes")
-    rows = list(struct.iter_unpack("<hhh", body))
-    if any(v < -4096 or v > 4095 for row in rows for v in row):
-        reject("Counts outside full-resolution ADXL345 range")
-    return rows
-
-
-def normalize(payload):
-    captured = validate_envelope(payload, RAW_KEYS, PROFILE_ID, "count")
-    if (payload["encoding"] != ENCODING or type(payload["gPerCount"]) not in (int, float)
-            or payload["gPerCount"] != G_PER_COUNT):
-        reject("Raw encoding and fixed count-to-g conversion must match profile")
-    if payload["quality"] == "valid" and payload["sampleCount"] != 512:
-        reject("Valid raw windows require 512 actual XYZ samples")
-    decode_samples(payload)
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False), captured
 
 
 def fft(values):
@@ -183,15 +149,18 @@ class RawVibrationStore(VibrationWindowStore):
                      w.captured,w.ordinal LIMIT 1""").fetchone()
 
     def prune(self):
+        if not self.processing_enabled:
+            return  # Retired server runtime preserves historical evidence.
         super().prune()
         with self.lock, self.db:
             self.db.execute("DELETE FROM raw_delivery WHERE ordinal NOT IN (SELECT ordinal FROM vibration_windows)")
 
-    def __init__(self, database=":memory:", *, model=None, event_mode="shadow"):
+    def __init__(self, database=":memory:", *, model=None, event_mode="shadow", processing_enabled=True):
         from .rf66_events import RF66Events, MODES
         if event_mode not in MODES:
             raise ValueError("RF66_EVENT_MODE must be shadow, events, or alerts")
-        self.model = model
+        self.processing_enabled = processing_enabled
+        self.model = model if processing_enabled else None
         super().__init__(database)
         self.variant = "spectral66"
         self.db.execute("CREATE TABLE IF NOT EXISTS raw_clock_anchors(device TEXT, boot TEXT, uptime INTEGER, captured REAL, PRIMARY KEY(device,boot))")
@@ -200,10 +169,24 @@ class RawVibrationStore(VibrationWindowStore):
         self.db.execute("CREATE TABLE IF NOT EXISTS raw_confirmation_heads(device TEXT,lane TEXT,ordinal INTEGER,PRIMARY KEY(device,lane))")
         self.db.commit()
         try:
-            self.events = RF66Events(self, event_mode)
+            self.events = RF66Events(self, event_mode if processing_enabled else "shadow")
         except Exception:
             self.close()
             raise
+
+    def start(self):
+        if self.processing_enabled:
+            super().start()
+
+    def tick(self):
+        return super().tick() if self.processing_enabled else False
+
+    def ingest(self, principal, device_id, payload):
+        ack, status = super().ingest(principal, device_id, payload)
+        if not self.processing_enabled:
+            ack.update(processingEnabled=False, inferenceEnabled=False, reason="LEGACY_RF66_DISABLED",
+                       replacementPath=f"/api/devices/{device_id}/periodic-snapshots")
+        return ack, status
 
     def input_names(self):
         return list(NAMES)
@@ -325,4 +308,9 @@ class RawVibrationStore(VibrationWindowStore):
         result["maxRows"] = self.max_rows
         result["configuredModel"] = self.model.metadata() if self.model is not None else None
         result["eventPolicy"] = self.events.metadata()
+        result["processingEnabled"] = self.processing_enabled
+        if not self.processing_enabled:
+            result.update(inferenceEnabled=False, runtimeStatus="disabled", historicalOnly=True,
+                          reason="LEGACY_RF66_DISABLED",
+                          replacementPath=f"/api/devices/{device_id}/periodic-snapshots")
         return result

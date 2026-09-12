@@ -1744,10 +1744,7 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
         # BaseServer.service_actions(), which runs in the HTTP accept loop.
         # One coordinator coalesces polling; ticks never overlap or accumulate.
         while not self._alert_stop.wait(0.5):
-            try:
-                self.raw_vibration.events.dispatch()
-            except Exception:
-                LOGGER.exception("RF66 event projection failed; durable transition retained")
+            # Retired RF66 incidents are history, not automatically projected or sent.
             if not self.auto_alerts:
                 continue
             try:
@@ -1840,7 +1837,7 @@ def create_server(
     server.raw_vibration = None
     server.periodic_snapshots = None
     try:
-        # This inbox deliberately has no worker until the new model is integrated.
+        # Prepare raw input asynchronously; no model is selected by this worker.
         server.periodic_snapshots = PeriodicSnapshotStore(snapshot_database)
         # Identity protection must survive disabling/replacing the ML runtime.
         server.model_history = ModelHistoryGuard(model_database)
@@ -1872,14 +1869,11 @@ def create_server(
             checkpoint=checkpoint if window_model_variant else None,
             variant=window_model_variant or "base21",
         )
-        rf66_model = None
-        if rf66_checksum and not rf66_artifact:
-            raise ValueError("RF66 checksum requires an explicit RF66 artifact")
-        if rf66_artifact:
-            from .rf66 import RF66Model
-
-            rf66_model = RF66Model.load(rf66_artifact, expected_checksum=rf66_checksum)
-        server.raw_vibration = RawVibrationStore(raw_window_database, model=rf66_model, event_mode=rf66_event_mode)
+        # Deprecated arguments are ignored, even when an old deployment still
+        # provides them. The HTTP server no longer has an RF66 loader path.
+        if rf66_artifact or rf66_checksum or rf66_event_mode != "shadow":
+            LOGGER.warning("Legacy RF66 configuration ignored: server inference is disabled")
+        server.raw_vibration = RawVibrationStore(raw_window_database, processing_enabled=False)
         server.analysis = AnalysisStore(analysis_database)
         server.communication_quality = CommunicationQualityStore(communication_database)
         server.alerts = AlertService(
@@ -1890,7 +1884,7 @@ def create_server(
         if server.model_inference is not None:
             server.model_inference.start()
         server.vibration_windows.start()
-        server.raw_vibration.start()
+        server.periodic_snapshots.start()
         server.start_alert_worker()
         if (
             state_database

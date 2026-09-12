@@ -1,13 +1,13 @@
-# IoT 상태 기반 단건 원시 구간 수신 — 1단계
+# IoT 상태 기반 단건 원시 구간 수신·입력 준비 — 2단계
 
 ## 범위와 현재 상태
 
 - 현재 권장 계약은 **`edge-state-snapshot-v1`**입니다. 보드는 모든 측정 구간을 판단하되 아래 네 조건에서만 현재 Raw 하나를 선택합니다.
 - 이전의 **이상 여부와 관계없는 5분 단건** 계약(`periodic-single-v1`)은 이미 전송 대기 중인 요청과 기존 보드의 호환을 위해 유지합니다. 새 정책을 이전 정책 ID로 보내지 않습니다.
-- 서버는 인증 → 입력·무결성 검증 → 원본/수신 시각/처리 상태 저장 → 커밋 → ACK까지 구현합니다.
-- `quality=valid`는 `queued`로 보존합니다. 새 추론 작업자는 아직 없으므로 자동 분석하지 않습니다.
+- 서버는 인증 → 입력·무결성 검증 → 원본/수신 시각/처리 상태 저장 → 커밋 → ACK를 반환하고, 별도 입력 준비 작업이 대기 구간을 처리합니다.
+- `quality=valid`는 우선 `queued`로 저장합니다. 입력 준비가 끝나면 `waiting_model`로 바뀝니다. 아직 새 모델이 없으므로 정상/이상 점수를 만들지 않습니다.
 - 오류 품질 구간도 원본을 보존하되 `unavailable`로 기록합니다. 이를 정상으로 판정하거나 0으로 채우지 않습니다.
-- 기존 API, 기존 RF66 모델·연속 3구간·이벤트·알림 경로와 과거 데이터는 변경하지 않습니다.
+- 기존 RF66 서버 로딩·자동 추론·자동 이벤트 투영은 중지합니다. 과거 원본·판정 결과는 삭제하지 않습니다. 기존 통계 경로와 별도 LSTM shadow 경로는 이 변경의 대상이 아닙니다.
 - 펌웨어 수정, 모델 교체, 새 경로의 이벤트·알림과 웹 화면 연결은 이번 단계에 포함하지 않습니다.
 
 `5분`/`10초`는 전송 선택 주기입니다. **샘플링 800 Hz, 512개 XYZ 샘플, 구간 길이 640 ms**와 다른 개념입니다.
@@ -190,7 +190,8 @@ ACK 예시의 의미:
   "duplicate": false,
   "lateArrival": false,
   "processingStatus": "queued",
-  "processingEnabled": false
+  "processingEnabled": true,
+  "inferenceEnabled": false
 }
 ```
 
@@ -200,6 +201,39 @@ ACK의 `policyId`는 해당 요청에 저장된 정책 ID이며 기존 정책의
 400/409는 규격·내용 문제를 수정해야 합니다. 저장 용량·DB 쓰기·커밋 실패 시 503이며 ACK를 주지 않습니다.
 타임아웃·응답 유실·503은 동일 요청으로 재시도할 수 있습니다. 성공한 요청을 재시도해도 중복 저장하지 않습니다.
 
+## 비동기 입력 준비와 모델 대기
+
+처리 흐름은 **수신 저장/ACK → 대기 구간 선택 → 입력 재검증·변환 → 결과 커밋 → 모델 대기**입니다.
+HTTP 처리는 변환 작업의 완료를 기다리지 않습니다. 서버 시작 시 `snapshot-input` 작업이 시작되고, 종료 시 작업을 정리한 후 DB를 닫습니다.
+
+| 상태 | 의미 | 정상/이상 판정 |
+| --- | --- | --- |
+| `queued` | 저장됐지만 입력 준비 전 | 없음 |
+| `waiting_model` | 입력 준비 완료, 교체 모델 미설정 | 없음 |
+| `unavailable` | 보고 품질 불량 또는 입력 준비 실패 | 없음, 정상으로 대체하지 않음 |
+
+- 입력 어댑터 ID: `adxl345-xyz-g-unmodified-v1`. 실제 원본 `counts`를 고정 환산값 `0.0039`로 g 단위로 변환합니다.
+- 준비 자료는 `analysis.preparedInput`에 저장합니다. `shape: [512, 3]`, `axes: [X,Y,Z]`, `unit: g`, `sampleRateHz: 800`, 실제 `values`를 포함합니다.
+- 평균/DC/중력 제거, 표준화, FFT, RF66 특징 추출, 12개 구간 시계열 구성은 하지 않습니다. **최종 모델의 특징 목록이나 입력 텐서를 확정한 것이 아니라 재현 가능한 원시 입력 준비**입니다.
+- 신호가 일정하다는 이유만으로 이전 RF66 규칙을 적용해 버리지 않습니다. 다만 ADXL345 포화 경계 count는 `clipped`로 처리합니다. 센서가 보고한 품질 불량은 준비 작업에 넣지 않습니다.
+- 원본 전체 digest와 샘플 SHA-256을 다시 검사합니다. 저장 무결성 실패는 `unavailable`로 기록해 다음 구간 처리를 막지 않습니다.
+- 준비된 결과에는 `inputPreparation: {adapterId, status: ready}`, `preparedAt`, `reason: MODEL_NOT_CONFIGURED`를 기록합니다.
+  `score`, `threshold`, `verdict`, `modelVersion`은 null이고 `inferenceEnabled`, `affectsAlerts`는 false입니다. 보드의 `ANOMALY_ACTIVE`로 모델 판정을 대신 채우지 않습니다.
+- `waiting_model`은 이 단계의 완료 상태입니다. 매 작업 주기마다 같은 구간을 다시 계산하지 않습니다. 미래 모델 연결 시의 명시적 재처리 정책은 별도로 구현해야 합니다.
+- 준비 작업은 짧은 SQLite 트랜잭션 하나로 선택·결과 저장을 처리합니다. 두 작업 연결이 겹쳐도 한 번만 처리하며, 커밋 실패/서버 중단 시 원본은 `queued`로 남아 재시작 후 처리됩니다.
+- 기존 DB 스키마 1과 원본 digest는 유지합니다. 수신 때 이미 허용된 대기 자료가 48시간보다 오래됐다는 이유로 준비 단계에서 버리지 않습니다. 새로 수신하는 오래된 요청에 대한 제한은 그대로입니다.
+
+## 기존 RF66 연결 중지
+
+- `app.py`는 `RF66_MODEL_ARTIFACT`, `RF66_MODEL_CHECKSUM`, `RF66_EVENT_MODE`를 모델 기동에 사용하지 않습니다.
+  `create_server`에 구형 RF66 인자가 직접 전달돼도 로더를 호출하지 않습니다. 설정을 삭제하지 않아도 재시작으로 RF66이 활성화되지 않습니다.
+- 서버의 기존 Raw 작업은 `processingEnabled: false`, `runtimeStatus: disabled`입니다. `start()`/`tick()`로 자동 66개 특징 추출·추론을 실행하지 않습니다.
+- 기존 `/raw-vibration-windows` POST는 호환을 위해 원본 저장·중복 ACK만 유지합니다. ACK의 `reason: LEGACY_RF66_DISABLED`, `replacementPath`를 확인하고 새 보드는 `/periodic-snapshots`를 사용해야 합니다. 두 경로 사이의 자동 이관은 없습니다.
+- 기존 Raw GET의 `configuredModel`은 null, `eventPolicy.mode`는 `disabled`입니다. 저장된 예전 결과는 그대로 조회하되 현재 판정으로 취급하지 않습니다. 화면에서도 연결 중지와 과거 이력을 표시합니다.
+- 기존 RF66 자동 사건 투영과 알림 발송은 중지합니다. 운영자의 명시적 과거 사건 검수/수동 종료 기능은 유지합니다. 기존 Raw 이력의 자동 정리도 중지하며 용량 현황은 계속 표시합니다.
+- RF66 로더·평가 코드 파일 자체는 과거 결과 재현을 위한 오프라인 테스트용으로 남깁니다. 서버의 자동 호출 경로와는 분리되어 있습니다.
+- 기존 모델 패키지가 백업 대상에 포함된 경우 그 파일 보존·무결성 검증은 유지합니다. 이는 모델 실행이나 활성화를 뜻하지 않습니다.
+
 ## 저장 파일·백업·관찰
 
 - 기본 파일: `output/periodic-snapshots.sqlite3`; 환경 변수: `PERIODIC_SNAPSHOT_DB_PATH`.
@@ -208,13 +242,15 @@ ACK의 `policyId`는 해당 요청에 저장된 정책 ID이며 기존 정책의
 - 이번 단계에서는 대기 자료를 자동 삭제하지 않습니다. 전체 최대 100,000행, 최대 10,000개 부팅 스트림.
   용량 도달 시 503으로 재시도를 요청하며 오래된 자료나 미처리 자료를 몰래 버리지 않습니다.
 - `operations inspect --device ...`에 별도 저장소의 행 수·상태·최근 측정/수신 시각이 표시됩니다.
-  `stage: ingest_only`, `processingEnabled: false`이고, 대기는 아직 시작하지 않은 추론 작업이지 RF66 작업자 장애가 아닙니다.
+  `stage: input_preparation`, `processingEnabled: true`, `inferenceEnabled: false`입니다. `waiting_model`은 의도된 상태이며 준비 지연 경고가 아닙니다.
+  준비 전 `queued`가 수신 후 120초를 넘으면 `PREPARATION_BACKLOG` 경고를 표시합니다.
 - GET의 `preferredPolicyId`·`transmissionPolicies`는 지원 계약을 알려줍니다. `latestTransmission`은 최신 **측정 시각**의 보고 원본이며 아직 수신이 없으면 null입니다.
   `intervalSec`는 해당 상태에서 기대하는 다음 **정기** 간격(정상 300/이상 10초)입니다. 즉시 보고의 원본 `transmission.intervalSec=0`과 구분합니다.
   이는 반복 주기이며 다음 시각 경계까지 남은 시간이 아닙니다. 복귀 직후 다음 5분 경계가 가까우면 정상 정기 구간이 300초보다 빨리 선택될 수 있습니다.
   inspect의 `latest.transmission`·`expectedReportIntervalSec`에도 이를 표시합니다.
   `boardStateSource: device_report`, `boardStateVerifiedByServer: false`로 서버가 연속 관측을 검증한 값이 아님을 표시합니다.
-  이는 마지막 보고 이력이지 현재도 그 상태라는 실시간 보장은 아닙니다. 새 경로의 온라인/미수신 감시는 이번 단계에서 연결하지 않습니다.
+  이는 마지막 보고 이력이지 현재도 그 상태라는 실시간 보장은 아닙니다. inspect는 상태별 정기 주기 + 60초를 넘어선 측정값과 입력 준비 불가를 경고합니다. 웹의 기존 온라인 판정은 변경하지 않습니다.
+- `operations observe`는 새 단건 저장소의 순번·측정 시각 진행을 검사합니다. 기존 RF66 이력의 정지를 현재 수신 장애로 판단하지 않습니다.
 - 백업 v2에 새 DB를 포함합니다. 기존 v1 백업도 계속 검증·복구할 수 있습니다.
   새 코드를 운영에 적용한 뒤 서비스를 시작하여 DB가 생성된 상태에서 백업합니다.
 - 기존 화면의 온라인 판정·이벤트 상태를 이 단계에서 변경하지 않습니다. 새 자료 확인은 위 GET API를 사용합니다.
@@ -222,7 +258,7 @@ ACK의 `policyId`는 해당 요청에 저장된 정책 ID이며 기존 정책의
 ## 검증 및 다음 단계
 
 ```text
-python -m unittest tests.test_edge_state_snapshots tests.test_periodic_snapshots tests.test_operations tests.test_transmission_policy tests.test_vibration_windows tests.test_raw_vibration tests.test_rf66_confirmation tests.test_rf66_events -q
+python -m unittest tests.test_snapshot_preparation tests.test_edge_state_snapshots tests.test_periodic_snapshots tests.test_operations tests.test_transmission_policy tests.test_vibration_windows tests.test_raw_vibration tests.test_rf66_confirmation tests.test_rf66_events -q
 ```
 
 단건·누락/추가 필드·단위·인코딩·해시·권한·매핑·중복·충돌·늦은 도착·시각 정지·쓰기 및 커밋 실패·
@@ -230,5 +266,8 @@ python -m unittest tests.test_edge_state_snapshots tests.test_periodic_snapshots
 새 정책은 네 사유의 수신·카운터 모순 거부·품질 불량·즉시 요청 재시도·늦은 진입 도착·기존 정책 공존·
 정상 복귀 뒤 300초 표시·재시작 후 보고 원본 유지·운영 조회·RF66 미실행을 검증합니다.
 
-다음 단계에서 이 inbox를 읽는 새 모델 입력 어댑터와 추론 작업자를 연결합니다.
-전송 프로필 검증과 모델 입력 구성은 분리하며, 기존 12개 이력/3구간 확인을 임의로 재사용하지 않습니다.
+2단계에서는 단위·축 순서 보존, 원본 재검증, 준비 결과 재시작 유지, 동시 처리 중복 방지,
+커밋 실패 복구, RF66 설정 무시, 기존 결과 보존을 추가 검증합니다.
+
+다음 단계는 교체 모델의 버전·입력 규격·전처리·출력 계약이 주어진 뒤 실제 추론 어댑터를 연결하는 것입니다.
+준비된 `[512,3]` 값이 새 모델에 곧바로 호환된다고 가정하지 않으며, 기존 12개 이력/3구간 확인도 임의로 재사용하지 않습니다.

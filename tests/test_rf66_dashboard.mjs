@@ -17,6 +17,17 @@ function fixture() {
 }
 const load=h=>h.run('loadRF66(devices,query)');
 
+test('disabled RF66 runtime is historical and never shown as an active model',async()=>{
+  const h=fixture();
+  h.context.respond=()=>({...result([item()],null),runtimeStatus:'disabled',processingEnabled:false,eventPolicy:{mode:'disabled'}});
+  await load(h);
+  const rendered=text(h.get('rf66Rows'));
+  assert.match(rendered,/기존 RF66 연결 중지/);
+  assert.match(rendered,/기존 RF66 자동 운영 중지/);
+  assert.doesNotMatch(rendered,/현재 적용: RF66/);
+  assert.match(rendered,/과거/);
+});
+
 test('event modes are explicit and RF66 event scores are not statistical scores',async()=>{
   for (const [mode,label] of [['shadow','이벤트/알림 미생성'],['events','알림 꺼짐'],['alerts','알림 활성화']]) {
     const h=fixture();h.context.respond=()=>({...result(),eventPolicy:{mode}});

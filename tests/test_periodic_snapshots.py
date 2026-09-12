@@ -63,7 +63,8 @@ class SnapshotTest(RpmSetup):
         ack, status = self.send(payload=payload)
         self.assertEqual((status, ack["accepted"]), (202, 1))
         self.assertEqual(ack["processingStatus"], "queued")
-        self.assertFalse(ack["processingEnabled"])
+        self.assertTrue(ack["processingEnabled"])
+        self.assertFalse(ack["inferenceEnabled"])
         self.assertFalse(ack["duplicate"])
         row = self.store.db.execute("SELECT * FROM periodic_snapshots").fetchone()
         self.assertFalse(self.store.db.in_transaction)
@@ -83,7 +84,7 @@ class SnapshotTest(RpmSetup):
         self.assertEqual([r["window"]["windowIndex"] for r in items], [1407, 938, 469, 0])
         self.assertTrue(all(r["analysis"]["status"] == "queued" for r in items))
         self.assertTrue(all("confirmation" not in r["analysis"] and "missingWindowsBefore" not in r for r in items))
-        self.assertFalse(hasattr(self.store, "worker"))
+        self.assertIsNone(self.store.worker)  # Direct store tests explicitly drive preparation.
 
     def test_duplicate_is_200_and_does_not_change_original_receipt(self):
         first, _ = self.send()
@@ -372,7 +373,8 @@ class SnapshotTest(RpmSetup):
                 report = operations.inspect(project, env, DEVICE)
                 component = report["databases"]["PERIODIC_SNAPSHOT_DB_PATH"]
                 self.assertEqual(component["statuses"], {"queued": 1, "unavailable": 1})
-                self.assertFalse(component["processingEnabled"])
+                self.assertTrue(component["processingEnabled"])
+                self.assertFalse(component["inferenceEnabled"])
                 self.assertNotIn("PERIODIC_SNAPSHOT_DB_PATH:PROCESSING_BACKLOG",
                                  [item["code"] for item in report["issues"]])
                 with mock.patch.object(operations, "run", return_value="a"*40):
@@ -439,7 +441,8 @@ class SnapshotTest(RpmSetup):
             self.assertEqual(request("GET", token=None)[0], 401)
             status, result = request("GET", token=self.token)
             self.assertEqual(status, 200)
-            self.assertEqual(result["statuses"], {"queued": 1})
+            self.assertEqual(sum(result["statuses"].values()), 1)
+            self.assertTrue(set(result["statuses"]) <= {"queued", "waiting_model"})
             self.assertEqual(result["items"][0]["window"], self.payload()["window"])
             for store in (server.raw_vibration, server.vibration_windows):
                 self.assertFalse(store.tick())

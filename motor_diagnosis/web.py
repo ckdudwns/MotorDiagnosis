@@ -126,8 +126,8 @@ def render_page() -> str:
       </section>
       <section class="grid">
         <article class="panel wide" id="rf66Panel">
-          <h2>RF66 진동 모델 · 구간별 비교 판정</h2>
-          <p>800Hz · 512샘플 · XYZ · 66개 특징. 기존 통계 점수와 별개입니다. 이벤트·알림은 별도 운영 모드에 따릅니다. 현장 성능 미검증 · 연속 3구간 확인은 별도 열에 표시합니다.</p>
+          <h2>RF66 진동 모델 · 과거 판정 이력</h2>
+          <p>기존 RF66 모델 로딩·자동 추론은 중지되었습니다. 아래는 기존 통계 점수와 별개인 과거 구간별 판정과 연속 3구간 확인 이력입니다. 새 단건 입력의 준비 상태는 별도 수신 API에서 확인합니다.</p>
           <p id="rf66Status" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
           <div id="rf66Rows"></div>
         </article>
@@ -499,7 +499,9 @@ def render_page() -> str:
       card.appendChild(title);
       const model = result.configuredModel;
       const configured = document.createElement("p");
-      configured.textContent = model
+      configured.textContent = result.runtimeStatus === "disabled"
+        ? "기존 RF66 연결 중지 · 모델 로딩·자동 추론·자동 이벤트/알림을 실행하지 않습니다. 아래는 과거 저장 이력입니다."
+        : model
         ? "현재 적용: RF66 (Random Forest) · " + model.modelVersion + " · 임계값 " + model.threshold + " (초과 시 이상 후보)"
         : "현재 RF66 모델 미설정 · 아래 기록이 있으면 과거 결과입니다.";
       configured.style.overflowWrap = "anywhere";
@@ -517,7 +519,7 @@ def render_page() -> str:
         : (model ? "원시 구간 입력 대기 · 모델은 준비됐지만 저장된 원시 구간이 없습니다." : "저장된 원시 구간이 없습니다.");
       card.appendChild(freshness);
       const eventMode = document.createElement("p");
-      eventMode.textContent = "이벤트 운영 모드: " + ({shadow:"비교만 · 이벤트/알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 활성화 (정책·입력 유효성 적용)"}[result.eventPolicy?.mode] || "미확인 (이전 서버)");
+      eventMode.textContent = "이벤트 운영 모드: " + ({disabled:"기존 RF66 자동 운영 중지",shadow:"비교만 · 이벤트/알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 활성화 (정책·입력 유효성 적용)"}[result.eventPolicy?.mode] || "미확인 (이전 서버)");
       card.appendChild(eventMode);
       if (items.length) {
         const rows = items.slice(0, 5).map(item => {

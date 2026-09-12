@@ -1,4 +1,4 @@
-"""Stage 1: durable single-window inbox. No inference, confirmation or events.
+"""Durable single-window inbox and model-independent input preparation.
 
 Board-selected delivery is independent of measurement sampling. Window index gaps
 are intentional selection, not missing continuous windows. Accepted originals
@@ -8,24 +8,27 @@ import base64
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import threading
 import time
 
 from . import data, device_lifecycle
-from .raw_vibration import PROFILE_ID as RAW_PROFILE, normalize as normalize_raw
+from .raw_samples import PROFILE_ID as RAW_PROFILE, normalize as normalize_raw
+from .snapshot_input import ADAPTER_ID, prepare_input
 from .transmission_policy import (
     EDGE_SNAPSHOT_POLICY_ID, snapshot_interval_seconds, snapshot_policy_metadata,
     validate_snapshot,
 )
-from .vibration_windows import reject
+from .window_envelope import reject
 
 MAX_BODY_BYTES = 64 * 1024
 MAX_ROWS = 100000
 MAX_STREAMS = 10000
 LIST_LIMIT = 20
 CLOCK_TOLERANCE_SECONDS = 1
+LOGGER = logging.getLogger(__name__)
 
 
 def iso(epoch):
@@ -42,14 +45,14 @@ def canonical(payload):
     return body
 
 
-def normalize_window(window):
+def normalize_window(window, *, check_time_bounds=True):
     """Verify wire bytes, not an RF66 feature vector or a JSON-file checksum."""
     integrity = window.get("integrity")
     if (not isinstance(integrity, dict) or set(integrity) != {"algorithm", "digest"}
             or integrity["algorithm"] != "sha256"):
         reject("integrity must specify algorithm=sha256 and digest", code="INVALID_PERIODIC_SNAPSHOT")
     raw = {key: value for key, value in window.items() if key != "integrity"}
-    _, captured = normalize_raw(raw)
+    _, captured = normalize_raw(raw, check_time_bounds=check_time_bounds)
     digest = integrity["digest"]
     if raw["samples"] is None:
         if digest is not None:
@@ -72,6 +75,8 @@ class PeriodicSnapshotStore:
 
     def __init__(self, database=":memory:"):
         self.lock = threading.RLock()
+        self.stop = threading.Event()
+        self.worker = None
         if str(database) != ":memory:":
             Path(database).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(database), check_same_thread=False, timeout=2)
@@ -215,8 +220,56 @@ class PeriodicSnapshotStore:
             "acknowledged": [{"bootId": row["boot"], "windowIndex": row["idx"],
                               "digest": row["digest"], "receivedAt": iso(row["received"])}],
             "duplicate": not bool(accepted), "lateArrival": bool(row["late"]),
-            "processingStatus": row["status"], "processingEnabled": False,
+            "processingStatus": row["status"], "processingEnabled": True,
+            "inferenceEnabled": False,
         }, 202 if accepted else 200
+
+    def start(self):
+        with self.lock:
+            if self.worker is not None:
+                return
+            self.worker = threading.Thread(target=self._run, name="snapshot-input", daemon=True)
+            self.worker.start()
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                if self.tick():
+                    continue
+            except Exception:
+                LOGGER.exception("Snapshot preparation failed; committed inbox retained for retry")
+            self.stop.wait(.5)
+
+    def tick(self):
+        # One short deterministic preparation transaction. A second process
+        # serializes at BEGIN IMMEDIATE; crashes cannot leave a processing lease
+        # stranded, count a row twice, or overwrite a final result.
+        with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute("SELECT * FROM periodic_snapshots WHERE status='queued' ORDER BY ordinal LIMIT 1").fetchone()
+            if row is None:
+                return False
+            result = {"status": "waiting_model", "reason": "MODEL_NOT_CONFIGURED",
+                      "score": None, "threshold": None, "verdict": None, "modelVersion": None,
+                      "inferenceEnabled": False, "affectsAlerts": False,
+                      "inputPreparation": {"adapterId": ADAPTER_ID, "status": "ready"}}
+            try:
+                payload = json.loads(row["body"])
+                if hashlib.sha256(canonical(payload).encode("utf-8")).hexdigest() != row["digest"]:
+                    reject("Stored snapshot digest mismatch", code="SNAPSHOT_INTEGRITY_MISMATCH")
+                window = validate_snapshot(payload)
+                # Already accepted input may legitimately outlive reception's 48h limit.
+                normalize_window(window, check_time_bounds=False)
+                result["preparedInput"] = prepare_input(window)
+            except (data.ApiError, ValueError, TypeError, KeyError, OverflowError) as exc:
+                result.update(status="unavailable", reason=(exc.code if isinstance(exc, data.ApiError)
+                              else str(exc) if str(exc) in {"clipped", "sample_gap"}
+                              else "INPUT_PREPARATION_FAILED"))
+                result["inputPreparation"]["status"] = "unavailable"
+            result["preparedAt"] = iso(time.time())
+            self.db.execute("UPDATE periodic_snapshots SET status=?,result=? WHERE ordinal=? AND status='queued'",
+                            (result["status"], json.dumps(result, allow_nan=False), row["ordinal"]))
+        return True
 
     @device_lifecycle.serialized
     def list_device(self, user, device_id):
@@ -242,7 +295,9 @@ class PeriodicSnapshotStore:
             "transmissionPolicies": snapshot_policy_metadata(),
             "latestTransmission": latest_transmission,
             "boardStateSource": "device_report", "boardStateVerifiedByServer": False,
-            "processingEnabled": False, "stage": "ingest_only", "limit": LIST_LIMIT,
+            "processingEnabled": True, "inferenceEnabled": False,
+            "stage": "input_preparation", "inputAdapterId": ADAPTER_ID,
+            "configuredModel": None, "modelStatus": "not_configured", "limit": LIST_LIMIT,
             "statuses": statuses, "supportedProfileIds": [RAW_PROFILE],
             "items": [{**json.loads(row["body"]), "ordinal": row["ordinal"],
                        "digest": row["digest"], "receivedAt": iso(row["received"]),
@@ -254,6 +309,9 @@ class PeriodicSnapshotStore:
         }
 
     def close(self):
+        self.stop.set()
+        if self.worker is not None:
+            self.worker.join()
         device_lifecycle.unregister_history(self)
         with self.lock:
             self.db.close()

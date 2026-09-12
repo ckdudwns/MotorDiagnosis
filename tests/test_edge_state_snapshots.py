@@ -70,7 +70,8 @@ class EdgeSnapshotTest(RpmSetup):
             self.assertEqual(json.loads(stored), payload)
         result = self.listing()
         self.assertEqual(result["statuses"], {"queued": 5})
-        self.assertFalse(result["processingEnabled"])
+        self.assertTrue(result["processingEnabled"])
+        self.assertFalse(result["inferenceEnabled"])
         self.assertFalse(result["boardStateVerifiedByServer"])
         for item in result["items"]:
             self.assertEqual(item["analysis"], {
@@ -248,7 +249,9 @@ class EdgeSnapshotTest(RpmSetup):
             self.assertEqual(request("POST", self.payload(3, "anomaly_enter"), token="wrong")[0], 401)
             self.assertEqual(request("POST", self.payload(3, "anomaly_enter", transmission={"anomalyCount": 2}))[0], 400)
             status, result = request("GET", token=self.token)
-            self.assertEqual((status, result["statuses"]), (200, {"queued": 4}))
+            self.assertEqual(status, 200)
+            self.assertEqual(sum(result["statuses"].values()), 4)
+            self.assertTrue(set(result["statuses"]) <= {"queued", "waiting_model"})
             self.assertEqual(result["latestTransmission"]["reason"], "normal_recovered")
             for store in (server.raw_vibration, server.vibration_windows):
                 self.assertFalse(store.tick())

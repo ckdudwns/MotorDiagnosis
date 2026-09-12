@@ -1,5 +1,5 @@
 """Versioned delivery metadata; never changes measurement identity or RF score."""
-from .vibration_windows import reject
+from .window_envelope import reject
 
 POLICY_ID = "edge-trigger-batch-v1"
 SNAPSHOT_POLICY_ID = "periodic-single-v1"

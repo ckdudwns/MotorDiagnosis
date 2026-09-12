@@ -127,6 +127,26 @@ class OperationsTest(unittest.TestCase):
             self.backup()
         self.assertFalse((self.project / "missing.db").exists())
 
+    def test_dual_model_backup_restore_keeps_both_artifacts_and_binding(self):
+        from tests.test_pump_dual_models import environment, FORECAST
+        from motor_diagnosis.pump_models import configured_model
+        self.env.update(environment())
+        original = configured_model(environment()).binding_id
+        folder = self.backup()
+        manifest = ops.verify_backup(folder)
+        target = Path(self.temp.name)/"dual-drill"
+        self.assertTrue(ops.restore_drill(folder,target)["verified"])
+        self.assertEqual((target/"PUMP_DUAL_FORECAST_ARTIFACT.bin").read_bytes(),FORECAST.read_bytes())
+        env = {**manifest["pumpDual"],"PUMP_DUAL_EVENT_ARTIFACT":str(target/"PUMP_DUAL_EVENT_ARTIFACT.bin"),
+               "PUMP_DUAL_FORECAST_ARTIFACT":str(target/"PUMP_DUAL_FORECAST_ARTIFACT.bin")}
+        self.assertEqual(configured_model(env).binding_id,original)
+        self.env["PUMP_DUAL_FORECAST_CHECKSUM"]="0"*64
+        with self.assertRaises(ValueError):self.backup()
+        manifest["files"]=[item for item in manifest["files"] if item["key"]!="PUMP_DUAL_FORECAST_ARTIFACT"]
+        (folder/"manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError,"Dual model pair"):
+            ops.verify_backup(folder)
+
     def test_tamper_traversal_and_incomplete_set_fail_before_restore(self):
         folder = self.backup()
         manifest_path = folder / "manifest.json"

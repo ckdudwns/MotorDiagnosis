@@ -129,7 +129,9 @@ class SnapshotInference:
                                "windowIndex", "timestamp", "startUptimeUs")}
                     context["historySequence"] = window.get("historySequence")
                     context["sensorId"] = window.get("sensorId")
-                    if window.get("profileId") == "adxl345-ac-cf-sk-ku-v1":
+                    context["ordinal"] = row["ordinal"]
+                    context["digest"] = row["digest"]
+                    if window.get("profileId") in ("adxl345-ac-cf-sk-ku-v1", "adxl345-ac-cf-sk-ku-25s-v1"):
                         context["eventType"] = payload["transmission"]["eventType"]
                         context["periodicSlotEpoch"] = window["periodicSlotEpoch"]
                 except (data.ApiError, ValueError, TypeError, KeyError, OverflowError):
@@ -161,15 +163,21 @@ class SnapshotInference:
         from .periodic_snapshots import canonical, normalize_window
         from .transmission_policy import validate_snapshot
         from .pump_summary import POLICY_ID, PROFILE_ID, FEATURES
+        from . import edge_feature_snapshots as features
+        grid = self.model.metadata()["inputContract"]["sourceProfileId"] == features.HISTORY_PROFILE_ID
+        profile = features.HISTORY_PROFILE_ID if grid else PROFILE_ID
+        policy = features.HISTORY_POLICY_ID if grid else POLICY_ID
+        selector = ("json_extract(body,'$.window.historySequence') IS NOT NULL" if grid else
+                    "json_extract(body,'$.transmission.reason')='history_periodic'")
         with self.store.lock:
-            rows = self.store.db.execute("""SELECT * FROM periodic_snapshots
+            rows = self.store.db.execute(f"""SELECT * FROM periodic_snapshots
                 WHERE device=? AND site=? AND asset=? AND boot=? AND sensor=? AND captured<? AND ordinal<?
                 AND json_extract(body,'$.window.profileId')=?
                 AND json_extract(body,'$.transmission.policyId')=?
-                AND json_extract(body,'$.transmission.reason')='history_periodic'
+                AND {selector}
                 ORDER BY captured DESC,ordinal DESC LIMIT 24""",
                 (current["device"], current["site"], current["asset"], current["boot"],
-                 current["sensor"], current["captured"], current["ordinal"], PROFILE_ID, POLICY_ID)).fetchall()
+                 current["sensor"], current["captured"], current["ordinal"], profile, policy)).fetchall()
         history = []
         for row in reversed(rows):
             payload = json.loads(row["body"])

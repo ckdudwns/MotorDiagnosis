@@ -486,8 +486,9 @@ def render_page() -> str:
     const snapshotTime = value => typeof value === "string" && Number.isFinite(Date.parse(value));
     const snapshotScope = (value, scope) => value && ["deviceId","siteId","assetId"].every(k => value[k] === scope[k]);
     const verifierFeatures = ["cf_a_1","cf_a_2","cf_a_3","sk_a_1","sk_a_2","sk_a_3","ku_a_1","ku_a_2","ku_a_3"];
-    const isHistoryVerifier = model => model?.contractId === "history-event-verifier-v1";
-    const isEdgeFeatureModel = model => model?.contractId === "edge-feature-event-v1";
+    const isDualModel = model => model?.contractId === "edge-feature-history-model-v1";
+    const isHistoryVerifier = model => model?.contractId === "history-event-verifier-v1" || isDualModel(model);
+    const isEdgeFeatureModel = model => model?.contractId === "edge-feature-event-v1" || isDualModel(model);
     function snapshotModelValid(model, scope) {
       const input = model?.inputContract;
       const common = snapshotScope(model?.scope, scope)
@@ -497,11 +498,21 @@ def render_page() -> str:
       if (!common) return false;
       if (isEdgeFeatureModel(model)) return typeof model.scope.sensorId === "string"
         && /^[A-Z0-9][A-Z0-9._-]{0,99}$/.test(model.scope.sensorId)
-        && input?.adapterId === "adxl345-ac-nine-moments-v1" && input.sourceProfileId === "adxl345-ac-cf-sk-ku-v1"
+        && input?.adapterId === "adxl345-ac-nine-moments-v1"
+        && input.sourceProfileId === (isDualModel(model) ? "adxl345-ac-cf-sk-ku-25s-v1" : "adxl345-ac-cf-sk-ku-v1")
         && JSON.stringify(input.shape) === "[9]" && JSON.stringify(input.features) === JSON.stringify(verifierFeatures)
         && JSON.stringify(input.axes) === '["X","Y","Z"]' && input.unit === "dimensionless"
         && input.sourceUnit === "g" && input.sampleRateHz === 800 && input.sampleCount === 512
-        && input.meanRemoved === true && input.momentConvention === "population-pearson";
+        && input.meanRemoved === true && input.momentConvention === "population-pearson"
+        && (!isDualModel(model) || model.modelId === "pump-event-verifier-v1"
+          && model.scoreType === "novelty_reference_ratio" && model.threshold === 1 && model.comparison === ">"
+          && input.historyIntervalSec === 25 && input.historyClock === "unix_epoch_25s" && input.maxWindowEndAgeSec === 1
+          && model.inputMode === "experimental-adxl25" && model.sourceFeatureEquivalenceVerified === false
+          && model.forecastModel?.modelId === "pump-summary-experiment-v2"
+          && /^sha256:[0-9a-f]{64}$/.test(model.forecastModel.modelVersion)
+          && model.forecastModel.windowRows === 13 && model.forecastModel.horizonSec === 300
+          && model.forecastModel.intervalSec === 25 && model.forecastModel.affectsAlerts === false
+          && model.forecastModel.operationallyApproved === false);
       if (isHistoryVerifier(model)) return model.modelId === "pump-event-verifier-v1"
         && typeof model.scope.sensorId === "string" && /^[A-Z0-9][A-Z0-9._-]{0,99}$/.test(model.scope.sensorId)
         && model.scoreType === "novelty_reference_ratio" && model.threshold === 1 && model.comparison === ">"
@@ -548,6 +559,13 @@ def render_page() -> str:
     }
     function snapshotReason(reason) {
       const labels = {MODEL_INPUT_CONTRACT_MISMATCH:"수신·특징 준비 가능 / 연결 모델과 입력 규격 불일치",
+        VERIFIER_HISTORY_INSUFFICIENT:"25초 과거 이력 24건 확보 필요",
+        VERIFIER_OUTPUT_INVALID:"오류 판정 계산 실패",
+        FORECAST_HISTORY_INSUFFICIENT:"현재 포함 25초 이력 13건 확보 필요",
+        FORECAST_HISTORY_DISCONTINUITY:"예측용 25초 이력 시각·순번 불연속",
+        FORECAST_HISTORY_QUALITY_OR_SCOPE:"예측용 이력 품질 불량 또는 부팅·대상 변경",
+        FORECAST_REQUIRES_SCHEDULED_RECORD:"즉시 보고는 예측 이력에 추가하지 않음 · 다음 정기 기록에서 예측",
+        FORECAST_OUTPUT_INVALID:"예측값 계산 실패",
         MODEL_SCOPE_MISMATCH:"수신 당시 해당 센서·장치에 모델 미배정",
         insufficient_samples:"512개 미만 수집",timeout:"센서 수집 시간 초과",non_finite:"특징값 NaN·무한대",
         zero_variance:"분산 0으로 특징 계산 불가",no_valid_window:"해당 구간에 유효 측정 없음",
@@ -563,14 +581,15 @@ def render_page() -> str:
       return Object.hasOwn(labels, reason) ? labels[reason] + " (" + reason + ")" : (reason || "—");
     }
     function snapshotDelivery(info) {
-      if (info?.policyId === "edge-feature-snapshot-v1") {
-        const reports = {periodic:["NORMAL","UTC 00·25·50초 정기 전송 (25·25·10초)"],
+      if (["edge-feature-snapshot-v1","edge-feature-history-v1"].includes(info?.policyId)) {
+        const history = info.policyId === "edge-feature-history-v1";
+        const reports = {periodic:[history ? info.state : "NORMAL",history ? "25초 등간격 정기 이력 · 이상 중에도 유지" : "UTC 00·25·50초 정기 전송 (25·25·10초)"],
           anomaly_start:["ANOMALY_ACTIVE","이상 진입 · 즉시 전송"],
-          anomaly_active:["ANOMALY_ACTIVE","이상 유지 · 10초 전송 / 정기 중단"],
+          anomaly_active:["ANOMALY_ACTIVE",history ? "이상 유지 · 10초 전송 / 25초 이력 유지" : "이상 유지 · 10초 전송 / 정기 중단"],
           recovery:["NORMAL","정상 복귀 · 즉시 전송"]};
         const r = Object.hasOwn(reports,info.eventType) ? reports[info.eventType] : null;
         const a=info.anomalyCount,n=info.normalCount;
-        if (!r || info.state!==r[0] || ![a,n].every(v=>Number.isInteger(v)&&v>=0&&v<=2147483647)
+        if (!r || info.state!==r[0] || !["NORMAL","ANOMALY_ACTIVE"].includes(info.state) || ![a,n].every(v=>Number.isInteger(v)&&v>=0&&v<=2147483647)
             || (a&&n) || (info.state==="NORMAL"&&a>=3) || (info.state==="ANOMALY_ACTIVE"&&n>=5)
             || (info.eventType==="anomaly_start"&&(a!==3||n!==0)) || (info.eventType==="recovery"&&(n!==5||a!==0)))
           return {state:"보고 형식 확인 필요",reason:"전송 정책 확인 필요",interval:null,counters:"미확인"};
@@ -626,6 +645,25 @@ def render_page() -> str:
       return `${model.modelId} · ${model.modelVersion} · 전처리 ${model.preprocessingVersion} · ${model.scoreType} · 점수 ${model.comparison} ${model.threshold}일 때 이상 후보`
         + (isHistoryVerifier(model) ? ` · 적용 센서 ${model.scope.sensorId} · 고장 확률 아님 · 라벨 기반 성능·적용 장비 검증 미완료` : "");
     }
+    function snapshotForecastValid(item) {
+      const a=item.analysis, f=a?.forecast, m=a?.inference?.model, w=item.window;
+      return isDualModel(m) && snapshotModelValid(m,w) && w.quality === "valid"
+        && w.sampleCount === 512 && w.reason === null
+        && w.sensorId === m.scope.sensorId && w.profileId === m.inputContract.sourceProfileId
+        && f?.status === "completed" && f.reason === null && f.affectsAlerts === false
+        && f.modelId === m.forecastModel.modelId && f.modelVersion === m.forecastModel.modelVersion
+        && f.stream === m.forecastModel.stream
+        && f.windowRows === 13 && f.horizonSec === 300 && f.intervalSec === 25
+        && f.operationallyApproved === false && f.basedOnMeasuredAt === w.timestamp
+        && snapshotTime(f.predictedFor) && Math.abs(Date.parse(f.predictedFor)-Date.parse(w.timestamp)-300000) <= 1
+        && Number.isInteger(w.periodicSlotEpoch) && f.targetSlotEpoch === w.periodicSlotEpoch+300
+        && f.features && Object.keys(f.features).length === 9 && verifierFeatures.every(k=>snapshotNumber(f.features[k]))
+        && Array.isArray(f.inputOrdinals) && f.inputOrdinals.length === 13 && f.inputOrdinals[12] === item.ordinal
+        && f.inputOrdinals.every((v,i)=>Number.isInteger(v) && v > 0 && (!i || v > f.inputOrdinals[i-1]))
+        && Array.isArray(f.inputDigests) && f.inputDigests.length === 13 && f.inputDigests[12] === item.digest
+        && f.inputDigests.every(v=>typeof v === "string" && /^[0-9a-f]{64}$/.test(v))
+        && a.inference.inputDigest === item.digest && snapshotTime(a.inference.completedAt);
+    }
     function renderSnapshotCard(result) {
       const card = document.createElement("section"); card.className = "history-card";
       const title = document.createElement("h3"); title.textContent = result.deviceId + " / " + result.assetId;
@@ -633,6 +671,7 @@ def render_page() -> str:
       configured.textContent = result.configuredModel ? "현재 연결 모델: " + snapshotModelText(result.configuredModel)
         : "현재 교체 모델 미설정 · 수신·입력 준비는 가능하며, 기존 RF66은 실행하지 않습니다.";
       if (result.modelCompatibility?.reason) configured.textContent += " · " + snapshotReason(result.modelCompatibility.reason);
+      if (isDualModel(result.configuredModel)) configured.textContent += " · ADXL 특징 비교 적용: 학습 원본 특징과의 동일성 미확인 · 예측은 알림에 미사용";
       const policy = document.createElement("p");
       policy.textContent = "단건 이벤트 운영 모드: " + ({shadow:"비교만 · 사건·알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 허용 (정책·입력 유효성 적용)"}[result.eventPolicy?.mode] || "미확인 (이전 서버)")
         + (isHistoryVerifier(result.configuredModel) ? " · 이력 검증 기준 초과로 발생 / 같은 모델 기준 미초과로 사건 해제 (장비 정상 확정 아님)"
@@ -659,6 +698,22 @@ def render_page() -> str:
         + " · 대상 측정 " + formatLocalTime(recent.window.timestamp) + " · " + snapshotProcessing(recent)
         + " · 현재 상태 보장 아님" : "조회된 최근 20건 내 완료된 모델 판정 없음";
       card.append(freshness,summary);
+      if (isDualModel(result.configuredModel) || latest.analysis?.forecast) {
+        const f=latest.analysis?.forecast, heading=document.createElement("h4");
+        heading.textContent="5분 뒤 특징값 예측 · 오류 판정과 별도";
+        card.appendChild(heading);
+        if (snapshotForecastValid(latest)) {
+          card.appendChild(facts([["예측 대상 시각",formatLocalTime(f.predictedFor)],
+            ["기준 측정 시각",formatLocalTime(f.basedOnMeasuredAt)], ["예측 모델",f.modelVersion],
+            ["입력 이력","현재 포함 13건 · 25초 등간격"], ["알림 반영","없음 · 고장 시점·잔여수명 예측이 아님"]]));
+          card.appendChild(statusTable("9개 특징의 예측값 (실측값 아님)",["특징","예측값"],
+            verifierFeatures.map(k=>[k,String(f.features[k])])));
+        } else {
+          const unavailable=document.createElement("p");
+          unavailable.textContent="예측 대기·불가 · " + (f?.status === "completed" ? "결과 형식 확인 필요" : snapshotReason(f?.reason || "MODEL_NOT_CONFIGURED"));
+          card.appendChild(unavailable);
+        }
+      }
       const scroll = document.createElement("div"); scroll.className = "table-scroll";
       scroll.appendChild(statusTable("최근 측정 최대 20건 · 점수 범위·의미는 모델별 규격을 따릅니다.",
         ["측정 / 서버 수신 시각","보드 보고 / 전송 사유","서버 처리·판정","모델 점수 / 임계 조건","입력 품질 / 사유","판정 완료 / 적용 모델","구간 식별 / 도착","사건 처리"],

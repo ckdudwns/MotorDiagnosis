@@ -7,7 +7,7 @@ import threading
 
 from motor_diagnosis.server import create_server
 from motor_diagnosis.alerts import configured_adapters
-from motor_diagnosis.pump_event_model import configured_model
+from motor_diagnosis.pump_models import configured_model
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PORT", "8787"))

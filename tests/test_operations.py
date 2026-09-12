@@ -42,7 +42,7 @@ class OperationsTest(unittest.TestCase):
         with closing(sqlite3.connect(self.project / ops.DB_DEFAULTS["ALERT_DB_PATH"])) as db:
             db.execute("CREATE TABLE alert_deliveries(status TEXT,due_at REAL)")
         with closing(sqlite3.connect(self.project / ops.DB_DEFAULTS["PERIODIC_SNAPSHOT_DB_PATH"])) as db:
-            db.execute("CREATE TABLE periodic_snapshots(device TEXT,captured REAL,received REAL,boot TEXT,idx INT,quality TEXT,status TEXT,ordinal INTEGER,late INTEGER)")
+            db.execute("CREATE TABLE periodic_snapshots(device TEXT,captured REAL,received REAL,boot TEXT,idx INT,quality TEXT,status TEXT,ordinal INTEGER,late INTEGER,body TEXT)")
         self.capacity = mock.patch.object(ops.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100*ops.GiB, 10*ops.GiB, 90*ops.GiB))
         self.capacity.start()
         self.addCleanup(self.capacity.stop)

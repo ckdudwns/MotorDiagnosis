@@ -1,6 +1,6 @@
 """Stage 1: durable single-window inbox. No inference, confirmation or events.
 
-Five-minute delivery is independent of measurement sampling. Window index gaps
+Board-selected delivery is independent of measurement sampling. Window index gaps
 are intentional selection, not missing continuous windows. Accepted originals
 are never pruned here; capacity exhaustion returns retryable backpressure.
 """
@@ -16,7 +16,8 @@ import time
 from . import data, device_lifecycle
 from .raw_vibration import PROFILE_ID as RAW_PROFILE, normalize as normalize_raw
 from .transmission_policy import (
-    SNAPSHOT_INTERVAL_SECONDS, SNAPSHOT_POLICY_ID, validate_snapshot,
+    EDGE_SNAPSHOT_POLICY_ID, snapshot_interval_seconds, snapshot_policy_metadata,
+    validate_snapshot,
 )
 from .vibration_windows import reject
 
@@ -208,8 +209,9 @@ class PeriodicSnapshotStore:
         except sqlite3.Error as exc:
             raise data.ApiError(503, "SNAPSHOT_STORAGE_UNAVAILABLE",
                                 "Snapshot not acknowledged; retry the unchanged request") from exc
+        transmission = json.loads(row["body"])["transmission"]
         return {
-            "deviceId": device_id, "policyId": SNAPSHOT_POLICY_ID, "accepted": accepted,
+            "deviceId": device_id, "policyId": transmission["policyId"], "accepted": accepted,
             "acknowledged": [{"bootId": row["boot"], "windowIndex": row["idx"],
                               "digest": row["digest"], "receivedAt": iso(row["received"])}],
             "duplicate": not bool(accepted), "lateArrival": bool(row["late"]),
@@ -231,9 +233,15 @@ class PeriodicSnapshotStore:
             statuses = dict(self.db.execute(
                 "SELECT status,count(*) FROM periodic_snapshots WHERE device=? AND site=? AND asset=? GROUP BY status",
                 scope))
+        latest_transmission = json.loads(rows[0]["body"])["transmission"] if rows else None
         return {
             "deviceId": device_id, "siteId": device["siteId"], "assetId": device["assetId"],
-            "policyId": SNAPSHOT_POLICY_ID, "intervalSec": SNAPSHOT_INTERVAL_SECONDS,
+            "policyId": latest_transmission["policyId"] if latest_transmission else EDGE_SNAPSHOT_POLICY_ID,
+            "intervalSec": snapshot_interval_seconds(latest_transmission or {}),
+            "preferredPolicyId": EDGE_SNAPSHOT_POLICY_ID,
+            "transmissionPolicies": snapshot_policy_metadata(),
+            "latestTransmission": latest_transmission,
+            "boardStateSource": "device_report", "boardStateVerifiedByServer": False,
             "processingEnabled": False, "stage": "ingest_only", "limit": LIST_LIMIT,
             "statuses": statuses, "supportedProfileIds": [RAW_PROFILE],
             "items": [{**json.loads(row["body"]), "ordinal": row["ordinal"],

@@ -143,19 +143,23 @@ $env:DEMO_ENABLED = "true"
 |---|---|---|
 | 백엔드 상태 | `output/runtime.sqlite3` | `STATE_DB_PATH` |
 | 알림 발송·재시도 이력 | `output/alerts.sqlite3` | `ALERT_DB_PATH` |
-| 5분 정기 단건 원본·처리 대기 | `output/periodic-snapshots.sqlite3` | `PERIODIC_SNAPSHOT_DB_PATH` |
+| 상태별 선택 단건 원본·처리 대기 | `output/periodic-snapshots.sqlite3` | `PERIODIC_SNAPSHOT_DB_PATH` |
 | MQTT 재시도 큐 | `output/mqtt_retry.sqlite3` | MQTT 서비스의 `--retry-db` 옵션 |
 
 테스트에서는 별도의 메모리 저장소를 사용할 수 있습니다. 테스트 환경의 저장 방식과 실제 애플리케이션 실행 시의 저장 방식을 구분해야 합니다.
 
 ### 텔레메트리 처리 원칙
 
-**5분 정기 단건 수신(1단계):** `POST /api/devices/{deviceId}/periodic-snapshots`를
-추가했습니다. 이상 여부와 관계없이 5분마다 선택한 원시 진동 구간 하나를 수신하며,
-즉시·우선·묶음 전송은 이 API에서 허용하지 않습니다. 샘플 SHA-256 검증 후 원본과
-처리 대기 상태를 별도 DB에 저장하고 ACK를 반환합니다. 이 경로는 아직 모델 추론과
-이벤트·알림을 실행하지 않으며, 기존 API·RF66 경로는 그대로 유지합니다.
-입력 필드·보드 전달 예시·재전송·검증 절차는 [정기 단건 수신 규격](docs/periodic-single-snapshots.md)을 참고하세요.
+**IoT 상태 기반 단건 수신(1단계):** `POST /api/devices/{deviceId}/periodic-snapshots`는
+`edge-state-snapshot-v1` 정책으로 선택한 원시 진동 구간 하나를 받습니다.
+정상 상태에서는 시각 기준 5분마다, 보드 이상 조건 연속 3회로 이상 상태에 진입할 때는 즉시,
+이상 유지 중에는 10초마다, 정상 조건 연속 5회로 복귀할 때는 즉시 각각 현재 구간 하나를 전송합니다.
+모든 Raw 또는 과거 5분치를 묶어서 보내는 정책이 아닙니다.
+서버는 전송 사유·상태·카운터와 샘플 SHA-256을 검증하고 원본·처리 대기 상태를 저장한 뒤 ACK합니다.
+보드의 상태/연속 횟수는 **장치 보고값**이며 서버 모델 판정이나 정답 라벨이 아닙니다.
+이 경로는 아직 모델 추론·이벤트·알림을 실행하지 않습니다. 기존 `periodic-single-v1` 요청과
+기존 API·RF66 경로는 호환 유지합니다.
+입력 필드·4종 전송 예시·재전송·검증 절차는 [IoT 단건 수신 규격](docs/periodic-single-snapshots.md)을 참고하세요.
 
 - 수집 데이터는 서버에서 형식·권한·장치 정보를 검증합니다.
 - 기존 요약 telemetry는 `(deviceId, sequence)`, 정기 단건 구간은 `(deviceId, bootId, windowIndex)`를 기준으로 재전송 중복을 처리합니다.

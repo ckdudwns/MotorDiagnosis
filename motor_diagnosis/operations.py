@@ -389,6 +389,7 @@ def inspect(project, env, device, *, now=None):
                                 issue("warning", "RF66_EVENT_PROJECTION_PENDING")
                 elif key == "PERIODIC_SNAPSHOT_DB_PATH":
                     from .periodic_snapshots import MAX_ROWS
+                    from .transmission_policy import snapshot_interval_seconds
                     item["statuses"] = dict(db.execute("SELECT status,count(*) FROM periodic_snapshots GROUP BY status"))
                     item["rows"] = sum(item["statuses"].values())
                     item["rowLimit"] = MAX_ROWS
@@ -399,10 +400,14 @@ def inspect(project, env, device, *, now=None):
                     item["oldestPendingAgeSec"] = None if oldest is None else now-oldest
                     if item["rows"] >= MAX_ROWS * .9:
                         issue("warning", key + ":ROW_CAPACITY")
-                    row = db.execute("""SELECT captured,received,boot,idx,quality,status FROM periodic_snapshots
+                    row = db.execute("""SELECT captured,received,boot,idx,quality,status,body FROM periodic_snapshots
                         WHERE device=? ORDER BY captured DESC,late ASC,ordinal DESC LIMIT 1""", (device,)).fetchone()
                     if row:
-                        item["latest"] = dict(zip(("captured", "receivedAtEpoch", "bootId", "index", "quality", "status"), row))
+                        item["latest"] = dict(zip(("captured", "receivedAtEpoch", "bootId", "index", "quality", "status"), row[:6]))
+                        transmission = json.loads(row[6])["transmission"]
+                        item["latest"].update(transmission=transmission,
+                                              expectedReportIntervalSec=snapshot_interval_seconds(transmission),
+                                              boardStateSource="device_report", boardStateVerifiedByServer=False)
                 elif key == "ALERT_DB_PATH":
                     item["statuses"] = dict(db.execute("SELECT status,count(*) FROM alert_deliveries GROUP BY status"))
                     old = db.execute("SELECT count(*) FROM alert_deliveries WHERE status IN ('pending','sending') AND due_at<?", (now-120,)).fetchone()[0]

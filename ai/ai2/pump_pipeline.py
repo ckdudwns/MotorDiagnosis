@@ -17,15 +17,16 @@ import numpy as np
 NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 LABELS = ("물 수위(L)", "슬러지 유무", "이벤트")
-VERSION = "pump-summary-experiment-v1"
-WINDOW_ROWS = 12
-EXPECTED_INTERVAL_SEC = 5
+VERSION = "pump-summary-experiment-v2"
+# Thirteen 25-second records span exactly five minutes from first to last.
+WINDOW_ROWS = 13
+EXPECTED_INTERVAL_SEC = 25
 FORECAST_HORIZON_SEC = 300
 FORECAST_STEPS = FORECAST_HORIZON_SEC // EXPECTED_INTERVAL_SEC
 
 
 def temporal_windows(records: list) -> tuple[list, np.ndarray]:
-    """Use past-only, exactly five-second windows within one split."""
+    """Use past-only, exactly 25-second windows within one split."""
     history, retained, vectors = [], [], []
     previous = None
     for item in records:
@@ -53,6 +54,26 @@ def temporal_windows(records: list) -> tuple[list, np.ndarray]:
         )
         retained.append(item)
     return retained, np.array(vectors)
+
+
+def select_cadence_records(records: list) -> list:
+    """Keep source rows on one 25-second grid without interpolating measurements.
+
+    The supplied workbook is sampled every five seconds.  Selecting grid-aligned
+    source observations makes its offline training contract identical to a live
+    adapter that emits one summary record every 25 seconds.  Missing grid points
+    are left missing so ``temporal_windows`` resets history rather than inventing
+    data.
+    """
+    if not records:
+        return []
+    anchor = records[0][0]
+    selected = []
+    for item in records:
+        elapsed = (item[0] - anchor).total_seconds()
+        if elapsed >= 0 and elapsed % EXPECTED_INTERVAL_SEC == 0:
+            selected.append(item)
+    return selected
 
 
 def window_vector(history: list[np.ndarray]) -> np.ndarray:
@@ -199,7 +220,7 @@ def validate_model(model: dict) -> None:
         model.get("windowRows") != WINDOW_ROWS
         or model.get("intervalSec") != EXPECTED_INTERVAL_SEC
     ):
-        raise ValueError("Model does not use the required 12-row, five-second contract")
+        raise ValueError("Model does not use the required 13-row, 25-second contract")
     if model.get("forecastHorizonSec") != FORECAST_HORIZON_SEC:
         raise ValueError("Model does not use the required five-minute forecast horizon")
     features, streams = model.get("features"), model.get("streams")
@@ -480,8 +501,9 @@ def experiment(sheets: dict, features: list[str]) -> tuple[dict, dict, list[dict
                 )
             seen_times.add(at)
             valid.append((at, values, key))
-        streams[sheet] = sorted(valid)
-        all_times.extend(item[0] for item in valid)
+        cadence_records = select_cadence_records(sorted(valid))
+        streams[sheet] = cadence_records
+        all_times.extend(item[0] for item in cadence_records)
     if not all_times:
         raise ValueError("No finite measurement rows")
     # Shared absolute cuts prevent simultaneous sensors crossing different splits.
@@ -502,6 +524,7 @@ def experiment(sheets: dict, features: list[str]) -> tuple[dict, dict, list[dict
         "windowRows": WINDOW_ROWS,
         "intervalSec": EXPECTED_INTERVAL_SEC,
         "forecastHorizonSec": FORECAST_HORIZON_SEC,
+        "inputHistorySec": (WINDOW_ROWS - 1) * EXPECTED_INTERVAL_SEC,
         "derivedFeatures": [
             name + ":" + statistic
             for statistic in ("last", "mean", "std", "delta")
@@ -619,7 +642,8 @@ def replay_fixed_model(
         # The supplied export's ``cnt`` is not a telemetry sequence (it repeats
         # across five-second observations).  Offline replay therefore assigns an
         # explicit replay-only order. Live adapters must pass device sequence.
-        for replay_sequence, (at, values, document_id) in enumerate(sorted(prepared)):
+        cadence_records = select_cadence_records(sorted(prepared))
+        for replay_sequence, (at, values, document_id) in enumerate(cadence_records):
             result = analyzer.ingest(
                 sensor_id,
                 at,

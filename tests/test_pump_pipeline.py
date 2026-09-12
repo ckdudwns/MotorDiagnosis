@@ -66,20 +66,22 @@ class PumpPipelineTest(unittest.TestCase):
                 for s in seconds
             ]
 
-        continuous = replay_events(points(range(0, 40, 5)))
+        continuous = replay_events(points(range(0, 200, 25)))
         self.assertTrue(
             any(item["kind"] == "asset_event_started" for item in continuous)
         )
-        broken = replay_events(points([0, 5, 10, 15, 60, 65, 70, 75]))
+        broken = replay_events(points([0, 25, 300, 325]))
         self.assertFalse(any(item["kind"] == "asset_event_started" for item in broken))
 
-    def records(self, count=300):
+    def records(self, count=300, interval_sec=5):
         start = datetime(2026, 9, 1, tzinfo=timezone.utc)
         return [
             {
                 "_document_id": str(i),
-                "createdAt": (start + timedelta(seconds=5 * i)).isoformat(),
-                "receivedAt": (start + timedelta(seconds=5 * i + 1)).isoformat(),
+                "createdAt": (start + timedelta(seconds=interval_sec * i)).isoformat(),
+                "receivedAt": (
+                    start + timedelta(seconds=interval_sec * i + 1)
+                ).isoformat(),
                 "rms_a_1": str(5 + np.sin(i / 7)),
                 "mqtt_topic": "sensor/1",
                 "이벤트": "",
@@ -132,7 +134,7 @@ class PumpPipelineTest(unittest.TestCase):
             experiment({"sensor": self.records()}, ["이벤트"])
 
     def test_gap_resets_window(self):
-        rows = self.records(24)
+        rows = self.records(26, 25)
         records = [
             (timestamp(row["createdAt"]), [float(row["rms_a_1"])], row["_document_id"])
             for row in rows
@@ -141,11 +143,11 @@ class PumpPipelineTest(unittest.TestCase):
             (at + timedelta(minutes=5), values, key) for at, values, key in records[12:]
         ]
         retained, matrix = temporal_windows(records)
-        self.assertEqual([row[2] for row in retained], ["11", "23"])
+        self.assertEqual([row[2] for row in retained], ["24", "25"])
         self.assertEqual(matrix.shape, (2, 4))
 
     def fixed_model(self):
-        model, report, _ = experiment({"sensor": self.records(600)}, ["rms_a_1"])
+        model, report, _ = experiment({"sensor": self.records(600, 25)}, ["rms_a_1"])
         model["evaluation"] = {
             "trainBefore": report["trainBefore"],
             "testFrom": report["testFrom"],
@@ -154,7 +156,7 @@ class PumpPipelineTest(unittest.TestCase):
 
     def test_fixed_model_analyzes_one_new_row_and_scores_its_prior_forecast(self):
         analyzer = FixedPumpAnalyzer(self.fixed_model())
-        rows = self.records(73)
+        rows = self.records(30, 25)
         compared = None
         for index, row in enumerate(rows):
             result = analyzer.ingest(
@@ -176,26 +178,26 @@ class PumpPipelineTest(unittest.TestCase):
         for index in range(12):
             analyzer.ingest(
                 "sensor",
-                (start + timedelta(seconds=5 * index)).isoformat(),
+                (start + timedelta(seconds=25 * index)).isoformat(),
                 index,
                 [1.0],
             )
         bad_gap = analyzer.ingest(
-            "sensor", (start + timedelta(seconds=70)).isoformat(), 12, [1.0]
+            "sensor", (start + timedelta(seconds=350)).isoformat(), 12, [1.0]
         )
         self.assertEqual(
             bad_gap["historyResetReason"], "timestamp_or_sequence_discontinuity"
         )
         self.assertEqual(bad_gap["historyCount"], 1)
         bad_sequence = analyzer.ingest(
-            "sensor", (start + timedelta(seconds=75)).isoformat(), 99, [1.0]
+            "sensor", (start + timedelta(seconds=375)).isoformat(), 99, [1.0]
         )
         self.assertEqual(
             bad_sequence["historyResetReason"], "timestamp_or_sequence_discontinuity"
         )
         invalid = analyzer.ingest(
             "sensor",
-            (start + timedelta(seconds=80)).isoformat(),
+            (start + timedelta(seconds=400)).isoformat(),
             100,
             [1.0],
             quality_ok=False,
@@ -205,7 +207,7 @@ class PumpPipelineTest(unittest.TestCase):
     def test_replay_uses_fixed_artifact_without_refitting(self):
         model = self.fixed_model()
         original = repr(model)
-        replay, summary = replay_fixed_model(model, {"sensor": self.records(600)})
+        replay, summary = replay_fixed_model(model, {"sensor": self.records(600, 25)})
         self.assertTrue(replay)
         self.assertEqual(summary["mode"], "fixed_model_sequential_replay")
         self.assertGreater(summary["forecastComparisons"], 0)

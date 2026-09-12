@@ -30,6 +30,9 @@ class RF66Events:
         """)
 
     def metadata(self):
+        if not self.store.processing_enabled:
+            return {"mode": "disabled", "policyId": POLICY, "notificationsEnabled": False,
+                    "reason": "LEGACY_RF66_DISABLED", "historicalOnly": True}
         return {"mode": self.mode, "policyId": POLICY, "openHits": 3,
                 "recoveryHits": 3, "maxObservationAgeSeconds": MAX_AGE,
                 "startIntervalRangeUs": interval_range_us(),

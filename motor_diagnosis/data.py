@@ -5378,7 +5378,7 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
     occurred_at = parse_rfc3339("event.occurredAt", event["occurredAt"])
     context_from = format_rfc3339(occurred_at - timedelta(minutes=5))
     context_to = format_rfc3339(occurred_at + timedelta(minutes=5))
-    points = [] if event.get("source") == "rf66" else _event_evidence_points(
+    points = [] if event.get("source") in {"rf66", "snapshot"} else _event_evidence_points(
         event,
         from_timestamp=context_from,
         to_timestamp=context_to,
@@ -5400,7 +5400,9 @@ def event_detail_for(user: dict[str, Any], event_id: str) -> dict[str, Any]:
         )
         evidence_snapshot = copy_payload(EVENT_EVIDENCE_SNAPSHOTS[event_snapshot["id"]])
     threshold_version = str(event_snapshot.get("thresholdVersion") or "").strip()
-    if event_snapshot.get("source") == "rf66":
+    if event_snapshot.get("source") == "snapshot":
+        applied_rule = copy_payload(event_snapshot.get("snapshotPolicy"))
+    elif event_snapshot.get("source") == "rf66":
         applied_rule = copy_payload(event_snapshot.get("rf66Policy"))
     elif event_snapshot.get("eventType") == "sensor_fault":
         applied_rule = copy_payload(

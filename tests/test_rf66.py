@@ -248,17 +248,11 @@ class StoreTest(RpmSetup):
             finally:
                 store.close()
 
-    def test_server_configuration_failure_and_http_result(self):
-        with self.assertRaises(ValueError):
-            create_server("127.0.0.1", 0, rf66_checksum=HASH)
-        with mock.patch.object(rf66.RF66Model, "load", side_effect=ValueError("bad artifact")):
-            with self.assertRaises(ValueError):
-                create_server("127.0.0.1", 0, rf66_artifact="test", rf66_checksum=HASH)
-        # Failure cleanup permits a subsequent normal start.
-        with mock.patch.object(rf66.RF66Model, "load", return_value=self.model) as loader:
+    def test_retired_server_ignores_rf66_configuration_and_keeps_raw_receipts(self):
+        with mock.patch.object(rf66.RF66Model, "load", side_effect=AssertionError("Retired loader called")) as loader:
             server = create_server("127.0.0.1", 0, demo_enabled=False, auto_alerts=False,
                                    rf66_artifact="test", rf66_checksum=HASH)
-        loader.assert_called_once_with("test", expected_checksum=HASH)
+        loader.assert_not_called()
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -272,14 +266,16 @@ class StoreTest(RpmSetup):
                                     "Content-Type": "application/json"})
                 response = connection.getresponse()
                 self.assertEqual(response.status, 202, response.read())
-                server.raw_vibration.tick()  # serialized with background worker
+                self.assertFalse(server.raw_vibration.tick())
+                self.assertIsNone(server.raw_vibration.worker)
                 connection.request("GET", path, headers={"Authorization": "Bearer " + token})
                 response = connection.getresponse()
                 body = json.load(response)
                 self.assertEqual(response.status, 200)
-                self.assertEqual(body["items"][0]["analysis"]["score"], .8)
-                self.assertEqual(body["configuredModel"]["modelVersion"], self.model.checksum)
-                self.assertEqual(body["eventPolicy"]["mode"], "shadow")
+                self.assertEqual(body["items"][0]["analysis"]["status"], "queued")
+                self.assertIsNone(body["configuredModel"])
+                self.assertEqual(body["eventPolicy"]["mode"], "disabled")
+                self.assertFalse(body["processingEnabled"])
                 resolve_path = "/api/events/RF66-MISSING/rf66-resolve"
                 connection.request("POST", resolve_path, json.dumps({"reason": "inspected"}),
                                    {"Content-Type": "application/json"})

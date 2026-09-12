@@ -115,8 +115,9 @@ def configured_adapters():
 class AlertService:
     MAX_ATTEMPTS = 3
 
-    def __init__(self, database=":memory:", *, adapters=None, clock=time.time, rf66_guard=None):
+    def __init__(self, database=":memory:", *, adapters=None, clock=time.time, rf66_guard=None, snapshot_guard=None):
         self._rf66_guard = rf66_guard or (lambda event: False)
+        self._snapshot_guard = snapshot_guard or (lambda event: False)
         self._owner_file = None
         if database != ":memory:":
             Path(database).parent.mkdir(parents=True, exist_ok=True)
@@ -228,6 +229,9 @@ class AlertService:
         return result
 
     def _queue(self, event, policies, *, is_test=False):
+        if event.get("source") == "snapshot" and not self._snapshot_guard(event):
+            return {"eventId": event["id"], "deliveries": [],
+                    "suppressed": [{"policyId": p["id"], "reason": "snapshot_notifications_disabled_or_stale"} for p in policies]}
         if event.get("source") == "rf66" and not self._rf66_guard(event):
             return {"eventId": event["id"], "deliveries": [],
                     "suppressed": [{"policyId": p["id"], "reason": "rf66_notifications_disabled_or_stale"} for p in policies]}
@@ -343,6 +347,8 @@ class AlertService:
 
     @staticmethod
     def _observation_key(event):
+        if event.get("source") == "snapshot":
+            return event["id"] + ":snapshot:" + event["snapshotTransition"]
         return (event["id"] + ":rf66:" + event["rf66Transition"]
                 if event.get("source") == "rf66" else event["id"])
 
@@ -397,6 +403,8 @@ class AlertService:
         started = time.monotonic()
         error, retryable = None, False
         try:
+            if row["event"].get("source") == "snapshot" and not self._snapshot_guard(row["event"]):
+                raise DeliveryError("SNAPSHOT_DELIVERY_DISABLED_OR_STALE", False)
             if row["event"].get("source") == "rf66" and not self._rf66_guard(row["event"]):
                 raise DeliveryError("RF66_DELIVERY_DISABLED_OR_STALE", False)
             if row["channel"] == "stub":

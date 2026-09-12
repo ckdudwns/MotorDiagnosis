@@ -41,6 +41,8 @@ class OperationsTest(unittest.TestCase):
                 db.commit()
         with closing(sqlite3.connect(self.project / ops.DB_DEFAULTS["ALERT_DB_PATH"])) as db:
             db.execute("CREATE TABLE alert_deliveries(status TEXT,due_at REAL)")
+        with closing(sqlite3.connect(self.project / ops.DB_DEFAULTS["PERIODIC_SNAPSHOT_DB_PATH"])) as db:
+            db.execute("CREATE TABLE periodic_snapshots(device TEXT,captured REAL,received REAL,boot TEXT,idx INT,quality TEXT,status TEXT,ordinal INTEGER,late INTEGER,body TEXT,result TEXT)")
         self.capacity = mock.patch.object(ops.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100*ops.GiB, 10*ops.GiB, 90*ops.GiB))
         self.capacity.start()
         self.addCleanup(self.capacity.stop)
@@ -306,7 +308,8 @@ finally:
         missing = self.project / ops.DB_DEFAULTS["SHADOW_MODEL_DB_PATH"]
         report = ops.inspect(self.project, self.env, "DEV-01-MOT-02", now=100)
         self.assertEqual(report["status"], "warning")
-        self.assertIn("RAW_INPUT_ABSENT", [i["code"] for i in report["issues"]])
+        self.assertIn("PERIODIC_SNAPSHOT_INPUT_ABSENT", [i["code"] for i in report["issues"]])
+        self.assertFalse(report["legacyRf66ProcessingEnabled"])
         self.assertNotIn("not-for-report", json.dumps(report))
         self.assertFalse(missing.exists())
         path = self.project / ops.DB_DEFAULTS["RAW_VIBRATION_WINDOW_DB_PATH"]
@@ -316,14 +319,15 @@ finally:
             db.commit()
         report = ops.inspect(self.project, self.env, "DEV-01-MOT-02", now=100)
         codes = [i["code"] for i in report["issues"]]
-        self.assertIn("RAW_INPUT_STALE_OR_FUTURE", codes)
-        self.assertIn("RAW_VIBRATION_WINDOW_DB_PATH:PROCESSING_BACKLOG", codes)
+        self.assertNotIn("RAW_INPUT_STALE_OR_FUTURE", codes)
+        self.assertNotIn("RAW_VIBRATION_WINDOW_DB_PATH:PROCESSING_BACKLOG", codes)
+        self.assertTrue(report["databases"]["RAW_VIBRATION_WINDOW_DB_PATH"]["historicalOnly"])
         with mock.patch.object(ops.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(10*ops.GiB, 9*ops.GiB, ops.GiB)):
             self.assertEqual(ops.inspect(self.project, self.env, "D")["status"], "critical")
 
     def test_frozen_time_is_not_successful_observation(self):
         def report(ordinal):
-            return {"status": "ok", "issues": [], "databases": {"RAW_VIBRATION_WINDOW_DB_PATH": {"latest": {"ordinal": ordinal, "captured": 1}}}}
+            return {"status": "ok", "issues": [], "databases": {"PERIODIC_SNAPSHOT_DB_PATH": {"latest": {"ordinal": ordinal, "captured": 1}}}}
         with mock.patch.object(ops, "discover", return_value=(self.project, self.env, {"MainPID":"1"})), \
              mock.patch.object(ops, "inspect", side_effect=[report(1), report(2)]), \
              mock.patch.object(ops.time, "monotonic", side_effect=[0, 0, 1]), \

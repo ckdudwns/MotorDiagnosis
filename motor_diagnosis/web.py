@@ -69,6 +69,9 @@ def render_page() -> str:
     .status-table { min-width:680px; }
     .status-table caption { text-align:left; font-weight:700; padding:12px 0; }
     .status-table td { font-size:14px; overflow-wrap:anywhere; }
+    #snapshotRows .table-scroll { max-height:480px; }
+    #snapshotRows .status-table { min-width:1100px; table-layout:fixed; }
+    #snapshotRows th { position:sticky; top:0; background:var(--panel); }
     #evidenceChart { height:220px; }
     textarea { resize:vertical; min-height:90px; }
     [hidden] { display:none !important; }
@@ -89,7 +92,7 @@ def render_page() -> str:
     <section id="appPanel" hidden>
       <div id="appStatus" class="notice" role="status" aria-live="polite" hidden></div>
       <nav class="workspace-nav" aria-label="업무 화면">
-        <button id="navOverview" aria-pressed="true" aria-controls="siteKpis rf66Panel sitesPanel notificationsPanel modelPanel healthPanel">운영 현황</button>
+        <button id="navOverview" aria-pressed="true" aria-controls="siteKpis snapshotPanel rf66Panel sitesPanel notificationsPanel modelPanel healthPanel">운영 현황</button>
         <button id="navEvents" aria-pressed="false" aria-controls="exportPanel chartPanel eventListPanel eventReviewPanel">이벤트 검수</button>
         <button id="navManagement" aria-pressed="false" aria-controls="managementPanel">운영 관리</button>
         <button id="navModels" aria-pressed="false" aria-controls="modelReviewPanel">AI 결과 검토</button>
@@ -125,9 +128,16 @@ def render_page() -> str:
         <div class="kpi"><span>위험 설비</span><strong id="criticalAssets">-</strong></div>
       </section>
       <section class="grid">
+        <article class="panel wide" id="snapshotPanel">
+          <h2>단건 진동 수신 · 새 모델 판정</h2>
+          <p>보드 보고 기준: 평상시 5분마다 1건 · 이상 진입 즉시 1건 · 이상 상태 중 10초마다 1건 · 정상 복귀 즉시 1건.</p>
+          <p>보드 상태는 장치가 보고한 값이며 서버 모델 판정과 다릅니다. 새 단건 결과는 기존 통계 점수·RF66 과거 이력과 별개입니다. 사건·알림은 아래 운영 모드에 따르며 교체 모델 미설정 시 생성하지 않습니다.</p>
+          <p id="snapshotStatus" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
+          <div id="snapshotRows"></div>
+        </article>
         <article class="panel wide" id="rf66Panel">
-          <h2>RF66 진동 모델 · 구간별 비교 판정</h2>
-          <p>800Hz · 512샘플 · XYZ · 66개 특징. 기존 통계 점수와 별개입니다. 이벤트·알림은 별도 운영 모드에 따릅니다. 현장 성능 미검증 · 연속 3구간 확인은 별도 열에 표시합니다.</p>
+          <h2>RF66 진동 모델 · 과거 판정 이력</h2>
+          <p>기존 RF66 모델 로딩·자동 추론은 중지되었습니다. 아래는 기존 통계 점수와 별개인 과거 구간별 판정과 연속 3구간 확인 이력입니다. 새 입력은 위의 ‘단건 진동 수신 · 새 모델 판정’에서 확인하세요.</p>
           <p id="rf66Status" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
           <div id="rf66Rows"></div>
         </article>
@@ -296,6 +306,7 @@ def render_page() -> str:
     }
 
     async function login() {
+      clearSnapshots();
       clearRF66();
       const response = await api("/api/auth/login", {
         method: "POST",
@@ -328,7 +339,7 @@ def render_page() -> str:
 
     function can(permission) { return permissions.includes("*") || permissions.includes(permission); }
     const WORKSPACE_VIEWS = {
-      overview:{button:"navOverview",title:"운영 현황",panels:["siteKpis","rf66Panel","sitesPanel","notificationsPanel","modelPanel","healthPanel"]},
+      overview:{button:"navOverview",title:"운영 현황",panels:["siteKpis","snapshotPanel","rf66Panel","sitesPanel","notificationsPanel","modelPanel","healthPanel"]},
       events:{button:"navEvents",title:"이벤트 검수",panels:["exportPanel","chartPanel","eventListPanel","eventReviewPanel"]},
       management:{button:"navManagement",title:"운영 관리",panels:["managementPanel"]},
       models:{button:"navModels",title:"AI 결과 검토",panels:["modelReviewPanel"]},
@@ -341,6 +352,8 @@ def render_page() -> str:
       if (view === "deviceOps" && !can("device:read")) return;
       const enteringModels = view === "models" && currentView !== "models";
       const enteringDevices = view === "deviceOps" && currentView !== "deviceOps";
+      const enteringOverview = view === "overview" && currentView !== "overview";
+      if (view !== "overview") clearSnapshots();
       currentView = view;
       for (const [name,config] of Object.entries(WORKSPACE_VIEWS)) {
         $(config.button).setAttribute("aria-pressed", String(name === view));
@@ -354,6 +367,7 @@ def render_page() -> str:
       if (view === "events") redrawChart();
       if (enteringModels && !modelReviewRow) act(() => loadModelQueue(true));
       if (enteringDevices && !opsDirty && !opsSaving) act(loadDeviceOperations);
+      if (enteringOverview) void loadSnapshots(selectionQuery());
     }
     function statusMessage(message, error = false) {
       $("appStatus").hidden = !message;
@@ -412,7 +426,9 @@ def render_page() -> str:
       if (currentView === "deviceOps") return loadDeviceOperations();
       const requestGeneration = ++renderGeneration;
       const query = selectionQuery();
-      if (!query) { statusMessage("조회 가능한 사이트 또는 설비가 없습니다."); return; }
+      if (!query) { clearSnapshots("조회 가능한 사이트 또는 설비가 없습니다."); statusMessage("조회 가능한 사이트 또는 설비가 없습니다."); return; }
+      // New input is independent of old telemetry, health and RF66 requests.
+      if (currentView === "overview") void loadSnapshots(query);
       if (JSON.stringify(query) !== JSON.stringify(lastQuery)) {lastQuery = null; $("exportBtn").disabled = true;}
       const site = selectedSite();
       const assetId = query.assetId, from = query.from, to = query.to;
@@ -459,6 +475,202 @@ def render_page() -> str:
       });
     }
 
+    let snapshotGeneration = 0, snapshotBusy = null;
+    function clearSnapshots(message = "설비를 선택하고 새로고침하세요.") {
+      snapshotGeneration++;
+      snapshotBusy = null;
+      $("snapshotRows").replaceChildren();
+      $("snapshotStatus").textContent = message;
+    }
+    const snapshotNumber = value => typeof value === "number" && Number.isFinite(value);
+    const snapshotTime = value => typeof value === "string" && Number.isFinite(Date.parse(value));
+    const snapshotScope = (value, scope) => value && ["deviceId","siteId","assetId"].every(k => value[k] === scope[k]);
+    function snapshotModelValid(model, scope) {
+      const input = model?.inputContract;
+      return model?.contractId === "single-snapshot-anomaly-v1" && snapshotScope(model.scope, scope)
+        && ["modelId","modelVersion","preprocessingVersion","scoreType"].every(k =>
+          typeof model[k] === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(model[k]))
+        && snapshotNumber(model.threshold) && [">",">=","<","<="].includes(model.comparison)
+        && input?.adapterId === "adxl345-xyz-g-unmodified-v1" && input.sourceProfileId === "adxl345-800hz-xyz-counts-v1"
+        && JSON.stringify(input.shape) === "[512,3]" && JSON.stringify(input.axes) === '["X","Y","Z"]'
+        && input.unit === "g" && input.sampleRateHz === 800 && input.gPerCount === .0039 && input.meanRemoved === false;
+    }
+    function snapshotCompleted(item) {
+      const a = item.analysis, model = a?.inference?.model, w = item.window;
+      if (a?.status !== "completed" || w.quality !== "valid" || w.sampleCount !== 512
+          || !snapshotModelValid(model, w) || !snapshotNumber(a.score) || !snapshotNumber(a.threshold)
+          || typeof a.verdict !== "boolean" || a.affectsAlerts !== false || a.reason !== null
+          || !snapshotTime(a.inference.completedAt) || a.inference.inputDigest !== item.digest
+          || !/^[0-9a-f]{64}$/.test(item.digest || "")
+          || a.modelVersion !== model.modelVersion || a.threshold !== model.threshold
+          || a.comparison !== model.comparison || a.scoreType !== model.scoreType) return false;
+      const decision = a.comparison === ">" ? a.score > a.threshold : a.comparison === ">=" ? a.score >= a.threshold
+        : a.comparison === "<" ? a.score < a.threshold : a.score <= a.threshold;
+      return a.verdict === decision;
+    }
+    function snapshotProcessing(item) {
+      const a = item.analysis || {}, job = item.inferenceJob;
+      if (snapshotCompleted(item)) return a.verdict ? "모델 이상 후보" : "모델 정상 후보";
+      if (a.status === "unavailable") return "판정 불가";
+      if (a.status === "queued" && item.window.quality === "valid") return "입력 준비 대기";
+      if (a.status === "waiting_model" && item.window.quality === "valid") return "모델 대기 · 이 구간에 모델 미배정";
+      if (a.status === "queued_inference" && item.window.quality === "valid" && job) {
+        if (job.runtimeAvailable === false) return "추론 대기 · 해당 모델 연결 중지";
+        if (job.runtimeAvailable === true && job.status === "running") return "모델 추론 중";
+        if (job.runtimeAvailable === true && job.status === "queued") return "모델 추론 대기";
+      }
+      return "판정 불가 · 결과 형식 확인 필요";
+    }
+    function snapshotReason(reason) {
+      const labels = {MODEL_NOT_CONFIGURED:"수신 당시 모델 미설정",INFERENCE_NOT_ENABLED:"입력 준비 전",
+        fifo_overrun:"센서 FIFO 넘침",clipped:"센서 포화",sample_gap:"샘플 누락",
+        sensor_unavailable:"센서 사용 불가",INPUT_PREPARATION_FAILED:"입력 준비 실패",
+        SNAPSHOT_INTEGRITY_MISMATCH:"무결성 불일치",SNAPSHOT_INPUT_INTEGRITY_FAILED:"추론 입력 무결성 확인 실패",
+        MODEL_EXECUTION_FAILED:"모델 실행 실패",MODEL_OUTPUT_INVALID:"모델 출력 형식 오류",
+        INFERENCE_DEADLINE_EXCEEDED:"추론 제한 시간 초과",INFERENCE_RETRY_EXHAUSTED:"추론 재시도 한도 초과"};
+      return Object.hasOwn(labels, reason) ? labels[reason] + " (" + reason + ")" : (reason || "—");
+    }
+    function snapshotDelivery(info) {
+      if (info?.policyId === "periodic-single-v1" && info.mode === "periodic" && info.intervalSec === 300)
+        return {state:"미보고 (이전 5분 정책)", reason:"5분 정기 전송", interval:300, counters:"미보고"};
+      const rules = {
+        normal_periodic:["NORMAL","periodic",300,"평상시 정기 전송"],
+        anomaly_enter:["ANOMALY_ACTIVE","immediate",0,"이상 진입 · 즉시 전송"],
+        anomaly_periodic:["ANOMALY_ACTIVE","periodic",10,"이상 상태 정기 전송"],
+        normal_recovered:["NORMAL","immediate",0,"정상 복귀 · 즉시 전송"],
+      };
+      const rule = Object.hasOwn(rules, info?.reason) ? rules[info.reason] : null;
+      const countsValid = [info?.anomalyCount,info?.normalCount].every(n => Number.isInteger(n) && n >= 0 && n <= 2147483647)
+        && !(info.anomalyCount && info.normalCount);
+      const transitionValid = countsValid && (info.reason === "anomaly_enter" ? info.anomalyCount === 3 && info.normalCount === 0
+        : info.reason === "normal_recovered" ? info.normalCount === 5 && info.anomalyCount === 0
+        : info.reason === "normal_periodic" ? info.anomalyCount < 3 : info.normalCount < 5);
+      if (info?.policyId !== "edge-state-snapshot-v1" || !rule || !transitionValid
+          || info.state !== rule[0] || info.mode !== rule[1] || info.intervalSec !== rule[2])
+        return {state:"보고 형식 확인 필요",reason:"전송 정책 확인 필요",interval:null,counters:"미확인"};
+      return {state:info.state === "NORMAL" ? "NORMAL · 보드 정상 상태" : "ANOMALY_ACTIVE · 보드 이상 상태",
+        reason:rule[3], interval:info.state === "NORMAL" ? 300 : 10,
+        counters:`이상 ${info.anomalyCount}회 / 정상 ${info.normalCount}회 (보드 보고)`};
+    }
+    function snapshotFreshness(item, queriedAt) {
+      const interval = snapshotDelivery(item.transmission).interval;
+      if (!snapshotTime(queriedAt) || interval === null) return "확인 불가 · 서버 조회 시각 또는 전송 정책 미확인";
+      const age = (Date.parse(queriedAt) - Date.parse(item.window.timestamp)) / 1000;
+      if (age < -5) return "시각 확인 필요 · 측정 시각이 서버 조회 시각보다 미래입니다.";
+      if (age > interval + 60) return `최신 측정 지연 · ${Math.round(age)}초 전 측정 (예상 ${interval}초 + 여유 60초 초과)`;
+      return `예상 보고 간격 내 · ${Math.max(0,Math.round(age))}초 전 측정 (예상 ${interval}초 + 여유 60초)`;
+    }
+    function snapshotModelText(model) {
+      return `${model.modelId} · ${model.modelVersion} · 전처리 ${model.preprocessingVersion} · ${model.scoreType} · 점수 ${model.comparison} ${model.threshold}일 때 이상 후보`;
+    }
+    function renderSnapshotCard(result) {
+      const card = document.createElement("section"); card.className = "history-card";
+      const title = document.createElement("h3"); title.textContent = result.deviceId + " / " + result.assetId;
+      const configured = document.createElement("p");
+      configured.textContent = result.configuredModel ? "현재 연결 모델: " + snapshotModelText(result.configuredModel)
+        : "현재 교체 모델 미설정 · 수신·입력 준비는 가능하며, 기존 RF66은 실행하지 않습니다.";
+      const policy = document.createElement("p");
+      policy.textContent = "단건 이벤트 운영 모드: " + ({shadow:"비교만 · 사건·알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 허용 (정책·입력 유효성 적용)"}[result.eventPolicy?.mode] || "미확인 (이전 서버)")
+        + " · 서버 이상 1건으로 발생 / 같은 모델 정상 1건으로 복귀 · 품질 불량·수신 중단은 관측 불명";
+      card.append(title,configured,policy);
+      // Measured time, not receipt time, determines the latest state. Keep the API's tie order.
+      const items = [...result.items].sort((a,b) => Date.parse(b.window.timestamp) - Date.parse(a.window.timestamp));
+      if (!items.length) {
+        const empty = document.createElement("p"); empty.textContent = "새 단건 입력 대기 · 이 경로에 저장된 측정이 없습니다. 기존 telemetry·RF66 수신과는 별개입니다.";
+        card.appendChild(empty); return card;
+      }
+      const latest = items[0], delivery = snapshotDelivery(latest.transmission);
+      card.appendChild(facts([
+        ["최근 측정 시각",formatLocalTime(latest.window.timestamp)], ["해당 구간 서버 수신 시각",formatLocalTime(latest.receivedAt)],
+        ["최근 측정의 보드 보고",delivery.state], ["전송 사유",delivery.reason],
+        ["최근 구간 서버 처리",snapshotProcessing(latest)], ["입력 품질·사유",latest.window.quality + " / " + snapshotReason(latest.analysis?.reason)],
+      ]));
+      const freshness = document.createElement("p"); freshness.textContent = snapshotFreshness(latest,result.queriedAt)
+        + " · 장치 온라인/오프라인 판정이 아닙니다. 아래 장치 상태에서 별도로 확인하세요.";
+      const summary = document.createElement("p"), recent = items.find(snapshotCompleted);
+      summary.textContent = recent ? "최근 측정 기준 완료 결과 · 판정 완료: " + formatLocalTime(recent.analysis.inference.completedAt)
+        + " · 대상 측정 " + formatLocalTime(recent.window.timestamp) + " · " + snapshotProcessing(recent)
+        + " · 현재 상태 보장 아님" : "조회된 최근 20건 내 완료된 모델 판정 없음";
+      card.append(freshness,summary);
+      const scroll = document.createElement("div"); scroll.className = "table-scroll";
+      scroll.appendChild(statusTable("최근 측정 최대 20건 · 점수 범위·의미는 모델별 규격을 따릅니다.",
+        ["측정 / 서버 수신 시각","보드 보고 / 전송 사유","서버 처리·판정","모델 점수 / 임계 조건","입력 품질 / 사유","판정 완료 / 적용 모델","구간 식별 / 도착","사건 처리"],
+        items.slice(0,20).map(item => {
+          const a = item.analysis || {}, valid = snapshotCompleted(item), d = snapshotDelivery(item.transmission);
+          const m = a.inference?.model;
+          const same = m && result.configuredModel && ["modelId","modelVersion","preprocessingVersion","scoreType","threshold","comparison"].every(k => m[k] === result.configuredModel[k]);
+          return [formatLocalTime(item.window.timestamp) + " / " + formatLocalTime(item.receivedAt),
+            d.state + " / " + d.reason + " / " + d.counters, snapshotProcessing(item),
+            valid ? `${a.score} / ${a.comparison} ${a.threshold} (${a.scoreType})` : "—",
+            item.window.quality + " / " + snapshotReason(a.reason),
+            valid ? formatLocalTime(a.inference.completedAt) + " / " + snapshotModelText(m) + (same ? "" : " (이전 모델 설정의 결과)") : "—",
+            item.window.bootId + " / #" + item.window.windowIndex + (item.lateArrival ? " · 늦은 도착" : ""),
+            ({pending:"처리 대기",processed:"처리 완료 (사건 발생 여부는 이벤트 검수에서 확인)",ignored:"사건 반영 제외"}[item.eventProcessing?.status] || "미기록") + (item.eventProcessing?.reason ? " · " + item.eventProcessing.reason : "")];
+        })));
+      card.appendChild(scroll); return card;
+    }
+    async function snapshotApi(path) {
+      const controller = new AbortController();
+      let timer;
+      const timeout = new Promise((resolve,reject) => {
+        timer = setTimeout(() => {reject(new Error("조회 제한 시간 초과 · 다음 갱신에서 재시도합니다.")); controller.abort();},15000);
+      });
+      try {return await Promise.race([api(path,{signal:controller.signal}),timeout]);}
+      finally {clearTimeout(timer);}
+    }
+    async function loadSnapshots(query) {
+      if (currentView !== "overview") return;
+      if (!query) {clearSnapshots("조회 가능한 사이트 또는 설비가 없습니다."); return;}
+      if (!["device:read","telemetry:read"].every(can)) {clearSnapshots("단건 수신 조회 권한이 없습니다."); return;}
+      const key = JSON.stringify([token,query.siteId,query.assetId]);
+      // A slow poll must finish, not be invalidated every five seconds.
+      if (snapshotBusy?.key === key) return;
+      clearSnapshots("단건 수신 조회 중 · 조회 기간 필터와 별개인 최근 측정 최대 20건입니다.");
+      const generation = snapshotGeneration, session = token;
+      snapshotBusy = {key,generation};
+      const current = () => generation === snapshotGeneration && session === token && currentView === "overview"
+        && $("siteSelect").value === query.siteId && $("assetSelect").value === query.assetId
+        && ["device:read","telemetry:read"].every(can);
+      try {
+        const devices = await snapshotApi(`/api/sites/${encodeURIComponent(query.siteId)}/devices`);
+        if (!current()) return;
+        if (!Array.isArray(devices)) throw new Error("장치 목록 형식 불일치");
+        const selected = devices.filter(d => d.siteId === query.siteId && d.assetId === query.assetId);
+        if (!selected.length) {$("snapshotStatus").textContent = "선택 설비에 조회 가능한 장치가 없습니다."; return;}
+        let errors = 0;
+        const cards = await Promise.all(selected.map(async device => {
+          const id = device.id || device.deviceId, scope = {deviceId:id,siteId:query.siteId,assetId:query.assetId};
+          try {
+            if (typeof id !== "string" || !id) throw new Error("장치 ID 확인 필요");
+            const result = await snapshotApi(`/api/devices/${encodeURIComponent(id)}/periodic-snapshots`);
+            if (!current()) return null;
+            if (!snapshotScope(result,scope) || !Array.isArray(result.items) || !Object.hasOwn(result,"configuredModel")
+                || result.affectsAlerts !== Boolean(result.configuredModel && result.eventPolicy?.mode === "alerts")
+                || result.items.some(item => !snapshotScope(item?.window,scope)
+                  || !snapshotTime(item.window.timestamp) || !snapshotTime(item.receivedAt)))
+              throw new Error("장치·설비 매핑 또는 결과 형식 불일치");
+            if (result.configuredModel !== null && !snapshotModelValid(result.configuredModel,scope))
+              throw new Error("단건 모델 설정 응답 확인 필요");
+            return renderSnapshotCard(result);
+          } catch (error) {
+            if (!current()) return null;
+            errors++;
+            const failed = document.createElement("p"); failed.className = "notice error";
+            failed.textContent = id + " · 단건 조회 실패: " + error.message + " · 로그인·권한·서버 배포 상태를 확인하세요.";
+            return failed;
+          }
+        }));
+        if (!current()) return;
+        $("snapshotRows").replaceChildren(...cards.filter(Boolean));
+        $("snapshotStatus").textContent = (errors ? `${errors}개 장치 조회 실패 · ` : "조회 완료 · ")
+          + "운영 현황에서 5초마다 갱신 · 조회 기간과 별개 · 시각은 브라우저 현지 시각입니다.";
+      } catch (error) {
+        if (current()) {$("snapshotRows").replaceChildren(); $("snapshotStatus").textContent = "단건 조회 실패: " + error.message;}
+      } finally {
+        if (snapshotBusy?.generation === generation) snapshotBusy = null;
+      }
+    }
+
     let rf66Generation = 0;
     function clearRF66(message = "설비를 선택하고 새로고침하세요.") {
       rf66Generation++;
@@ -499,7 +711,9 @@ def render_page() -> str:
       card.appendChild(title);
       const model = result.configuredModel;
       const configured = document.createElement("p");
-      configured.textContent = model
+      configured.textContent = result.runtimeStatus === "disabled"
+        ? "기존 RF66 연결 중지 · 모델 로딩·자동 추론·자동 이벤트/알림을 실행하지 않습니다. 아래는 과거 저장 이력입니다."
+        : model
         ? "현재 적용: RF66 (Random Forest) · " + model.modelVersion + " · 임계값 " + model.threshold + " (초과 시 이상 후보)"
         : "현재 RF66 모델 미설정 · 아래 기록이 있으면 과거 결과입니다.";
       configured.style.overflowWrap = "anywhere";
@@ -517,7 +731,7 @@ def render_page() -> str:
         : (model ? "원시 구간 입력 대기 · 모델은 준비됐지만 저장된 원시 구간이 없습니다." : "저장된 원시 구간이 없습니다.");
       card.appendChild(freshness);
       const eventMode = document.createElement("p");
-      eventMode.textContent = "이벤트 운영 모드: " + ({shadow:"비교만 · 이벤트/알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 활성화 (정책·입력 유효성 적용)"}[result.eventPolicy?.mode] || "미확인 (이전 서버)");
+      eventMode.textContent = "이벤트 운영 모드: " + ({disabled:"기존 RF66 자동 운영 중지",shadow:"비교만 · 이벤트/알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 활성화 (정책·입력 유효성 적용)"}[result.eventPolicy?.mode] || "미확인 (이전 서버)");
       card.appendChild(eventMode);
       if (items.length) {
         const rows = items.slice(0, 5).map(item => {
@@ -663,7 +877,8 @@ def render_page() -> str:
       if (!rows.length) panel.textContent = "No notifications.";
       rows.forEach(row => {
         const item = document.createElement("p");
-        item.textContent = `${row.isTest ? "[TEST] " : ""}${row.event.isSynthetic ? "[SYNTHETIC] " : ""}${row.event.title} · ${new Date(row.deliveredAt).toLocaleString()}`;
+        const transition = row.event.source === "snapshot" ? (row.event.snapshotTransition === "closed" ? "[단건 모델 정상 복귀] " : "[단건 모델 이상 발생] ") : "";
+        item.textContent = `${row.isTest ? "[TEST] " : ""}${row.event.isSynthetic ? "[SYNTHETIC] " : ""}${transition}${row.event.title} · ${new Date(row.deliveredAt).toLocaleString()}`;
         panel.appendChild(item);
       });
     }
@@ -736,7 +951,7 @@ def render_page() -> str:
         const pill = document.createElement("span");
         pill.className = `pill ${["warning", "critical", "device"].includes(event.severity) ? event.severity : ""}`;
         pill.textContent = event.label;
-        meta.append(pill, ` ${formatLocalTime(event.occurredAt)} - ` + (event.source === "rf66" ? `RF66 ${event.rf66Score} · ${event.status} · ${event.rf66Observation}` : event.score));
+        meta.append(pill, ` ${formatLocalTime(event.occurredAt)} - ` + eventModelSummary(event));
         button.append(title, document.createElement("br"), meta);
         return button;
       }));
@@ -934,14 +1149,21 @@ def render_page() -> str:
       }
     }
 
+    function eventModelSummary(event) {
+      if (event.source === "snapshot") return `단건 모델 발생 점수 ${event.snapshotScore} (통계 점수 아님) · ${event.modelVersion} · ${event.status} · `
+        + ({observing:"이상 관측 중",recovered:"정상 판정으로 복귀",unknown:"관측 불명 (자동 복귀 아님)",operator_resolved:"작업자 수동 해제"}[event.snapshotObservation] || "관측 미확인");
+      if (event.source === "rf66") return `RF66 ${event.rf66Score} · ${event.status} · ${event.rf66Observation}`;
+      return `점수 ${event.maxScore ?? event.score ?? "-"}`;
+    }
     function rf66ResolutionControls(event, current) {
       const section = document.createElement("section");
-      if (event.source !== "rf66" || event.status !== "open" || !can("event:review")) return section;
+      if (!["rf66","snapshot"].includes(event.source) || event.status !== "open" || !can("event:review")) return section;
+      const label = event.source === "snapshot" ? "단건 모델" : "RF66";
       const reason = document.createElement("textarea"), button = document.createElement("button"), status = document.createElement("p");
-      reason.setAttribute("aria-label", "RF66 수동 해제 사유");
+      reason.setAttribute("aria-label", label + " 수동 해제 사유");
       reason.setAttribute("maxlength", "500");
       reason.placeholder = "모델 교체·점검 등 수동 해제 사유 (센서 정상 복귀와 별도 기록)";
-      button.textContent = "RF66 이벤트 수동 해제";
+      button.textContent = label + " 이벤트 수동 해제";
       button.addEventListener("click", async () => {
         if (button.disabled || !current() || !can("event:review")) return;
         const value = reason.value.trim();
@@ -949,7 +1171,7 @@ def render_page() -> str:
         if (!confirm("이 이벤트를 수동 해제할까요? 정상 복귀 알림은 보내지 않으며 작업자와 사유가 기록됩니다.")) return;
         button.disabled = true;
         try {
-          await api(`/api/events/${encodeURIComponent(event.id)}/rf66-resolve`, {method:"POST",body:JSON.stringify({reason:value})});
+          await api(`/api/events/${encodeURIComponent(event.id)}/${event.source}-resolve`, {method:"POST",body:JSON.stringify({reason:value})});
           if (current()) status.textContent = "수동 해제 저장 완료 · 목록은 다음 새로고침에 반영됩니다.";
         } catch (error) {
           if (current()) {status.textContent = "해제 실패: " + error.message; button.disabled = false;}
@@ -978,11 +1200,12 @@ def render_page() -> str:
       detail.replaceChildren();
       const title = document.createElement("b");
       title.textContent = event.title;
-      detail.append(title, document.createElement("br"), `${formatLocalTime(event.occurredAt)} · ${event.duration ?? "-"} · ` + (event.source === "rf66" ? `RF66 확률 점수 ${event.rf66Score} (통계 점수 아님) · 상태 ${event.status} · 관측 ${event.rf66Observation}` : `점수 ${event.maxScore ?? event.score ?? "-"}`), document.createElement("br"), event.note || "");
+      detail.append(title, document.createElement("br"), `${formatLocalTime(event.occurredAt)} · ${event.duration ?? "-"} · ` + eventModelSummary(event), document.createElement("br"), event.note || "");
       const missing = document.createElement("p");
       detail.appendChild(rf66ResolutionControls(event, () => generation === detailGeneration && selectedEventId === eventId));
       missing.className = "notice";
-      missing.textContent = response.context.rawDataMissing ? "요약 시계열 없음: 보관기간 만료 또는 미수신. 보존된 특징·버전만 표시합니다." : `전후 요약 시계열 ${response.context.points.length}건 · 출처 ${response.context.source} (원시 파형은 별도 분석 기록에서 확인)`;
+      missing.textContent = event.source === "snapshot" ? "단건 모델 사건입니다. 발생·최근·복귀 판정의 구간 식별자, 무결성 해시와 모델 조건을 보존합니다. 연속 시계열·RF66 3구간 정책을 사용하지 않습니다."
+        : response.context.rawDataMissing ? "요약 시계열 없음: 보관기간 만료 또는 미수신. 보존된 특징·버전만 표시합니다." : `전후 요약 시계열 ${response.context.points.length}건 · 출처 ${response.context.source} (원시 파형은 별도 분석 기록에서 확인)`;
       detail.appendChild(missing);
       if (response.analysis) {
         const analysis = document.createElement("section");
@@ -998,12 +1221,14 @@ def render_page() -> str:
           ["사진 참조",(point.photoRefs || []).join(" · ")],["설치 버전 시각",formatLocalTime(point.versionAt)]
         ]));
       } else detail.appendChild(facts([["발생 당시 설치 정보","미확인 — 기록된 과거 설치 정보 없음"]]));
-      $("eventEvidence").textContent = JSON.stringify({context:{from:response.context.from, to:response.context.to, source:response.context.source}, featureSnapshot:response.featureSnapshot, appliedRule:response.appliedRule, modelVersion:response.modelVersion, deviceSnapshot:response.deviceSnapshot}, null, 2);
+      $("eventEvidence").textContent = JSON.stringify({context:{from:response.context.from, to:response.context.to, source:response.context.source}, featureSnapshot:response.featureSnapshot, appliedRule:response.appliedRule, modelVersion:response.modelVersion, deviceSnapshot:response.deviceSnapshot,
+        ...(event.source === "snapshot" ? {lastEvidence:event.snapshotLastEvidence,recoveryEvidence:event.snapshotRecoveryEvidence,resolution:event.snapshotResolution,observationReason:event.snapshotObservationReason} : {})}, null, 2);
       const rule = response.appliedRule || {};
       $("evidenceSummary").replaceChildren(facts([
         ["이벤트 ID",event.id], ["모델 버전",response.modelVersion], ["규칙 버전",rule.version || rule.policyId],
         ["장치",response.deviceSnapshot?.deviceId || response.deviceSnapshot?.id],
-        ["진입 점수 임계값",event.source === "rf66" ? event.rf66Threshold : rule.scoreThreshold], ["규칙 지속시간",event.source === "rf66" ? "발생/복귀 각 3구간" : measuredValue(rule.durationSec,"초")],
+        ["진입 점수 임계값",event.source === "snapshot" ? `${event.snapshotEvidence?.comparison} ${event.snapshotThreshold} (${event.snapshotEvidence?.scoreType})` : event.source === "rf66" ? event.rf66Threshold : rule.scoreThreshold],
+        ["규칙 지속시간",event.source === "snapshot" ? "서버 이상 1건 발생 / 같은 모델 정상 1건 복귀" : event.source === "rf66" ? "발생/복귀 각 3구간" : measuredValue(rule.durationSec,"초")],
         ["규칙 활성",rule.active === true ? "활성" : rule.active === false ? "비활성" : "미수신"],
         ["신호 출처",response.context.source],
       ]));
@@ -1743,6 +1968,7 @@ def render_page() -> str:
       }
     }
     function invalidateScope(resetWindow = false) {
+      clearSnapshots();
       clearRF66();
       invalidateDeviceOperations();
       modelQueueGeneration++; modelQueueRows = []; modelQueueTotal = 0; modelQueuePage = 1; clearModelReview(); renderModelQueue();

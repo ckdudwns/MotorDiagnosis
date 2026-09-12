@@ -28,11 +28,12 @@ DB_DEFAULTS = {
     "ANALYSIS_DB_PATH": "output/analysis.sqlite3",
     "VIBRATION_WINDOW_DB_PATH": "output/vibration-windows.sqlite3",
     "RAW_VIBRATION_WINDOW_DB_PATH": "output/raw-vibration-windows.sqlite3",
+    "PERIODIC_SNAPSHOT_DB_PATH": "output/periodic-snapshots.sqlite3",
     "COMMUNICATION_QUALITY_DB_PATH": "output/communication-quality.sqlite3",
     "SHADOW_MODEL_DB_PATH": "output/model-inference.sqlite3",
 }
 FILE_KEYS = ("AUTH_USERS_FILE", "INGEST_TOKENS_FILE", "RF66_MODEL_ARTIFACT", "SHADOW_MODEL_ARTIFACT")
-SAFE_ENV = {*DB_DEFAULTS, *FILE_KEYS, "RF66_MODEL_CHECKSUM", "RF66_EVENT_MODE", "SHADOW_MODEL_CHECKSUM"}
+SAFE_ENV = {*DB_DEFAULTS, *FILE_KEYS, "RF66_MODEL_CHECKSUM", "RF66_EVENT_MODE", "SHADOW_MODEL_CHECKSUM", "SNAPSHOT_EVENT_MODE"}
 GiB = 1024 ** 3
 
 
@@ -185,7 +186,7 @@ def make_backup(project, env, info, destination, *, stopped):
         raise ValueError("Insufficient backup free space (copy size plus 2 GiB reserve)")
     folder = destination / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:12])
     private_directory(folder, fresh=True)
-    manifest = {"formatVersion": 1, "createdAt": stamp(), "complete": True,
+    manifest = {"formatVersion": 2, "createdAt": stamp(), "complete": True,
                 "consistency": "service_stopped", "project": str(project),
                 "serviceUser": info.get("User"), "eventMode": env.get("RF66_EVENT_MODE", "shadow"),
                 "modelChecksum": env.get("RF66_MODEL_CHECKSUM"), "files": [], "absentOptional": absent}
@@ -268,13 +269,16 @@ def resume_backup(project, service):
 def verify_backup(folder):
     regular(folder / "manifest.json")
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-    if (manifest.get("formatVersion") != 1 or manifest.get("complete") is not True
+    if (manifest.get("formatVersion") not in (1, 2) or manifest.get("complete") is not True
             or manifest.get("consistency") != "service_stopped"):
         raise ValueError("Incomplete/unsupported backup")
     files = manifest.get("files", [])
     keys = [item["key"] for item in files]
     names = [item["file"] for item in files]
     required = (set(DB_DEFAULTS) - {"SHADOW_MODEL_DB_PATH"}) | {"AUTH_USERS_FILE"}
+    if manifest["formatVersion"] == 1:
+        # Backups created before the periodic inbox must remain restorable.
+        required.discard("PERIODIC_SNAPSHOT_DB_PATH")
     if not required <= set(keys) or len(keys) != len(set(keys)) or len(names) != len(set(names)):
         raise ValueError("Incomplete/duplicate database set")
     if manifest.get("modelChecksum") and "RF66_MODEL_ARTIFACT" not in keys:
@@ -308,7 +312,8 @@ def restore_drill(folder, destination):
 
 def inspect(project, env, device, *, now=None):
     now = time.time() if now is None else now
-    report = {"at": now, "deviceId": device, "eventMode": env.get("RF66_EVENT_MODE", "shadow"),
+    report = {"at": now, "deviceId": device, "eventMode": "disabled",
+              "legacyRf66ProcessingEnabled": False,
               "databases": {}, "issues": []}
     def issue(level, code):
         report["issues"].append({"level": level, "code": code})
@@ -346,9 +351,10 @@ def inspect(project, env, device, *, now=None):
                         oldest = db.execute("""SELECT min(CASE WHEN d.metadata IS NOT NULL THEN d.received ELSE w.captured END)
                             FROM vibration_windows w LEFT JOIN raw_delivery d ON w.ordinal=d.ordinal WHERE w.status='queued'""").fetchone()[0]
                     item["oldestPendingAgeSec"] = None if oldest is None else now-oldest
-                    if pending >= 3276 or (oldest is not None and now-oldest > 30):
+                    if key != "RAW_VIBRATION_WINDOW_DB_PATH" and (pending >= 3276 or (oldest is not None and now-oldest > 30)):
                         issue("warning", key + ":PROCESSING_BACKLOG")
                     if key == "RAW_VIBRATION_WINDOW_DB_PATH":
+                        item.update(processingEnabled=False, historicalOnly=True, reason="LEGACY_RF66_DISABLED")
                         row = db.execute("SELECT ordinal,captured,boot,idx,body,status,result FROM vibration_windows WHERE device=? ORDER BY captured DESC,ordinal DESC LIMIT 1", (device,)).fetchone()
                         sequence = db.execute("SELECT seq FROM sqlite_sequence WHERE name='vibration_windows'").fetchone()
                         item["acceptedTotal"] = sequence[0] if sequence else 0
@@ -367,22 +373,72 @@ def inspect(project, env, device, *, now=None):
                                     if metadata.get("policyId") == "edge-trigger-batch-v1" and metadata.get("mode") == "periodic":
                                         cadence_limit = 360  # 300s reporting period + 60s transport grace; NOT event freshness.
                             item["latest"]["maxExpectedAgeSec"] = cadence_limit
-                            if not -5 <= now-row[1] <= cadence_limit:
-                                issue("warning", "RAW_INPUT_STALE_OR_FUTURE")
-                            if body["quality"] != "valid":
-                                issue("warning", "RAW_INPUT_QUALITY")
-                            if row[5] in {"unavailable", "waiting_model"}:
-                                issue("warning", "RF66_INFERENCE_UNAVAILABLE")
-                        else:
-                            issue("warning", "RAW_INPUT_ABSENT")
                         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                         if "rf66_incidents" in tables:
                             item["incidents"] = db.execute("SELECT count(*) FROM rf66_incidents").fetchone()[0]
                             item["unprojectedIncidents"] = db.execute("SELECT count(*) FROM rf66_incidents WHERE projected<revision").fetchone()[0]
                             if item["incidents"] >= 9000:
                                 issue("warning", "RF66_INCIDENT_CAPACITY")
-                            if item["unprojectedIncidents"]:
-                                issue("warning", "RF66_EVENT_PROJECTION_PENDING")
+                elif key == "PERIODIC_SNAPSHOT_DB_PATH":
+                    from .periodic_snapshots import MAX_ROWS
+                    from .transmission_policy import snapshot_interval_seconds
+                    item["statuses"] = dict(db.execute("SELECT status,count(*) FROM periodic_snapshots GROUP BY status"))
+                    item["rows"] = sum(item["statuses"].values())
+                    item["rowLimit"] = MAX_ROWS
+                    item["processingEnabled"] = True
+                    item["inferenceEnabled"] = False
+                    item["stage"] = "input_preparation"
+                    item["modelStatus"] = "not_configured"
+                    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    item["eventMode"] = env.get("SNAPSHOT_EVENT_MODE", "events")
+                    if "snapshot_incidents" in tables:
+                        from .snapshot_events import MAX_INCIDENTS
+                        item["incidents"] = dict(db.execute("SELECT status,count(*) FROM snapshot_incidents GROUP BY status"))
+                        item["unprojectedIncidents"] = db.execute("SELECT count(*) FROM snapshot_incidents WHERE projected<revision").fetchone()[0]
+                        item["eventJobs"] = dict(db.execute("SELECT status,count(*) FROM snapshot_event_jobs GROUP BY status"))
+                        if item["unprojectedIncidents"]:
+                            issue("warning", "PERIODIC_SNAPSHOT_EVENT_PROJECTION_PENDING")
+                        if sum(item["incidents"].values()) >= MAX_INCIDENTS * .9:
+                            issue("warning", "PERIODIC_SNAPSHOT_INCIDENT_CAPACITY")
+                    if "snapshot_inference_jobs" in tables:
+                        jobs = dict(db.execute("SELECT status,count(*) FROM snapshot_inference_jobs GROUP BY status"))
+                        item["inferenceJobs"] = jobs
+                        if jobs:
+                            # Persisted jobs are evidence of an assigned adapter,
+                            # not proof of this live process's current configuration.
+                            item.update(inferenceEnabled=None, modelStatus="runtime_not_observed", stage="inference")
+                        old_job = db.execute("""SELECT min(j.created) FROM snapshot_inference_jobs j
+                            JOIN periodic_snapshots w USING(ordinal)
+                            WHERE w.status='queued_inference' AND j.status IN ('queued','running')""").fetchone()[0]
+                        item["oldestInferencePendingAgeSec"] = None if old_job is None else now-old_job
+                        if old_job is not None and now-old_job > 120:
+                            issue("warning", key + ":INFERENCE_BACKLOG")
+                    oldest = db.execute("SELECT min(received) FROM periodic_snapshots WHERE status='queued'").fetchone()[0]
+                    item["oldestPendingAgeSec"] = None if oldest is None else now-oldest
+                    if oldest is not None and now-oldest > 120:
+                        issue("warning", key + ":PREPARATION_BACKLOG")
+                    if item["rows"] >= MAX_ROWS * .9:
+                        issue("warning", key + ":ROW_CAPACITY")
+                    row = db.execute("""SELECT captured,received,boot,idx,quality,status,body,ordinal,result FROM periodic_snapshots
+                        WHERE device=? ORDER BY captured DESC,late ASC,ordinal DESC LIMIT 1""", (device,)).fetchone()
+                    if row:
+                        item["latest"] = dict(zip(("captured", "receivedAtEpoch", "bootId", "index", "quality", "status"), row[:6]))
+                        transmission = json.loads(row[6])["transmission"]
+                        item["latest"].update(transmission=transmission,
+                                              expectedReportIntervalSec=snapshot_interval_seconds(transmission),
+                                              boardStateSource="device_report", boardStateVerifiedByServer=False,
+                                              ordinal=row[7], ageSec=now-row[0])
+                        analysis = json.loads(row[8]) if row[8] else {}
+                        item["latest"]["inputPreparation"] = analysis.get("inputPreparation")
+                        item["latest"]["inference"] = analysis.get("inference")
+                        item["latest"]["reason"] = analysis.get("reason")
+                        if not -5 <= now-row[0] <= snapshot_interval_seconds(transmission) + 60:
+                            issue("warning", "PERIODIC_SNAPSHOT_INPUT_STALE_OR_FUTURE")
+                        if row[5] == "unavailable":
+                            issue("warning", "PERIODIC_SNAPSHOT_INFERENCE_UNAVAILABLE" if analysis.get("inference")
+                                  else "PERIODIC_SNAPSHOT_INPUT_UNAVAILABLE")
+                    else:
+                        issue("warning", "PERIODIC_SNAPSHOT_INPUT_ABSENT")
                 elif key == "ALERT_DB_PATH":
                     item["statuses"] = dict(db.execute("SELECT status,count(*) FROM alert_deliveries GROUP BY status"))
                     old = db.execute("SELECT count(*) FROM alert_deliveries WHERE status IN ('pending','sending') AND due_at<?", (now-120,)).fetchone()[0]
@@ -424,7 +480,7 @@ def observe(service, device, seconds, interval, destination):
                 project, env, info = discover(service)
                 report = inspect(project, env, device)
                 report["pid"] = info["MainPID"]
-                latest = report["databases"]["RAW_VIBRATION_WINDOW_DB_PATH"].get("latest")
+                latest = report["databases"].get("PERIODIC_SNAPSHOT_DB_PATH", {}).get("latest")
                 if latest and previous and latest["ordinal"] > previous["ordinal"]:
                     progressed = True
                     if latest["captured"] <= previous["captured"]:
@@ -446,7 +502,8 @@ def observe(service, device, seconds, interval, destination):
     if not progressed and worst == "ok":
         worst = "warning"
     return {"report": str(destination), "observations": count, "status": worst,
-            "rawInputProgressObserved": progressed, "fieldValidation": "not_performed"}
+            "rawInputProgressObserved": progressed, "inputSource": "periodic-snapshots",
+            "snapshotInputProgressObserved": progressed, "fieldValidation": "not_performed"}
 
 
 def revoke_upload_key(path, key, *, apply=False):

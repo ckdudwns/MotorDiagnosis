@@ -9,58 +9,25 @@ import json
 import logging
 import math
 from pathlib import Path
-import re
 import sqlite3
 import threading
 import time
 
 from . import data, device_lifecycle
 from .window_features import PROFILE_ID, derive, feature_names
+from .window_envelope import COMMON_KEYS, QUALITY, RETENTION, reject
+from .window_envelope import validate_envelope as validate_measurement_envelope
 
 LOGGER = logging.getLogger(__name__)
-RETENTION = 2 * 86400
 MAX_ROWS = 500000
 MAX_PENDING = 4096
 MAX_STREAMS = 10000
 MAX_BATCH = 16
-KEYS = {"schemaVersion", "deviceId", "siteId", "assetId", "bootId",
-        "windowIndex", "timestamp", "startUptimeUs", "sampleRateHz",
-        "sampleCount", "profileId", "axes", "unit", "quality", "features"}
-QUALITY = {"valid", "fifo_overrun", "sensor_unavailable", "sample_gap",
-           "clipped", "constant_axis", "processing_overflow"}
-
-
-def reject(message, status=400, code="INVALID_VIBRATION_WINDOW"):
-    raise data.ApiError(status, code, message)
+KEYS = COMMON_KEYS | {"features"}
 
 
 def validate_envelope(payload, keys=KEYS, profile=PROFILE_ID, unit="g"):
-    if not isinstance(payload, dict) or set(payload) != keys:
-        reject("Use the exact versioned vibration-window envelope")
-    for key in ("deviceId", "siteId", "assetId"):
-        # Registration uses required_text(...).upper(), not a second ID grammar.
-        # Require the canonical spelling on the wire to preserve stream identity.
-        if payload[key] != data.required_text(payload, key).upper():
-            reject("Invalid " + key)
-    if not isinstance(payload["bootId"], str) or not re.fullmatch(r"[0-9a-f]{32}", payload["bootId"]):
-        reject("bootId must be 32 lowercase hexadecimal characters")
-    for key, low, high in (("windowIndex", 0, 2**31 - 1),
-                           ("startUptimeUs", 0, 2**53 - 1),
-                           ("sampleCount", 0, 512)):
-        if type(payload[key]) is not int or not low <= payload[key] <= high:
-            reject("Invalid " + key)
-    if (type(payload["schemaVersion"]) is not int or payload["schemaVersion"] != 1
-            or type(payload["sampleRateHz"]) is not int or payload["sampleRateHz"] != 800
-            or payload["profileId"] != profile or payload["unit"] != unit
-            or payload["axes"] != ["X", "Y", "Z"]):
-        reject("The 800 Hz XYZ g profile must match exactly")
-    quality = payload["quality"]
-    if not isinstance(quality, str) or quality not in QUALITY:
-        reject("Unknown quality state")
-    captured = data.parse_rfc3339("timestamp", payload["timestamp"]).timestamp()
-    if not time.time() - RETENTION <= captured <= time.time() + 300:
-        reject("Window timestamp outside retention/future bounds")
-    return captured
+    return validate_measurement_envelope(payload, keys, profile, unit)
 
 
 def normalize(payload):

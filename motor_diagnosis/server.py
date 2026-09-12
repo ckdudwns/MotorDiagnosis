@@ -9,6 +9,7 @@ import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -116,6 +117,7 @@ from .edge_analysis import AnalysisStore
 from .model_inference import ModelInferenceStore
 from .vibration_windows import VibrationWindowStore
 from .raw_vibration import RawVibrationStore
+from .periodic_snapshots import PeriodicSnapshotStore
 from .model_history import ModelHistoryGuard
 from .model_registry import create_baseline_version, create_model_version, versions_for
 from .ai_results import submit_result, review_model
@@ -242,6 +244,10 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
         user = self.require_user()
+        if (len(segments) == 4 and segments[:2] == ["api", "devices"]
+                and segments[3] == "periodic-snapshots"):
+            self.send_json(self.server.periodic_snapshots.list_device(user, segments[2]))
+            return
         if (len(segments) == 4 and segments[:2] == ["api", "devices"]
                 and segments[3] in {"vibration-windows", "raw-vibration-windows"}):
             store = self.server.raw_vibration if segments[3] == "raw-vibration-windows" else self.server.vibration_windows
@@ -770,6 +776,13 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             self.send_json(result, status=status)
             return
+        if (len(segments) == 4 and segments[:2] == ["api", "devices"]
+                and segments[3] == "periodic-snapshots"):
+            result, status = self.server.periodic_snapshots.ingest(
+                telemetry_principal_for_token(self.bearer_token()), segments[2], payload
+            )
+            self.send_json(result, status=status)
+            return
         if analysis_path:
             result, status = self.server.analysis.ingest(
                 telemetry_principal_for_token(self.bearer_token()), segments[2], payload
@@ -788,6 +801,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if len(segments) == 4 and segments[:2] == ["api", "events"] and segments[3] == "rf66-resolve":
             self.send_json(self.server.raw_vibration.events.resolve(self.require_user(), segments[2], payload))
+            return
+        if len(segments) == 4 and segments[:2] == ["api", "events"] and segments[3] == "snapshot-resolve":
+            self.send_json(self.server.periodic_snapshots.events.resolve(self.require_user(), segments[2], payload))
             return
         if segments == ["api", "auth", "login"]:
             self.send_json(authenticate(payload))
@@ -1731,10 +1747,11 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
         # BaseServer.service_actions(), which runs in the HTTP accept loop.
         # One coordinator coalesces polling; ticks never overlap or accumulate.
         while not self._alert_stop.wait(0.5):
+            # Retired RF66 incidents are history, not automatically projected or sent.
             try:
-                self.raw_vibration.events.dispatch()
+                self.periodic_snapshots.events.tick()
             except Exception:
-                LOGGER.exception("RF66 event projection failed; durable transition retained")
+                LOGGER.exception("Snapshot event processing failed; committed work retained for retry")
             if not self.auto_alerts:
                 continue
             try:
@@ -1763,6 +1780,8 @@ class MotorDiagnosisServer(ThreadingHTTPServer):
             self.vibration_windows.close()
         if getattr(self, "raw_vibration", None) is not None:
             self.raw_vibration.close()
+        if getattr(self, "periodic_snapshots", None) is not None:
+            self.periodic_snapshots.close()
         if getattr(self, "model_inference", None) is not None:
             self.model_inference.close()
         if getattr(self, "model_history", None) is not None:
@@ -1792,6 +1811,9 @@ def create_server(
     model_preprocessing_profile=None,
     window_database=":memory:",
     raw_window_database=":memory:",
+    snapshot_database=":memory:",
+    snapshot_model=None,
+    snapshot_event_mode="events",
     window_model_variant=None,
     rf66_artifact=None,
     rf66_checksum=None,
@@ -1800,6 +1822,12 @@ def create_server(
     # Fail closed before opening sockets or persistent databases in production.
     authentication_users()
     validate_ingest_auth()
+    if snapshot_database != ":memory:":
+        snapshot_path = Path(snapshot_database).resolve()
+        other_paths = (state_database, alert_database, communication_database,
+                       analysis_database, model_database, window_database, raw_window_database)
+        if any(p and str(p) != ":memory:" and Path(p).resolve() == snapshot_path for p in other_paths):
+            raise ValueError("Periodic snapshots require a separate database file")
     if demo_enabled is None:
         demo_enabled = os.environ.get("DEMO_ENABLED", "false").lower() == "true"
     configure_runtime_state(state_database)
@@ -1816,7 +1844,11 @@ def create_server(
     server.model_history = None
     server.vibration_windows = None
     server.raw_vibration = None
+    server.periodic_snapshots = None
     try:
+        # Only an explicitly supplied, scoped adapter can infer new snapshots.
+        # app.py intentionally supplies none until a replacement model is agreed.
+        server.periodic_snapshots = PeriodicSnapshotStore(snapshot_database, model=snapshot_model, event_mode=snapshot_event_mode)
         # Identity protection must survive disabling/replacing the ML runtime.
         server.model_history = ModelHistoryGuard(model_database)
         checkpoint = None
@@ -1847,25 +1879,23 @@ def create_server(
             checkpoint=checkpoint if window_model_variant else None,
             variant=window_model_variant or "base21",
         )
-        rf66_model = None
-        if rf66_checksum and not rf66_artifact:
-            raise ValueError("RF66 checksum requires an explicit RF66 artifact")
-        if rf66_artifact:
-            from .rf66 import RF66Model
-
-            rf66_model = RF66Model.load(rf66_artifact, expected_checksum=rf66_checksum)
-        server.raw_vibration = RawVibrationStore(raw_window_database, model=rf66_model, event_mode=rf66_event_mode)
+        # Deprecated arguments are ignored, even when an old deployment still
+        # provides them. The HTTP server no longer has an RF66 loader path.
+        if rf66_artifact or rf66_checksum or rf66_event_mode != "shadow":
+            LOGGER.warning("Legacy RF66 configuration ignored: server inference is disabled")
+        server.raw_vibration = RawVibrationStore(raw_window_database, processing_enabled=False)
         server.analysis = AnalysisStore(analysis_database)
         server.communication_quality = CommunicationQualityStore(communication_database)
         server.alerts = AlertService(
             alert_database,
             adapters=alert_adapters,
             rf66_guard=server.raw_vibration.events.notification_allowed,
+            snapshot_guard=server.periodic_snapshots.events.notification_allowed,
         )
         if server.model_inference is not None:
             server.model_inference.start()
         server.vibration_windows.start()
-        server.raw_vibration.start()
+        server.periodic_snapshots.start()
         server.start_alert_worker()
         if (
             state_database

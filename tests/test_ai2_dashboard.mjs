@@ -421,7 +421,7 @@ await check('workspace navigation is wired to unique existing panels', () => {
   assert.match(source,/@media \(max-width:900px\)/);
 });
 
-await check('each workspace reveals only its panels without new API requests', () => {
+await check('each workspace reveals only its panels; overview refreshes only new snapshots', () => {
   const h = harness(); h.run('setupManagement()');
   assert.equal(h.get('managementPanel').hidden,true);
   const views = clone(h.run('WORKSPACE_VIEWS'));
@@ -433,7 +433,7 @@ await check('each workspace reveals only its panels without new API requests', (
     }
     assert.equal(h.get('viewHeading').textContent,views[view].title);
   }
-  assert.equal(h.requests.length,0);
+  assert.deepEqual(h.requests.map(r=>r.path),['/api/sites/S1/devices']);
   h.run('setView("not-a-view")'); assert.equal(h.run('currentView'),'overview');
 });
 
@@ -452,7 +452,7 @@ await check('navigation preserves review, memo, management drafts and chart sele
   assert.equal(h.get('managementReason').value,'management draft'); assert.equal(h.get('reviewReason').value,'review reason');
   assert.equal(h.get('attachmentRefs').value,'survey://draft'); assert.equal(h.get('severityFilter').value,'critical');
   assert.deepEqual(clone(h.run('[reviewDirty,memoDirty,managementDirty,editingNoteId]')),[true,true,true,'N1']);
-  assert.equal(h.requests.length,calls);
+  assert.deepEqual(h.requests.slice(calls).map(r=>r.path),['/api/sites/S1/devices']);
 });
 
 await check('management navigation respects read access including audit-only users', () => {
@@ -664,7 +664,8 @@ await check('AI evidence and draft survive telemetry timers and workspace naviga
   const calls=h.requests.length, generation=h.run('modelReviewGeneration');
   for (const interval of h.intervals) interval();
   h.run('setView("overview"); setView("models"); setView("models")');
-  assert.equal(h.requests.length,calls); assert.equal(h.run('modelReviewGeneration'),generation);
+  assert.deepEqual(h.requests.slice(calls).map(r=>r.path),['/api/sites/S1/devices']);
+  assert.equal(h.run('modelReviewGeneration'),generation);
   assert.equal(h.run('modelReviewRow.version'),'M1'); assert.equal(h.run('modelQueuePage'),2);
   assert.equal(h.get('modelReviewReason').value,'still inspecting evidence');
   assert.equal(h.get('modelReviewPanel').hidden,false);

@@ -308,6 +308,45 @@ class DualServingTest(RpmSetup):
             server.shutdown(); server.server_close(); thread.join()
 
     @unittest.skipUnless(shutil.which("node"),"Node required for shipped UI")
+    def test_backfilled_history_forecast_is_visible_using_real_api_response(self):
+        for seq in range(13):
+            if seq != 8:
+                self.send(self.payload(seq))
+        self.send(self.payload(8)); self.process()
+        before = self.store.list_device(self.admin, DEVICE)
+        self.assertEqual(before["items"][0]["analysis"]["forecast"]["reason"], "FORECAST_HISTORY_INSUFFICIENT")
+        self.send(self.payload(13)); self.process()
+        after = self.store.list_device(self.admin, DEVICE)
+        forecast = after["items"][0]["analysis"]["forecast"]
+        self.assertEqual(forecast["status"], "completed")
+        self.assertEqual(forecast["inputOrdinals"], [2,3,4,5,6,7,8,13,9,10,11,12,14])
+        # The earlier receipt stays unchanged; only subsequent inference can use backfill.
+        saved = next(r for r in after["items"] if r["ordinal"] == before["items"][0]["ordinal"])
+        self.assertEqual(saved["analysis"], before["items"][0]["analysis"])
+        self.assert_dashboard({"snapshots": [before, after]})
+
+    @unittest.skipUnless(shutil.which("node"),"Node required for shipped UI")
+    def test_dual_model_open_and_reference_clear_notifications_use_actual_event_metadata(self):
+        self.store.events.mode = "alerts"
+        self.history(24)
+        notifications = []
+        # Control the decision only: test the actual persistence/event/rendering chain.
+        for seq, score, state in ((24, 2., "open"), (25, 0., "closed")):
+            self.store.events.clock = lambda seq=seq: self.base + seq*25
+            self.send(self.payload(seq))
+            with patch("motor_diagnosis.pump_models.score_vector", return_value=(score, score, score)):
+                self.process()
+            self.store.events.tick()
+            event = json.loads(self.store.db.execute("SELECT payload FROM snapshot_incidents").fetchone()[0])
+            self.assertEqual(event["snapshotTransition"], state)
+            self.assertTrue(self.store.events.notification_allowed(event))
+            self.assertEqual(event["snapshotEvidence"]["inference"]["model"], self.model.metadata())
+            if state == "closed":
+                self.assertEqual(event["endReason"], "novelty_reference_not_exceeded")
+            notifications.append({"event": event, "deliveredAt": self.payload(seq)["window"]["timestamp"]})
+        self.assert_dashboard({"snapshots": [], "notifications": notifications})
+
+    @unittest.skipUnless(shutil.which("node"),"Node required for shipped UI")
     def test_real_api_results_render_forecast_independently_of_event_warmup(self):
         cases=[]
         self.history(12)
@@ -319,6 +358,9 @@ class DualServingTest(RpmSetup):
         for mode in ("shadow","events","alerts"):
             self.store.events.mode=mode
             cases.append(self.store.list_device(self.admin,DEVICE))
+        self.assert_dashboard(cases)
+
+    def assert_dashboard(self, cases):
         result=subprocess.run([shutil.which("node"),"tests/pump_dual_dashboard_fixture.mjs"],
             cwd=Path(__file__).resolve().parents[1],input=json.dumps(cases),
             capture_output=True,text=True,encoding="utf-8",timeout=30)

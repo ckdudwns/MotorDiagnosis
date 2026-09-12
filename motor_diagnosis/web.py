@@ -659,7 +659,10 @@ def render_page() -> str:
         && Number.isInteger(w.periodicSlotEpoch) && f.targetSlotEpoch === w.periodicSlotEpoch+300
         && f.features && Object.keys(f.features).length === 9 && verifierFeatures.every(k=>snapshotNumber(f.features[k]))
         && Array.isArray(f.inputOrdinals) && f.inputOrdinals.length === 13 && f.inputOrdinals[12] === item.ordinal
-        && f.inputOrdinals.every((v,i)=>Number.isInteger(v) && v > 0 && (!i || v > f.inputOrdinals[i-1]))
+        // Receipt IDs are not measurement order: backfill may arrive out of order.
+        // The server validates history slots; prior inputs must precede this receipt.
+        && f.inputOrdinals.every((v,i)=>Number.isInteger(v) && v > 0 && (i === 12 || v < item.ordinal))
+        && new Set(f.inputOrdinals).size === 13
         && Array.isArray(f.inputDigests) && f.inputDigests.length === 13 && f.inputDigests[12] === item.digest
         && f.inputDigests.every(v=>typeof v === "string" && /^[0-9a-f]{64}$/.test(v))
         && a.inference.inputDigest === item.digest && snapshotTime(a.inference.completedAt);
@@ -1005,7 +1008,7 @@ def render_page() -> str:
       if (!rows.length) panel.textContent = "No notifications.";
       rows.forEach(row => {
         const item = document.createElement("p");
-        const verifier = row.event.snapshotEvidence?.inference?.model?.contractId === "history-event-verifier-v1";
+        const verifier = isHistoryVerifier(row.event.snapshotEvidence?.inference?.model);
         const transition = row.event.source === "snapshot" ? (verifier
           ? (row.event.snapshotTransition === "closed" ? "[이력 모델 기준 미초과 · 사건 해제] " : "[이력 모델 기준 초과 · 이상 후보] ")
           : (row.event.snapshotTransition === "closed" ? "[단건 모델 정상 복귀] " : "[단건 모델 이상 발생] ")) : "";

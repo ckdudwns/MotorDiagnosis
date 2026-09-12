@@ -35,13 +35,19 @@ class SnapshotModelAdapter:
                     "inputContract", "scope", "scoreType", "threshold", "comparison"}
         if not isinstance(metadata, dict) or set(metadata) != required:
             raise ValueError("Explicit snapshot model metadata is required")
-        if metadata["contractId"] != CONTRACT_ID or metadata["inputContract"] != INPUT_CONTRACT:
+        from .pump_summary import INPUT_CONTRACT as HISTORY_INPUT
+        contracts = {CONTRACT_ID: INPUT_CONTRACT, "history-event-verifier-v1": HISTORY_INPUT}
+        if (not isinstance(metadata["contractId"], str) or metadata["contractId"] not in contracts
+                or metadata["inputContract"] != contracts[metadata["contractId"]]):
             raise ValueError("Unsupported single-snapshot model input contract")
         for key in ("modelId", "modelVersion", "preprocessingVersion", "scoreType"):
             if (not isinstance(metadata[key], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}", metadata[key])):
                 raise ValueError("Invalid snapshot model " + key)
         scope = metadata["scope"]
-        if (not isinstance(scope, dict) or set(scope) != {"deviceId", "siteId", "assetId"}
+        scope_keys = {"deviceId", "siteId", "assetId"}
+        if metadata["contractId"] == "history-event-verifier-v1":
+            scope_keys.add("sensorId")
+        if (not isinstance(scope, dict) or set(scope) != scope_keys
                 or any(not isinstance(v, str) or not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{0,99}", v) for v in scope.values())):
             raise ValueError("An explicit device/site/asset scope is required")
         if (not finite_number(metadata["threshold"]) or not isinstance(metadata["comparison"], str)

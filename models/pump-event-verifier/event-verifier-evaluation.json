@@ -1,0 +1,32 @@
+{
+  "trainBefore": "2026-09-07T16:49:15+00:00",
+  "testFrom": "2026-09-07T20:34:40+00:00",
+  "groundTruthMetrics": null,
+  "limitation": "No review labels. Scores are novelty evidence, not confirmed-fault probabilities.",
+  "streams": {
+    "freshwater_supply_motor2": {
+      "status": "experimental_unlabeled",
+      "counts": {
+        "train": 1599,
+        "calibration": 492,
+        "test": 518
+      },
+      "testReferenceExceedanceFraction": {
+        "robust": 0.009652509652509652,
+        "pca": 0.03088803088803089
+      }
+    },
+    "freshwater_supply_motor3": {
+      "status": "experimental_unlabeled",
+      "counts": {
+        "train": 1599,
+        "calibration": 492,
+        "test": 8130
+      },
+      "testReferenceExceedanceFraction": {
+        "robust": 0.03345633456334563,
+        "pca": 0.0965559655596556
+      }
+    }
+  }
+}

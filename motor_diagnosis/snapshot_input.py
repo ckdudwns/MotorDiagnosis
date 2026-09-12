@@ -5,6 +5,9 @@ ADAPTER_ID = "adxl345-xyz-g-unmodified-v1"
 
 
 def prepare_input(window):
+    from .pump_summary import PROFILE_ID, prepare
+    if window.get("profileId") == PROFILE_ID:
+        return prepare(window)
     if window["quality"] != "valid":
         raise ValueError(window["quality"])
     rows = decode_samples(window)

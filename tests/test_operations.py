@@ -96,6 +96,27 @@ class OperationsTest(unittest.TestCase):
             ops.restore_drill(folder, restored)
         self.assertNotIn("not-for-report", (folder / "manifest.json").read_text())
 
+    def test_pump_json_model_backup_and_restore_keeps_exact_checksum_and_sensor_binding(self):
+        from motor_diagnosis.pump_event_model import ENV_KEYS, configured_model
+        artifact = Path(__file__).resolve().parents[1]/"models/pump-event-verifier/event-verifier-model.json"
+        checksum = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        values = [str(artifact),checksum,"freshwater_supply_motor2","DEV-01-MOT-02","SITE-01","SITE-01-MOT-02","SENSOR-02"]
+        self.env.update(zip(ENV_KEYS,values))
+        folder = self.backup()
+        manifest = ops.verify_backup(folder)
+        self.assertEqual(manifest["pumpVerifier"]["PUMP_EVENT_VERIFIER_SENSOR_ID"],"SENSOR-02")
+        target=Path(self.temp.name)/"pump-drill"
+        self.assertTrue(ops.restore_drill(folder,target)["verified"])
+        restored=target/"PUMP_EVENT_VERIFIER_ARTIFACT.bin"
+        self.assertEqual(restored.read_bytes(),artifact.read_bytes())
+        env={**manifest["pumpVerifier"],"PUMP_EVENT_VERIFIER_ARTIFACT":str(restored)}
+        self.assertEqual(configured_model(env).metadata()["scope"]["sensorId"],"SENSOR-02")
+        self.env["PUMP_EVENT_VERIFIER_CHECKSUM"]="0"*64
+        before=set(self.root.glob("*/manifest.json"))
+        with self.assertRaises(ValueError):
+            self.backup()
+        self.assertEqual(set(self.root.glob("*/manifest.json")),before)
+
     def test_missing_or_alias_database_rejected_before_backup(self):
         self.env["RAW_VIBRATION_WINDOW_DB_PATH"] = ops.DB_DEFAULTS["STATE_DB_PATH"]
         with self.assertRaises(ValueError):

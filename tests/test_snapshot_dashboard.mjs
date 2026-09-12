@@ -41,6 +41,51 @@ const value = h => text(h.get('snapshotRows'));
 const defer = () => {let resolve,reject; const promise=new Promise((yes,no)=>{resolve=yes;reject=no;}); return {promise,resolve,reject};};
 const settle = () => new Promise(resolve=>setImmediate(resolve));
 
+function verifierMetadata() {
+  return {...metadata(),contractId:'history-event-verifier-v1',modelId:'pump-event-verifier-v1',
+    scoreType:'novelty_reference_ratio',threshold:1,scope:{...scope,sensorId:'SENSOR-02'},
+    inputContract:{adapterId:'pump-nine-source-features-v1',sourceProfileId:'pump-cf-sk-ku-summary-v1',
+      shape:[9],features:['cf_a_1','cf_a_2','cf_a_3','sk_a_1','sk_a_2','sk_a_3','ku_a_1','ku_a_2','ku_a_3'],
+      unit:'source_feature_values',historyRows:24,historyIntervalSec:25,currentEventMaxDelaySec:50}};
+}
+function verifierRow(score=0) {
+  const m=verifierMetadata(),row=completed(score,m);
+  Object.assign(row.window,{sensorId:'SENSOR-02',profileId:m.inputContract.sourceProfileId,
+    features:Object.fromEntries(m.inputContract.features.map(k=>[k,0]))});
+  row.analysis.evidence={historicalRecordsUsed:24};
+  row.transmission={...transmission('normal_periodic'),policyId:'pump-verifier-history-v1',reason:'history_periodic',intervalSec:25};
+  return row;
+}
+test('verifier ratio and baseline outcome never claim fault probability or confirmed normal',async()=>{
+  for (const score of [0,1,1.01,40]) {
+    const h=fixture(),row=verifierRow(score);
+    h.context.reply=()=>({...result([row],verifierMetadata()),eventPolicy:{mode:'events'}});await load(h);
+    assert.match(value(h),score>1 ? /이상 후보 · 학습 기준 초과/ : /학습 기준 미초과 · 정상 확정 아님/);
+    assert.ok(value(h).includes(`${score} / > 1 (novelty_reference_ratio)`));
+    assert.match(value(h),/25초 정기 이력/);assert.match(value(h),/24건 \/ 필요 24건/);
+    assert.match(value(h),/SENSOR-02/);assert.match(value(h),/고장 확률 아님/);
+    assert.doesNotMatch(value(h),/모델 정상 후보|서버 이상 1건으로 발생/);
+  }
+});
+test('verifier incomplete history and sensor mismatch never produce a prediction',async()=>{
+  const h=fixture(),row=verifierRow(2);
+  row.window.sensorId='SENSOR-03';h.context.reply=()=>result([row],verifierMetadata());await load(h);
+  assert.match(value(h),/결과 형식 확인 필요/);assert.doesNotMatch(value(h),/이상 후보 · 학습 기준 초과/);
+  row.window.sensorId='SENSOR-02';row.analysis.status='unavailable';row.analysis.reason='VERIFIER_REQUIRES_24_PRIOR_RECORDS';
+  row.analysis.evidence.historicalRecordsUsed=3;await load(h);
+  assert.match(value(h),/25초 과거 이력 24건 확보 필요/);assert.match(value(h),/3건 \/ 필요 24건/);
+});
+test('verifier freshness uses 25 seconds and recovery notification is not a normal guarantee',async()=>{
+  const h=fixture(),row=verifierRow(0);
+  h.context.reply=()=>({...result([row],verifierMetadata()),queriedAt:at(86)});await load(h);
+  assert.match(value(h),/최신 측정 지연.*예상 25초/);
+  h.context.event={source:'snapshot',snapshotTransition:'closed',title:'이력 검증',
+    snapshotEvidence:{inference:{model:verifierMetadata()}}};
+  h.run('renderNotifications([{event,deliveredAt:"2026-09-12T00:00:00Z"}])');
+  assert.match(text(h.get('notifications')),/이력 모델 기준 미초과 · 사건 해제/);
+  assert.doesNotMatch(text(h.get('notifications')),/정상 복귀/);
+});
+
 test('overview has an independent new panel and preserves historical RF66',()=>{
   assert.match(source,/id="snapshotPanel"/); assert.match(source,/id="rf66Panel"/);
   assert.ok(!source.includes('.innerHTML'));

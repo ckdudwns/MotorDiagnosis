@@ -130,7 +130,7 @@ def render_page() -> str:
       <section class="grid">
         <article class="panel wide" id="snapshotPanel">
           <h2>단건 진동 수신 · 새 모델 판정</h2>
-          <p>보드 보고 기준: 평상시 5분마다 1건 · 이상 진입 즉시 1건 · 이상 상태 중 10초마다 1건 · 정상 복귀 즉시 1건.</p>
+          <p>새 이력 정책: 상태와 관계없이 25초마다 특징 9개 · 과거 24건 확보 후 검증. 이상 진입·정상 복귀 즉시, 이상 유지 중 10초 보고는 이력과 별도로 검증합니다. 이전 5분 단건 정책도 구분하여 표시합니다.</p>
           <p>보드 상태는 장치가 보고한 값이며 서버 모델 판정과 다릅니다. 새 단건 결과는 기존 통계 점수·RF66 과거 이력과 별개입니다. 사건·알림은 아래 운영 모드에 따르며 교체 모델 미설정 시 생성하지 않습니다.</p>
           <p id="snapshotStatus" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
           <div id="snapshotRows"></div>
@@ -485,19 +485,33 @@ def render_page() -> str:
     const snapshotNumber = value => typeof value === "number" && Number.isFinite(value);
     const snapshotTime = value => typeof value === "string" && Number.isFinite(Date.parse(value));
     const snapshotScope = (value, scope) => value && ["deviceId","siteId","assetId"].every(k => value[k] === scope[k]);
+    const verifierFeatures = ["cf_a_1","cf_a_2","cf_a_3","sk_a_1","sk_a_2","sk_a_3","ku_a_1","ku_a_2","ku_a_3"];
+    const isHistoryVerifier = model => model?.contractId === "history-event-verifier-v1";
     function snapshotModelValid(model, scope) {
       const input = model?.inputContract;
-      return model?.contractId === "single-snapshot-anomaly-v1" && snapshotScope(model.scope, scope)
+      const common = snapshotScope(model?.scope, scope)
         && ["modelId","modelVersion","preprocessingVersion","scoreType"].every(k =>
           typeof model[k] === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(model[k]))
-        && snapshotNumber(model.threshold) && [">",">=","<","<="].includes(model.comparison)
+        && snapshotNumber(model.threshold) && [">",">=","<","<="].includes(model.comparison);
+      if (!common) return false;
+      if (isHistoryVerifier(model)) return model.modelId === "pump-event-verifier-v1"
+        && typeof model.scope.sensorId === "string" && /^[A-Z0-9][A-Z0-9._-]{0,99}$/.test(model.scope.sensorId)
+        && model.scoreType === "novelty_reference_ratio" && model.threshold === 1 && model.comparison === ">"
+        && input?.adapterId === "pump-nine-source-features-v1" && input.sourceProfileId === "pump-cf-sk-ku-summary-v1"
+        && JSON.stringify(input.shape) === "[9]" && JSON.stringify(input.features) === JSON.stringify(verifierFeatures)
+        && input.unit === "source_feature_values" && input.historyRows === 24 && input.historyIntervalSec === 25 && input.currentEventMaxDelaySec === 50;
+      return model.contractId === "single-snapshot-anomaly-v1"
         && input?.adapterId === "adxl345-xyz-g-unmodified-v1" && input.sourceProfileId === "adxl345-800hz-xyz-counts-v1"
         && JSON.stringify(input.shape) === "[512,3]" && JSON.stringify(input.axes) === '["X","Y","Z"]'
         && input.unit === "g" && input.sampleRateHz === 800 && input.gPerCount === .0039 && input.meanRemoved === false;
     }
     function snapshotCompleted(item) {
       const a = item.analysis, model = a?.inference?.model, w = item.window;
-      if (a?.status !== "completed" || w.quality !== "valid" || w.sampleCount !== 512
+      const inputValid = isHistoryVerifier(model) ? w.profileId === "pump-cf-sk-ku-summary-v1"
+        && w.sensorId === model.scope?.sensorId
+        && w.features && Object.keys(w.features).length === 9 && verifierFeatures.every(k=>snapshotNumber(w.features[k]))
+        : w.sampleCount === 512;
+      if (a?.status !== "completed" || w.quality !== "valid" || !inputValid
           || !snapshotModelValid(model, w) || !snapshotNumber(a.score) || !snapshotNumber(a.threshold)
           || typeof a.verdict !== "boolean" || a.affectsAlerts !== false || a.reason !== null
           || !snapshotTime(a.inference.completedAt) || a.inference.inputDigest !== item.digest
@@ -510,7 +524,9 @@ def render_page() -> str:
     }
     function snapshotProcessing(item) {
       const a = item.analysis || {}, job = item.inferenceJob;
-      if (snapshotCompleted(item)) return a.verdict ? "모델 이상 후보" : "모델 정상 후보";
+      if (snapshotCompleted(item)) return isHistoryVerifier(a.inference.model)
+        ? (a.verdict ? "이상 후보 · 학습 기준 초과" : "학습 기준 미초과 · 정상 확정 아님")
+        : (a.verdict ? "모델 이상 후보" : "모델 정상 후보");
       if (a.status === "unavailable") return "판정 불가";
       if (a.status === "queued" && item.window.quality === "valid") return "입력 준비 대기";
       if (a.status === "waiting_model" && item.window.quality === "valid") return "모델 대기 · 이 구간에 모델 미배정";
@@ -522,7 +538,10 @@ def render_page() -> str:
       return "판정 불가 · 결과 형식 확인 필요";
     }
     function snapshotReason(reason) {
-      const labels = {MODEL_NOT_CONFIGURED:"수신 당시 모델 미설정",INFERENCE_NOT_ENABLED:"입력 준비 전",
+      const labels = {VERIFIER_REQUIRES_24_PRIOR_RECORDS:"25초 과거 이력 24건 확보 필요",
+        VERIFIER_HISTORY_DISCONTINUITY:"25초 이력 시각·순번 불연속",VERIFIER_HISTORY_UPTIME_DISCONTINUITY:"이력 uptime 불연속",
+        VERIFIER_HISTORY_QUALITY_OR_SCOPE:"이력 품질 불량 또는 부팅·대상 변경",VERIFIER_EVENT_HISTORY_TOO_OLD:"마지막 이력과 현재 구간의 간격이 50초 초과 또는 시각 불일치",
+        MODEL_NOT_CONFIGURED:"수신 당시 모델 미설정",INFERENCE_NOT_ENABLED:"입력 준비 전",
         fifo_overrun:"센서 FIFO 넘침",clipped:"센서 포화",sample_gap:"샘플 누락",
         sensor_unavailable:"센서 사용 불가",INPUT_PREPARATION_FAILED:"입력 준비 실패",
         SNAPSHOT_INTEGRITY_MISMATCH:"무결성 불일치",SNAPSHOT_INPUT_INTEGRITY_FAILED:"추론 입력 무결성 확인 실패",
@@ -531,6 +550,22 @@ def render_page() -> str:
       return Object.hasOwn(labels, reason) ? labels[reason] + " (" + reason + ")" : (reason || "—");
     }
     function snapshotDelivery(info) {
+      if (info?.policyId === "pump-verifier-history-v1") {
+        const history = info.reason === "history_periodic";
+        const expected = history ? [info.state,"periodic",25] : {
+          anomaly_enter:["ANOMALY_ACTIVE","immediate",0],anomaly_periodic:["ANOMALY_ACTIVE","periodic",10],
+          normal_recovered:["NORMAL","immediate",0]}[info.reason];
+        const a=info.anomalyCount,n=info.normalCount;
+        if (!expected || !["NORMAL","ANOMALY_ACTIVE"].includes(info.state)
+            || info.state!==expected[0] || info.mode!==expected[1] || info.intervalSec!==expected[2]
+            || ![a,n].every(v=>Number.isInteger(v)&&v>=0&&v<=2147483647) || (a&&n)
+            || (info.state==="NORMAL"&&a>=3) || (info.state==="ANOMALY_ACTIVE"&&n>=5)
+            || (info.reason==="anomaly_enter"&&(a!==3||n!==0)) || (info.reason==="normal_recovered"&&(n!==5||a!==0)))
+          return {state:"보고 형식 확인 필요",reason:"전송 정책 확인 필요",interval:null,counters:"미확인"};
+        return {state:info.state+" · 보드 보고",reason:history ? "25초 정기 이력" : {
+          anomaly_enter:"이상 진입 · 즉시 검증",anomaly_periodic:"이상 유지 · 10초 검증",normal_recovered:"정상 복귀 · 즉시 검증"}[info.reason],
+          interval:info.state==="NORMAL" ? 25 : 10,counters:`이상 ${a}회 / 정상 ${n}회 (보드 보고)`};
+      }
       if (info?.policyId === "periodic-single-v1" && info.mode === "periodic" && info.intervalSec === 300)
         return {state:"미보고 (이전 5분 정책)", reason:"5분 정기 전송", interval:300, counters:"미보고"};
       const rules = {
@@ -561,7 +596,8 @@ def render_page() -> str:
       return `예상 보고 간격 내 · ${Math.max(0,Math.round(age))}초 전 측정 (예상 ${interval}초 + 여유 60초)`;
     }
     function snapshotModelText(model) {
-      return `${model.modelId} · ${model.modelVersion} · 전처리 ${model.preprocessingVersion} · ${model.scoreType} · 점수 ${model.comparison} ${model.threshold}일 때 이상 후보`;
+      return `${model.modelId} · ${model.modelVersion} · 전처리 ${model.preprocessingVersion} · ${model.scoreType} · 점수 ${model.comparison} ${model.threshold}일 때 이상 후보`
+        + (isHistoryVerifier(model) ? ` · 적용 센서 ${model.scope.sensorId} · 고장 확률 아님 · 라벨 기반 성능·적용 장비 검증 미완료` : "");
     }
     function renderSnapshotCard(result) {
       const card = document.createElement("section"); card.className = "history-card";
@@ -571,7 +607,8 @@ def render_page() -> str:
         : "현재 교체 모델 미설정 · 수신·입력 준비는 가능하며, 기존 RF66은 실행하지 않습니다.";
       const policy = document.createElement("p");
       policy.textContent = "단건 이벤트 운영 모드: " + ({shadow:"비교만 · 사건·알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 허용 (정책·입력 유효성 적용)"}[result.eventPolicy?.mode] || "미확인 (이전 서버)")
-        + " · 서버 이상 1건으로 발생 / 같은 모델 정상 1건으로 복귀 · 품질 불량·수신 중단은 관측 불명";
+        + (isHistoryVerifier(result.configuredModel) ? " · 이력 검증 기준 초과로 발생 / 같은 모델 기준 미초과로 사건 해제 (장비 정상 확정 아님)"
+          : " · 서버 이상 1건으로 발생 / 같은 모델 정상 1건으로 복귀") + " · 품질 불량·수신 중단은 관측 불명";
       card.append(title,configured,policy);
       // Measured time, not receipt time, determines the latest state. Keep the API's tie order.
       const items = [...result.items].sort((a,b) => Date.parse(b.window.timestamp) - Date.parse(a.window.timestamp));
@@ -581,9 +618,11 @@ def render_page() -> str:
       }
       const latest = items[0], delivery = snapshotDelivery(latest.transmission);
       card.appendChild(facts([
+        ["최근 측정 센서",latest.window.sensorId || "미구분 (이전 Raw 규격)"],
         ["최근 측정 시각",formatLocalTime(latest.window.timestamp)], ["해당 구간 서버 수신 시각",formatLocalTime(latest.receivedAt)],
         ["최근 측정의 보드 보고",delivery.state], ["전송 사유",delivery.reason],
         ["최근 구간 서버 처리",snapshotProcessing(latest)], ["입력 품질·사유",latest.window.quality + " / " + snapshotReason(latest.analysis?.reason)],
+        ["검증에 사용한 과거 이력",latest.analysis?.evidence ? `${latest.analysis.evidence.historicalRecordsUsed}건 / 필요 24건` : "—"],
       ]));
       const freshness = document.createElement("p"); freshness.textContent = snapshotFreshness(latest,result.queriedAt)
         + " · 장치 온라인/오프라인 판정이 아닙니다. 아래 장치 상태에서 별도로 확인하세요.";
@@ -598,13 +637,14 @@ def render_page() -> str:
         items.slice(0,20).map(item => {
           const a = item.analysis || {}, valid = snapshotCompleted(item), d = snapshotDelivery(item.transmission);
           const m = a.inference?.model;
-          const same = m && result.configuredModel && ["modelId","modelVersion","preprocessingVersion","scoreType","threshold","comparison"].every(k => m[k] === result.configuredModel[k]);
+          const same = m && result.configuredModel && ["modelId","modelVersion","preprocessingVersion","scoreType","threshold","comparison"].every(k => m[k] === result.configuredModel[k])
+            && (!isHistoryVerifier(m) || m.scope.sensorId === result.configuredModel.scope.sensorId);
           return [formatLocalTime(item.window.timestamp) + " / " + formatLocalTime(item.receivedAt),
             d.state + " / " + d.reason + " / " + d.counters, snapshotProcessing(item),
             valid ? `${a.score} / ${a.comparison} ${a.threshold} (${a.scoreType})` : "—",
             item.window.quality + " / " + snapshotReason(a.reason),
             valid ? formatLocalTime(a.inference.completedAt) + " / " + snapshotModelText(m) + (same ? "" : " (이전 모델 설정의 결과)") : "—",
-            item.window.bootId + " / #" + item.window.windowIndex + (item.lateArrival ? " · 늦은 도착" : ""),
+            (item.window.sensorId ? item.window.sensorId+" / " : "") + item.window.bootId + " / #" + item.window.windowIndex + (item.lateArrival ? " · 늦은 도착" : ""),
             ({pending:"처리 대기",processed:"처리 완료 (사건 발생 여부는 이벤트 검수에서 확인)",ignored:"사건 반영 제외"}[item.eventProcessing?.status] || "미기록") + (item.eventProcessing?.reason ? " · " + item.eventProcessing.reason : "")];
         })));
       card.appendChild(scroll); return card;
@@ -877,7 +917,10 @@ def render_page() -> str:
       if (!rows.length) panel.textContent = "No notifications.";
       rows.forEach(row => {
         const item = document.createElement("p");
-        const transition = row.event.source === "snapshot" ? (row.event.snapshotTransition === "closed" ? "[단건 모델 정상 복귀] " : "[단건 모델 이상 발생] ") : "";
+        const verifier = row.event.snapshotEvidence?.inference?.model?.contractId === "history-event-verifier-v1";
+        const transition = row.event.source === "snapshot" ? (verifier
+          ? (row.event.snapshotTransition === "closed" ? "[이력 모델 기준 미초과 · 사건 해제] " : "[이력 모델 기준 초과 · 이상 후보] ")
+          : (row.event.snapshotTransition === "closed" ? "[단건 모델 정상 복귀] " : "[단건 모델 이상 발생] ")) : "";
         item.textContent = `${row.isTest ? "[TEST] " : ""}${row.event.isSynthetic ? "[SYNTHETIC] " : ""}${transition}${row.event.title} · ${new Date(row.deliveredAt).toLocaleString()}`;
         panel.appendChild(item);
       });
@@ -1204,7 +1247,7 @@ def render_page() -> str:
       const missing = document.createElement("p");
       detail.appendChild(rf66ResolutionControls(event, () => generation === detailGeneration && selectedEventId === eventId));
       missing.className = "notice";
-      missing.textContent = event.source === "snapshot" ? "단건 모델 사건입니다. 발생·최근·복귀 판정의 구간 식별자, 무결성 해시와 모델 조건을 보존합니다. 연속 시계열·RF66 3구간 정책을 사용하지 않습니다."
+      missing.textContent = event.source === "snapshot" ? "서버 모델 사건입니다. 발생·최근·해제 판정의 식별자, 무결성 해시와 모델 조건을 보존합니다. 이력 모델은 과거 24개 기록의 근거도 포함합니다. RF66 3구간 정책과 별개입니다."
         : response.context.rawDataMissing ? "요약 시계열 없음: 보관기간 만료 또는 미수신. 보존된 특징·버전만 표시합니다." : `전후 요약 시계열 ${response.context.points.length}건 · 출처 ${response.context.source} (원시 파형은 별도 분석 기록에서 확인)`;
       detail.appendChild(missing);
       if (response.analysis) {

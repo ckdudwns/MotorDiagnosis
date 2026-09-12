@@ -19,6 +19,7 @@ from .raw_samples import PROFILE_ID as RAW_PROFILE, normalize as normalize_raw
 from .snapshot_input import ADAPTER_ID, prepare_input
 from .snapshot_inference import SnapshotInference
 from .snapshot_model import SnapshotModelAdapter
+from .pump_summary import PROFILE_ID as SUMMARY_PROFILE, POLICY_ID as HISTORY_POLICY
 from .snapshot_events import MODES as EVENT_MODES, SnapshotEvents
 from .transmission_policy import (
     EDGE_SNAPSHOT_POLICY_ID, snapshot_interval_seconds, snapshot_policy_metadata,
@@ -50,6 +51,9 @@ def canonical(payload):
 
 def normalize_window(window, *, check_time_bounds=True):
     """Verify wire bytes, not an RF66 feature vector or a JSON-file checksum."""
+    if window.get("profileId") == SUMMARY_PROFILE:
+        from .pump_summary import normalize
+        return normalize(window, check_time_bounds=check_time_bounds)
     integrity = window.get("integrity")
     if (not isinstance(integrity, dict) or set(integrity) != {"algorithm", "digest"}
             or integrity["algorithm"] != "sha256"):
@@ -96,7 +100,7 @@ class PeriodicSnapshotStore:
                 raise ValueError("Periodic snapshots require a separate database file")
             if "periodic_snapshot_schema" in tables:
                 versions = self.db.execute("SELECT version FROM periodic_snapshot_schema").fetchall()
-                if len(versions) != 1 or versions[0][0] not in (1, 2, 3):
+                if len(versions) != 1 or versions[0][0] not in (1, 2, 3, 4):
                     raise ValueError("Unsupported periodic snapshot schema")
             self.db.executescript("""
                 PRAGMA journal_mode=WAL;
@@ -137,9 +141,11 @@ class PeriodicSnapshotStore:
                     projected INTEGER NOT NULL DEFAULT 0);
                 CREATE UNIQUE INDEX IF NOT EXISTS snapshot_active_incident
                     ON snapshot_incidents(device,binding) WHERE status='open';
-                UPDATE periodic_snapshot_schema SET version=3;
+                UPDATE periodic_snapshot_schema SET version=3 WHERE version<3;
                 COMMIT;
             """)
+            from .snapshot_schema import add_sensor_identity
+            add_sensor_identity(self.db)
         except Exception:
             self.db.close()
             raise
@@ -155,10 +161,11 @@ class PeriodicSnapshotStore:
     def _check_chronology(self, window, captured):
         """Clock checks use acquisition time, never HTTP arrival intervals."""
         device, boot, index = (window[k] for k in ("deviceId", "bootId", "windowIndex"))
+        sensor = window.get("sensorId", "")
         uptime = window["startUptimeUs"]
         context = json.dumps([window[k] for k in ("siteId", "assetId", "profileId")])
         stream = self.db.execute(
-            "SELECT * FROM snapshot_streams WHERE device=? AND boot=?", (device, boot)).fetchone()
+            "SELECT * FROM snapshot_streams WHERE device=? AND sensor=? AND boot=?", (device, sensor, boot)).fetchone()
         if stream:
             if context != stream["context"]:
                 reject("Snapshot stream context changed; use a new bootId", 409, "SNAPSHOT_SEQUENCE_CONFLICT")
@@ -168,8 +175,8 @@ class PeriodicSnapshotStore:
             # Late retries may fill history but cannot falsify either neighbor.
             for operator, order in (("<", "DESC"), (">", "ASC")):
                 neighbor = self.db.execute(
-                    f"SELECT idx,uptime,captured FROM periodic_snapshots WHERE device=? AND boot=? "
-                    f"AND idx{operator}? ORDER BY idx {order} LIMIT 1", (device, boot, index)).fetchone()
+                    f"SELECT idx,uptime,captured FROM periodic_snapshots WHERE device=? AND sensor=? AND boot=? "
+                    f"AND idx{operator}? ORDER BY idx {order} LIMIT 1", (device, sensor, boot, index)).fetchone()
                 if neighbor:
                     if operator == "<":
                         ordered = uptime > neighbor["uptime"] and captured > neighbor["captured"]
@@ -181,8 +188,8 @@ class PeriodicSnapshotStore:
         else:
             if self.db.execute("SELECT count(*) FROM snapshot_streams").fetchone()[0] >= self.max_streams:
                 reject("Snapshot stream capacity reached; retry later", 503, "SNAPSHOT_BACKPRESSURE")
-            self.db.execute("INSERT INTO snapshot_streams VALUES(?,?,?,?,?)",
-                            (device, boot, context, uptime, captured))
+            self.db.execute("INSERT INTO snapshot_streams VALUES(?,?,?,?,?,?)",
+                            (device, boot, context, uptime, captured, sensor))
 
     @device_lifecycle.serialized
     def ingest(self, principal, device_id, payload):
@@ -203,25 +210,36 @@ class PeriodicSnapshotStore:
                 # Exact retry remains valid even if its original measurement has
                 # aged beyond the NEW-input time bounds. No ACK timestamp rewrite.
                 boot, index = window.get("bootId"), window.get("windowIndex")
+                sensor = window.get("sensorId", "")
+                if not isinstance(sensor, str):
+                    reject("Invalid sensorId", code="INVALID_PERIODIC_SNAPSHOT")
                 if not isinstance(boot, str) or type(index) is not int:
                     reject("Invalid snapshot identity", code="INVALID_PERIODIC_SNAPSHOT")
                 if not 0 <= index <= 2**31 - 1:
                     reject("Invalid windowIndex", code="INVALID_PERIODIC_SNAPSHOT")
                 row = self.db.execute(
-                    "SELECT * FROM periodic_snapshots WHERE device=? AND boot=? AND idx=?",
-                    (device_id, boot, index)).fetchone()
+                    "SELECT * FROM periodic_snapshots WHERE device=? AND sensor=? AND boot=? AND idx=?",
+                    (device_id, sensor, boot, index)).fetchone()
                 accepted = 0
                 if row:
                     if row["digest"] != digest:
                         reject("Same snapshot identity has different content", 409, "SNAPSHOT_CONFLICT")
                 else:
                     captured = normalize_window(window)
+                    if window.get("profileId") == SUMMARY_PROFILE and window.get("historySequence") is not None:
+                        # A retry uses the same window identity; a second distinct
+                        # window cannot reuse a scheduled-history sequence.
+                        conflict = self.db.execute("""SELECT 1 FROM periodic_snapshots
+                            WHERE device=? AND sensor=? AND boot=? AND json_extract(body,'$.window.historySequence')=? LIMIT 1""",
+                            (device_id, sensor, boot, window["historySequence"])).fetchone()
+                        if conflict:
+                            reject("History sequence already belongs to a different window", 409, "SNAPSHOT_SEQUENCE_CONFLICT")
                     if self.db.execute("SELECT count(*) FROM periodic_snapshots").fetchone()[0] >= self.max_rows:
                         reject("Snapshot storage capacity reached; retry later", 503, "SNAPSHOT_BACKPRESSURE")
                     self._check_chronology(window, captured)
                     latest = self.db.execute(
-                        "SELECT max(captured) FROM periodic_snapshots WHERE device=? AND site=? AND asset=?",
-                        (device_id, window["siteId"], window["assetId"])).fetchone()[0]
+                        "SELECT max(captured) FROM periodic_snapshots WHERE device=? AND sensor=? AND site=? AND asset=?",
+                        (device_id, sensor, window["siteId"], window["assetId"])).fetchone()[0]
                     late = latest is not None and captured <= latest
                     quality = window["quality"]
                     status = "queued" if quality == "valid" else "unavailable"
@@ -231,11 +249,11 @@ class PeriodicSnapshotStore:
                     })
                     inserted = self.db.execute(
                         """INSERT INTO periodic_snapshots
-                        (device,site,asset,boot,idx,uptime,captured,received,digest,body,late,quality,status,result)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (device,site,asset,boot,idx,uptime,captured,received,digest,body,late,quality,status,result,sensor)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (device_id, window["siteId"], window["assetId"], boot, index,
                          window["startUptimeUs"], captured, time.time(), digest, body,
-                         int(late), quality, status, result))
+                         int(late), quality, status, result, sensor))
                     row = self.db.execute("SELECT * FROM periodic_snapshots WHERE ordinal=?",
                                           (inserted.lastrowid,)).fetchone()
                     self.inference.enqueue(inserted.lastrowid, window)
@@ -249,6 +267,7 @@ class PeriodicSnapshotStore:
         return {
             "deviceId": device_id, "policyId": transmission["policyId"], "accepted": accepted,
             "acknowledged": [{"bootId": row["boot"], "windowIndex": row["idx"],
+                              **({"sensorId": row["sensor"]} if row["sensor"] else {}),
                               "digest": row["digest"], "receivedAt": iso(row["received"])}],
             "duplicate": not bool(accepted), "lateArrival": bool(row["late"]),
             "processingStatus": row["status"], "processingEnabled": True,
@@ -293,6 +312,7 @@ class PeriodicSnapshotStore:
                 # Already accepted input may legitimately outlive reception's 48h limit.
                 normalize_window(window, check_time_bounds=False)
                 result["preparedInput"] = prepare_input(window)
+                result["inputPreparation"]["adapterId"] = result["preparedInput"]["adapterId"]
             except (data.ApiError, ValueError, TypeError, KeyError, OverflowError) as exc:
                 result.update(status="unavailable", reason=(exc.code if isinstance(exc, data.ApiError)
                               else str(exc) if str(exc) in {"clipped", "sample_gap"}
@@ -332,23 +352,25 @@ class PeriodicSnapshotStore:
                 ORDER BY w.captured DESC,w.late ASC,w.ordinal DESC LIMIT ?""", (*scope, LIST_LIMIT))}
         latest_transmission = json.loads(rows[0]["body"])["transmission"] if rows else None
         model = self.inference.model
-        configured = model.metadata() if model is not None and model.matches(
-            {"deviceId": device_id, "siteId": device["siteId"], "assetId": device["assetId"]}) else None
+        current_scope = {"deviceId": device_id, "siteId": device["siteId"], "assetId": device["assetId"]}
+        configured = model.metadata() if model is not None and all(
+            model.metadata()["scope"].get(k) == v for k, v in current_scope.items()) else None
         return {
             "deviceId": device_id, "siteId": device["siteId"], "assetId": device["assetId"],
             "queriedAt": iso(time.time()),
             "policyId": latest_transmission["policyId"] if latest_transmission else EDGE_SNAPSHOT_POLICY_ID,
             "intervalSec": snapshot_interval_seconds(latest_transmission or {}),
-            "preferredPolicyId": EDGE_SNAPSHOT_POLICY_ID,
+            "preferredPolicyId": HISTORY_POLICY if configured and getattr(model, "requires_history", False) else EDGE_SNAPSHOT_POLICY_ID,
             "transmissionPolicies": snapshot_policy_metadata(),
             "latestTransmission": latest_transmission,
             "boardStateSource": "device_report", "boardStateVerifiedByServer": False,
             "processingEnabled": True, "inferenceEnabled": configured is not None,
-            "stage": "inference" if configured else "input_preparation", "inputAdapterId": ADAPTER_ID,
+            "stage": "inference" if configured else "input_preparation",
+            "inputAdapterId": configured["inputContract"]["adapterId"] if configured else ADAPTER_ID,
             "configuredModel": configured, "modelStatus": "ready" if configured else "not_configured", "limit": LIST_LIMIT,
             "affectsAlerts": configured is not None and self.events.mode == "alerts", "historyReprocessingEnabled": False,
             "eventPolicy": self.events.metadata(),
-            "statuses": statuses, "supportedProfileIds": [RAW_PROFILE],
+            "statuses": statuses, "supportedProfileIds": [RAW_PROFILE, SUMMARY_PROFILE],
             "items": [{**json.loads(row["body"]), "ordinal": row["ordinal"],
                        "digest": row["digest"], "receivedAt": iso(row["received"]),
                        "lateArrival": bool(row["late"]),

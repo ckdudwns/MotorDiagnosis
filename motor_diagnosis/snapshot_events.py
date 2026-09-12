@@ -51,6 +51,11 @@ class SnapshotEvents:
                               (ordinal, self.mode, binding, "pending", None))
 
     def _latest(self, device):
+        model = self.store.inference.model
+        if getattr(model, "requires_history", False):
+            return self.store.db.execute("SELECT * FROM periodic_snapshots WHERE device=? AND sensor=? "
+                "ORDER BY captured DESC,late ASC,ordinal DESC LIMIT 1",
+                (device, model.metadata()["scope"]["sensorId"])).fetchone()
         return self.store.db.execute("SELECT * FROM periodic_snapshots WHERE device=? "
             "ORDER BY captured DESC,late ASC,ordinal DESC LIMIT 1", (device,)).fetchone()
 
@@ -97,7 +102,8 @@ class SnapshotEvents:
                 return "MODEL_OR_INPUT_CHANGED"
             score, verdict = result.get("score"), result.get("verdict")
             if (type(score) not in (int, float) or not math.isfinite(score) or type(verdict) is not bool
-                    or result.get("reason") is not None or window.get("sampleCount") != 512
+                    or result.get("reason") is not None
+                    or (not getattr(model, "requires_history", False) and window.get("sampleCount") != 512)
                     or any(result.get(k) != meta[k] for k in ("modelVersion", "threshold", "comparison", "scoreType"))):
                 return "MODEL_RESULT_INVALID"
             threshold = meta["threshold"]
@@ -114,10 +120,12 @@ class SnapshotEvents:
         payload, result = json.loads(row["body"]), json.loads(row["result"])
         w = payload["window"]
         return {"ordinal": row["ordinal"], "digest": row["digest"],
+                **({"sensorId": w["sensorId"]} if "sensorId" in w else {}),
                 "receivedAt": row["received"],
                 **{k: w[k] for k in ("deviceId", "siteId", "assetId", "bootId", "windowIndex", "timestamp", "quality")},
                 **{k: result[k] for k in ("score", "threshold", "comparison", "scoreType", "verdict", "modelVersion")},
-                "inference": result["inference"], "transmission": payload["transmission"]}
+                "inference": result["inference"], "transmission": payload["transmission"],
+                **({"modelEvidence": result["evidence"]} if "evidence" in result else {})}
 
     def _save(self, event):
         event["snapshotRevision"] = event.get("snapshotRevision", 0) + 1
@@ -155,8 +163,13 @@ class SnapshotEvents:
                         "snapshotScore": result["score"], "snapshotThreshold": result["threshold"],
                         "snapshotPolicy": self.metadata(), "snapshotTransition": "open",
                         "snapshotTransitionAt": w["timestamp"], "snapshotEvidence": evidence}
+                    if getattr(model, "requires_history", False):
+                        event.update(title=row["asset"] + " · 이력 검증 모델 기준 초과",
+                                     sensorId=w["sensorId"], verificationLabel="unknown",
+                                     note="25초 이력 24건 대비 이상 후보입니다. 점수는 고장 확률이 아니며 확정 고장 판정이 아닙니다.")
             elif event is not None and not result["verdict"]:
-                event.update(status="closed", endAt=w["timestamp"], endReason="single_normal_snapshot",
+                event.update(status="closed", endAt=w["timestamp"],
+                    endReason="novelty_reference_not_exceeded" if getattr(model, "requires_history", False) else "single_normal_snapshot",
                     snapshotTransition="closed", snapshotTransitionAt=w["timestamp"], snapshotRecoveryEvidence=evidence)
             if event is not None:
                 event_id = event["id"]

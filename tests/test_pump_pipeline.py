@@ -145,7 +145,7 @@ class PumpPipelineTest(unittest.TestCase):
         self.assertEqual(matrix.shape, (2, 4))
 
     def fixed_model(self):
-        model, report, _ = experiment({"sensor": self.records()}, ["rms_a_1"])
+        model, report, _ = experiment({"sensor": self.records(600)}, ["rms_a_1"])
         model["evaluation"] = {
             "trainBefore": report["trainBefore"],
             "testFrom": report["testFrom"],
@@ -154,7 +154,8 @@ class PumpPipelineTest(unittest.TestCase):
 
     def test_fixed_model_analyzes_one_new_row_and_scores_its_prior_forecast(self):
         analyzer = FixedPumpAnalyzer(self.fixed_model())
-        rows = self.records(13)
+        rows = self.records(73)
+        compared = None
         for index, row in enumerate(rows):
             result = analyzer.ingest(
                 "sensor",
@@ -163,9 +164,11 @@ class PumpPipelineTest(unittest.TestCase):
                 [float(row["rms_a_1"])],
                 source_document_id=row["_document_id"],
             )
+            if "previousForecast" in result:
+                compared = result
         self.assertEqual(result["status"], "analyzed")
-        self.assertIn("previousForecast", result)
-        self.assertEqual(result["nextForecast"]["horizonSec"], EXPECTED_INTERVAL_SEC)
+        self.assertIsNotNone(compared)
+        self.assertEqual(result["nextForecast"]["horizonSec"], 300)
 
     def test_fixed_model_resets_on_non_five_second_gap_or_sequence_break(self):
         analyzer = FixedPumpAnalyzer(self.fixed_model())
@@ -202,7 +205,7 @@ class PumpPipelineTest(unittest.TestCase):
     def test_replay_uses_fixed_artifact_without_refitting(self):
         model = self.fixed_model()
         original = repr(model)
-        replay, summary = replay_fixed_model(model, {"sensor": self.records()})
+        replay, summary = replay_fixed_model(model, {"sensor": self.records(600)})
         self.assertTrue(replay)
         self.assertEqual(summary["mode"], "fixed_model_sequential_replay")
         self.assertGreater(summary["forecastComparisons"], 0)

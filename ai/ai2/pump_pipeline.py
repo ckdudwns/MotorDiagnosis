@@ -20,6 +20,8 @@ LABELS = ("물 수위(L)", "슬러지 유무", "이벤트")
 VERSION = "pump-summary-experiment-v1"
 WINDOW_ROWS = 12
 EXPECTED_INTERVAL_SEC = 5
+FORECAST_HORIZON_SEC = 300
+FORECAST_STEPS = FORECAST_HORIZON_SEC // EXPECTED_INTERVAL_SEC
 
 
 def temporal_windows(records: list) -> tuple[list, np.ndarray]:
@@ -66,7 +68,7 @@ def window_vector(history: list[np.ndarray]) -> np.ndarray:
 @dataclass
 class _RuntimeState:
     history: list[tuple[datetime, int, np.ndarray]] = field(default_factory=list)
-    pending_forecast: dict | None = None
+    pending_forecasts: dict[str, dict] = field(default_factory=dict)
 
 
 class FixedPumpAnalyzer:
@@ -125,7 +127,7 @@ class FixedPumpAnalyzer:
         )
         if not quality_ok or (previous is not None and not continuous):
             state.history.clear()
-            state.pending_forecast = None
+            state.pending_forecasts.clear()
             result["historyResetReason"] = (
                 "quality_invalid"
                 if not quality_ok
@@ -133,12 +135,10 @@ class FixedPumpAnalyzer:
             )
         if not quality_ok:
             return result
-        if (
-            state.pending_forecast
-            and state.pending_forecast["predictedFor"] == at.isoformat()
-        ):
-            predicted = np.array(state.pending_forecast["values"])
-            scale = np.array(state.pending_forecast["targetStd"])
+        pending = state.pending_forecasts.pop(at.isoformat(), None)
+        if pending is not None:
+            predicted = np.array(pending["values"])
+            scale = np.array(pending["targetStd"])
             error = np.abs(predicted - numeric)
             result["previousForecast"] = {
                 "predictedFor": at.isoformat(),
@@ -177,8 +177,8 @@ class FixedPumpAnalyzer:
             ) + np.array(
                 forecast["targetMean"]
             )
-            predicted_at = (at + timedelta(seconds=EXPECTED_INTERVAL_SEC)).isoformat()
-            state.pending_forecast = {
+            predicted_at = (at + timedelta(seconds=FORECAST_HORIZON_SEC)).isoformat()
+            state.pending_forecasts[predicted_at] = {
                 "predictedFor": predicted_at,
                 "values": estimate.tolist(),
                 "targetStd": forecast["targetStd"],
@@ -186,7 +186,7 @@ class FixedPumpAnalyzer:
             result["nextForecast"] = {
                 "predictedFor": predicted_at,
                 "features": estimate.tolist(),
-                "horizonSec": EXPECTED_INTERVAL_SEC,
+                "horizonSec": FORECAST_HORIZON_SEC,
             }
         return result
 
@@ -200,6 +200,8 @@ def validate_model(model: dict) -> None:
         or model.get("intervalSec") != EXPECTED_INTERVAL_SEC
     ):
         raise ValueError("Model does not use the required 12-row, five-second contract")
+    if model.get("forecastHorizonSec") != FORECAST_HORIZON_SEC:
+        raise ValueError("Model does not use the required five-minute forecast horizon")
     features, streams = model.get("features"), model.get("streams")
     if not isinstance(features, list) or not features or not isinstance(streams, dict):
         raise ValueError("Model is missing features or sensor streams")
@@ -381,18 +383,19 @@ def predict(model: dict, matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def forecast_experiment(
     groups: list, matrices: list[np.ndarray]
 ) -> tuple[dict | None, dict]:
-    """Predict the next five-second summary; compare with last-value persistence."""
+    """Predict the summary five minutes ahead; compare with last-value persistence."""
     pairs = []
     for group, matrix in zip(groups, matrices):
         indices = [
             i
-            for i in range(len(group) - 1)
-            if (group[i + 1][0] - group[i][0]).total_seconds() == 5
+            for i in range(len(group) - FORECAST_STEPS)
+            if (group[i + FORECAST_STEPS][0] - group[i][0]).total_seconds()
+            == FORECAST_HORIZON_SEC
         ]
         pairs.append(
             (
                 matrix[indices],
-                np.array([group[i + 1][1] for i in indices]),
+                np.array([group[i + FORECAST_STEPS][1] for i in indices]),
                 np.array([group[i][1] for i in indices]),
             )
         )
@@ -420,7 +423,7 @@ def forecast_experiment(
     persistence = float(np.mean(np.abs(last - ty) / ystd))
     artifact = {
         "type": "ridge",
-        "horizonSec": 5,
+        "horizonSec": FORECAST_HORIZON_SEC,
         "alpha": alpha,
         "inputMean": xmean.tolist(),
         "inputStd": xstd.tolist(),
@@ -431,7 +434,7 @@ def forecast_experiment(
     }
     metrics = {
         "status": "experimental",
-        "horizonSec": 5,
+        "horizonSec": FORECAST_HORIZON_SEC,
         "testPairs": len(tx),
         "testStandardizedMAE": mae,
         "persistenceStandardizedMAE": persistence,
@@ -498,6 +501,7 @@ def experiment(sheets: dict, features: list[str]) -> tuple[dict, dict, list[dict
         "streams": {},
         "windowRows": WINDOW_ROWS,
         "intervalSec": EXPECTED_INTERVAL_SEC,
+        "forecastHorizonSec": FORECAST_HORIZON_SEC,
         "derivedFeatures": [
             name + ":" + statistic
             for statistic in ("last", "mean", "std", "delta")

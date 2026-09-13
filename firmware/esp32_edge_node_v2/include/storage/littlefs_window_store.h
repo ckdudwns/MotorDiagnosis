@@ -20,12 +20,14 @@ struct TelemetryMetadata {
     uint64_t windowMeasuredUptimeUs = 0;
     uint64_t windowMeasuredAtEpochUs = 0;
     uint64_t periodicSlotEpochUs = 0;
+    uint32_t historySequence = 0;
     uint8_t windowMeasuredAtValid = 0;
     uint8_t periodicSlotEpochValid = 0;
     uint8_t featuresValid = 0;
     uint16_t sampleCount = 0;
     uint8_t anomalyCount = 0;
     uint8_t normalCount = 0;
+    uint8_t anomalyActive = 0;
     char quality[24] = {};
     char reason[48] = {};
 };

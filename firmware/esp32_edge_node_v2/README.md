@@ -9,8 +9,8 @@ The existing `firmware/esp32_edge_node` implementation is not changed.
 - Mean removal and nine dimensionless features:
   `cf_a_1..3`, `sk_a_1..3`, `ku_a_1..3`.
 - Raw samples and RMS/peak values are not stored or sent to the server.
-- Normal operation selects the latest valid completed window for each UTC
-  25-second slot.
+- Normal operation selects the latest valid completed window for each
+  Unix-epoch-aligned 25-second slot, including while an anomaly is active.
 - Anomaly policy keeps the existing 3-consecutive-entry and 5-consecutive-
   recovery rules. Thresholds are test-only compile-time settings in
   `include/config/app_config.h`.
@@ -29,14 +29,16 @@ Content-Type: application/json
 ```
 
 The request has exactly two top-level keys: `window` and `transmission`.
-`window.schemaVersion` is `2`; the wire `windowIndex` is a common report
+`window.schemaVersion` is `3`; the wire `windowIndex` is a common report
 sequence for all event types and resets to zero on reboot with a new `bootId`.
-The internal per-measurement index is not sent.
+The internal per-measurement index is not sent. The history-only
+`historySequence` starts at zero for each boot and advances only for scheduled
+25-second records; event-only reports send `null`.
 
 `window.timestamp` is the UTC start time of the measured window and
-`startUptimeUs` is its monotonic start time. `periodicSlotEpoch` is the UTC
-25-second boundary in Unix seconds for `periodic`, and `null` for other event
-types.
+`startUptimeUs` is its monotonic start time. `periodicSlotEpoch` is the
+closing UTC 25-second boundary in Unix seconds for scheduled records, and
+`null` for event-only reports.
 
 `integrity.digest` is SHA-256 of the final transmitted feature numbers in this
 order:

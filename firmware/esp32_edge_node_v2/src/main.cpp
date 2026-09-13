@@ -30,8 +30,10 @@
 
 namespace {
 
-// Production periodic policy: one feature summary every 25 seconds.
+// History schedule: one UTC epoch-aligned slot every 25 seconds.
 constexpr uint64_t kPeriodicIntervalUs = 25000000ULL;
+constexpr uint64_t kWindowDurationUs = 640000ULL;
+constexpr uint64_t kMaxWindowEndAgeUs = 1000000ULL;
 constexpr uint64_t kAnomalyIntervalUs = 10000000ULL;
 constexpr UBaseType_t kCandidateQueueDepth = 4;
 constexpr uint32_t kRetryDelayMs = 1000;
@@ -64,6 +66,7 @@ StaticQueue_t candidateQueueControl;
 char bootId[33] = {};
 uint32_t nextWindowIndex = 0;
 uint32_t nextReportIndex = 0;
+uint32_t nextHistorySequence = 0;
 
 struct PeriodicSlot {
     bool initialized = false;
@@ -82,6 +85,14 @@ struct PeriodicSlot {
 PeriodicSlot periodicSlot;
 
 bool enqueueCandidate(const TransmissionCandidate& value);
+
+uint64_t periodicSlotStartUs(uint64_t measuredEpochUs) {
+    return (measuredEpochUs / kPeriodicIntervalUs) * kPeriodicIntervalUs;
+}
+
+uint64_t periodicSlotEndUs(uint64_t slotStartUs) {
+    return slotStartUs + kPeriodicIntervalUs;
+}
 
 void createBootId() {
     const uint32_t words[] = {esp_random(), esp_random(), esp_random(),
@@ -111,7 +122,7 @@ void preparePendingMetadata(PendingWindow& pending, uint32_t index,
     uint64_t measuredEpochUs, bool timestampValid) {
     TelemetryMetadata& metadata = pending.metadata;
     metadata = TelemetryMetadata{};
-    metadata.schemaVersion = 2;
+    metadata.schemaVersion = 3;
     fillIdentity(metadata);
     metadata.measuredWindowIndex = index;
     metadata.windowMeasuredUptimeUs = measuredUptimeUs;
@@ -148,44 +159,56 @@ void resetPeriodicSlot(uint64_t periodicSlotEpochUs) {
 }
 
 void emitPeriodicSlot() {
-    if (periodicSlot.suppressed) {
-        return;
-    }
-
-    TransmissionCandidate value = periodicSlot.latest;
-    if (!periodicSlot.hasValid) {
+    const uint64_t closingBoundaryUs =
+        periodicSlotEndUs(periodicSlot.periodicSlotEpochUs);
+    const bool latestFitsBoundary =
+        periodicSlot.hasValid &&
+        periodicSlot.latest.window.metadata.windowMeasuredAtValid &&
+        periodicSlot.latest.window.metadata.windowMeasuredAtEpochUs >=
+            closingBoundaryUs - kWindowDurationUs - kMaxWindowEndAgeUs &&
+        periodicSlot.latest.window.metadata.windowMeasuredAtEpochUs <=
+            closingBoundaryUs - kWindowDurationUs;
+    TransmissionCandidate value = latestFitsBoundary ? periodicSlot.latest
+                                                      : TransmissionCandidate{};
+    if (!latestFitsBoundary) {
         value = TransmissionCandidate{};
         TelemetryMetadata& metadata = value.window.metadata;
-        metadata.schemaVersion = 2;
+        metadata.schemaVersion = 3;
         fillIdentity(metadata);
         metadata.measuredWindowIndex = periodicSlot.lastMeasuredWindowIndex;
-        metadata.windowMeasuredAtEpochUs = periodicSlot.lastMeasuredAtEpochUs;
-        metadata.windowMeasuredAtValid = periodicSlot.lastMeasuredAtValid;
-        metadata.anomalyCount = periodicSlot.anomalyCount;
-        metadata.normalCount = periodicSlot.normalCount;
+        metadata.windowMeasuredAtEpochUs = closingBoundaryUs;
+        metadata.windowMeasuredAtValid = 1;
+        metadata.anomalyCount = 0;
+        metadata.normalCount = 0;
         setInvalidReason(metadata, periodicSlot.invalidReason);
         value.reason = CandidateReason::periodic;
     }
 
-    value.window.metadata.periodicSlotEpochUs = periodicSlot.periodicSlotEpochUs;
+    value.window.metadata.periodicSlotEpochUs = closingBoundaryUs;
     value.window.metadata.periodicSlotEpochValid = 1;
+    value.window.metadata.historySequence = nextHistorySequence++;
     value.window.metadata.windowIndex = nextReportIndex++;
-    if (periodicSlot.hasValid) {
+    if (latestFitsBoundary) {
         copyText(value.window.metadata.reason, "none");
     }
+    Serial.print("[HISTORY] slot_epoch=");
+    Serial.print(static_cast<unsigned long>(closingBoundaryUs / 1000000ULL));
+    Serial.print(" historySequence=");
+    Serial.print(value.window.metadata.historySequence);
+    Serial.print(" quality=");
+    Serial.println(latestFitsBoundary ? "valid" : "invalid");
     enqueueCandidate(value);
 }
 
 void advancePeriodicSlot(uint64_t measuredEpochUs) {
-    const uint64_t slotUs =
-        (measuredEpochUs / kPeriodicIntervalUs) * kPeriodicIntervalUs;
+    const uint64_t slotUs = periodicSlotStartUs(measuredEpochUs);
     if (!periodicSlot.initialized) {
         resetPeriodicSlot(slotUs);
         return;
     }
     while (periodicSlot.periodicSlotEpochUs < slotUs) {
         emitPeriodicSlot();
-        resetPeriodicSlot(periodicSlot.periodicSlotEpochUs + kPeriodicIntervalUs);
+        resetPeriodicSlot(periodicSlotEndUs(periodicSlot.periodicSlotEpochUs));
     }
 }
 
@@ -193,6 +216,14 @@ void noteValidPeriodic(const TransmissionCandidate& value,
                        uint64_t measuredEpochUs,
                        const TransmissionPolicyDecision& decision) {
     advancePeriodicSlot(measuredEpochUs);
+    const uint64_t slotEndUs =
+        periodicSlotEndUs(periodicSlot.periodicSlotEpochUs);
+    const bool windowFitsSlot =
+        measuredEpochUs >= periodicSlot.periodicSlotEpochUs &&
+        measuredEpochUs <= slotEndUs - kWindowDurationUs;
+    if (!windowFitsSlot) {
+        return;
+    }
     periodicSlot.lastMeasuredWindowIndex =
         value.window.metadata.measuredWindowIndex;
     periodicSlot.lastMeasuredAtEpochUs =
@@ -200,11 +231,6 @@ void noteValidPeriodic(const TransmissionCandidate& value,
     periodicSlot.lastMeasuredAtValid = value.window.metadata.windowMeasuredAtValid;
     periodicSlot.anomalyCount = decision.anomalyCount;
     periodicSlot.normalCount = decision.normalCount;
-    if (decision.state != TransmissionPolicyState::normal ||
-        decision.action != TransmissionPolicyAction::discard) {
-        periodicSlot.suppressed = true;
-        return;
-    }
     periodicSlot.latest = value;
     periodicSlot.hasValid = true;
 }
@@ -219,9 +245,6 @@ void noteInvalidPeriodic(uint64_t measuredEpochUs, uint32_t windowIndex,
     periodicSlot.anomalyCount = decision.anomalyCount;
     periodicSlot.normalCount = decision.normalCount;
     copyText(periodicSlot.invalidReason, reason);
-    if (decision.state == TransmissionPolicyState::anomalyActive) {
-        periodicSlot.suppressed = true;
-    }
 }
 
 bool formatTimestamp(uint64_t epochUs, char (&output)[40]) {
@@ -393,8 +416,14 @@ bool buildUploadPayload(const PendingWindow& pending, CandidateReason reason,
     payload += ",\"integrity\":{\"algorithm\":\"sha256\",\"digest\":\"";
     payload += featureDigest;
     payload += "\"},\"periodicSlotEpoch\":";
-    if (periodic) {
+    if (pending.metadata.periodicSlotEpochValid) {
         appendUint64(payload, pending.metadata.periodicSlotEpochUs / 1000000ULL);
+    } else {
+        payload += "null";
+    }
+    payload += ",\"historySequence\":";
+    if (pending.metadata.periodicSlotEpochValid) {
+        appendUint64(payload, pending.metadata.historySequence);
     } else {
         payload += "null";
     }
@@ -403,7 +432,8 @@ bool buildUploadPayload(const PendingWindow& pending, CandidateReason reason,
     payload += "\",\"eventType\":\"";
     payload += candidateType(reason);
     payload += "\",\"state\":\"";
-    payload += (reason == CandidateReason::anomalyStart ||
+    payload += (pending.metadata.anomalyActive != 0 ||
+                        reason == CandidateReason::anomalyStart ||
                         reason == CandidateReason::anomalyActive
                     ? "ANOMALY_ACTIVE"
                     : "NORMAL");
@@ -528,34 +558,45 @@ bool ackMatches(const String& response, const PendingWindow& pending,
         return false;
     }
 
-    const bool newRecord = statusCode == 202 &&
-                           matchUnsignedField(response, "accepted", 1, 0,
-                                               acknowledgedKey) &&
-                           matchBoolField(response, "duplicate", false, 0,
-                                          acknowledgedKey);
-    const bool duplicateRecord = statusCode == 200 &&
-                                 matchUnsignedField(response, "accepted", 0,
-                                                    0, acknowledgedKey) &&
-                                 matchBoolField(response, "duplicate", true, 0,
-                                                acknowledgedKey);
-    return (newRecord || duplicateRecord) &&
-           matchStringField(response, "deviceId", pending.metadata.deviceId, 0,
-                            acknowledgedKey) &&
-           matchStringField(response, "policyId", app::kPolicyId, 0,
-                            acknowledgedKey) &&
-           matchStringField(response, "sensorId", pending.metadata.sensorId,
-                            objectStart, objectEnd) &&
-           matchStringField(response, "bootId", pending.metadata.bootId,
-                            objectStart, objectEnd) &&
-           matchUnsignedField(response, "windowIndex",
-                              pending.metadata.windowIndex, objectStart,
-                              objectEnd) &&
-           matchStringField(response, "eventType", candidateType(reason),
-                            objectStart, objectEnd) &&
-           matchStringField(response, "featureDigest", featureDigest,
-                            objectStart, objectEnd) &&
-           matchBoolField(response, "durablyStored", true, objectStart,
-                          objectEnd);
+    const int responseEnd = response.length();
+    const bool acceptedOne =
+        matchUnsignedField(response, "accepted", 1, 0, responseEnd);
+    const bool acceptedZero =
+        matchUnsignedField(response, "accepted", 0, 0, responseEnd);
+    const bool duplicateFalse =
+        matchBoolField(response, "duplicate", false, 0, responseEnd);
+    const bool duplicateTrue =
+        matchBoolField(response, "duplicate", true, 0, responseEnd);
+    const bool newRecord = statusCode == 202 && acceptedOne && duplicateFalse;
+    const bool duplicateRecord =
+        statusCode == 200 && acceptedZero && duplicateTrue;
+    const bool statusMatches = newRecord || duplicateRecord;
+    const bool deviceMatches =
+        matchStringField(response, "deviceId", pending.metadata.deviceId, 0,
+                         responseEnd);
+    const bool policyMatches =
+        matchStringField(response, "policyId", app::kPolicyId, 0,
+                         responseEnd);
+    const bool sensorMatches =
+        matchStringField(response, "sensorId", pending.metadata.sensorId,
+                         objectStart, objectEnd);
+    const bool bootMatches =
+        matchStringField(response, "bootId", pending.metadata.bootId,
+                         objectStart, objectEnd);
+    const bool indexMatches =
+        matchUnsignedField(response, "windowIndex", pending.metadata.windowIndex,
+                           objectStart, objectEnd);
+    const bool eventMatches =
+        matchStringField(response, "eventType", candidateType(reason),
+                         objectStart, objectEnd);
+    const bool featureMatches =
+        matchStringField(response, "featureDigest", featureDigest, objectStart,
+                         objectEnd);
+    const bool durableMatches =
+        matchBoolField(response, "durablyStored", true, objectStart, objectEnd);
+    return statusMatches && deviceMatches && policyMatches && sensorMatches &&
+           bootMatches && indexMatches && eventMatches && featureMatches &&
+           durableMatches;
 }
 
 bool enqueueCandidate(const TransmissionCandidate& value) {
@@ -630,6 +671,8 @@ CandidateReason candidateReasonFromAction(TransmissionPolicyAction action) {
 
 void applyPolicyMetadata(TelemetryMetadata& metadata,
                          const TransmissionPolicyDecision& decision) {
+    metadata.anomalyActive =
+        decision.state == TransmissionPolicyState::anomalyActive ? 1 : 0;
     metadata.anomalyCount = decision.anomalyCount;
     metadata.normalCount = decision.normalCount;
     if (decision.action == TransmissionPolicyAction::recovery) {
@@ -740,7 +783,7 @@ void uploadTask(void*) {
         Serial.print(requestUs);
         Serial.print(" ack=");
         Serial.println(acknowledged ? "true" : "false");
-        if (statusCode < 200 || statusCode >= 300) {
+        if (statusCode < 200 || statusCode >= 300 || !acknowledged) {
             Serial.print("[UPLOAD] response=");
             Serial.println(response);
         }
@@ -892,6 +935,11 @@ void setup() {
     createBootId();
     Serial.print("[BOOT] boot_id=");
     Serial.println(bootId);
+    Serial.print("[HISTORY] profile=");
+    Serial.print(app::kFeatureProfileId);
+    Serial.print(" policy=");
+    Serial.print(app::kPolicyId);
+    Serial.println(" interval_sec=25 history_sequence=per-slot");
 
     wifiTime.begin();
 

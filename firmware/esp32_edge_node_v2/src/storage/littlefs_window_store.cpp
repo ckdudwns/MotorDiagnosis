@@ -13,7 +13,7 @@ namespace {
 
 constexpr char kRetryDirectory[] = "/retry";
 constexpr uint32_t kFeatureRecordMagic = 0x4D324654;
-constexpr uint16_t kFeatureRecordVersion = 2;
+constexpr uint16_t kFeatureRecordVersion = 3;
 constexpr size_t kRecordWriteBudgetBytes = 1024;
 constexpr size_t kProtectedReserveBytes = kRecordWriteBudgetBytes * 2;
 

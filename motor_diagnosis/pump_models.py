@@ -17,7 +17,7 @@ import re
 from . import data, edge_feature_snapshots as contract
 from .pump_event_model import read_artifact, score_vector, _object, _numbers
 from .snapshot_model import SnapshotModelAdapter
-from .pump_model_settings import ENV_KEYS, INPUT_MODE
+from .pump_model_settings import ENV_KEYS, INPUT_MODE, RAW_CF_INPUT_MODE, INPUT_MODES
 
 FORECAST_TYPE = "pump-summary-experiment-v3"
 
@@ -119,8 +119,11 @@ class PumpDualModels(SnapshotModelAdapter):
     requires_history = True
 
     def __init__(self, event_path, event_checksum, forecast_path, forecast_checksum, stream, scope, *, input_mode):
-        if input_mode != INPUT_MODE:
-            raise ValueError("Explicit experimental-adxl25 input mode required; source equivalence is unverified")
+        if input_mode not in INPUT_MODES:
+            raise ValueError("Explicit experimental ADXL input mode required; source equivalence is unverified")
+        self._input_mode = input_mode
+        raw_cf = input_mode == RAW_CF_INPUT_MODE
+        input_contract = contract.RAW_CF_HISTORY_INPUT_CONTRACT if raw_cf else contract.HISTORY_INPUT_CONTRACT
         event = read_artifact(event_path, event_checksum)
         forecast = read_forecast(forecast_path, forecast_checksum)
         if (stream not in event["streams"] or stream not in forecast["streams"]
@@ -132,10 +135,10 @@ class PumpDualModels(SnapshotModelAdapter):
         self._forecast_meta = {"modelId": FORECAST_TYPE, "modelVersion": "sha256:" + forecast_checksum,
                               "stream": stream, "windowRows": 13, "intervalSec": 25, "horizonSec": 300,
                               "affectsAlerts": False, "operationallyApproved": False}
-        super().__init__({"contractId": contract.HISTORY_CONTRACT_ID,
+        super().__init__({"contractId": contract.RAW_CF_HISTORY_CONTRACT_ID if raw_cf else contract.HISTORY_CONTRACT_ID,
             "modelId": "pump-event-verifier-v1", "modelVersion": "sha256:" + event_checksum,
-            "preprocessingVersion": "pump-dual-adxl25-v3:" + stream + ":" + forecast_checksum,
-            "inputContract": copy.deepcopy(contract.HISTORY_INPUT_CONTRACT), "scope": scope,
+            "preprocessingVersion": ("pump-dual-raw-cf-v1:" if raw_cf else "pump-dual-adxl25-v3:") + stream + ":" + forecast_checksum,
+            "inputContract": copy.deepcopy(input_contract), "scope": scope,
             "scoreType": "novelty_reference_ratio", "threshold": 1.0, "comparison": ">"},
             lambda *_: {"unavailableReason": "VERIFIER_HISTORY_REQUIRED"})
         self.binding_id = hashlib.sha256(json.dumps(self.metadata(), sort_keys=True,
@@ -143,7 +146,7 @@ class PumpDualModels(SnapshotModelAdapter):
 
     def metadata(self):
         return {**super().metadata(), "forecastModel": copy.deepcopy(self._forecast_meta),
-                "inputMode": INPUT_MODE, "sourceFeatureEquivalenceVerified": False,
+                "inputMode": self._input_mode, "sourceFeatureEquivalenceVerified": False,
                 "domainValidated": False}
 
     def _history_reason(self, history, context, count):
@@ -181,7 +184,8 @@ class PumpDualModels(SnapshotModelAdapter):
                 and uptime > 0)
 
     def evaluate_history(self, prepared, context, history):
-        if ({k: prepared.get(k) for k in contract.HISTORY_INPUT_CONTRACT} != contract.HISTORY_INPUT_CONTRACT
+        input_contract = self._metadata["inputContract"]
+        if ({k: prepared.get(k) for k in input_contract} != input_contract
                 or not _numbers(prepared.get("values"), 9)
                 or any(context.get(k) != v for k, v in self.metadata()["scope"].items())):
             raise ValueError("Dual model input/sensor binding mismatch")
@@ -190,7 +194,7 @@ class PumpDualModels(SnapshotModelAdapter):
                   "score": None, "verdict": None,
                   "evidence": {"decision": "insufficient_history", "historicalRecordsUsed": len(history),
                     "groundTruthAvailable": False, "domainValidated": False,
-                    "sourceFeatureEquivalenceVerified": False, "inputMode": INPUT_MODE}}
+                    "sourceFeatureEquivalenceVerified": False, "inputMode": self._input_mode}}
         if reason is None:
             try:
                 score, robust, pca = score_vector(self._event, [r["values"] for r in history], prepared["values"])
@@ -267,7 +271,7 @@ def main():
     parser.add_argument("--stream", required=True)
     for name in ("device", "site", "asset", "sensor"):
         parser.add_argument("--"+name, required=True)
-    parser.add_argument("--input-mode", required=True, choices=[INPUT_MODE])
+    parser.add_argument("--input-mode", required=True, choices=INPUT_MODES)
     args = parser.parse_args()
     model = PumpDualModels(args.event_artifact, args.event_checksum, args.forecast_artifact,
         args.forecast_checksum, args.stream,

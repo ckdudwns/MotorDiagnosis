@@ -239,7 +239,7 @@ class PeriodicSnapshotStore:
                         if conflict:
                             reject("UTC slot already has a report; retry its original identity and content",
                                    409, "SNAPSHOT_SLOT_CONFLICT")
-                    if window.get("profileId") in (SUMMARY_PROFILE, feature_snapshots.HISTORY_PROFILE_ID) and window.get("historySequence") is not None:
+                    if window.get("profileId") in (SUMMARY_PROFILE, *feature_snapshots.HISTORY_PROFILE_IDS) and window.get("historySequence") is not None:
                         # A retry uses the same window identity; a second distinct
                         # window cannot reuse a scheduled-history sequence.
                         conflict = self.db.execute("""SELECT 1 FROM periodic_snapshots
@@ -409,7 +409,7 @@ class PeriodicSnapshotStore:
         compatibility = self._feature_compatibility(latest_window) if latest_window and latest_window.get(
             "profileId") in feature_snapshots.PROFILE_IDS else None
         usable = configured is not None and (compatibility is None or compatibility["status"] == "ready")
-        adapter_id = feature_snapshots.ADAPTER_ID if compatibility else (
+        adapter_id = feature_snapshots.input_contract(latest_window["profileId"])["adapterId"] if compatibility else (
             configured["inputContract"]["adapterId"] if configured else ADAPTER_ID)
         model_status = compatibility["status"] if compatibility else ("ready" if configured else "not_configured")
         return {

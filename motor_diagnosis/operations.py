@@ -471,7 +471,8 @@ def inspect(project, env, device, *, now=None):
                         item["latest"]["forecast"] = analysis.get("forecast")
                         item["latest"]["reason"] = analysis.get("reason")
                         window = json.loads(row[6])["window"]
-                        if window.get("profileId") in ("adxl345-ac-cf-sk-ku-v1", "adxl345-ac-cf-sk-ku-25s-v1"):
+                        from .edge_feature_snapshots import PROFILE_IDS
+                        if window.get("profileId") in PROFILE_IDS:
                             item["latest"].update(profileId=window["profileId"], eventType=transmission["eventType"],
                                 qualityReason=window["reason"], periodicSlotEpoch=window["periodicSlotEpoch"],
                                 modelCompatibility=analysis.get("modelCompatibility"))

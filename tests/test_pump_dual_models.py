@@ -250,7 +250,7 @@ class DualServingTest(RpmSetup):
         self.history(13)
         report=operations.inspect(Path(self.temp.name),{"PERIODIC_SNAPSHOT_DB_PATH":str(self.path)},DEVICE)
         latest=report["databases"]["PERIODIC_SNAPSHOT_DB_PATH"]["latest"]
-        self.assertEqual(latest["profileId"],contract.HISTORY_PROFILE_ID)
+        self.assertEqual(latest["profileId"],self.model.metadata()["inputContract"]["sourceProfileId"])
         self.assertEqual(latest["forecast"]["status"],"completed")
 
     def test_older_invalid_can_block_verifier_without_blocking_13_record_forecast(self):

@@ -556,7 +556,8 @@ def render_page() -> str:
     const snapshotTime = value => typeof value === "string" && Number.isFinite(Date.parse(value));
     const snapshotScope = (value, scope) => value && ["deviceId","siteId","assetId"].every(k => value[k] === scope[k]);
     const verifierFeatures = ["cf_a_1","cf_a_2","cf_a_3","sk_a_1","sk_a_2","sk_a_3","ku_a_1","ku_a_2","ku_a_3"];
-    const isDualModel = model => model?.contractId === "edge-feature-history-model-v1";
+    const isRawCfModel = model => model?.contractId === "edge-feature-history-model-v2";
+    const isDualModel = model => model?.contractId === "edge-feature-history-model-v1" || isRawCfModel(model);
     const isHistoryVerifier = model => model?.contractId === "history-event-verifier-v1" || isDualModel(model);
     const isEdgeFeatureModel = model => model?.contractId === "edge-feature-event-v1" || isDualModel(model);
     function snapshotModelValid(model, scope) {
@@ -568,16 +569,23 @@ def render_page() -> str:
       if (!common) return false;
       if (isEdgeFeatureModel(model)) return typeof model.scope.sensorId === "string"
         && /^[A-Z0-9][A-Z0-9._-]{0,99}$/.test(model.scope.sensorId)
-        && input?.adapterId === "adxl345-ac-nine-moments-v1"
-        && input.sourceProfileId === (isDualModel(model) ? "adxl345-ac-cf-sk-ku-25s-v1" : "adxl345-ac-cf-sk-ku-v1")
+        && input?.adapterId === (isRawCfModel(model) ? "adxl345-raw-cf-centered-moments-v2" : "adxl345-ac-nine-moments-v1")
+        && input.sourceProfileId === (isRawCfModel(model) ? "adxl345-raw-cf-centered-sk-ku-25s-v2"
+          : isDualModel(model) ? "adxl345-ac-cf-sk-ku-25s-v1" : "adxl345-ac-cf-sk-ku-v1")
         && JSON.stringify(input.shape) === "[9]" && JSON.stringify(input.features) === JSON.stringify(verifierFeatures)
         && JSON.stringify(input.axes) === '["X","Y","Z"]' && input.unit === "dimensionless"
         && input.sourceUnit === "g" && input.sampleRateHz === 800 && input.sampleCount === 512
-        && input.meanRemoved === true && input.momentConvention === "population-pearson"
+        && (isRawCfModel(model) ? !Object.hasOwn(input,"meanRemoved")
+          && input.featureDefinitions?.cf === "max(abs(raw))/sqrt(mean(raw**2))"
+          && input.featureDefinitions?.sk === "mean(centered**3)/mean(centered**2)**1.5"
+          && input.featureDefinitions?.ku === "mean(centered**4)/mean(centered**2)**2"
+          && input.featureDefinitions?.centered === "raw-mean(raw)" : input.meanRemoved === true)
+        && input.momentConvention === "population-pearson"
         && (!isDualModel(model) || model.modelId === "pump-event-verifier-v1"
           && model.scoreType === "novelty_reference_ratio" && model.threshold === 1 && model.comparison === ">"
           && input.historyIntervalSec === 25 && input.historyClock === "unix_epoch_25s" && input.maxWindowEndAgeSec === 1
-          && model.inputMode === "experimental-adxl25" && model.sourceFeatureEquivalenceVerified === false
+          && model.inputMode === (isRawCfModel(model) ? "experimental-adxl25-raw-cf" : "experimental-adxl25")
+          && model.sourceFeatureEquivalenceVerified === false
           && ["pump-summary-experiment-v2","pump-summary-experiment-v3"].includes(model.forecastModel?.modelId)
           && /^sha256:[0-9a-f]{64}$/.test(model.forecastModel.modelVersion)
           && model.forecastModel.windowRows === 13 && model.forecastModel.horizonSec === 300
@@ -781,9 +789,11 @@ def render_page() -> str:
       const mode={shadow:"비교만 · 사건·알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 허용"}[result.eventPolicy?.mode] || "운영 모드 미확인";
       card.append(title,facts([["모델 연결","오류 판정 + 예측 연결 완료"],["학습 기준",training],
         ["분석 대상",`${scope.deviceId} / ${scope.sensorId}`],["이벤트·알림",mode],
+        ["모델 입력 프로파일",m.inputContract.sourceProfileId],
+        ["특징 계산 규격",isRawCfModel(m) ? "CF: 평균 제거 전 · SK/KU: 평균 제거 후 (Pearson)" : "CF/SK/KU: 평균 제거 후 (Pearson)"],
         ["현재 알림 반영",result.affectsAlerts ? "오류 판정 사건에 조건부 적용" : "미적용"]]));
       const note=document.createElement("p");note.className="live-context";
-      note.textContent="비교 적용 · 학습 기준 미초과는 장비 정상 확정이 아닙니다. 예측값은 알림에 사용하지 않습니다.";card.appendChild(note);
+      note.textContent="비교 적용 · 학습 원본 특징과의 계산식 동일성 미확인. 학습 기준 미초과는 장비 정상 확정이 아닙니다. 예측값은 알림에 사용하지 않습니다.";card.appendChild(note);
       const freshness=document.createElement("p");freshness.className="notice";
       freshness.textContent=latest ? snapshotFreshness(latest,result.queriedAt) : "대상 센서 입력 대기";
       if(latest && snapshotTime(result.queriedAt) && Date.parse(result.queriedAt)-Date.parse(latest.window.timestamp)>85000) freshness.className+=" error";

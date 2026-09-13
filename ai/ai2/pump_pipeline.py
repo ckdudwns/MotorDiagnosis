@@ -17,7 +17,7 @@ import numpy as np
 NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 LABELS = ("물 수위(L)", "슬러지 유무", "이벤트")
-VERSION = "pump-summary-experiment-v2"
+VERSION = "pump-summary-experiment-v3"
 # Thirteen 25-second records span exactly five minutes from first to last.
 WINDOW_ROWS = 13
 EXPECTED_INTERVAL_SEC = 25
@@ -86,6 +86,17 @@ def window_vector(history: list[np.ndarray]) -> np.ndarray:
     )
 
 
+def physical_feature_violations(features: list[str], values: np.ndarray) -> list[str]:
+    """Return explicit violations; never hide them by clipping model inputs/outputs."""
+    violations = []
+    for name, value in zip(features, values):
+        if name.startswith("cf_") and value < 1.0:
+            violations.append(f"{name}: crest_factor_below_one")
+        if name.startswith("ku_") and value < 1.0:
+            violations.append(f"{name}: pearson_kurtosis_below_one")
+    return violations
+
+
 @dataclass
 class _RuntimeState:
     history: list[tuple[datetime, int, np.ndarray]] = field(default_factory=list)
@@ -140,6 +151,20 @@ class FixedPumpAnalyzer:
             "modelVersion": self.model["modelType"],
             "status": "warming_up",
         }
+        physical_violations = physical_feature_violations(
+            self.model["features"], numeric
+        )
+        if physical_violations:
+            state.history.clear()
+            state.pending_forecasts.clear()
+            result.update(
+                {
+                    "status": "prediction_unavailable",
+                    "predictionUnavailableReason": "input_physical_constraint_violation",
+                    "invalidFeatures": physical_violations,
+                }
+            )
+            return result
         previous = state.history[-1] if state.history else None
         continuous = (
             previous is not None
@@ -166,7 +191,6 @@ class FixedPumpAnalyzer:
                 "rawMae": float(np.mean(error)),
                 "standardizedMae": float(np.mean(error / scale)),
             }
-            state.pending_forecast = None
         state.history.append((at, sequence, numeric))
         state.history = state.history[-WINDOW_ROWS:]
         result["historyCount"] = len(state.history)
@@ -191,6 +215,15 @@ class FixedPumpAnalyzer:
             }
         )
         if forecast is not None:
+            if robust[0] > forecast["inputRobustLimit"]:
+                result.update(
+                    {
+                        "status": "prediction_unavailable",
+                        "predictionUnavailableReason": "input_outside_training_envelope",
+                        "inputRobustLimit": forecast["inputRobustLimit"],
+                    }
+                )
+                return result
             estimate = (vector - np.array(forecast["inputMean"])) / np.array(
                 forecast["inputStd"]
             ) @ np.array(forecast["weights"]) * np.array(
@@ -198,6 +231,25 @@ class FixedPumpAnalyzer:
             ) + np.array(
                 forecast["targetMean"]
             )
+            output_violations = physical_feature_violations(
+                self.model["features"], estimate
+            )
+            lower = np.array(forecast["targetLower"])
+            upper = np.array(forecast["targetUpper"])
+            if (
+                not np.isfinite(estimate).all()
+                or np.any(estimate < lower)
+                or np.any(estimate > upper)
+                or output_violations
+            ):
+                result.update(
+                    {
+                        "status": "prediction_unavailable",
+                        "predictionUnavailableReason": "prediction_outside_safe_envelope",
+                        "invalidFeatures": output_violations,
+                    }
+                )
+                return result
             predicted_at = (at + timedelta(seconds=FORECAST_HORIZON_SEC)).isoformat()
             state.pending_forecasts[predicted_at] = {
                 "predictedFor": predicted_at,
@@ -226,6 +278,13 @@ def validate_model(model: dict) -> None:
     features, streams = model.get("features"), model.get("streams")
     if not isinstance(features, list) or not features or not isinstance(streams, dict):
         raise ValueError("Model is missing features or sensor streams")
+    for stream in streams.values():
+        forecast = stream.get("forecast") if isinstance(stream, dict) else None
+        if forecast is None:
+            continue
+        required = ("inputRobustLimit", "targetLower", "targetUpper")
+        if any(name not in forecast for name in required):
+            raise ValueError("Model forecast is missing safe-serving limits")
 
 
 def load_model(path: Path) -> dict:
@@ -451,6 +510,8 @@ def forecast_experiment(
         "targetMean": ymean.tolist(),
         "targetStd": ystd.tolist(),
         "weights": weights.tolist(),
+        "targetLower": y.min(axis=0).tolist(),
+        "targetUpper": y.max(axis=0).tolist(),
         "operationallyApproved": False,
     }
     metrics = {
@@ -569,6 +630,11 @@ def experiment(sheets: dict, features: list[str]) -> tuple[dict, dict, list[dict
         model["thresholds"] = thresholds
         artifacts["streams"][sensor] = model
         forecast, forecast_metrics = forecast_experiment(groups, matrices)
+        if forecast is not None:
+            # Do not extrapolate a Ridge forecast beyond every calibration input
+            # observed while selecting the model.  A new baseline/retraining is
+            # safer than a finite but impossible result.
+            forecast["inputRobustLimit"] = float(np.max(calibration[0]))
         model["forecast"] = forecast
         test_scores = predict(model, matrices[2])
         report["streams"][sensor] = {

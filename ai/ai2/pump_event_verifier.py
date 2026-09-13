@@ -16,6 +16,7 @@ import numpy as np
 from ai.ai2.pump_pipeline import (
     EXPECTED_INTERVAL_SEC,
     fit_model,
+    physical_feature_violations,
     predict,
     select_cadence_records,
     timestamp,
@@ -230,6 +231,27 @@ class PumpEventVerifier:
                 "decision": "insufficient_history",
                 "confidence": None,
                 "reason": "invalid_history_or_event_values",
+                "historicalRecordsUsed": 0,
+            }
+        current_violations = physical_feature_violations(
+            self.model["features"], current
+        )
+        if current_violations:
+            return {
+                "decision": "likely_sensor_issue",
+                "confidence": 100,
+                "reason": "input_physical_constraint_violation",
+                "invalidFeatures": current_violations,
+                "historicalRecordsUsed": HISTORY_ROWS,
+            }
+        if any(
+            physical_feature_violations(self.model["features"], row[2])
+            for row in ordered
+        ):
+            return {
+                "decision": "insufficient_history",
+                "confidence": None,
+                "reason": "history_physical_constraint_violation",
                 "historicalRecordsUsed": 0,
             }
         for previous, following in zip(ordered, ordered[1:]):

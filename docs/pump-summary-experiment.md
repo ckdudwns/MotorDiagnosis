@@ -80,6 +80,22 @@ python -m ai.ai2.pump_pipeline "../new data/new_export.xlsx" --output output/pum
 36개 수치다. 새 실제값이 들어오면 직전 예측의 raw/표준화 MAE를 함께 반환한다. 이는
 다음 특징값 예측 오차이며 고장 발생 시각·고장 확률·RUL 예측값이 아니다.
 
+### 예측 안전 제한
+
+고정 모델은 유한한 숫자라는 이유만으로 예측을 완료 처리하지 않는다. 현재 13행 입력의
+robust 편차가 조정 분할에서 관측한 최대 입력 편차를 넘으면
+`prediction_unavailable`과 `input_outside_training_envelope`을 반환한다. Ridge 회귀를
+학습 범위 밖에 외삽해 음수 CF·음수 Pearson 첨도 같은 값을 표시하지 않기 위한 제한이다.
+
+또한 예측된 각 값이 학습 타깃의 최소·최대 범위를 벗어나거나, CF가 1 미만·Pearson
+첨도가 1 미만이면 `prediction_outside_safe_envelope`으로 예측을 보류한다. 값을 0으로
+clamp하지 않는다. 입력 자체가 CF 1 미만 또는 Pearson 첨도 1 미만이면
+`input_physical_constraint_violation`으로 이력을 초기화하고, 보드·학습 원본의 특징 계산
+규격을 대조하거나 모델을 재학습해야 한다.
+
+이 제한이 포함되지 않은 이전 `pump-summary-experiment-v2` 모델 파일은 운영 로더가
+거부한다. 새 `pump-summary-experiment-v3` 모델을 학습해 배포해야 한다.
+
 ## 즉시 이상 확인 모델
 
 `PumpEventVerifier`는 추세 예측 모델과 독립된 두 번째 모델이다. ESP32가 엣지 이상

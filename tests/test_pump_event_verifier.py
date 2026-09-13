@@ -82,6 +82,20 @@ class PumpEventVerifierTest(unittest.TestCase):
         )
         self.assertEqual(result["decision"], "likely_sensor_issue")
 
+    def test_impossible_crest_factor_is_not_scored_as_a_real_anomaly(self):
+        model, _ = train_event_verifier({"sensor": self.rows()}, ["rms_a_1"])
+        model["features"] = ["cf_a_1"]
+        rows = self.rows()
+        result = PumpEventVerifier(model).verify(
+            "sensor",
+            rows[124]["createdAt"],
+            [-0.323],
+            self.history(rows),
+            quality_ok=True,
+        )
+        self.assertEqual(result["decision"], "likely_sensor_issue")
+        self.assertEqual(result["reason"], "input_physical_constraint_violation")
+
 
 if __name__ == "__main__":
     unittest.main()

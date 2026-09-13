@@ -1,6 +1,7 @@
 """Pump experiment leakage, gap and input-boundary regressions."""
 
 from datetime import datetime, timedelta, timezone
+from copy import deepcopy
 import unittest
 from pathlib import Path
 import tempfile
@@ -20,6 +21,7 @@ from ai.ai2.pump_pipeline import (
     read_workbook,
     replay_events,
     replay_fixed_model,
+    physical_feature_violations,
 )
 
 
@@ -203,6 +205,39 @@ class PumpPipelineTest(unittest.TestCase):
             quality_ok=False,
         )
         self.assertEqual(invalid["historyResetReason"], "quality_invalid")
+
+    def test_out_of_distribution_input_returns_prediction_unavailable(self):
+        analyzer = FixedPumpAnalyzer(self.fixed_model())
+        rows = self.records(13, 25)
+        for index, row in enumerate(rows[:12]):
+            analyzer.ingest("sensor", row["createdAt"], index, [float(row["rms_a_1"])])
+        result = analyzer.ingest("sensor", rows[12]["createdAt"], 12, [1000.0])
+        self.assertEqual(result["status"], "prediction_unavailable")
+        self.assertEqual(
+            result["predictionUnavailableReason"], "input_outside_training_envelope"
+        )
+        self.assertNotIn("nextForecast", result)
+
+    def test_unsafe_forecast_and_physical_feature_values_are_not_clamped(self):
+        self.assertEqual(
+            physical_feature_violations(
+                ["cf_a_1", "sk_a_1", "ku_a_1"], np.array([-0.3, 0.0, -10.2])
+            ),
+            ["cf_a_1: crest_factor_below_one", "ku_a_1: pearson_kurtosis_below_one"],
+        )
+        model = deepcopy(self.fixed_model())
+        model["streams"]["sensor"]["forecast"]["targetLower"] = [1000.0]
+        model["streams"]["sensor"]["forecast"]["targetUpper"] = [1001.0]
+        analyzer = FixedPumpAnalyzer(model)
+        rows = self.records(13, 25)
+        for index, row in enumerate(rows):
+            result = analyzer.ingest(
+                "sensor", row["createdAt"], index, [float(row["rms_a_1"])]
+            )
+        self.assertEqual(result["status"], "prediction_unavailable")
+        self.assertEqual(
+            result["predictionUnavailableReason"], "prediction_outside_safe_envelope"
+        )
 
     def test_replay_uses_fixed_artifact_without_refitting(self):
         model = self.fixed_model()

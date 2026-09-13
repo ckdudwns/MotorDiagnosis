@@ -19,7 +19,7 @@ from .pump_event_model import read_artifact, score_vector, _object, _numbers
 from .snapshot_model import SnapshotModelAdapter
 from .pump_model_settings import ENV_KEYS, INPUT_MODE
 
-FORECAST_TYPE = "pump-summary-experiment-v2"
+FORECAST_TYPE = "pump-summary-experiment-v3"
 
 
 def read_forecast(path, checksum):
@@ -50,9 +50,18 @@ def read_forecast(path, checksum):
         if (not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", name) or not isinstance(stream, dict)
                 or set(stream) != {"center", "scale", "active", "pcaMean", "pcaAxes", "thresholds", "forecast"}):
             raise ValueError("Invalid forecast stream")
+        active = stream["active"]
+        if (not _numbers(stream["center"], 36) or not _numbers(stream["scale"], 36)
+                or any(v < 0 for v in stream["scale"])
+                or not isinstance(active, list) or not active
+                or any(type(i) is not int or not 0 <= i < 36 for i in active)
+                or len(set(active)) != len(active)
+                or any(stream["scale"][i] <= 0 for i in active)):
+            raise ValueError("Invalid forecast input guard")
         forecast = stream["forecast"]
         if (not isinstance(forecast, dict) or set(forecast) != {"type", "horizonSec", "alpha", "inputMean",
-                "inputStd", "targetMean", "targetStd", "weights", "operationallyApproved"}
+                "inputStd", "targetMean", "targetStd", "weights", "operationallyApproved",
+                "targetLower", "targetUpper", "inputRobustLimit"}
                 or forecast["type"] != "ridge" or type(forecast["horizonSec"]) is not int
                 or forecast["horizonSec"] != 300 or forecast["operationallyApproved"] is not False
                 or not _numbers([forecast["alpha"]], 1) or forecast["alpha"] < 0
@@ -62,22 +71,48 @@ def read_forecast(path, checksum):
                 or not isinstance(forecast["weights"], list) or len(forecast["weights"]) != 36
                 or any(not _numbers(row, 9) for row in forecast["weights"])):
             raise ValueError("Invalid forecast dimensions/scales")
+        if (not _numbers([forecast["inputRobustLimit"]], 1) or forecast["inputRobustLimit"] <= 0
+                or not _numbers(forecast["targetLower"], 9) or not _numbers(forecast["targetUpper"], 9)
+                or any(lo > hi for lo, hi in zip(forecast["targetLower"], forecast["targetUpper"]))):
+            raise ValueError("Invalid forecast guard limits")
     return model
 
 
-def predict_features(forecast, history):
-    """PR45 window_vector and ridge transform, population std; never fit/clip."""
+def forecast_vector(history):
+    """Past-only last/mean/population-std/delta blocks, in artifact order."""
     if len(history) != 13 or any(not _numbers(row, 9) for row in history):
         raise ValueError("Forecast requires 13 finite nine-feature records")
     mean = [math.fsum(row[j] for row in history) / 13 for j in range(9)]
     std = [math.sqrt(math.fsum((row[j]-mean[j])**2 for row in history) / 13) for j in range(9)]
-    vector = list(history[-1]) + mean + std + [history[-1][j]-history[0][j] for j in range(9)]
+    return list(history[-1]) + mean + std + [history[-1][j]-history[0][j] for j in range(9)]
+
+
+def predict_features(forecast, history):
+    """Unmodified ridge equation; serving guards below never clip its output."""
+    vector = forecast_vector(history)
     scaled = [(v-m)/s for v, m, s in zip(vector, forecast["inputMean"], forecast["inputStd"])]
     values = [math.fsum(scaled[i]*forecast["weights"][i][j] for i in range(36))
               * forecast["targetStd"][j] + forecast["targetMean"][j] for j in range(9)]
     if any(not math.isfinite(v) for v in values):
         raise ValueError("Nonfinite forecast")
     return values
+
+
+def forecast_input_check(stream, history):
+    vector = forecast_vector(history)
+    # Use the forecast stream's fitted robust scales, NOT ridge inputStd or
+    # the separate 24-record event verifier's scales/thresholds.
+    robust = max(abs((vector[i]-stream["center"][i])/stream["scale"][i])
+                 for i in stream["active"])
+    if not math.isfinite(robust):
+        raise ValueError("Nonfinite forecast input distance")
+    return robust, stream["forecast"]["inputRobustLimit"]
+
+
+def forecast_output_valid(forecast, values):
+    return (_numbers(values, 9)
+            and all(lo <= v <= hi for v, lo, hi in zip(values, forecast["targetLower"], forecast["targetUpper"]))
+            and all(values[i] >= 1 for i in (0, 1, 2, 6, 7, 8)))
 
 
 class PumpDualModels(SnapshotModelAdapter):
@@ -93,12 +128,13 @@ class PumpDualModels(SnapshotModelAdapter):
             raise ValueError("Both models require the same explicit training source and stream")
         self._event = copy.deepcopy(event["streams"][stream])
         self._forecast = copy.deepcopy(forecast["streams"][stream]["forecast"])
+        self._forecast_stream = copy.deepcopy(forecast["streams"][stream])
         self._forecast_meta = {"modelId": FORECAST_TYPE, "modelVersion": "sha256:" + forecast_checksum,
                               "stream": stream, "windowRows": 13, "intervalSec": 25, "horizonSec": 300,
                               "affectsAlerts": False, "operationallyApproved": False}
         super().__init__({"contractId": contract.HISTORY_CONTRACT_ID,
             "modelId": "pump-event-verifier-v1", "modelVersion": "sha256:" + event_checksum,
-            "preprocessingVersion": "pump-dual-adxl25-v1:" + stream + ":" + forecast_checksum,
+            "preprocessingVersion": "pump-dual-adxl25-v3:" + stream + ":" + forecast_checksum,
             "inputContract": copy.deepcopy(contract.HISTORY_INPUT_CONTRACT), "scope": scope,
             "scoreType": "novelty_reference_ratio", "threshold": 1.0, "comparison": ">"},
             lambda *_: {"unavailableReason": "VERIFIER_HISTORY_REQUIRED"})
@@ -179,7 +215,19 @@ class PumpDualModels(SnapshotModelAdapter):
                 forecast["reason"] = "FORECAST_" + failure
             else:
                 try:
-                    values = predict_features(self._forecast, [r["values"] for r in prior]+[prepared["values"]])
+                    inputs = [r["values"] for r in prior]+[prepared["values"]]
+                    robust, limit = forecast_input_check(self._forecast_stream, inputs)
+                    forecast["guard"] = {"policyId": "pump-forecast-reject-v3", "inputRobust": robust,
+                                         "inputRobustLimit": limit, "outputClipped": False}
+                    if robust > limit:
+                        forecast["reason"] = "FORECAST_INPUT_OUT_OF_DISTRIBUTION"
+                        result["forecast"] = forecast
+                        return result
+                    values = predict_features(self._forecast, inputs)
+                    if not forecast_output_valid(self._forecast, values):
+                        forecast["reason"] = "FORECAST_OUTPUT_OUT_OF_RANGE"
+                        result["forecast"] = forecast
+                        return result
                     at = data.parse_rfc3339("timestamp", context["timestamp"]).timestamp()
                     forecast.update(status="completed", features=dict(zip(contract.FEATURES, values)),
                         basedOnMeasuredAt=context["timestamp"],

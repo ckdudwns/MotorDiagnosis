@@ -170,6 +170,7 @@ await check('late management response is discarded after scope change', async ()
 
 await check('render races preserve newer rows and user drafts', async () => {
   const h = harness(); let release;
+  h.run('currentView="events"');
   h.context.respond = path => {
     const url = new URL(path,'http://local');
     if (url.pathname === '/api/telemetry') return url.searchParams.get('assetId') === 'A1' ? new Promise(resolve => {release=resolve;}) : {points:[],units:{}};
@@ -336,6 +337,7 @@ await check('late delete refresh cannot erase the subsequently saved note', asyn
 await check('failed filter or page requests cannot retain selectable old events', async () => {
   for (const control of ['severityFilter','eventLabelFilter','reviewedFilter','eventSort','eventsNext']) {
     const h = harness(); h.context.respond = detailResponses; await h.run('selectEvent("OLD")');
+    h.run('currentView="events"');
     h.run('events=[{id:"OLD",title:"Old warning",severity:"warning"}]; eventTotal=24; renderEvents(); renderPager("events",1,24); rememberSelection();');
     h.get(control).value = {severityFilter:'critical',eventLabelFilter:'confirmed_anomaly',reviewedFilter:'true',eventSort:'score_desc'}[control] || '';
     h.context.respond = () => {throw new Error('filtered request failed');};
@@ -381,6 +383,7 @@ await check('late note failures and responses from another event cannot replace 
 
 await check('a pre-filter response stays discarded after failure and refresh recovers the new filter', async () => {
   const h = harness(), oldTelemetry = deferred();
+  h.run('currentView="events"');
   const warning = {id:'OLD',title:'Warning',severity:'warning'}, critical = {id:'NEW',title:'Critical',severity:'critical'};
   function response(path) {
     const url = new URL(path,'http://local');
@@ -421,11 +424,12 @@ await check('workspace navigation is wired to unique existing panels', () => {
   assert.match(source,/@media \(max-width:900px\)/);
 });
 
-await check('each workspace reveals only its panels; overview refreshes only new snapshots', () => {
+await check('each workspace reveals only its panels and live view has no legacy dependencies', () => {
   const h = harness(); h.run('setupManagement()');
   assert.equal(h.get('managementPanel').hidden,true);
   const views = clone(h.run('WORKSPACE_VIEWS'));
   for (const view of ['events','management','overview']) {
+    h.requests.length=0;
     h.get(views[view].button).listeners.click();
     for (const [name,config] of Object.entries(views)) {
       assert.equal(h.get(config.button).getAttribute('aria-pressed'),String(name === view));
@@ -433,7 +437,8 @@ await check('each workspace reveals only its panels; overview refreshes only new
     }
     assert.equal(h.get('viewHeading').textContent,views[view].title);
   }
-  assert.deepEqual(h.requests.map(r=>r.path),['/api/sites/S1/devices']);
+  assert.ok(h.requests.some(r=>r.path==='/api/sites/S1/devices'));
+  assert.ok(h.requests.every(r=>!r.path.includes('/api/telemetry?')&&!r.path.includes('/model-versions')&&!r.path.includes('/raw-vibration-windows')));
   h.run('setView("not-a-view")'); assert.equal(h.run('currentView'),'overview');
 });
 
@@ -452,7 +457,7 @@ await check('navigation preserves review, memo, management drafts and chart sele
   assert.equal(h.get('managementReason').value,'management draft'); assert.equal(h.get('reviewReason').value,'review reason');
   assert.equal(h.get('attachmentRefs').value,'survey://draft'); assert.equal(h.get('severityFilter').value,'critical');
   assert.deepEqual(clone(h.run('[reviewDirty,memoDirty,managementDirty,editingNoteId]')),[true,true,true,'N1']);
-  assert.deepEqual(h.requests.slice(calls).map(r=>r.path),['/api/sites/S1/devices']);
+  assert.ok(h.requests.slice(calls).every(r=>(!r.options.method||r.options.method==='GET')&&!r.path.includes('/api/events')));
 });
 
 await check('management navigation respects read access including audit-only users', () => {
@@ -664,7 +669,7 @@ await check('AI evidence and draft survive telemetry timers and workspace naviga
   const calls=h.requests.length, generation=h.run('modelReviewGeneration');
   for (const interval of h.intervals) interval();
   h.run('setView("overview"); setView("models"); setView("models")');
-  assert.deepEqual(h.requests.slice(calls).map(r=>r.path),['/api/sites/S1/devices']);
+  assert.ok(h.requests.slice(calls).every(r=>(!r.options.method||r.options.method==='GET')&&!r.path.includes('/api/model-results')));
   assert.equal(h.run('modelReviewGeneration'),generation);
   assert.equal(h.run('modelReviewRow.version'),'M1'); assert.equal(h.run('modelQueuePage'),2);
   assert.equal(h.get('modelReviewReason').value,'still inspecting evidence');
@@ -812,7 +817,7 @@ await check('operations published state survives a late history and following lo
 await check('operations timers and read-only refreshes preserve an in-progress configuration', async () => {
   const h=opsHarness(); await h.run('loadDeviceOperations()'); opsDraft(h);
   h.run('setView("deviceOps")'); assert.equal(h.get('telemetryPeriodField').hidden,true);
-  h.run('setView("overview")'); assert.equal(h.get('telemetryPeriodField').hidden,false);
+  h.run('setView("overview")'); assert.equal(h.get('telemetryPeriodField').hidden,true);
   h.run('setView("deviceOps")'); const calls=h.requests.length; for(const tick of h.intervals) tick();
   assert.equal(h.requests.length,calls); await h.run('loadOpsHealth()'); await h.run('loadOpsQuality()');
   assert.equal(h.get('opsConfigReason').value,'fixture reason'); assert.equal(h.get('opsInterval').value,'6000');

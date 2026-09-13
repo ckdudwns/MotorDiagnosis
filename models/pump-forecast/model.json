@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "modelType": "pump-summary-experiment-v2",
+  "modelType": "pump-summary-experiment-v3",
   "features": [
     "cf_a_1",
     "cf_a_2",
@@ -1143,7 +1143,30 @@
             0.003736170529993295
           ]
         ],
-        "operationallyApproved": false
+        "targetLower": [
+          1.04,
+          1.08,
+          1.01,
+          -0.13,
+          -0.59,
+          -1.21,
+          2.39,
+          2.24,
+          2.7
+        ],
+        "targetUpper": [
+          2.74,
+          7.51,
+          1.62,
+          1.03,
+          1.01,
+          0.12,
+          58.6,
+          60.01,
+          60.89
+        ],
+        "operationallyApproved": false,
+        "inputRobustLimit": 4.239656202424295
       }
     },
     "freshwater_supply_motor3": {
@@ -2290,7 +2313,30 @@
             0.015871762867074056
           ]
         ],
-        "operationallyApproved": false
+        "targetLower": [
+          1.01,
+          1.08,
+          1.01,
+          -2.35,
+          -0.15,
+          -0.7,
+          2.77,
+          2.48,
+          2.13
+        ],
+        "targetUpper": [
+          2.68,
+          7.52,
+          1.48,
+          0.16,
+          0.19,
+          0.15,
+          139.2,
+          95.47,
+          52.0
+        ],
+        "operationallyApproved": false,
+        "inputRobustLimit": 12.35294632503314
       }
     }
   },

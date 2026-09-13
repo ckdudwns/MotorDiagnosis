@@ -19,7 +19,8 @@ for(const response of cases) {
   assert.match(content,/학습 원본 특징과의 동일성 미확인/);
   const row=response.items[0],f=row.analysis.forecast;
   if(f?.status==='completed') {
-    assert.match(content,/9개 특징의 예측값 \(실측값 아님\)/);
+    assert.match(content,/9개 특징의 실측값과 예측값/);
+    assert.match(content,/5분 뒤 예측 \(실측값 아님\)/);
     for(const [key,value] of Object.entries(f.features)) {
       assert.ok(content.includes(key));assert.ok(content.includes(String(value)));
     }
@@ -47,5 +48,17 @@ for(const row of input.notifications || []) {
   assert.match(content,row.event.snapshotTransition==='closed'
     ? /이력 모델 기준 미초과 · 사건 해제/ : /이력 모델 기준 초과 · 이상 후보/);
   assert.doesNotMatch(content,/정상 복귀|단건 모델 이상 발생/);
+}
+for(const response of input.blockedForecasts || []) {
+  const h=harness();h.context.reply=response;
+  const card=h.run('renderSnapshotCard(reply)');
+  const walk=e=>[e,...e.children.flatMap(walk)];
+  const panel=walk(card).find(e=>e.className==='live-module forecast');
+  assert.match(text(panel),/입력이 학습 기준에서 벗어남/);
+  assert.match(text(panel),/예측 입력 이탈값/);
+  assert.doesNotMatch(text(panel),/예측 완료|최근 정기 이력의 예측 · 현재 보고의 결과 아님/);
+  const body=walk(card).find(e=>e.tagName==='table').children.find(e=>e.tagName==='tbody');
+  assert.equal(body.children.length,9);
+  assert.ok(body.children.every(r=>r.children[2].textContent==='—'));
 }
 console.log(`${cases.length} real dual-model responses and forecast provenance checks passed.`);

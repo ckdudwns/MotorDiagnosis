@@ -131,7 +131,7 @@ test('feature-only schedule and board events render without raw or a fabricated 
     assert.ok(value(h).includes(label));assert.match(value(h),/모델 대기/);
     assert.doesNotMatch(value(h),/전송 정책 확인 필요|모델 이상 후보|모델 정상 후보|warming_up/);
   }
-  assert.match(source,/25·25·10초 간격/);
+  assert.ok(source.includes('정기 이력은 Unix 시각 기준 25초 간격이며 이상 상태에서도 유지'));
 });
 test('incompatible history model and invalid feature records have explicit non-normal reasons',async()=>{
   const h=fixture(),row=featureRow();
@@ -317,7 +317,8 @@ test('device and telemetry permissions are required, model-read is not spuriousl
 test('no selection, no matching devices and non-overview views never issue window queries',async()=>{
   const h=fixture();await h.run('loadSnapshots(null)');assert.equal(h.requests.length,0);
   h.context.devices=[{id:'D2',siteId:'S2',assetId:'A2'}];await load(h);assert.equal(h.requests.length,1);
-  h.run('setView("events")');await load(h);assert.equal(h.requests.length,1);
+  h.run('setView("events")');await load(h);
+  assert.equal(h.requests.filter(r=>r.path.endsWith('/periodic-snapshots')).length,0);
 });
 test('foreign response identity and embedded model scopes are rejected',async()=>{
   for (const level of ['outer','window']) for (const key of Object.keys(scope)) {
@@ -384,7 +385,8 @@ test('invalidated old requests cannot overwrite newer snapshots or release their
 });
 test('new panel refresh works when all legacy dashboard APIs fail',async()=>{
   const h=fixture();h.context.reply=path=>{if(path.endsWith('/periodic-snapshots')) return result([item()]); throw new Error('legacy unavailable');};
-  await assert.rejects(h.run('render()'),/legacy unavailable/);await settle();assert.match(value(h),/모델 대기/);
+  await h.run('render()');await settle();assert.match(value(h),/모델 대기/);
+  assert.ok(h.requests.every(r=>!r.path.includes('/api/telemetry?')&&!r.path.includes('/raw-vibration-windows')&&!r.path.includes('/model-versions')));
   assert.equal(h.intervals.length,1);
   h.intervals[0]();await settle();assert.equal(h.requests.filter(r=>r.path.endsWith('/periodic-snapshots')).length,2);
 });

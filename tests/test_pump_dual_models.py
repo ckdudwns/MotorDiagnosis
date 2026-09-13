@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import http.client
 import json
+import math
 from pathlib import Path
 import tempfile
 import time
@@ -24,7 +25,7 @@ from tests.test_measured_rpm import RpmSetup
 from tests.test_pump_event_model import ARTIFACT, CHECKSUM, STREAM, SCOPE, DEVICE
 
 FORECAST = ARTIFACT.parents[1]/"pump-forecast/model.json"
-FORECAST_HASH = "fc8e3c1f6cfced57b404ab8fde1d733cdbe288cee148f6bfe0fa4556d666106a"
+FORECAST_HASH = "f91bd1b999f213e7f24b07b51ba28970b13e0dbbec7bb6afaea5100cfb04d9a6"
 
 
 def environment():
@@ -111,13 +112,21 @@ class DualServingTest(RpmSetup):
         self.path=Path(self.temp.name)/"snapshots.sqlite3"
         self.base=int(time.time()-700)//25*25
         self.model=configured_model(environment())
+        # Serving/lifecycle fixtures use a deterministic in-range predictor.
+        # Real artifact ridge arithmetic and guard failures are tested separately.
+        predictor = patch("motor_diagnosis.pump_models.predict_features",
+                          return_value=list(self.model._forecast["targetMean"]))
+        predictor.start(); self.addCleanup(predictor.stop)
         self.store=PeriodicSnapshotStore(self.path,model=self.model)
         self.addCleanup(lambda:self.store.close())
 
     def payload(self, sequence, *, event="periodic", quality="valid", scheduled=True, state=None, offset=-1., boot="a"*32):
         slot=self.base+sequence*25
         at=slot+offset if quality=="valid" else slot
-        features=dict(zip(contract.FEATURES,[2.,2.1,2.2,0.,.1,.2,3.,3.1,3.2])) if quality=="valid" else None
+        means=[1.045,1.1,1.01,0.,-.01,0.,3.,3.,3.]
+        values=[m+math.sqrt(2)*self.model._forecast_stream["center"][18+j]
+                *math.sin(2*math.pi*sequence/13+j) for j,m in enumerate(means)]
+        features=dict(zip(contract.FEATURES,values)) if quality=="valid" else None
         a,n={"periodic":(0,0),"anomaly_start":(3,0),"anomaly_active":(4,0),"recovery":(0,5)}[event]
         return {"window":{**SCOPE,"schemaVersion":3,"bootId":boot,"windowIndex":int((at-self.base+100)*100),
             "timestamp":datetime.fromtimestamp(at,timezone.utc).isoformat(),"startUptimeUs":int((at-self.base+100)*1e6),
@@ -306,6 +315,26 @@ class DualServingTest(RpmSetup):
             self.assertFalse(server.raw_vibration.processing_enabled)
         finally:
             server.shutdown(); server.server_close(); thread.join()
+
+    @unittest.skipUnless(shutil.which("node"),"Node required for shipped UI")
+    def test_real_guard_rejection_remains_visible_after_unscheduled_report(self):
+        self.history(25)
+        self.assertEqual(self.latest()["analysis"]["forecast"]["status"], "completed")
+        blocked = self.payload(25)
+        blocked["window"]["features"]["cf_a_2"] = 1000.
+        blocked["window"]["integrity"]["digest"] = contract.feature_digest(blocked["window"]["features"])
+        self.assertEqual(self.send(blocked)[1], 202)
+        self.process()
+        rejected = self.latest()
+        self.assertEqual(rejected["analysis"]["forecast"]["reason"], "FORECAST_INPUT_OUT_OF_DISTRIBUTION")
+        cases = [self.store.list_device(self.admin, DEVICE)]
+        self.assertEqual(self.send(self.payload(26, scheduled=False, event="anomaly_active", offset=-20.))[1], 202)
+        self.process()
+        self.assertEqual(self.latest()["analysis"]["forecast"]["reason"], "FORECAST_REQUIRES_SCHEDULED_RECORD")
+        after = self.store.list_device(self.admin, DEVICE)
+        self.assertEqual(next(r for r in after["items"] if r["ordinal"] == rejected["ordinal"]), rejected)
+        cases.append(after)
+        self.assert_dashboard({"snapshots": [], "blockedForecasts": cases})
 
     @unittest.skipUnless(shutil.which("node"),"Node required for shipped UI")
     def test_backfilled_history_forecast_is_visible_using_real_api_response(self):

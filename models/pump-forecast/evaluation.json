@@ -1,0 +1,67 @@
+{
+  "commonCoverageFrom": "2026-09-07T05:33:00+00:00",
+  "commonCoverageTo": "2026-09-08T00:20:05+00:00",
+  "trainBefore": "2026-09-07T16:49:15+00:00",
+  "testFrom": "2026-09-07T20:34:40+00:00",
+  "groundTruthMetrics": null,
+  "streams": {
+    "freshwater_supply_motor2": {
+      "counts": {
+        "train": 1611,
+        "calibration": 516,
+        "test": 530
+      },
+      "status": "experimental",
+      "forecast": {
+        "status": "experimental",
+        "horizonSec": 300,
+        "testPairs": 518,
+        "testStandardizedMAE": 0.2694021907089671,
+        "persistenceStandardizedMAE": 0.3370269115679812,
+        "beatsPersistence": true,
+        "failurePrediction": false
+      },
+      "droppedConstantFeatures": [
+        "cf_a_1:last",
+        "cf_a_3:last",
+        "cf_a_3:mean",
+        "cf_a_3:std",
+        "cf_a_1:delta",
+        "cf_a_3:delta"
+      ],
+      "testExceedanceFraction": {
+        "robust": 0.04339622641509434,
+        "pca": 0.007547169811320755
+      }
+    },
+    "freshwater_supply_motor3": {
+      "counts": {
+        "train": 1611,
+        "calibration": 516,
+        "test": 8166
+      },
+      "status": "experimental",
+      "forecast": {
+        "status": "experimental",
+        "horizonSec": 300,
+        "testPairs": 8130,
+        "testStandardizedMAE": 0.3241649403230484,
+        "persistenceStandardizedMAE": 0.38445646576915027,
+        "beatsPersistence": true,
+        "failurePrediction": false
+      },
+      "droppedConstantFeatures": [
+        "cf_a_1:last",
+        "cf_a_3:last",
+        "cf_a_1:mean",
+        "cf_a_1:std",
+        "cf_a_1:delta"
+      ],
+      "testExceedanceFraction": {
+        "robust": 0.026818515797207936,
+        "pca": 0.05633112907176096
+      }
+    }
+  },
+  "limitation": "Unlabeled observations. Exceedances are not confirmed faults or false positives."
+}

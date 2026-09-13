@@ -79,10 +79,12 @@ test('three-window confirmation is separate, strict and never a normal guarantee
   }
 });
 
-test('RF66 overview markup and source remain safe',()=>{
+test('RF66 history remains available but is hidden from the live overview',()=>{
   assert.match(source,/id="rf66Panel"/);
   assert.ok(!source.includes('.innerHTML'));
   const h=fixture(); h.run('setView("overview")');
+  assert.equal(h.get('rf66Panel').hidden,true);
+  h.run('setView("models")');
   assert.equal(h.get('rf66Panel').hidden,false);
   h.run('setView("events")');
   assert.equal(h.get('rf66Panel').hidden,true);

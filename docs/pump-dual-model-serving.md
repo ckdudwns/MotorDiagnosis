@@ -8,14 +8,14 @@
 | 역할 | 저장소 파일 | 입력 | 출력 |
 |---|---|---|---|
 | 오류 판정 | `models/pump-event-verifier/event-verifier-model.json` | 같은 센서·부팅의 직전 24건 + 현재 9개 특징 | 학습 기준 대비 이상 가능성, 점수 > 1 |
-| 예측 | `models/pump-forecast/model.json` (`model (2).json` 원본) | 현재 포함 13건의 9개 특징 | 현재 측정 시각 + 300초의 9개 특징값 |
+| 예측 | `models/pump-forecast/model.json` (최신 `model.json`, v3) | 현재 포함 13건의 9개 특징 | 현재 측정 시각 + 300초의 9개 특징값 또는 예측 불가 |
 
 오류 모델의 점수는 **고장 확률이 아닌 기준 대비 편차 비율**이다.
 예측은 고장 발생 시각·잔여수명 예측이 아니다. 예측값은 사건·알림 판정에 사용하지 않는다.
 
 오류 모델 SHA-256: `0c2d24015a44744fb5f96554652dcbd3d2a82d30949cf36f729a620084429135`
 
-예측 모델 SHA-256: `fc8e3c1f6cfced57b404ab8fde1d733cdbe288cee148f6bfe0fa4556d666106a`
+예측 모델 v3 SHA-256: `f91bd1b999f213e7f24b07b51ba28970b13e0dbbec7bb6afaea5100cfb04d9a6`
 
 두 파일의 학습 원본 해시는 동일하다. 각 파일에 `freshwater_supply_motor2`와
 `freshwater_supply_motor3` 계수가 따로 있다. **실제 장치/센서 → 학습 stream 배정은 운영자가 명시해야 한다.**
@@ -159,7 +159,7 @@ ACK는 **영구 저장 성공**이며, 이력 확보 또는 모델 계산 완료
 Environment="PUMP_DUAL_EVENT_ARTIFACT=/home/ubuntu/MotorDiagnosis/models/pump-event-verifier/event-verifier-model.json"
 Environment="PUMP_DUAL_EVENT_CHECKSUM=0c2d24015a44744fb5f96554652dcbd3d2a82d30949cf36f729a620084429135"
 Environment="PUMP_DUAL_FORECAST_ARTIFACT=/home/ubuntu/MotorDiagnosis/models/pump-forecast/model.json"
-Environment="PUMP_DUAL_FORECAST_CHECKSUM=fc8e3c1f6cfced57b404ab8fde1d733cdbe288cee148f6bfe0fa4556d666106a"
+Environment="PUMP_DUAL_FORECAST_CHECKSUM=f91bd1b999f213e7f24b07b51ba28970b13e0dbbec7bb6afaea5100cfb04d9a6"
 Environment="PUMP_DUAL_STREAM=<확정한 학습 stream>"
 Environment="PUMP_DUAL_DEVICE_ID=DEV-01-MOT-02"
 Environment="PUMP_DUAL_SITE_ID=SITE-01"
@@ -179,7 +179,7 @@ Environment="PUMP_DUAL_INPUT_MODE=experimental-adxl25"
   --event-artifact models/pump-event-verifier/event-verifier-model.json \
   --event-checksum 0c2d24015a44744fb5f96554652dcbd3d2a82d30949cf36f729a620084429135 \
   --forecast-artifact models/pump-forecast/model.json \
-  --forecast-checksum fc8e3c1f6cfced57b404ab8fde1d733cdbe288cee148f6bfe0fa4556d666106a \
+  --forecast-checksum f91bd1b999f213e7f24b07b51ba28970b13e0dbbec7bb6afaea5100cfb04d9a6 \
   --stream '<확정한 학습 stream>' \
   --device DEV-01-MOT-02 --site SITE-01 --asset SITE-01-MOT-02 --sensor SENSOR-02 \
   --input-mode experimental-adxl25
@@ -189,6 +189,31 @@ Environment="PUMP_DUAL_INPUT_MODE=experimental-adxl25"
 두 모델과 배정 설정은 운영 백업 대상에 함께 포함되며, 복구 검사에서 파일 해시와 쌍 구성을 다시 확인한다.
 
 ## 5. 검증 명령
+
+### v3 예측 보호 규칙
+
+v3는 기존 Ridge 계수와 표준화 통계를 유지하며 `inputRobustLimit`,
+`targetLower/targetUpper`를 추가한 파일이다. 재학습이나 센서 특징 동일성 검증을 뜻하지 않는다.
+동봉 `models/pump-forecast/evaluation.json`은 제공된 평가 기록이며,
+새 차단 규칙을 적용한 현장 성능 또는 차단율로 해석하지 않는다.
+
+- 13건으로 만든 last/mean/population-std/delta 36차원 벡터에 예측 stream의
+  `max(abs((vector[i]-center[i])/scale[i]))` (`i in active`)를 계산한다.
+  Ridge의 inputStd나 오류 모델의 24건 기준과 혼용하지 않는다.
+- 이 값이 inputRobustLimit을 **초과**하면 `FORECAST_INPUT_OUT_OF_DISTRIBUTION`이다.
+- 기존 Ridge 계산과 targetStd/targetMean 역변환은 변경하지 않는다.
+- 결과가 targetLower/targetUpper의 닫힌 구간 밖이거나 CF/Pearson 첨도가 1 미만이면
+  `FORECAST_OUTPUT_OUT_OF_RANGE`이다. NaN/inf/계산 실패는 `FORECAST_OUTPUT_INVALID`이다.
+- 서버 정책 `pump-forecast-reject-v3`는 값을 자르거나 0으로 대체하지 않는다.
+  차단 시 status=unavailable, features=null과 guard 근거를 저장한다.
+  오류 판정 모델은 별도로 계속 실행하며 기존 사건·알림 모드는 바꾸지 않는다.
+- 현재 예측이 차단되면 화면에서 이전 성공 예측을 대신 표시하지 않는다.
+  과거 원문은 그대로 남고, v2 메타데이터도 이력 조회 시 인식한다.
+
+배포 시 모델 파일만 먼저 덮어쓰지 않는다. 기존 운영 백업 후 **v3 서버 코드·파일과 위 체크섬을 함께**
+적용하고 모델 사전 검사를 통과한 뒤 서비스를 재시작한다. 이전 체크섬이나 v2 파일을 계속
+사용하면 새 로더가 거부한다. 새 preprocessingVersion/binding은 대기 작업을 분리하며
+과거 결과 재계산·알림 재발송은 하지 않는다. 롤백은 대응되는 코드·v2 파일·체크섬을 함께 복원한다.
 
 ```bash
 .venv/bin/python -m unittest tests.test_pump_dual_models tests.test_pump_event_model \

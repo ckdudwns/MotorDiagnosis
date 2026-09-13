@@ -70,8 +70,23 @@ def render_page() -> str:
     .status-table caption { text-align:left; font-weight:700; padding:12px 0; }
     .status-table td { font-size:14px; overflow-wrap:anywhere; }
     #snapshotRows .table-scroll { max-height:480px; }
-    #snapshotRows .status-table { min-width:1100px; table-layout:fixed; }
+    #snapshotRows .status-table { min-width:680px; }
     #snapshotRows th { position:sticky; top:0; background:var(--panel); }
+    .live-models { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; margin:16px 0; }
+    .live-module { min-width:0; border:1px solid var(--line); border-top:3px solid var(--teal); border-radius:8px; padding:18px; }
+    .live-module.forecast { border-top-color:var(--blue); }
+    .live-module h4 { margin:0 0 10px; font-size:18px; }
+    .live-state { font-size:20px; font-weight:700; margin:10px 0; }
+    .live-context { color:var(--muted); line-height:1.6; }
+    .live-module .facts { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .live-feature-table { overflow:auto; }
+    #snapshotPanel .live-feature-table .status-table { min-width:0; table-layout:fixed; }
+    .live-feature-table td, .live-feature-table th { overflow-wrap:anywhere; }
+    .live-feature-table td { font-variant-numeric:tabular-nums; }
+    .live-feature-table td:last-child { color:var(--blue); }
+    @media (min-width:901px) { .toolbar:has(#telemetryPeriodField[hidden]) { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+    .live-models p, .live-module dd { overflow-wrap:anywhere; }
+    @media (max-width:900px) { .live-models { grid-template-columns:1fr; } }
     #evidenceChart { height:220px; }
     textarea { resize:vertical; min-height:90px; }
     [hidden] { display:none !important; }
@@ -92,10 +107,10 @@ def render_page() -> str:
     <section id="appPanel" hidden>
       <div id="appStatus" class="notice" role="status" aria-live="polite" hidden></div>
       <nav class="workspace-nav" aria-label="업무 화면">
-        <button id="navOverview" aria-pressed="true" aria-controls="siteKpis snapshotPanel rf66Panel sitesPanel notificationsPanel modelPanel healthPanel">운영 현황</button>
+        <button id="navOverview" aria-pressed="true" aria-controls="snapshotPanel notificationsPanel healthPanel">운영 현황</button>
         <button id="navEvents" aria-pressed="false" aria-controls="exportPanel chartPanel eventListPanel eventReviewPanel">이벤트 검수</button>
         <button id="navManagement" aria-pressed="false" aria-controls="managementPanel">운영 관리</button>
-        <button id="navModels" aria-pressed="false" aria-controls="modelReviewPanel">AI 결과 검토</button>
+        <button id="navModels" aria-pressed="false" aria-controls="siteKpis sitesPanel rf66Panel modelPanel modelReviewPanel">이전 분석·이력</button>
         <button id="navDeviceOps" aria-pressed="false" aria-controls="deviceOpsPanel">장치 운영</button>
       </nav>
       <h2 id="viewHeading" class="workspace-title">운영 현황</h2>
@@ -121,7 +136,7 @@ def render_page() -> str:
         <div class="actions"><button id="applyRange">기간 적용</button><button id="exportBtn" class="secondary" disabled>선택 조건 내보내기</button></div>
         <small id="exportScope">내보내기는 설비·조회 기간·데이터셋 버전을 사용합니다. 아래 이벤트 목록 필터는 신호 데이터에 적용되지 않습니다.</small>
       </section>
-      <section class="kpis" id="siteKpis" aria-label="전체 접근 가능 사이트 현황">
+      <section class="kpis" id="siteKpis" aria-label="등록 사이트와 기존 통계 지표 · 현재 AI 판정 아님" hidden>
         <div class="kpi"><span>사이트</span><strong id="siteCount">-</strong></div>
         <div class="kpi"><span>온라인 장치</span><strong id="onlineCount">-</strong></div>
         <div class="kpi"><span>주의 설비</span><strong id="warningAssets">-</strong></div>
@@ -129,20 +144,21 @@ def render_page() -> str:
       </section>
       <section class="grid">
         <article class="panel wide" id="snapshotPanel">
-          <h2>단건 진동 수신 · 새 모델 판정</h2>
-          <p>특징값 전용 정책: 평상시 매 분 UTC 00·25·50초(25·25·10초 간격)에 최근 유효 특징 9개를 전송합니다. 이상 진입·복귀 즉시, 이상 유지 중 10초마다 전송하며 정기 보고는 중단합니다. Raw는 보내지 않습니다. 보드 상태와 서버 모델 판정은 별개입니다.</p>
-          <p>보드 상태는 장치가 보고한 값이며 서버 모델 판정과 다릅니다. 새 단건 결과는 기존 통계 점수·RF66 과거 이력과 별개입니다. 사건·알림은 아래 운영 모드에 따르며 교체 모델 미설정 시 생성하지 않습니다.</p>
+          <h2>진동 수신 · 오류 판정 · 5분 뒤 예측</h2>
+          <p class="live-context">25초 등간격으로 특징 9개를 수집합니다. 오류 판정은 직전 24건과 현재값을 비교하고, 예측은 현재 포함 13건으로 5분 뒤 특징값을 계산합니다.</p>
+          <details><summary>측정·전송 기준</summary><p>800Hz · XYZ · 512샘플에서 CF·왜도·Pearson 첨도를 계산합니다. 정기 이력은 Unix 시각 기준 25초 간격이며 이상 상태에서도 유지합니다. 보드 이상 3회 진입·정상 5회 복귀 시 즉시, 이상 유지 중에는 10초마다 추가 보고합니다. 보드 상태는 서버 모델 판정이 아닙니다. Raw는 전송하지 않습니다.</p><p>새 단건 결과는 기존 통계 점수·RF66 과거 이력과 별개입니다. 과거 분석은 ‘이전 분석·이력’ 탭에서 확인하세요.</p></details>
           <p id="snapshotStatus" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
           <div id="snapshotRows"></div>
         </article>
-        <article class="panel wide" id="rf66Panel">
+        <article class="panel wide" id="rf66Panel" hidden>
           <h2>RF66 진동 모델 · 과거 판정 이력</h2>
-          <p>기존 RF66 모델 로딩·자동 추론은 중지되었습니다. 아래는 기존 통계 점수와 별개인 과거 구간별 판정과 연속 3구간 확인 이력입니다. 새 입력은 위의 ‘단건 진동 수신 · 새 모델 판정’에서 확인하세요.</p>
+          <p>기존 RF66 모델 로딩·자동 추론은 중지되었습니다. 과거 구간별 판정과 연속 3구간 확인 이력이며 현재 장비 상태를 뜻하지 않습니다. 새 입력과 두 모델 결과는 ‘운영 현황’에서 확인하세요.</p>
           <p id="rf66Status" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
           <div id="rf66Rows"></div>
         </article>
-        <article class="panel wide" id="sitesPanel">
-          <h2>전체 사이트 현황</h2>
+        <article class="panel wide" id="sitesPanel" hidden>
+          <h2>등록 사이트 · 기존 통계 현황</h2>
+          <p>등록 목록과 이전 통계 경로의 지표입니다. 현재 오류 판정 모델의 결과나 실제 장치 연결을 보증하지 않습니다.</p>
           <div class="table-scroll"><table><thead><tr><th>사이트</th><th>지역</th><th>상태</th><th>정상</th><th>주의</th><th>위험</th><th>미검수</th><th>최근 수신</th><th>장치</th></tr></thead><tbody id="siteRows"></tbody></table></div>
           <div class="actions"><button id="sitesPrev" class="secondary">이전</button><span id="sitesPage"></span><button id="sitesNext" class="secondary">다음</button></div>
         </article>
@@ -168,8 +184,8 @@ def render_page() -> str:
           <h2>웹 알림</h2>
           <div id="notifications" role="status" aria-live="polite">No notifications.</div>
         </article>
-        <article class="panel" id="modelPanel">
-          <h2>AI 기준선·모델 정보</h2>
+        <article class="panel" id="modelPanel" hidden>
+          <h2>이전 AI 기준선·모델 정보</h2>
           <div id="modelResult" role="status" aria-live="polite">Loading model metadata.</div>
         </article>
         <article class="panel wide" id="modelReviewPanel" hidden>
@@ -212,7 +228,7 @@ def render_page() -> str:
           <div class="actions"><button id="saveNote" disabled>메모 등록</button><button id="cancelNote" class="secondary">편집 취소</button></div>
           <div id="noteHistory" class="history"></div>
         </article>
-        <article class="panel wide" id="healthPanel"><h2>선택 사이트의 장치·서비스 상태</h2><div id="deviceHealth" class="table-scroll"></div><div id="serviceHealth" class="table-scroll"></div></article>
+        <article class="panel wide" id="healthPanel"><h2>선택 설비의 장치·서비스 상태</h2><div id="deviceHealth" class="table-scroll"></div><details><summary>서버 서비스 상태</summary><div id="serviceHealth" class="table-scroll"></div></details></article>
         <article class="panel wide" id="managementPanel" hidden>
           <h2>운영 관리</h2>
           <div class="subgrid"><label>관리 항목<select id="managementKind"></select></label><label>항목 선택<select id="managementRecord"></select></label></div>
@@ -339,10 +355,10 @@ def render_page() -> str:
 
     function can(permission) { return permissions.includes("*") || permissions.includes(permission); }
     const WORKSPACE_VIEWS = {
-      overview:{button:"navOverview",title:"운영 현황",panels:["siteKpis","snapshotPanel","rf66Panel","sitesPanel","notificationsPanel","modelPanel","healthPanel"]},
+      overview:{button:"navOverview",title:"운영 현황",panels:["snapshotPanel","notificationsPanel","healthPanel"]},
       events:{button:"navEvents",title:"이벤트 검수",panels:["exportPanel","chartPanel","eventListPanel","eventReviewPanel"]},
       management:{button:"navManagement",title:"운영 관리",panels:["managementPanel"]},
-      models:{button:"navModels",title:"AI 결과 검토",panels:["modelReviewPanel"]},
+      models:{button:"navModels",title:"이전 분석·이력",panels:["siteKpis","sitesPanel","rf66Panel","modelPanel","modelReviewPanel"]},
       deviceOps:{button:"navDeviceOps",title:"장치 운영",panels:["deviceOpsPanel"]},
     };
     function hasManagementAccess() {return can("audit-log:read") || Object.values(MANAGEMENT).some(config => can(config.permission + ":read"));}
@@ -353,7 +369,10 @@ def render_page() -> str:
       const enteringModels = view === "models" && currentView !== "models";
       const enteringDevices = view === "deviceOps" && currentView !== "deviceOps";
       const enteringOverview = view === "overview" && currentView !== "overview";
+      const enteringEvents = view === "events" && currentView !== "events";
+      if(view !== currentView) renderGeneration++;
       if (view !== "overview") clearSnapshots();
+      if (view !== "models") clearRF66();
       currentView = view;
       for (const [name,config] of Object.entries(WORKSPACE_VIEWS)) {
         $(config.button).setAttribute("aria-pressed", String(name === view));
@@ -362,12 +381,13 @@ def render_page() -> str:
       $("navManagement").hidden = !hasManagementAccess();
       $("navModels").hidden = !can("model:read");
       $("navDeviceOps").hidden = !can("device:read");
-      $("telemetryPeriodField").hidden = view === "deviceOps";
+      $("telemetryPeriodField").hidden = view !== "events";
       $("viewHeading").textContent = WORKSPACE_VIEWS[view].title;
       if (view === "events") redrawChart();
-      if (enteringModels && !modelReviewRow) act(() => loadModelQueue(true));
+      if (enteringModels) act(() => Promise.all([loadLegacyOverview(selectionQuery()), modelReviewRow ? null : loadModelQueue(true)]));
       if (enteringDevices && !opsDirty && !opsSaving) act(loadDeviceOperations);
-      if (enteringOverview) void loadSnapshots(selectionQuery());
+      if (enteringOverview) act(render);
+      if (enteringEvents && !reviewDirty && !memoDirty) act(render);
     }
     function statusMessage(message, error = false) {
       $("appStatus").hidden = !message;
@@ -420,9 +440,50 @@ def render_page() -> str:
       return true;
     }
 
+    async function loadLiveOverview(query) {
+      if (!query) {clearSnapshots("조회 가능한 사이트 또는 설비가 없습니다."); return;}
+      const generation=++renderGeneration, session=token;
+      const current=()=>generation===renderGeneration && token===session && currentView==="overview"
+        && $("siteSelect").value===query.siteId && $("assetSelect").value===query.assetId;
+      await Promise.all([loadSnapshots(query), (async()=>{
+        try {
+          const devices=can("device:read") ? await snapshotApi(`/api/sites/${encodeURIComponent(query.siteId)}/devices`) : [];
+          if (!Array.isArray(devices)) throw new Error("장치 목록 형식 확인 필요");
+          const selected=devices.filter(d=>d.siteId===query.siteId && d.assetId===query.assetId);
+          const health=await Promise.all(selected.map(d=>snapshotApi(`/api/devices/${encodeURIComponent(d.id || d.deviceId)}/health`)));
+          const dependencies=can("service-health:read") ? await snapshotApi("/api/health/dependencies").catch(error=>({error:error.message})) : null;
+          if (current()) renderHealth(health,dependencies);
+        } catch(error) {if(current()) {$("deviceHealth").textContent="장치 상태 조회 실패 · "+error.message; $("serviceHealth").replaceChildren();}}
+      })(), (async()=>{
+        if (!can("alert:read")) {if(current()) $("notifications").textContent="알림 조회 권한이 없습니다.";return;}
+        try {
+          const reply=await snapshotApi(`/api/alerts?siteId=${encodeURIComponent(query.siteId)}&channel=web&status=sent&size=10`);
+          if (!Array.isArray(reply.items)) throw new Error("알림 응답 형식 확인 필요");
+          if(current()) renderNotifications(reply.items);
+        } catch(error) {if(current()) $("notifications").textContent="알림 조회 실패 · "+error.message;}
+      })()]);
+    }
+    async function loadLegacyOverview(query) {
+      if(!query || currentView!=="models") return;
+      const generation=++renderGeneration,session=token;
+      const current=()=>generation===renderGeneration && token===session && currentView==="models"
+        && $("siteSelect").value===query.siteId && $("assetSelect").value===query.assetId;
+      const [summaries,models,devices]=await Promise.all([
+        api("/api/dashboard/sites-summary"),
+        api(`/api/model-versions?siteId=${encodeURIComponent(query.siteId)}&assetId=${encodeURIComponent(query.assetId)}&size=1`),
+        can("device:read") ? api(`/api/sites/${encodeURIComponent(query.siteId)}/devices`) : []]);
+      if(!current()) return;
+      siteSummaries=summaries; renderSiteRows(); renderModelResult(models.items);
+      $("siteCount").textContent=summaries.length;
+      $("onlineCount").textContent=summaries.reduce((n,s)=>n+s.onlineDevices,0);
+      $("warningAssets").textContent=summaries.reduce((n,s)=>n+s.warningAssets,0);
+      $("criticalAssets").textContent=summaries.reduce((n,s)=>n+s.criticalAssets,0);
+      await loadRF66(devices,query);
+    }
     async function render() {
+      if (currentView === "overview") return loadLiveOverview(selectionQuery());
       clearRF66("새로고침 후 RF66 결과를 확인합니다.");
-      if (currentView === "models") return loadModelQueue(true);
+      if (currentView === "models") return Promise.all([loadModelQueue(true),loadLegacyOverview(selectionQuery())]);
       if (currentView === "deviceOps") return loadDeviceOperations();
       const requestGeneration = ++renderGeneration;
       const query = selectionQuery();
@@ -454,7 +515,6 @@ def render_page() -> str:
       renderNotifications(alertPage.items);
       renderModelResult(modelPage.items);
       renderHealth(devices, dependencies);
-      void loadRF66(devices, query);
       $("siteCount").textContent = siteSummaries.length;
       $("onlineCount").textContent = siteSummaries.reduce((n, s) => n + s.onlineDevices, 0);
       $("warningAssets").textContent = siteSummaries.reduce((n, s) => n + s.warningAssets, 0);
@@ -476,6 +536,16 @@ def render_page() -> str:
     }
 
     let snapshotGeneration = 0, snapshotBusy = null;
+    const snapshotOpenDetails = new Map();
+    function snapshotDetails(key) {
+      const details=document.createElement("details");
+      details.open=snapshotOpenDetails.get(key) === true;
+      details.addEventListener("toggle",()=>{
+        if(snapshotOpenDetails.size>=100 && !snapshotOpenDetails.has(key)) snapshotOpenDetails.delete(snapshotOpenDetails.keys().next().value);
+        snapshotOpenDetails.set(key,details.open);
+      });
+      return details;
+    }
     function clearSnapshots(message = "설비를 선택하고 새로고침하세요.") {
       snapshotGeneration++;
       snapshotBusy = null;
@@ -508,7 +578,7 @@ def render_page() -> str:
           && model.scoreType === "novelty_reference_ratio" && model.threshold === 1 && model.comparison === ">"
           && input.historyIntervalSec === 25 && input.historyClock === "unix_epoch_25s" && input.maxWindowEndAgeSec === 1
           && model.inputMode === "experimental-adxl25" && model.sourceFeatureEquivalenceVerified === false
-          && model.forecastModel?.modelId === "pump-summary-experiment-v2"
+          && ["pump-summary-experiment-v2","pump-summary-experiment-v3"].includes(model.forecastModel?.modelId)
           && /^sha256:[0-9a-f]{64}$/.test(model.forecastModel.modelVersion)
           && model.forecastModel.windowRows === 13 && model.forecastModel.horizonSec === 300
           && model.forecastModel.intervalSec === 25 && model.forecastModel.affectsAlerts === false
@@ -566,6 +636,9 @@ def render_page() -> str:
         FORECAST_HISTORY_QUALITY_OR_SCOPE:"예측용 이력 품질 불량 또는 부팅·대상 변경",
         FORECAST_REQUIRES_SCHEDULED_RECORD:"즉시 보고는 예측 이력에 추가하지 않음 · 다음 정기 기록에서 예측",
         FORECAST_OUTPUT_INVALID:"예측값 계산 실패",
+        FORECAST_INPUT_OUT_OF_DISTRIBUTION:"예측 불가 · 입력이 학습 기준에서 벗어남",
+        FORECAST_OUTPUT_OUT_OF_RANGE:"예측 불가 · 예측값이 허용 범위를 벗어남",
+        FORECAST_RESULT_PENDING:"현재 구간의 예측 처리 결과 대기",
         MODEL_SCOPE_MISMATCH:"수신 당시 해당 센서·장치에 모델 미배정",
         insufficient_samples:"512개 미만 수집",timeout:"센서 수집 시간 초과",non_finite:"특징값 NaN·무한대",
         zero_variance:"분산 0으로 특징 계산 불가",no_valid_window:"해당 구간에 유효 측정 없음",
@@ -658,6 +731,11 @@ def render_page() -> str:
         && snapshotTime(f.predictedFor) && Math.abs(Date.parse(f.predictedFor)-Date.parse(w.timestamp)-300000) <= 1
         && Number.isInteger(w.periodicSlotEpoch) && f.targetSlotEpoch === w.periodicSlotEpoch+300
         && f.features && Object.keys(f.features).length === 9 && verifierFeatures.every(k=>snapshotNumber(f.features[k]))
+        && ["cf_a_1","cf_a_2","cf_a_3","ku_a_1","ku_a_2","ku_a_3"].every(k=>f.features[k]>=1)
+        && (f.modelId !== "pump-summary-experiment-v3" || f.guard?.policyId === "pump-forecast-reject-v3"
+          && snapshotNumber(f.guard.inputRobust) && f.guard.inputRobust>=0
+          && snapshotNumber(f.guard.inputRobustLimit) && f.guard.inputRobustLimit>0
+          && f.guard.inputRobust<=f.guard.inputRobustLimit && f.guard.outputClipped===false)
         && Array.isArray(f.inputOrdinals) && f.inputOrdinals.length === 13 && f.inputOrdinals[12] === item.ordinal
         // Receipt IDs are not measurement order: backfill may arrive out of order.
         // The server validates history slots; prior inputs must precede this receipt.
@@ -667,7 +745,135 @@ def render_page() -> str:
         && f.inputDigests.every(v=>typeof v === "string" && /^[0-9a-f]{64}$/.test(v))
         && a.inference.inputDigest === item.digest && snapshotTime(a.inference.completedAt);
     }
+    function sameSnapshotModel(left,right) {
+      return Boolean(left && right && ["contractId","modelId","modelVersion","preprocessingVersion","scoreType","threshold","comparison"].every(k=>left[k]===right[k])
+        && ["deviceId","siteId","assetId","sensorId"].every(k=>left.scope?.[k]===right.scope?.[k])
+        && (!isDualModel(left) || left.forecastModel?.modelVersion===right.forecastModel?.modelVersion
+          && left.forecastModel?.stream===right.forecastModel?.stream));
+    }
+    function featureValuesValid(window) {
+      return window?.quality==="valid" && window.sampleCount===512 && window.features
+        && Object.keys(window.features).length===9 && verifierFeatures.every(k=>snapshotNumber(window.features[k]));
+    }
+    function featureDisplay(value) { return snapshotNumber(value) ? String(Number(value.toPrecision(6))) : "—"; }
+    function liveModelReason(item,model,kind) {
+      if(!item) return "새 규격 입력 대기 · 저장된 해당 센서 측정이 없습니다.";
+      const w=item.window,a=item.analysis || {};
+      if(w.sensorId!==model.scope.sensorId) return "대상 센서 입력 대기 · 현재 수신 센서와 모델 적용 센서가 다릅니다.";
+      if(w.profileId!==model.inputContract.sourceProfileId) return "입력 규격 불일치 · 보드의 25초 등간격 규격과 historySequence를 확인하세요.";
+      if(w.quality!=="valid") return "입력 품질 불량 · "+snapshotReason(w.reason || a.reason);
+      if(a.status==="waiting_model") return "모델 배정 전 수신 기록 · 현재 모델은 연결되어 있으며 새 입력부터 처리합니다.";
+      if(["queued","queued_inference"].includes(a.status)) return snapshotProcessing(item);
+      if(!sameSnapshotModel(a.inference?.model,model)) return "이전 모델 설정의 기록 · 현재 설정의 새 결과 대기";
+      if(kind==="forecast") return a.forecast?.status==="completed" ? "예측 결과 형식 확인 필요 · 값 표시 보류"
+        : "예측 대기·불가 · "+snapshotReason(a.forecast?.reason || "FORECAST_RESULT_PENDING");
+      return snapshotProcessing(item)+(a.reason ? " · "+snapshotReason(a.reason) : "");
+    }
+    function renderDualModelCard(result) {
+      const card=document.createElement("section");card.className="history-card";
+      const m=result.configuredModel,scope=m.scope;
+      const items=[...result.items].sort((a,b)=>Date.parse(b.window.timestamp)-Date.parse(a.window.timestamp));
+      const sensorItems=items.filter(row=>row.window.sensorId===scope.sensorId);
+      const latest=sensorItems[0],lastReceived=[...items].sort((a,b)=>Date.parse(b.receivedAt)-Date.parse(a.receivedAt))[0];
+      const title=document.createElement("h3");title.textContent=`${result.deviceId} / ${result.assetId} · ${scope.sensorId}`;
+      const stream=m.forecastModel.stream;
+      const training={freshwater_supply_motor2:"센서 2 학습 기준",freshwater_supply_motor3:"센서 3 학습 기준"}[stream] || stream;
+      const mode={shadow:"비교만 · 사건·알림 미생성",events:"이벤트 기록 · 알림 꺼짐",alerts:"이벤트 기록 + 알림 허용"}[result.eventPolicy?.mode] || "운영 모드 미확인";
+      card.append(title,facts([["모델 연결","오류 판정 + 예측 연결 완료"],["학습 기준",training],
+        ["분석 대상",`${scope.deviceId} / ${scope.sensorId}`],["이벤트·알림",mode],
+        ["현재 알림 반영",result.affectsAlerts ? "오류 판정 사건에 조건부 적용" : "미적용"]]));
+      const note=document.createElement("p");note.className="live-context";
+      note.textContent="비교 적용 · 학습 기준 미초과는 장비 정상 확정이 아닙니다. 예측값은 알림에 사용하지 않습니다.";card.appendChild(note);
+      const freshness=document.createElement("p");freshness.className="notice";
+      freshness.textContent=latest ? snapshotFreshness(latest,result.queriedAt) : "대상 센서 입력 대기";
+      if(latest && snapshotTime(result.queriedAt) && Date.parse(result.queriedAt)-Date.parse(latest.window.timestamp)>85000) freshness.className+=" error";
+      if(lastReceived && snapshotTime(result.queriedAt)) {
+        const receivedAge=(Date.parse(result.queriedAt)-Date.parse(lastReceived.receivedAt))/1000;
+        freshness.textContent+=receivedAge < -5 ? " · 서버 수신 시각 확인 필요" : ` · 조회된 최근 기록의 마지막 도착: ${Math.max(0,Math.round(receivedAge))}초 전`;
+      }
+      freshness.textContent+=" · 보드 온라인 상태와 측정 데이터의 최신성은 별도로 확인합니다.";
+      card.appendChild(freshness);
+      if(latest) card.appendChild(facts([["최근 측정 시각",formatLocalTime(latest.window.timestamp)],
+        ["해당 구간 서버 수신 시각",formatLocalTime(latest.receivedAt)],
+        ["입력 품질",latest.window.quality+" / "+snapshotReason(latest.window.reason)],
+        ["최근 측정의 보드 보고",snapshotDelivery(latest.transmission).state],
+        ["전송 사유",snapshotDelivery(latest.transmission).reason],
+        ["정기 이력 순번",Number.isInteger(latest.window.historySequence) ? latest.window.historySequence : "없음 · 즉시 보고 또는 이전 규격"]]));
+      if(items.length && !latest) {const other=document.createElement("p");other.textContent="다른 센서의 수신 기록은 있으나 모델 대상 센서의 측정은 없습니다.";card.appendChild(other);}
+      const modules=document.createElement("div");modules.className="live-models";
+      const detector=document.createElement("section");detector.className="live-module";
+      const detectorTitle=document.createElement("h4");detectorTitle.textContent="오류 판정 · 현재값과 직전 24건 비교";
+      const detectorState=document.createElement("p");detectorState.className="live-state";
+      const matching=latest && sameSnapshotModel(latest.analysis?.inference?.model,m);
+      const complete=matching && snapshotCompleted(latest);
+      detectorState.textContent=complete ? snapshotProcessing(latest) : liveModelReason(latest,m,"verifier");
+      const count=matching ? latest.analysis?.evidence?.historicalRecordsUsed : null;
+      const historyCount=Number.isInteger(count) && count>=0 && count<=24 ? `${count}건 / 필요 24건` : "서버 검사 결과 대기 / 필요 24건";
+      detector.append(detectorTitle,detectorState,facts([["모델 점수",complete ? String(latest.analysis.score) : "—"],
+        ["이상 후보 조건",`점수 ${m.comparison} ${m.threshold} · 고장 확률 아님`],
+        ["검사 대상 과거 이력",historyCount],
+        ["판정 완료 시각",complete ? formatLocalTime(latest.analysis.inference.completedAt) : "—"]]));
+      const rule=document.createElement("p");rule.className="live-context";
+      rule.textContent="25초 이력의 품질·부팅·순번·시각 연속성을 서버가 검사합니다. 건수만 채웠다고 판정하지 않습니다. 첫 정기 기록부터 약 10분이 필요합니다.";
+      detector.appendChild(rule);
+      const eventState=document.createElement("p");eventState.className="live-context";
+      eventState.textContent="현재 구간의 사건 처리: "+({pending:"처리 대기",processed:"처리 완료 · 사건 발생 여부는 이벤트 검수에서 확인",ignored:"사건 반영 제외"}[latest?.eventProcessing?.status] || "미기록")
+        +(latest?.eventProcessing?.reason ? " · "+latest.eventProcessing.reason : "");detector.appendChild(eventState);
+      const forecastPanel=document.createElement("section");forecastPanel.className="live-module forecast";
+      const forecastTitle=document.createElement("h4");forecastTitle.textContent="5분 뒤 특징값 예측 · 오류 판정과 별도";
+      const forecastState=document.createElement("p");forecastState.className="live-state";
+      const forecastBlocked=["FORECAST_INPUT_OUT_OF_DISTRIBUTION","FORECAST_OUTPUT_OUT_OF_RANGE","FORECAST_OUTPUT_INVALID"].includes(latest?.analysis?.forecast?.reason)
+        || (latest?.analysis?.forecast?.status==="completed" && !snapshotForecastValid(latest));
+      const prediction=forecastBlocked ? undefined : sensorItems.find(row=>row.window.bootId===latest?.window.bootId
+        && sameSnapshotModel(row.analysis?.inference?.model,m) && snapshotForecastValid(row));
+      const f=prediction?.analysis.forecast;
+      const historical=prediction && prediction.ordinal!==latest?.ordinal;
+      forecastState.textContent=prediction ? (historical ? "최근 정기 이력의 예측 · 현재 보고의 결과 아님" : "예측 완료") : liveModelReason(latest,m,"forecast");
+      forecastPanel.append(forecastTitle,forecastState);
+      if(prediction) forecastPanel.appendChild(facts([["예측 대상 시각",formatLocalTime(f.predictedFor)],
+        ["기준 측정 시각",formatLocalTime(f.basedOnMeasuredAt)],["입력 이력","현재 포함 13건 · 25초 등간격"],
+        ["예측 대상 시점",snapshotTime(result.queriedAt) ? (Date.parse(f.predictedFor)<=Date.parse(result.queriedAt) ? "이미 지난 시각 · 저장된 예측" : "서버 조회 시각 이후") : "조회 시각 미확인"]]));
+      else forecastPanel.appendChild(facts([["필요 이력","현재 포함 연속 13건"],["예측 범위","기준 측정 시각 + 300초"]]));
+      if(historical) {const why=document.createElement("p");why.textContent="현재 보고: "+liveModelReason(latest,m,"forecast");forecastPanel.appendChild(why);}
+      const guard=latest?.analysis?.forecast?.guard;
+      if(guard?.policyId==="pump-forecast-reject-v3" && snapshotNumber(guard.inputRobust) && snapshotNumber(guard.inputRobustLimit))
+        forecastPanel.appendChild(facts([["예측 입력 이탈값",featureDisplay(guard.inputRobust)],["예측 입력 허용 기준",featureDisplay(guard.inputRobustLimit)]]));
+      const forecastHint=document.createElement("p");forecastHint.className="live-context";
+      forecastHint.textContent="첫 정기 기록부터 약 5분이 필요합니다. 즉시 보고는 정기 이력과 구분합니다. 고장 시점·잔여수명 예측이 아니며 사건·알림을 발생시키거나 해제하지 않습니다.";
+      forecastPanel.appendChild(forecastHint);modules.append(detector,forecastPanel);card.appendChild(modules);
+      const values=document.createElement("div");values.className="live-feature-table";
+      const validValues=featureValuesValid(latest?.window);
+      values.appendChild(statusTable("9개 특징의 실측값과 예측값 · 무단위",
+        ["특징 / 축","최근 실측",prediction ? "5분 뒤 예측 (실측값 아님)" : "예측 대기"],
+        verifierFeatures.map(k=>[k+" · "+({cf:"CF",sk:"왜도",ku:"Pearson 첨도"}[k.slice(0,2)])+" "+({1:"X",2:"Y",3:"Z"}[k.at(-1)]),
+          validValues ? featureDisplay(latest.window.features[k]) : "—", prediction ? featureDisplay(f.features[k]) : "—"])));
+      const precision=document.createElement("p");precision.className="live-context";
+      precision.textContent="표시값은 유효숫자 6자리입니다. 원래 정밀도의 특징값은 아래 상세에서 확인할 수 있습니다.";values.appendChild(precision);
+      if(historical) {const basis=document.createElement("p");basis.className="live-context";basis.textContent="예측 열은 위에 표시한 기준 측정 시각에서 계산한 값이며 최근 실측과 기준 시각이 다를 수 있습니다.";values.appendChild(basis);}
+      card.appendChild(values);
+      const detailKey=JSON.stringify([result.siteId,result.assetId,result.deviceId,scope.sensorId]);
+      const records=snapshotDetails(detailKey+":records"),recordTitle=document.createElement("summary");recordTitle.textContent="최근 수신·판정 이력 (최대 20건)";
+      const scroll=document.createElement("div");scroll.className="table-scroll";
+      scroll.appendChild(statusTable("수신 기록 · 실제 측정 순서 · 이전 설정의 결과는 별도 표시",
+        ["센서 / 측정 / 수신","전송 사유 / 품질","오류 판정 / 점수","예측 처리","부팅 / 이력 순번 / 구간"],items.slice(0,20).map(row=>{
+          const a=row.analysis || {},old=a.inference?.model && !sameSnapshotModel(a.inference.model,m);
+          return [displayValue(row.window.sensorId)+" / "+formatLocalTime(row.window.timestamp)+" / "+formatLocalTime(row.receivedAt),
+            snapshotDelivery(row.transmission).reason+" / "+row.window.quality+" / "+snapshotReason(row.window.reason),
+            snapshotProcessing(row)+(snapshotCompleted(row) ? ` · ${a.score} / ${a.comparison} ${a.threshold} (${a.scoreType})` : "")+(old ? " · 이전 모델 설정의 결과" : ""),
+            snapshotForecastValid(row) ? "예측 완료 · "+formatLocalTime(a.forecast.predictedFor) : snapshotReason(a.forecast?.reason || a.reason),
+            row.window.bootId+" / "+displayValue(row.window.historySequence)+" / #"+row.window.windowIndex+(row.lateArrival ? " · 늦은 도착" : "")];
+        })));
+      records.append(recordTitle,scroll);card.appendChild(records);
+      const metadata=snapshotDetails(detailKey+":model"),metadataTitle=document.createElement("summary");metadataTitle.textContent="모델·입력 규격·분석 근거 상세";
+      const warning=document.createElement("p");warning.textContent="학습 원본 특징과의 동일성 미확인 · 현장 적용 성능 미검증 · 운영 승인 전 비교 적용. 원본과 과거 결과는 변경하지 않습니다.";
+      metadata.append(metadataTitle,warning,rawDetails("현재 연결 모델과 입력 호환성",{model:m,compatibility:result.modelCompatibility,eventPolicy:result.eventPolicy}),
+        rawDetails("최근 실측 특징값 원문",latest?.window.features || null),
+        rawDetails("최근 구간의 서버 분석 근거",latest?.analysis || null));
+      if(historical) metadata.appendChild(rawDetails("표시한 최근 정기 예측의 근거",prediction.analysis));
+      card.appendChild(metadata);return card;
+    }
     function renderSnapshotCard(result) {
+      if(isDualModel(result.configuredModel)) return renderDualModelCard(result);
       const card = document.createElement("section"); card.className = "history-card";
       const title = document.createElement("h3"); title.textContent = result.deviceId + " / " + result.assetId;
       const configured = document.createElement("p");
@@ -1284,6 +1490,9 @@ def render_page() -> str:
     }
 
     function eventModelSummary(event) {
+      if(event.source === "snapshot" && isHistoryVerifier(event.snapshotEvidence?.inference?.model))
+        return `이력 모델 발생 점수 ${event.snapshotScore} (고장 확률 아님) · ${event.modelVersion} · ${event.status} · `
+          + ({observing:"학습 기준 초과 관측 중",recovered:"학습 기준 미초과로 사건 해제 · 장비 정상 확정 아님",unknown:"관측 불명 (자동 해제 아님)",operator_resolved:"작업자 수동 해제"}[event.snapshotObservation] || "관측 미확인");
       if (event.source === "snapshot") return `단건 모델 발생 점수 ${event.snapshotScore} (통계 점수 아님) · ${event.modelVersion} · ${event.status} · `
         + ({observing:"이상 관측 중",recovered:"정상 판정으로 복귀",unknown:"관측 불명 (자동 복귀 아님)",operator_resolved:"작업자 수동 해제"}[event.snapshotObservation] || "관측 미확인");
       if (event.source === "rf66") return `RF66 ${event.rf66Score} · ${event.status} · ${event.rf66Observation}`;
@@ -1362,7 +1571,7 @@ def render_page() -> str:
         ["이벤트 ID",event.id], ["모델 버전",response.modelVersion], ["규칙 버전",rule.version || rule.policyId],
         ["장치",response.deviceSnapshot?.deviceId || response.deviceSnapshot?.id],
         ["진입 점수 임계값",event.source === "snapshot" ? `${event.snapshotEvidence?.comparison} ${event.snapshotThreshold} (${event.snapshotEvidence?.scoreType})` : event.source === "rf66" ? event.rf66Threshold : rule.scoreThreshold],
-        ["규칙 지속시간",event.source === "snapshot" ? "서버 이상 1건 발생 / 같은 모델 정상 1건 복귀" : event.source === "rf66" ? "발생/복귀 각 3구간" : measuredValue(rule.durationSec,"초")],
+        ["규칙 지속시간",event.source === "snapshot" ? (isHistoryVerifier(event.snapshotEvidence?.inference?.model) ? "이력 검증 기준 초과로 발생 / 같은 모델 기준 미초과로 사건 해제 (정상 확정 아님)" : "서버 이상 1건 발생 / 같은 모델 정상 1건 복귀") : event.source === "rf66" ? "발생/복귀 각 3구간" : measuredValue(rule.durationSec,"초")],
         ["규칙 활성",rule.active === true ? "활성" : rule.active === false ? "비활성" : "미수신"],
         ["신호 출처",response.context.source],
       ]));

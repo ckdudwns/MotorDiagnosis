@@ -19,7 +19,8 @@ for(const response of cases) {
   assert.match(content,/학습 원본 특징과의 동일성 미확인/);
   const row=response.items[0],f=row.analysis.forecast;
   if(f?.status==='completed') {
-    assert.match(content,/9개 특징의 예측값 \(실측값 아님\)/);
+    assert.match(content,/9개 특징의 실측값과 예측값/);
+    assert.match(content,/5분 뒤 예측 \(실측값 아님\)/);
     for(const [key,value] of Object.entries(f.features)) {
       assert.ok(content.includes(key));assert.ok(content.includes(String(value)));
     }

@@ -822,20 +822,27 @@ def render_page() -> str:
       const forecastPanel=document.createElement("section");forecastPanel.className="live-module forecast";
       const forecastTitle=document.createElement("h4");forecastTitle.textContent="5분 뒤 특징값 예측 · 오류 판정과 별도";
       const forecastState=document.createElement("p");forecastState.className="live-state";
-      const forecastBlocked=["FORECAST_INPUT_OUT_OF_DISTRIBUTION","FORECAST_OUTPUT_OUT_OF_RANGE","FORECAST_OUTPUT_INVALID"].includes(latest?.analysis?.forecast?.reason)
-        || (latest?.analysis?.forecast?.status==="completed" && !snapshotForecastValid(latest));
-      const prediction=forecastBlocked ? undefined : sensorItems.find(row=>row.window.bootId===latest?.window.bootId
-        && sameSnapshotModel(row.analysis?.inference?.model,m) && snapshotForecastValid(row));
+      // Choose the latest scheduled measurement BEFORE checking its outcome.
+      // Nonperiodic reports must not bypass a rejected/pending scheduled result
+      // to resurrect an older success. Scheduled events also carry a slot.
+      const forecastRecord=sensorItems.find(row=>row.window.bootId===latest?.window.bootId
+        && (Number.isInteger(row.window.periodicSlotEpoch) || row.transmission?.eventType==="periodic")) || latest;
+      const prediction=forecastRecord && sameSnapshotModel(forecastRecord.analysis?.inference?.model,m)
+        && snapshotForecastValid(forecastRecord) ? forecastRecord : undefined;
       const f=prediction?.analysis.forecast;
       const historical=prediction && prediction.ordinal!==latest?.ordinal;
-      forecastState.textContent=prediction ? (historical ? "최근 정기 이력의 예측 · 현재 보고의 결과 아님" : "예측 완료") : liveModelReason(latest,m,"forecast");
+      const priorScheduled=forecastRecord && forecastRecord.ordinal!==latest?.ordinal;
+      forecastState.textContent=prediction ? (historical ? "최근 정기 이력의 예측 · 현재 보고의 결과 아님" : "예측 완료") : liveModelReason(forecastRecord,m,"forecast");
       forecastPanel.append(forecastTitle,forecastState);
       if(prediction) forecastPanel.appendChild(facts([["예측 대상 시각",formatLocalTime(f.predictedFor)],
         ["기준 측정 시각",formatLocalTime(f.basedOnMeasuredAt)],["입력 이력","현재 포함 13건 · 25초 등간격"],
         ["예측 대상 시점",snapshotTime(result.queriedAt) ? (Date.parse(f.predictedFor)<=Date.parse(result.queriedAt) ? "이미 지난 시각 · 저장된 예측" : "서버 조회 시각 이후") : "조회 시각 미확인"]]));
       else forecastPanel.appendChild(facts([["필요 이력","현재 포함 연속 13건"],["예측 범위","기준 측정 시각 + 300초"]]));
-      if(historical) {const why=document.createElement("p");why.textContent="현재 보고: "+liveModelReason(latest,m,"forecast");forecastPanel.appendChild(why);}
-      const guard=latest?.analysis?.forecast?.guard;
+      if(priorScheduled) {
+        if(!prediction) forecastPanel.appendChild(facts([["예측 확인 기준 정기 측정 시각",formatLocalTime(forecastRecord.window.timestamp)]]));
+        const why=document.createElement("p");why.textContent="현재 보고: "+liveModelReason(latest,m,"forecast");forecastPanel.appendChild(why);
+      }
+      const guard=forecastRecord?.analysis?.forecast?.guard;
       if(guard?.policyId==="pump-forecast-reject-v3" && snapshotNumber(guard.inputRobust) && snapshotNumber(guard.inputRobustLimit))
         forecastPanel.appendChild(facts([["예측 입력 이탈값",featureDisplay(guard.inputRobust)],["예측 입력 허용 기준",featureDisplay(guard.inputRobustLimit)]]));
       const forecastHint=document.createElement("p");forecastHint.className="live-context";
@@ -869,7 +876,7 @@ def render_page() -> str:
       metadata.append(metadataTitle,warning,rawDetails("현재 연결 모델과 입력 호환성",{model:m,compatibility:result.modelCompatibility,eventPolicy:result.eventPolicy}),
         rawDetails("최근 실측 특징값 원문",latest?.window.features || null),
         rawDetails("최근 구간의 서버 분석 근거",latest?.analysis || null));
-      if(historical) metadata.appendChild(rawDetails("표시한 최근 정기 예측의 근거",prediction.analysis));
+      if(priorScheduled) metadata.appendChild(rawDetails("표시한 최근 정기 예측의 근거",forecastRecord.analysis || null));
       card.appendChild(metadata);return card;
     }
     function renderSnapshotCard(result) {

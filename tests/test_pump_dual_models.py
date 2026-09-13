@@ -317,6 +317,26 @@ class DualServingTest(RpmSetup):
             server.shutdown(); server.server_close(); thread.join()
 
     @unittest.skipUnless(shutil.which("node"),"Node required for shipped UI")
+    def test_real_guard_rejection_remains_visible_after_unscheduled_report(self):
+        self.history(25)
+        self.assertEqual(self.latest()["analysis"]["forecast"]["status"], "completed")
+        blocked = self.payload(25)
+        blocked["window"]["features"]["cf_a_2"] = 1000.
+        blocked["window"]["integrity"]["digest"] = contract.feature_digest(blocked["window"]["features"])
+        self.assertEqual(self.send(blocked)[1], 202)
+        self.process()
+        rejected = self.latest()
+        self.assertEqual(rejected["analysis"]["forecast"]["reason"], "FORECAST_INPUT_OUT_OF_DISTRIBUTION")
+        cases = [self.store.list_device(self.admin, DEVICE)]
+        self.assertEqual(self.send(self.payload(26, scheduled=False, event="anomaly_active", offset=-20.))[1], 202)
+        self.process()
+        self.assertEqual(self.latest()["analysis"]["forecast"]["reason"], "FORECAST_REQUIRES_SCHEDULED_RECORD")
+        after = self.store.list_device(self.admin, DEVICE)
+        self.assertEqual(next(r for r in after["items"] if r["ordinal"] == rejected["ordinal"]), rejected)
+        cases.append(after)
+        self.assert_dashboard({"snapshots": [], "blockedForecasts": cases})
+
+    @unittest.skipUnless(shutil.which("node"),"Node required for shipped UI")
     def test_backfilled_history_forecast_is_visible_using_real_api_response(self):
         for seq in range(13):
             if seq != 8:

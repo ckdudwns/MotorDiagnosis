@@ -38,8 +38,10 @@ class SnapshotModelAdapter:
         from .pump_summary import INPUT_CONTRACT as HISTORY_INPUT
         from .edge_feature_snapshots import INPUT_CONTRACT as FEATURE_INPUT, CONTRACT_ID as FEATURE_CONTRACT
         from .edge_feature_snapshots import HISTORY_INPUT_CONTRACT, HISTORY_CONTRACT_ID
+        from .edge_feature_snapshots import RAW_CF_HISTORY_INPUT_CONTRACT, RAW_CF_HISTORY_CONTRACT_ID
         contracts = {CONTRACT_ID: INPUT_CONTRACT, "history-event-verifier-v1": HISTORY_INPUT,
-                     FEATURE_CONTRACT: FEATURE_INPUT, HISTORY_CONTRACT_ID: HISTORY_INPUT_CONTRACT}
+                     FEATURE_CONTRACT: FEATURE_INPUT, HISTORY_CONTRACT_ID: HISTORY_INPUT_CONTRACT,
+                     RAW_CF_HISTORY_CONTRACT_ID: RAW_CF_HISTORY_INPUT_CONTRACT}
         if (not isinstance(metadata["contractId"], str) or metadata["contractId"] not in contracts
                 or metadata["inputContract"] != contracts[metadata["contractId"]]):
             raise ValueError("Unsupported single-snapshot model input contract")
@@ -48,7 +50,7 @@ class SnapshotModelAdapter:
                 raise ValueError("Invalid snapshot model " + key)
         scope = metadata["scope"]
         scope_keys = {"deviceId", "siteId", "assetId"}
-        if metadata["contractId"] in ("history-event-verifier-v1", FEATURE_CONTRACT, HISTORY_CONTRACT_ID):
+        if metadata["contractId"] in ("history-event-verifier-v1", FEATURE_CONTRACT, HISTORY_CONTRACT_ID, RAW_CF_HISTORY_CONTRACT_ID):
             scope_keys.add("sensorId")
         if (not isinstance(scope, dict) or set(scope) != scope_keys
                 or any(not isinstance(v, str) or not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{0,99}", v) for v in scope.values())):

@@ -131,7 +131,8 @@ class SnapshotInference:
                     context["sensorId"] = window.get("sensorId")
                     context["ordinal"] = row["ordinal"]
                     context["digest"] = row["digest"]
-                    if window.get("profileId") in ("adxl345-ac-cf-sk-ku-v1", "adxl345-ac-cf-sk-ku-25s-v1"):
+                    from .edge_feature_snapshots import PROFILE_IDS
+                    if window.get("profileId") in PROFILE_IDS:
                         context["eventType"] = payload["transmission"]["eventType"]
                         context["periodicSlotEpoch"] = window["periodicSlotEpoch"]
                 except (data.ApiError, ValueError, TypeError, KeyError, OverflowError):
@@ -164,8 +165,8 @@ class SnapshotInference:
         from .transmission_policy import validate_snapshot
         from .pump_summary import POLICY_ID, PROFILE_ID, FEATURES
         from . import edge_feature_snapshots as features
-        grid = self.model.metadata()["inputContract"]["sourceProfileId"] == features.HISTORY_PROFILE_ID
-        profile = features.HISTORY_PROFILE_ID if grid else PROFILE_ID
+        profile = self.model.metadata()["inputContract"]["sourceProfileId"]
+        grid = profile in features.HISTORY_PROFILE_IDS
         policy = features.HISTORY_POLICY_ID if grid else POLICY_ID
         selector = ("json_extract(body,'$.window.historySequence') IS NOT NULL" if grid else
                     "json_extract(body,'$.transmission.reason')='history_periodic'")

@@ -79,6 +79,9 @@ AI1 학습 결과의 생성과 백엔드 모델 등록, 사용 승인, 실제 �
 오류 판정은 직전 24건+현재값, Ridge 예측은 현재 포함 13건으로 5분 뒤 특징 9개를 계산합니다.
 두 결과는 독립 저장·표시하며 예측값은 사건·알림에 사용하지 않습니다.
 학습 원본과 ADXL 특징의 동일성이 미확인되어 명시적인 비교 적용 설정과 센서별 stream 배정이 필요합니다.
+평균 제거 전 CF를 보내는 보드는 [Raw CF + centered SK/KU v2 규격](docs/raw-cf-profile-v2.md)의
+`adxl345-raw-cf-centered-sk-ku-25s-v2`와 `experimental-adxl25-raw-cf`를 함께 사용합니다.
+v1 이력을 새 계약에 섞지 않으며 모델 계수·예측 차단 기준은 변경하지 않습니다.
 [이전 RF66 연결·검증 안내](docs/rf66-shadow-inference.md)는 과거 구현 참고용입니다.
 
 ## 3. 저장소 구조

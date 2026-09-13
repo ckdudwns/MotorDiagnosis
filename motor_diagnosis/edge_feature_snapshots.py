@@ -20,7 +20,11 @@ CONTRACT_ID = "edge-feature-event-v1"
 HISTORY_PROFILE_ID = "adxl345-ac-cf-sk-ku-25s-v1"
 HISTORY_POLICY_ID = "edge-feature-history-v1"
 HISTORY_CONTRACT_ID = "edge-feature-history-model-v1"
-PROFILE_IDS = (PROFILE_ID, HISTORY_PROFILE_ID)
+RAW_CF_HISTORY_PROFILE_ID = "adxl345-raw-cf-centered-sk-ku-25s-v2"
+RAW_CF_ADAPTER_ID = "adxl345-raw-cf-centered-moments-v2"
+RAW_CF_HISTORY_CONTRACT_ID = "edge-feature-history-model-v2"
+HISTORY_PROFILE_IDS = (HISTORY_PROFILE_ID, RAW_CF_HISTORY_PROFILE_ID)
+PROFILE_IDS = (PROFILE_ID, *HISTORY_PROFILE_IDS)
 INPUT_CONTRACT = {
     "adapterId": ADAPTER_ID, "sourceProfileId": PROFILE_ID,
     "shape": [9], "features": list(FEATURES), "unit": "dimensionless",
@@ -32,10 +36,23 @@ HISTORY_INPUT_CONTRACT = {
     "historyIntervalSec": 25, "historyClock": "unix_epoch_25s",
     "maxWindowEndAgeSec": 1,
 }
+# Mixed preprocessing must not claim that CF was mean-removed. These are
+# declarations of board arithmetic, not transformations applied by the server.
+RAW_CF_HISTORY_INPUT_CONTRACT = {
+    **{k: v for k, v in HISTORY_INPUT_CONTRACT.items() if k != "meanRemoved"},
+    "adapterId": RAW_CF_ADAPTER_ID, "sourceProfileId": RAW_CF_HISTORY_PROFILE_ID,
+    "featureDefinitions": {
+        "cf": "max(abs(raw))/sqrt(mean(raw**2))",
+        "sk": "mean(centered**3)/mean(centered**2)**1.5",
+        "ku": "mean(centered**4)/mean(centered**2)**2",
+        "centered": "raw-mean(raw)",
+    },
+}
 
 
 def input_contract(profile):
-    return HISTORY_INPUT_CONTRACT if profile == HISTORY_PROFILE_ID else INPUT_CONTRACT
+    return {PROFILE_ID: INPUT_CONTRACT, HISTORY_PROFILE_ID: HISTORY_INPUT_CONTRACT,
+            RAW_CF_HISTORY_PROFILE_ID: RAW_CF_HISTORY_INPUT_CONTRACT}[profile]
 KEYS = {"schemaVersion", "deviceId", "siteId", "assetId", "sensorId", "bootId",
         "windowIndex", "timestamp", "startUptimeUs", "sampleRateHz", "sampleCount",
         "profileId", "axes", "unit", "quality", "reason", "features", "integrity",
@@ -49,7 +66,7 @@ def invalid(message):
 
 
 def normalize(window, *, check_time_bounds=True):
-    history = isinstance(window, dict) and window.get("profileId") == HISTORY_PROFILE_ID
+    history = isinstance(window, dict) and window.get("profileId") in HISTORY_PROFILE_IDS
     keys = KEYS | {"historySequence"} if history else KEYS
     if not isinstance(window, dict) or set(window) != keys:
         invalid("Use the exact feature-only envelope; rawWindow/samples/encoding are not accepted")
@@ -107,7 +124,7 @@ def normalize(window, *, check_time_bounds=True):
 
 
 def validate_delivery(info, window):
-    history = window.get("profileId") == HISTORY_PROFILE_ID
+    history = window.get("profileId") in HISTORY_PROFILE_IDS
     keys = {"policyId", "eventType", "state", "anomalyCount", "normalCount"}
     if (set(info) != keys or window.get("profileId") not in PROFILE_IDS
             or info["policyId"] != (HISTORY_POLICY_ID if history else POLICY_ID)):

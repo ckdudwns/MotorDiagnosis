@@ -4,6 +4,7 @@ import {readFileSync} from 'node:fs';
 import {harness, source} from './dashboard_harness.mjs';
 
 const text = e => typeof e === 'string' ? e : e.textContent + ' ' + e.children.map(text).join(' ');
+const walk = e => typeof e === 'string' ? [] : [e,...e.children.flatMap(walk)];
 const scope = {deviceId:'D1',siteId:'S1',assetId:'A1'};
 const measured = '2026-09-12T00:00:00Z';
 const at = seconds => new Date(Date.parse(measured) + seconds * 1000).toISOString();
@@ -106,7 +107,8 @@ test('overview has an independent new panel and preserves historical RF66',()=>{
   assert.ok(!source.includes('.innerHTML'));
   const h=fixture();h.run('setView("overview")');assert.equal(h.get('snapshotPanel').hidden,false);
   h.run('setView("events")');assert.equal(h.get('snapshotPanel').hidden,true);
-  assert.match(source,/새 단건 결과는 기존 통계 점수·RF66 과거 이력과 별개/);
+  h.run('setView("models")');assert.equal(h.get('snapshotPanel').hidden,true);assert.equal(h.get('rf66Panel').hidden,false);
+  assert.deepEqual(Array.from(h.run('WORKSPACE_VIEWS.overview.panels')),['snapshotPanel','overviewIssuesPanel']);
 });
 
 function featureMetadata() {
@@ -131,7 +133,7 @@ test('feature-only schedule and board events render without raw or a fabricated 
     assert.ok(value(h).includes(label));assert.match(value(h),/모델 대기/);
     assert.doesNotMatch(value(h),/전송 정책 확인 필요|모델 이상 후보|모델 정상 후보|warming_up/);
   }
-  assert.ok(source.includes('정기 이력은 Unix 시각 기준 25초 간격이며 이상 상태에서도 유지'));
+  assert.ok(source.includes('25초 등간격 정기 이력 · 이상 중에도 유지'));
 });
 test('incompatible history model and invalid feature records have explicit non-normal reasons',async()=>{
   const h=fixture(),row=featureRow();
@@ -200,7 +202,9 @@ test('snapshot events and notifications distinguish open, recovery and unknown',
   h.context.event={id:'SNAPSHOT-TEST',title:'단건 모델 이상 후보',source:'snapshot',occurredAt:measured,
     snapshotScore:.8,score:null,modelVersion:'model-v2',snapshotObservation:'unknown',status:'open',severity:'critical',label:'needs_review'};
   h.run('events=[event];renderEvents()');
-  assert.match(text(h.get('events')),/발생 점수 0.8/);assert.match(text(h.get('events')),/관측 불명/);
+  assert.match(text(h.get('events')),/진행 중/);
+  assert.doesNotMatch(text(h.get('events')),/발생 점수/);
+  assert.match(h.run('eventModelSummary(event)'),/발생 점수 0.8/);assert.match(h.run('eventModelSummary(event)'),/관측 불명/);
   assert.doesNotMatch(text(h.get('events')),/null|RF66/);
   h.run('renderNotifications([{event:{...event,snapshotTransition:"open"},deliveredAt:event.occurredAt},{event:{...event,snapshotTransition:"closed"},deliveredAt:event.occurredAt}])');
   assert.match(text(h.get('notifications')),/단건 모델 이상 발생/);
@@ -301,10 +305,11 @@ test('past model results are labelled even if only preprocessing or threshold ch
 test('latest waiting input cannot be disguised by an older completed or late-arriving result',async()=>{
   const h=fixture(),old=completed(1),latest=item();old.receivedAt=at(100);old.lateArrival=true;
   latest.window.timestamp=at(50);latest.window.windowIndex=200;
-  h.context.reply=()=>result([old,latest],metadata());await load(h);
-  const card=h.get('snapshotRows').children[0],current=card.children.find(child=>text(child).includes('최근 구간 서버 처리'));
-  assert.match(text(current),/모델 대기/);
-  assert.doesNotMatch(text(current),/모델 이상 후보/);assert.match(value(h),/늦은 도착/);
+  h.context.reply=()=>({...result([old,latest],metadata()),queriedAt:at(54)});await load(h);
+  const card=h.get('snapshotRows').children[0],current=card.children.find(child=>child.className?.split(' ').includes('verdict'));
+  assert.equal(text(current).trim(),'판정 대기');
+  assert.doesNotMatch(text(current),/이상 후보|기준 미초과/);assert.match(value(h),/늦은 도착/);
+  assert.match(value(h),/모델 대기/);
   assert.match(value(h),/대상 측정/);assert.match(value(h),/현재 상태 보장 아님/);
 });
 test('device and telemetry permissions are required, model-read is not spuriously required',async()=>{
@@ -397,7 +402,9 @@ test('entering overview triggers refresh immediately',async()=>{
 test('up to twenty measured rows are ordered and rendered independently of the time filter',async()=>{
   const h=fixture(),rows=Array.from({length:22},(_,i)=>{const r=item();r.window.timestamp=at(i);r.window.windowIndex=i;return r;});
   h.context.reply=()=>result(rows);h.context.query.from='2030-01-01';await load(h);
-  const card=h.get('snapshotRows').children[0],table=card.children.at(-1).children[0];
+  const card=h.get('snapshotRows').children[0],details=card.children.find(e=>e.tagName==='details');
+  assert.ok(details);assert.ok(!details.open);
+  const table=walk(details).find(e=>e.tagName==='table'&&text(e.children.find(child=>child.tagName==='caption')).startsWith('최근 측정 최대 20건'));
   const rendered=table.children.find(e=>e.tagName==='tbody').children;assert.equal(rendered.length,20);
   assert.match(text(rendered[0]),/#21/);assert.match(text(rendered.at(-1)),/#2/);
   assert.ok(!h.requests.at(-1).path.includes('?'));

@@ -32,6 +32,12 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_ROWS = 100000
 MAX_STREAMS = 10000
 LIST_LIMIT = 20
+EXPORT_LIMIT = 100000
+EXPORT_RANGE_SECONDS = 31 * 24 * 60 * 60
+MEASUREMENT_CSV_FIELDS = (
+    "site_id", "asset_id", "device_id", "sensor_id", "measured_at", "received_at",
+    "profile_id", "quality", "reason", *feature_snapshots.FEATURES,
+)
 CLOCK_TOLERANCE_SECONDS = 1
 LOGGER = logging.getLogger(__name__)
 
@@ -378,6 +384,54 @@ class PeriodicSnapshotStore:
             self.db.execute("UPDATE periodic_snapshots SET status=?,result=? WHERE ordinal=? AND status='queued'",
                             (result["status"], json.dumps(result, allow_nan=False), row["ordinal"]))
         return True
+
+    @device_lifecycle.serialized
+    def export_measurements(self, user, site_id, asset_id, from_timestamp, to_timestamp):
+        """Export original feature measurements, independent of inference or its display limit."""
+        for permission in ("export:read", "telemetry:read", "device:read"):
+            data.require_permission(user, permission)
+        start = data.parse_rfc3339("from", from_timestamp)
+        end = data.parse_rfc3339("to", to_timestamp)
+        if start > end:
+            raise data.ApiError(400, "INVALID_TIME_RANGE", "from must be earlier than or equal to to.")
+        if (end - start).total_seconds() > EXPORT_RANGE_SECONDS:
+            raise data.ApiError(400, "SNAPSHOT_EXPORT_RANGE_TOO_LARGE", "Export at most 31 days at a time.")
+        with data.STORE_LOCK:
+            data.get_site(site_id)
+            data.require_site_access(user, site_id)
+            data.get_asset(site_id, asset_id)
+            device_ids = [device["id"] for device in data.DEVICES
+                          if device["siteId"] == site_id and device["assetId"] == asset_id]
+        # The lifecycle gate keeps device assignments stable while STORE_LOCK is released.
+        # Query each current device using snapshot_latest, without an unbounded SQL IN list.
+        stored = []
+        profiles = ",".join("?" for _ in feature_snapshots.PROFILE_IDS)
+        with self.lock:
+            for device_id in device_ids:
+                stored.extend(self.db.execute(
+                    "SELECT ordinal,captured,received,body FROM periodic_snapshots "
+                    "WHERE device=? AND site=? AND asset=? AND captured>=? AND captured<=? "
+                    f"AND json_extract(body,'$.window.profileId') IN ({profiles}) "
+                    "ORDER BY captured,ordinal LIMIT ?",
+                    (device_id, site_id, asset_id, start.timestamp(), end.timestamp(),
+                     *feature_snapshots.PROFILE_IDS, EXPORT_LIMIT - len(stored) + 1)).fetchall())
+                if len(stored) > EXPORT_LIMIT:
+                    raise data.ApiError(413, "SNAPSHOT_EXPORT_TOO_LARGE",
+                                        "Export exceeds 100000 measurements; choose a shorter period.")
+        rows = []
+        for item in sorted(stored, key=lambda row: (row["captured"], row["ordinal"])):
+            window = json.loads(item["body"])["window"]
+            values = window["features"] if window["quality"] == "valid" else None
+            rows.append({
+                "site_id": window["siteId"], "asset_id": window["assetId"],
+                "device_id": window["deviceId"], "sensor_id": window["sensorId"],
+                "measured_at": window["timestamp"], "received_at": iso(item["received"]),
+                "profile_id": window["profileId"], "quality": window["quality"],
+                "reason": window["reason"],
+                **{feature: values[feature] if values is not None else None
+                   for feature in feature_snapshots.FEATURES},
+            })
+        return {"rows": rows, "from": start, "to": end}
 
     @device_lifecycle.serialized
     def list_device(self, user, device_id):

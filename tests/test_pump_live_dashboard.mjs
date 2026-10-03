@@ -107,10 +107,12 @@ test('v2 historical metadata is still recognized without running the old model',
 
 test('live overview keeps historical models and statistics off the working surface',()=>{
   const h=harness(); h.run('setView("overview")');
-  for(const id of ['snapshotPanel','healthPanel','notificationsPanel']) assert.equal(h.get(id).hidden,false);
+  for(const id of ['snapshotPanel','overviewIssuesPanel']) assert.equal(h.get(id).hidden,false);
+  assert.deepEqual(Array.from(h.run('WORKSPACE_VIEWS.overview.panels')),['snapshotPanel','overviewIssuesPanel']);
+  for(const id of ['healthPanel','notificationsPanel']) assert.match(source,new RegExp(`id="${id}" hidden`));
   for(const id of ['rf66Panel','siteKpis','sitesPanel','modelPanel','modelReviewPanel']) assert.equal(h.get(id).hidden,true);
   assert.equal(h.get('telemetryPeriodField').hidden,true);
-  assert.match(source,/정기 이력은 Unix 시각 기준 25초 간격이며 이상 상태에서도 유지/);
+  assert.match(source,/25초 등간격 정기 이력 · 이상 중에도 유지/);
 });
 
 test('two models show source scope, exact features, ratio, separate 24/13 histories and target time',()=>{

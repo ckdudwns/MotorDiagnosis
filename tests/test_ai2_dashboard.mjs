@@ -173,17 +173,13 @@ await check('render races preserve newer rows and user drafts', async () => {
   h.run('currentView="events"');
   h.context.respond = path => {
     const url = new URL(path,'http://local');
-    if (url.pathname === '/api/telemetry') return url.searchParams.get('assetId') === 'A1' ? new Promise(resolve => {release=resolve;}) : {points:[],units:{}};
-    if (url.pathname === '/api/dashboard/sites-summary') return [];
-    if (url.pathname === '/api/events') return {items:[{id:url.searchParams.get('assetId'),occurredAt:'2026-09-06T00:00:00Z'}],page:1,size:12,total:1};
-    if (url.pathname.startsWith('/api/anomaly/rules/')) return {};
-    if (url.pathname.endsWith('/devices')) return [];
-    if (url.pathname === '/api/health/dependencies') return {};
-    return {items:[]};
+    assert.equal(url.pathname,'/api/events');
+    if (url.searchParams.get('assetId') === 'A1') return new Promise(resolve => {release=resolve;});
+    return {items:[{id:url.searchParams.get('assetId'),occurredAt:'2026-09-06T00:00:00Z'}],page:1,size:12,total:1};
   };
   h.run(`selectedEventId='E1'; reviewDirty=true; $("noteInput").value='draft';`);
   const first = h.run('render()'); h.get('assetSelect').value='A2'; await h.run('render()');
-  release({points:[],units:{}}); await first;
+  release({items:[{id:'A1',occurredAt:'2026-09-06T00:00:00Z'}],page:1,size:12,total:1}); await first;
   assert.equal(h.run('events[0].id'),'A2'); assert.equal(h.get('noteInput').value,'draft');
   assert.equal(h.run('selectedEventId'),'E1');
 });
@@ -382,24 +378,21 @@ await check('late note failures and responses from another event cannot replace 
 });
 
 await check('a pre-filter response stays discarded after failure and refresh recovers the new filter', async () => {
-  const h = harness(), oldTelemetry = deferred();
+  const h = harness(), oldEvents = deferred();
   h.run('currentView="events"');
   const warning = {id:'OLD',title:'Warning',severity:'warning'}, critical = {id:'NEW',title:'Critical',severity:'critical'};
   function response(path) {
     const url = new URL(path,'http://local');
-    if (url.pathname === '/api/telemetry') return {points:[],units:{}};
+    assert.equal(url.pathname,'/api/events');
     if (url.pathname === '/api/events') return {items:[critical],page:1,size:12,total:1};
-    if (url.pathname === '/api/dashboard/sites-summary' || url.pathname.endsWith('/devices')) return [];
-    if (url.pathname.startsWith('/api/anomaly/rules/') || url.pathname === '/api/health/dependencies') return {};
-    return {items:[]};
   }
   h.context.warning = warning; h.run('events=[warning]; eventTotal=1; renderEvents();');
   h.get('severityFilter').value='warning'; h.run('rememberSelection()');
-  h.context.respond = path => path.startsWith('/api/telemetry?') ? oldTelemetry.promise : response(path);
+  h.context.respond = path => path.startsWith('/api/events?') ? oldEvents.promise : response(path);
   const previous = h.run('render()');
   h.get('severityFilter').value='critical'; h.context.respond = () => {throw new Error('filter unavailable');};
   await h.get('severityFilter').listeners.change();
-  oldTelemetry.resolve({points:[],units:{}}); await previous;
+  oldEvents.resolve({items:[warning],page:1,size:12,total:1}); await previous;
   assert.equal(h.run('events.length'),0); assert.equal(h.get('eventsPage').textContent,'조회 실패');
   h.context.respond = response; await h.get('refreshBtn').listeners.click();
   assert.deepEqual(clone(h.run('events.map(item=>item.id)')),['NEW']);
@@ -457,7 +450,7 @@ await check('navigation preserves review, memo, management drafts and chart sele
   assert.equal(h.get('managementReason').value,'management draft'); assert.equal(h.get('reviewReason').value,'review reason');
   assert.equal(h.get('attachmentRefs').value,'survey://draft'); assert.equal(h.get('severityFilter').value,'critical');
   assert.deepEqual(clone(h.run('[reviewDirty,memoDirty,managementDirty,editingNoteId]')),[true,true,true,'N1']);
-  assert.ok(h.requests.slice(calls).every(r=>(!r.options.method||r.options.method==='GET')&&!r.path.includes('/api/events')));
+  assert.ok(h.requests.slice(calls).every(r=>(!r.options.method||r.options.method==='GET')&&!/^\/api\/events\//.test(r.path)));
 });
 
 await check('management navigation respects read access including audit-only users', () => {
@@ -506,7 +499,7 @@ await check('review cards show actor, reason and label transitions as safe text'
   const h = harness(); h.run(`renderReviewHistory({items:[{id:'R1',changedAt:null,actor:{name:'<img>'},before:{label:'needs_review'},after:{label:'confirmed_anomaly',note:'<script>draft</script>'},reason:'checked sensor'}],page:1,size:20,total:1})`);
   const card = h.get('reviewHistory').children[0], summary = textOf(card.children[1]);
   assert.equal(card.children[0].textContent,'— · <img>'); assert.equal(card.children[0].children.length,0);
-  assert.match(summary,/이전 라벨.*검수 필요.*변경 라벨.*이상 확인/);
+  assert.match(summary,/이전 라벨.*확인 필요.*변경 라벨.*이상 확인/);
   assert.match(summary,/변경 사유.*checked sensor/); assert.match(summary,/<script>draft<\/script>/);
   assert.equal(card.children[2].tagName,'details');
 });

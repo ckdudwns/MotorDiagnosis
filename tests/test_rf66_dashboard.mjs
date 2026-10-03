@@ -37,8 +37,10 @@ test('event modes are explicit and RF66 event scores are not statistical scores'
   h.context.rows=[{id:'RF66-TEST',title:'RF66 event',source:'rf66',occurredAt:'2026-09-08T00:00:00Z',
     score:null,rf66Score:.85,status:'open',rf66Observation:'unknown',severity:'critical',label:'needs_review'}];
   h.run('events=rows;renderEvents()');
-  assert.match(text(h.get('events')),/RF66 0.85/);
-  assert.match(text(h.get('events')),/unknown/);
+  assert.match(text(h.get('events')),/진행 중/);
+  assert.doesNotMatch(text(h.get('events')),/RF66 0.85/);
+  assert.match(h.run('eventModelSummary(rows[0])'),/RF66 0.85/);
+  assert.match(h.run('eventModelSummary(rows[0])'),/unknown/);
   assert.doesNotMatch(text(h.get('events')),/null/);
 });
 

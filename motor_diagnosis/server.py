@@ -117,7 +117,7 @@ from .edge_analysis import AnalysisStore
 from .model_inference import ModelInferenceStore
 from .vibration_windows import VibrationWindowStore
 from .raw_vibration import RawVibrationStore
-from .periodic_snapshots import PeriodicSnapshotStore
+from .periodic_snapshots import MEASUREMENT_CSV_FIELDS, PeriodicSnapshotStore
 from .model_history import ModelHistoryGuard
 from .model_registry import create_baseline_version, create_model_version, versions_for
 from .ai_results import submit_result, review_model
@@ -244,6 +244,13 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
         user = self.require_user()
+        if segments == ["api", "periodic-snapshots", "export"]:
+            export = self.server.periodic_snapshots.export_measurements(
+                user, required_query(query, "siteId"), required_query(query, "assetId"),
+                required_query(query, "from"), required_query(query, "to"),
+            )
+            self.send_measurement_csv(export)
+            return
         if (len(segments) == 4 and segments[:2] == ["api", "devices"]
                 and segments[3] == "periodic-snapshots"):
             self.send_json(self.server.periodic_snapshots.list_device(user, segments[2]))
@@ -1280,6 +1287,29 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_measurement_csv(self, export: dict[str, Any]) -> None:
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=MEASUREMENT_CSV_FIELDS, lineterminator="\r\n")
+        writer.writeheader()
+        writer.writerows(
+            {key: _safe_csv_cell(value) for key, value in row.items()} for row in export["rows"]
+        )
+        body = ("\ufeff" + output.getvalue()).encode("utf-8")
+        # Only server-formatted UTC timestamps enter this response header.
+        filename = f"measurements_{export['from']:%Y%m%dT%H%M%SZ}_{export['to']:%Y%m%dT%H%M%SZ}.csv"
+        self.send_response(200)
+        self.send_header("content-type", "text/csv; charset=utf-8")
+        self.send_header("content-disposition", f'attachment; filename="{filename}"')
+        self.send_header("x-measurement-record-count", str(len(export["rows"])))
+        self.send_header("cache-control", "no-store")
+        self.send_header("access-control-allow-origin", "*")
+        self.send_header("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+        self.send_header("access-control-allow-headers", "authorization, content-type")
+        self.send_header("access-control-expose-headers", "content-disposition, x-measurement-record-count")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def send_dataset_csv(self, export: dict[str, Any]) -> None:
         manifest = export["manifest"]
         rows = []
@@ -1546,7 +1576,12 @@ def paginated_events(
     )
     severity = query.get("severity", [""])[0].strip().lower()
     label = query.get("label", [""])[0].strip().lower()
+    status = query.get("status", [""])[0].strip().lower()
     reviewed = optional_boolean_query(query, "reviewed")
+    if status:
+        if status not in {"open", "closed"}:
+            raise ApiError(400, "INVALID_STATUS", "status must be open or closed.")
+        rows = [item for item in rows if str(item.get("status", "")).lower() == status]
     if severity:
         if severity not in {"warning", "critical", "device"}:
             raise ApiError(400, "INVALID_SEVERITY", "severity filter is not supported.")

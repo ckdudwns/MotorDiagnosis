@@ -7,7 +7,9 @@ def render_page() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bind Edge AI Motor Diagnosis</title>
+  <title>MotorDiagnosis 운영 대시보드</title>
+  <meta name="description" content="모터 진동·음향 모니터링, 이벤트 검수 및 장치 운영">
+  <meta name="referrer" content="no-referrer">
   <style>
     :root { color-scheme: light; --ink:#17211f; --muted:#66716d; --line:#d8ded9; --bg:#f4f6f3; --panel:#fff; --teal:#14796f; --red:#c2413b; --amber:#b7791f; --blue:#2472a3; }
     * { box-sizing:border-box; }
@@ -91,11 +93,57 @@ def render_page() -> str:
     textarea { resize:vertical; min-height:90px; }
     [hidden] { display:none !important; }
     @media (max-width:900px) { .login,.toolbar,.grid,.kpis { grid-template-columns:1fr; } header { display:grid; } }
+
+    body {font-size:15px; line-height:1.5; background:#f5f7f8; --line:#e3e8eb; --ink:#253438; --muted:#6b797e; --teal:#16776d;}
+    header {background:#fff;color:var(--ink);border-bottom:1px solid var(--line);padding:18px 32px;}
+    header h1 {font-size:19px;letter-spacing:-.6px;} header span {color:var(--muted);font-size:13px;}
+    main {padding:24px 32px;max-width:1540px;} #appPanel {gap:20px;}
+    .panel,.kpi {border-radius:12px;box-shadow:none;padding:22px;} .login {max-width:700px;margin:8vh auto;width:100%;}
+    .workspace-nav {align-items:center;gap:8px;border:0;padding:0;}
+    .workspace-nav > button {min-width:0;border:0;background:transparent;padding:10px 18px;}
+    .workspace-nav > button[aria-pressed="true"] {color:var(--teal);background:#e6f2ef;}
+    .nav-spacer {flex:1;} #csvToggle {border:1px solid var(--line);background:#fff;color:var(--ink);}
+    .admin-menu {position:relative;} .admin-menu > summary {font-size:13px;color:var(--muted);padding:10px;}
+    .admin-links {position:absolute;right:0;top:100%;width:190px;background:white;border:1px solid var(--line);padding:8px;border-radius:10px;z-index:4;box-shadow:0 8px 20px #25343812;}
+    .admin-links button {display:block;width:100%;min-width:0;text-align:left;border:0;padding:9px;}
+    .workspace-layout {display:grid;grid-template-columns:238px minmax(0,1fr);gap:24px;align-items:start;}
+    .asset-sidebar {padding:20px 14px;position:sticky;top:20px;}
+    .asset-sidebar > label {padding:0 6px 18px;border-bottom:1px solid var(--line);}
+    .asset-sidebar h2 {font-size:13px;color:var(--muted);margin:20px 8px 12px;}
+    .asset-list {display:grid;gap:6px;}.asset-item {background:transparent;border:1px solid transparent;color:var(--ink);text-align:left;padding:13px 12px;font-weight:600;}
+    .asset-item[aria-pressed="true"] {background:#edf6f3;border-color:#bcd9d2;color:var(--teal);}
+    .asset-item small {display:block;font-size:12px;font-weight:400;margin-top:3px;}
+    .workspace-content {min-width:0;display:grid;gap:20px;}.workspace-heading {display:flex;gap:14px;align-items:center;justify-content:space-between;}
+    .workspace-title {font-size:25px;letter-spacing:-.8px;}.workspace-heading p {margin:4px 0 0;font-size:13px;color:var(--muted);}
+    .workspace-tools {display:flex;gap:8px;align-items:center;}.workspace-tools button {width:auto;white-space:nowrap;}.workspace-tools label {font-size:12px;}
+    .grid {grid-template-columns:minmax(0,.85fr) minmax(0,1.15fr);gap:20px;}
+    #snapshotStatus {font-size:12px;color:var(--muted);margin:0 0 14px;}
+    .operating-card {padding:0 0 18px;margin-bottom:20px;border-bottom:1px solid var(--line);}.operating-card:last-child {margin:0;padding-bottom:0;border:0;}
+    .operating-card h3 {font-size:13px;color:var(--muted);font-weight:500;margin:0 0 10px;}
+    .verdict {font-size:27px;font-weight:700;letter-spacing:-.8px;margin:0;color:var(--ink);}
+    .verdict.anomaly {color:#b65330;}.verdict.unavailable {color:#67747a;}.verdict.ready {color:var(--teal);}
+    .verdict-note {font-size:14px;color:var(--muted);margin:6px 0 20px;}
+    .operating-card > .facts {grid-template-columns:repeat(3,minmax(0,1fr));margin:18px 0 24px;}
+    .facts dt {font-size:12px;}.facts dd {font-size:14px;font-weight:500;}.facts div {background:#f6f8f9;}
+    .operating-card details {border-top:1px solid var(--line);padding-top:8px;margin-top:12px;} .operating-card summary {font-size:14px;}
+    .operating-card .live-module {padding:16px;}.operating-card .live-state {font-size:17px;}
+    .operating-card .history-card {border:0;}.live-context {font-size:13px;}
+    #overviewIssues .event {margin-top:8px;display:flex;justify-content:space-between;align-items:center;gap:16px;}
+    #overviewIssues .event span {font-size:12px;color:var(--muted);font-weight:400;}
+    .section-title {display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;}.section-title h2 {margin:0;}
+    .section-title button {width:auto;font-size:13px;} #overviewIssues:empty {display:none;}
+    #csvPanel {border-color:#bcd9d2;} #csvPanel h2 {font-size:17px;margin:0;} .csv-fields {display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end;margin:18px 0 12px;}
+    #csvStatus {font-size:13px;margin-top:10px;} .csv-help {font-size:13px;color:var(--muted);margin:0;}
+    #eventListPanel .subgrid {grid-template-columns:1fr 1fr;margin-bottom:16px;} #events .event {padding:14px;}.event b {font-size:14px;}.event div {margin-top:7px;font-size:12px;font-weight:400;}
+    #eventReviewPanel > h2 {margin:0;} #eventDetail {font-size:14px;}.detail > details {border-top:1px solid var(--line);padding-top:8px;}
+    #reviewExtras > label {margin:12px 0;} #eventFilters {margin-bottom:16px;}.subgrid select {min-width:0;}
+    @media (max-width:1000px) {.workspace-layout {grid-template-columns:205px minmax(0,1fr);gap:18px;}.grid {grid-template-columns:1fr;}.operating-card > .facts {grid-template-columns:1fr;}}
+    @media (max-width:680px) {header {padding:16px 18px;display:flex;}header > div > span {display:none;}main {padding:16px;}.workspace-layout {grid-template-columns:1fr;}.asset-sidebar {position:static;padding:14px;}.asset-sidebar > label {border:0;padding:0 0 12px;}.asset-sidebar h2 {display:none;}.asset-list {display:flex;overflow:auto;}.asset-item {min-width:145px;}.panel {padding:18px;}.workspace-heading {align-items:flex-start;}.workspace-title {font-size:21px;}.workspace-tools {flex-direction:column;align-items:flex-end;}.workspace-nav {gap:4px;}.workspace-nav > button {padding:9px 10px;font-size:13px;}.admin-menu > summary {font-size:12px;}.csv-fields {grid-template-columns:1fr;}.operating-card > .facts {gap:6px;}.verdict {font-size:24px;}.nav-spacer {display:none;} #csvToggle {margin-left:auto;}}
   </style>
 </head>
 <body>
   <header>
-    <div><h1>Bind Edge AI Motor Diagnosis</h1><span>실측 모니터링 · 이벤트 검수</span></div>
+    <div><h1>MotorDiagnosis</h1><span>설비 상태 모니터링</span></div>
     <span id="signedInUser"></span>
   </header>
   <main>
@@ -107,24 +155,40 @@ def render_page() -> str:
     <section id="appPanel" hidden>
       <div id="appStatus" class="notice" role="status" aria-live="polite" hidden></div>
       <nav class="workspace-nav" aria-label="업무 화면">
-        <button id="navOverview" aria-pressed="true" aria-controls="snapshotPanel notificationsPanel healthPanel">운영 현황</button>
-        <button id="navEvents" aria-pressed="false" aria-controls="exportPanel chartPanel eventListPanel eventReviewPanel">이벤트 검수</button>
-        <button id="navManagement" aria-pressed="false" aria-controls="managementPanel">운영 관리</button>
-        <button id="navModels" aria-pressed="false" aria-controls="siteKpis sitesPanel rf66Panel modelPanel modelReviewPanel">이전 분석·이력</button>
-        <button id="navDeviceOps" aria-pressed="false" aria-controls="deviceOpsPanel">장치 운영</button>
+        <button id="navOverview" aria-pressed="true" aria-controls="snapshotPanel overviewIssuesPanel">설비 현황</button>
+        <button id="navEvents" aria-pressed="false" aria-controls="eventListPanel eventReviewPanel">이상·조치 이력</button>
+        <span class="nav-spacer"></span>
+        <button id="csvToggle" aria-expanded="false" aria-controls="csvPanel" hidden>↓ 측정값 CSV</button>
+        <details id="adminMenu" class="admin-menu" hidden><summary>관리</summary><div class="admin-links">
+          <button id="navManagement" aria-pressed="false" aria-controls="managementPanel">운영 관리</button>
+          <button id="navDeviceOps" aria-pressed="false" aria-controls="deviceOpsPanel">장치 운영</button>
+          <button id="navModels" aria-pressed="false" aria-controls="siteKpis sitesPanel rf66Panel modelPanel modelReviewPanel">이전 분석·이력</button>
+        </div></details>
       </nav>
-      <h2 id="viewHeading" class="workspace-title">운영 현황</h2>
-      <section class="toolbar panel">
-        <label>사이트<select id="siteSelect"></select></label>
-        <label>설비<select id="assetSelect"></select></label>
-        <label id="telemetryPeriodField">조회 기간<select id="periodSelect">
-          <option value="1">최근 1시간</option>
-          <option value="6">최근 6시간</option>
-          <option value="24" selected>최근 24시간</option>
-        </select></label>
-        <button id="refreshBtn">새로고침</button>
-        <button class="danger" id="injectBtn" hidden>데모 이상 주입</button>
+      <section id="csvPanel" class="panel" hidden aria-labelledby="csvHeading">
+        <div class="section-title"><h2 id="csvHeading">측정값 CSV 다운로드</h2><button id="csvClose" class="secondary">닫기</button></div>
+        <div class="csv-fields">
+          <label>설비<select id="csvAsset"></select></label>
+          <label>측정 기간<select id="csvPeriod"><option value="1">최근 1시간</option><option value="24" selected>최근 24시간</option><option value="168">최근 7일</option></select></label>
+          <button id="csvDownload">CSV 다운로드</button>
+        </div>
+        <p class="csv-help">선택 기간에 서버에 보관된 측정 시각·설비·센서·입력 품질과 9개 측정값을 저장합니다. 예측값은 포함하지 않으며, 유효하지 않은 측정값은 빈칸으로 남깁니다.</p>
+        <div id="csvStatus" role="status" aria-live="polite"></div>
       </section>
+      <div class="workspace-layout">
+        <aside class="asset-sidebar panel" aria-label="설비 선택">
+          <label>사업장<select id="siteSelect"></select></label>
+          <label hidden>설비<select id="assetSelect"></select></label>
+          <h2>설비 목록</h2><div id="assetList" class="asset-list"></div>
+        </aside>
+        <div class="workspace-content">
+          <div class="workspace-heading">
+            <div><h2 id="viewHeading" class="workspace-title">설비 현황</h2><p id="viewSubtitle">설비를 선택해 현재 상태를 확인하세요.</p></div>
+            <div class="workspace-tools">
+              <label id="telemetryPeriodField" hidden>조회 기간<select id="periodSelect"><option value="1">최근 1시간</option><option value="6">최근 6시간</option><option value="24" selected>최근 24시간</option><option value="168">최근 7일</option></select></label>
+              <button id="refreshBtn" class="secondary">새로고침</button><button class="danger" id="injectBtn" hidden>데모 이상 주입</button>
+            </div>
+          </div>
       <section class="panel" id="exportPanel" hidden>
         <h2>조회 범위·내보내기</h2>
         <div class="subgrid">
@@ -144,11 +208,13 @@ def render_page() -> str:
       </section>
       <section class="grid">
         <article class="panel wide" id="snapshotPanel">
-          <h2>진동 수신 · 오류 판정 · 5분 뒤 예측</h2>
-          <p class="live-context">25초 등간격으로 특징 9개를 수집합니다. 오류 판정은 직전 24건과 현재값을 비교하고, 예측은 현재 포함 13건으로 5분 뒤 특징값을 계산합니다.</p>
-          <details><summary>측정·전송 기준</summary><p>800Hz · XYZ · 512샘플에서 CF·왜도·Pearson 첨도를 계산합니다. 정기 이력은 Unix 시각 기준 25초 간격이며 이상 상태에서도 유지합니다. 보드 이상 3회 진입·정상 5회 복귀 시 즉시, 이상 유지 중에는 10초마다 추가 보고합니다. 보드 상태는 서버 모델 판정이 아닙니다. Raw는 전송하지 않습니다.</p><p>새 단건 결과는 기존 통계 점수·RF66 과거 이력과 별개입니다. 과거 분석은 ‘이전 분석·이력’ 탭에서 확인하세요.</p></details>
+          <h2>현재 상태</h2>
           <p id="snapshotStatus" role="status" aria-live="polite">설비를 선택하고 새로고침하세요.</p>
           <div id="snapshotRows"></div>
+        </article>
+        <article class="panel wide" id="overviewIssuesPanel">
+          <div class="section-title"><h2>확인할 이상</h2><button id="openHistory" class="secondary">전체 이력 보기 →</button></div>
+          <div id="overviewIssues" role="status" aria-live="polite">설비를 선택하세요.</div>
         </article>
         <article class="panel wide" id="rf66Panel" hidden>
           <h2>RF66 진동 모델 · 과거 판정 이력</h2>
@@ -170,17 +236,17 @@ def render_page() -> str:
           <small id="chartRange"></small>
         </article>
         <article class="panel" id="eventListPanel" hidden>
-          <h2>이벤트 목록</h2>
-          <div class="subgrid">
-            <label>심각도<select id="severityFilter"><option value="">전체</option><option value="critical">Critical</option><option value="warning">Warning</option><option value="device">Device</option></select></label>
-            <label>라벨<select id="eventLabelFilter"><option value="">전체</option><option value="needs_review">Needs review</option><option value="normal_false_positive">Normal / false positive</option><option value="confirmed_anomaly">Confirmed anomaly</option><option value="sensor_issue">Sensor issue</option><option value="repair_completed">Repair completed</option></select></label>
+          <h2>이상 이력</h2>
+          <details id="eventFilters"><summary>이력 필터</summary><div class="subgrid">
+            <label>심각도<select id="severityFilter"><option value="">전체</option><option value="critical">위험</option><option value="warning">주의</option><option value="device">장치</option></select></label>
+            <label>라벨<select id="eventLabelFilter"><option value="">전체</option><option value="needs_review">확인 필요</option><option value="normal_false_positive">이상 없음·오탐</option><option value="confirmed_anomaly">이상 확인</option><option value="sensor_issue">센서 점검 필요</option><option value="repair_completed">조치 완료</option></select></label>
             <label>검수 상태<select id="reviewedFilter"><option value="">전체</option><option value="false">미검수</option><option value="true">검수 완료</option></select></label>
             <label>정렬<select id="eventSort"><option value="unreviewed_desc">미검수 우선</option><option value="occurredAt_desc">최신순</option><option value="occurredAt_asc">오래된순</option><option value="score_desc">최대 점수순</option></select></label>
           </div>
-          <div id="events" class="event-list"></div>
+          </details><div id="events" class="event-list"></div>
           <div class="actions"><button id="eventsPrev" class="secondary">이전</button><span id="eventsPage"></span><button id="eventsNext" class="secondary">다음</button></div>
         </article>
-        <article class="panel" id="notificationsPanel">
+        <article class="panel" id="notificationsPanel" hidden>
           <h2>웹 알림</h2>
           <div id="notifications" role="status" aria-live="polite">No notifications.</div>
         </article>
@@ -202,23 +268,25 @@ def render_page() -> str:
           <div id="modelReviewStatus" role="status" aria-live="polite"></div>
         </article>
         <article class="panel detail" id="eventReviewPanel" hidden>
-          <h2>이벤트 상세·검수</h2>
+          <h2>상세·조치 기록</h2>
           <div id="eventDetail">목록에서 이벤트를 선택하세요.</div>
+          <details><summary>발생 당시 측정·판정 근거</summary>
           <canvas id="evidenceChart" width="900" height="220" aria-label="선택 이벤트 전후 신호"></canvas>
           <div id="evidenceSummary"></div>
           <details><summary>특징·규칙·장치 스냅샷</summary><pre id="eventEvidence"></pre></details>
-          <label>검수 라벨<select id="labelSelect">
-            <option value="needs_review">Needs review</option>
-            <option value="normal_false_positive">Normal / false positive</option>
-            <option value="confirmed_anomaly">Confirmed anomaly</option>
-            <option value="sensor_issue">Sensor issue</option>
-            <option value="repair_completed">Repair completed</option>
+          </details>
+          <label>처리 상태<select id="labelSelect">
+            <option value="needs_review">확인 필요</option>
+            <option value="normal_false_positive">이상 없음·오탐</option>
+            <option value="confirmed_anomaly">이상 확인</option>
+            <option value="sensor_issue">센서 점검 필요</option>
+            <option value="repair_completed">조치 완료</option>
           </select></label>
-          <label>검수 요약 메모<textarea id="noteInput"></textarea></label>
-          <label>검수 변경 사유<input id="reviewReason" maxlength="1000"></label>
-          <button id="saveReview" disabled>검수 저장</button>
+          <label>조치 메모<textarea id="noteInput" placeholder="확인 내용과 조치 사항을 남겨주세요."></textarea></label>
+          <details><summary>변경 사유 별도 입력</summary><label>변경 사유<input id="reviewReason" maxlength="1000" placeholder="비워두면 조치 메모를 사유로 기록합니다."></label></details>
+          <button id="saveReview" disabled>조치 기록 저장</button>
           <details><summary>전체 검수 변경 이력</summary><div id="reviewHistory" class="history"></div><button id="reviewsMore" class="secondary" hidden>이력 더 보기</button></details>
-          <h2>원인·점검·조치 메모</h2>
+          <details id="reviewExtras"><summary>추가 메모·변경 기록</summary>
           <div id="notesStatus" role="status" aria-live="polite"></div>
           <button id="notesRefresh" class="secondary" disabled>메모 목록 새로고침</button>
           <div id="eventNotes"></div>
@@ -226,9 +294,9 @@ def render_page() -> str:
           <label>개별 메모<textarea id="memoText" maxlength="2000"></textarea></label>
           <label>첨부 참조 (한 줄에 하나)<textarea id="attachmentRefs" placeholder="https:// 또는 survey:// 참조"></textarea></label>
           <div class="actions"><button id="saveNote" disabled>메모 등록</button><button id="cancelNote" class="secondary">편집 취소</button></div>
-          <div id="noteHistory" class="history"></div>
+          <div id="noteHistory" class="history"></div></details>
         </article>
-        <article class="panel wide" id="healthPanel"><h2>선택 설비의 장치·서비스 상태</h2><div id="deviceHealth" class="table-scroll"></div><details><summary>서버 서비스 상태</summary><div id="serviceHealth" class="table-scroll"></div></details></article>
+        <article class="panel wide" id="healthPanel" hidden><h2>선택 설비의 장치·서비스 상태</h2><div id="deviceHealth" class="table-scroll"></div><details><summary>서버 서비스 상태</summary><div id="serviceHealth" class="table-scroll"></div></details></article>
         <article class="panel wide" id="managementPanel" hidden>
           <h2>운영 관리</h2>
           <div class="subgrid"><label>관리 항목<select id="managementKind"></select></label><label>항목 선택<select id="managementRecord"></select></label></div>
@@ -282,6 +350,8 @@ def render_page() -> str:
           <div id="opsWindowsStatus" role="status"></div><div id="opsWindowsRows"></div>
         </article>
       </section>
+        </div>
+      </div>
     </section>
   </main>
   <script>
@@ -307,10 +377,23 @@ def render_page() -> str:
     const CHART_PAD = 34;
     const $ = (id) => document.getElementById(id);
 
+    // BEGIN BACKEND TRANSPORT
+    function backendUrl(path) {
+      if (typeof path !== "string" || !path.startsWith("/api/")
+          || /[\\\u0000-\u0020#]/.test(path)
+          || /(?:^|\/)(?:\.|%2e){1,2}(?:\/|$)/i.test(path.split("?")[0]))
+        throw new Error("허용되지 않은 API 경로입니다.");
+      return path;
+    }
+    function backendFetch(path, options = {}) {
+      return fetch(backendUrl(path), {...options, credentials:"omit", redirect:"error", referrerPolicy:"no-referrer", cache:"no-store"});
+    }
+    // END BACKEND TRANSPORT
+
     async function api(path, options = {}, preserveJson = false) {
       const headers = {...(options.headers || {})};
       if (token) headers.authorization = `Bearer ${token}`;
-      const res = await fetch(path, {...options, headers});
+      const res = await backendFetch(path, {...options, headers});
       const type = res.headers.get("content-type") || "";
       const original = preserveJson ? await res.text() : null;
       let body;
@@ -329,6 +412,7 @@ def render_page() -> str:
         headers: {"content-type": "application/json"},
         body: JSON.stringify({username: $("username").value, password: $("password").value})
       });
+      $("password").value = "";
       token = response.session.token;
       permissions = response.rolePolicy.permissions;
       $("signedInUser").textContent = `${response.user.name} · ${response.rolePolicy.name}`;
@@ -341,29 +425,121 @@ def render_page() -> str:
       const boot = await api("/api/bootstrap");
       sites = boot.sites;
       events = boot.events;
-      $("injectBtn").hidden = !boot.demoEnabled;
+      $("injectBtn").hidden = !boot.demoEnabled || !hasAdminAccess();
       setOptions($("siteSelect"), sites, item => item.id, item => item.name);
       setupManagement();
-      if (can("dataset:read")) {
-        const datasets = await apiPages("/api/datasets");
-        setOptions($("datasetSelect"), [{id:"", name:"실시간 실측 데이터"}, ...datasets.filter(item => item.source?.type === "internal")], item => item.id, item => item.id ? `${item.name || item.id} · ${item.id}` : item.name);
-      }
       if (!sites.length) { statusMessage("조회 가능한 사이트가 없습니다."); return; }
       await renderAssets();
       await render();
     }
 
+    let assetCatalog = [], exportGeneration = 0, measurementExportBusy = false;
+    function canExportMeasurements() {return ["export:read","telemetry:read","device:read"].every(can);}
+    function updateOperatingHeading() {
+      const asset=assetCatalog.find(row=>row.id===$("assetSelect").value);
+      $("viewHeading").textContent=currentView==="overview" ? asset?.name || "설비 현황" : WORKSPACE_VIEWS[currentView].title;
+      $("viewSubtitle").textContent=currentView==="overview" ? "현재 판정과 측정 수신 상태를 확인하세요." : (asset?.name || "설비 선택") + (currentView==="events" ? " · 발생 이력과 조치 기록" : " · 관리자 도구");
+    }
+    function renderAssetList() {
+      $("assetList").replaceChildren(...assetCatalog.map(asset=>{
+        const button=document.createElement("button");button.className="asset-item";
+        button.setAttribute("aria-pressed",String(asset.id===$("assetSelect").value));
+        const name=document.createElement("span");name.textContent=asset.name || asset.id;
+        const hint=document.createElement("small");hint.textContent=asset.id===$("assetSelect").value ? "선택한 설비" : "상태 확인하기";
+        button.append(name,hint);
+        button.addEventListener("click",()=>act(async()=>{
+          if(asset.id===$("assetSelect").value || !allowSelectionChange()) return;
+          $("assetSelect").value=asset.id;invalidateScope();rememberSelection();await render();
+        }));return button;
+      }));
+      if(!assetCatalog.length) $("assetList").textContent="등록된 설비가 없습니다.";
+    }
+    function closeMeasurementExport() {$("csvPanel").hidden=true;$("csvToggle").setAttribute("aria-expanded","false");}
+    function measurementExportQuery() {
+      if(!token || !canExportMeasurements()) throw new Error("측정값 다운로드 권한이 없습니다.");
+      const siteId=$("siteSelect").value, assetId=$("csvAsset").value, hours=Number($("csvPeriod").value);
+      if(!sites.some(site=>site.id===siteId) || !assetCatalog.some(asset=>asset.id===assetId)) throw new Error("다운로드할 설비를 선택하세요.");
+      if(![1,24,168].includes(hours)) throw new Error("측정 기간을 다시 선택하세요.");
+      const to=new Date();return {siteId,assetId,from:new Date(to.getTime()-hours*3600000).toISOString(),to:to.toISOString()};
+    }
+    function exportScopeKey() {return JSON.stringify([token,$("siteSelect").value,$("assetSelect").value,$("csvAsset").value,$("csvPeriod").value]);}
+    async function downloadMeasurements() {
+      if(measurementExportBusy) return;
+      const generation=++exportGeneration,key=exportScopeKey();
+      const current=()=>generation===exportGeneration && key===exportScopeKey() && canExportMeasurements();
+      try {
+        const query=measurementExportQuery();measurementExportBusy=true;$("csvDownload").disabled=true;
+        $("csvStatus").textContent="선택 기간의 측정값을 준비하고 있습니다.";
+        const response=await backendFetch(`/api/periodic-snapshots/export?${scopeParams(query)}`,{headers:{Authorization:`Bearer ${token}`}});
+        if(!current()) return;
+        if(!response.ok) {
+          if(response.status===404) throw new Error("측정값 CSV 기능을 사용하려면 서버 업데이트가 필요합니다.");
+          if(response.status===413) throw new Error("측정값이 너무 많습니다. 더 짧은 기간을 선택하세요.");
+          let message="측정값을 다운로드하지 못했습니다.";
+          try {const body=await response.json();message=body.error?.message || message;} catch (_) {}
+          throw new Error(message);
+        }
+        if(!/^text\/csv(?:;|$)/i.test(response.headers.get("content-type") || "")) throw new Error("서버의 CSV 응답 형식을 확인할 수 없습니다.");
+        const blob=await response.blob();if(!current()) return;
+        const url=URL.createObjectURL(blob),link=document.createElement("a");
+        const safeAsset=query.assetId.replace(/[^a-zA-Z0-9_-]/g,"_").slice(0,80);
+        link.href=url;link.download=`measurements_${safeAsset}_${query.to.slice(0,10)}.csv`;
+        document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+        const count=response.headers.get("x-measurement-record-count");
+        $("csvStatus").textContent=count && /^\d+$/.test(count) ? (count==="0" ? "선택 기간에 측정값이 없어 열 이름만 저장했습니다." : `${Number(count).toLocaleString("ko-KR")}건의 측정값을 저장했습니다.`) : "측정값 CSV를 저장했습니다.";
+      } catch(error) {if(current()) $("csvStatus").textContent=error.message;}
+      finally {measurementExportBusy=false;$("csvDownload").disabled=!canExportMeasurements();if(!current()) $("csvStatus").textContent="조회 조건이 변경되어 다운로드를 취소했습니다. 다시 다운로드하세요.";}
+    }
+    function renderOperatingSnapshotCard(result) {
+      const model=result.configuredModel;
+      const rows=[...result.items].sort((a,b)=>Date.parse(b.window.timestamp)-Date.parse(a.window.timestamp));
+      const latest=rows.find(row=>!model?.scope?.sensorId || row.window.sensorId===model.scope.sensorId);
+      const age=latest && snapshotTime(result.queriedAt) ? Date.parse(result.queriedAt)-Date.parse(latest.window.timestamp) : NaN;
+      const fresh=Number.isFinite(age) && age>=-5000 && age<=85000;
+      const complete=Boolean(latest && fresh && result.inferenceEnabled && sameSnapshotModel(latest.analysis?.inference?.model,model) && snapshotCompleted(latest));
+      const unavailable=latest && (!fresh || latest.window.quality!=="valid" || latest.analysis?.status==="unavailable"
+        || (latest.analysis?.status==="completed" && !complete) || (result.modelCompatibility && result.modelCompatibility.status!=="ready"));
+      const card=document.createElement("section");card.className="operating-card";
+      const title=document.createElement("h3");title.textContent=(latest?.window.sensorId || model?.scope?.sensorId || "센서")+" · "+result.deviceId;
+      const verdict=document.createElement("p");verdict.className="verdict "+(complete ? latest.analysis.verdict ? "anomaly" : "ready" : "unavailable");
+      verdict.textContent=complete ? latest.analysis.verdict ? "이상 후보 감지" : "학습 기준 미초과" : !latest ? "측정 대기" : unavailable ? "판정 불가" : "판정 대기";
+      const note=document.createElement("p");note.className="verdict-note";
+      note.textContent=complete ? latest.analysis.verdict ? "측정값이 학습 기준을 초과했습니다. 설비와 이상 이력을 확인하세요." : "현재 측정값은 학습 기준을 넘지 않았습니다. 장비 정상 확정을 뜻하지 않습니다."
+        : !latest ? "대상 센서의 측정값을 기다리고 있습니다." : !fresh ? "최신 측정값을 확인할 수 없습니다. 센서 수신 상태를 확인하세요." : latest.window.quality!=="valid" ? "입력 품질을 확인할 수 없어 판정하지 않습니다." : unavailable ? "입력과 연결 모델의 판정 근거를 확인해야 합니다. 아래 상세를 확인하세요." : "측정 이력과 모델 판정 결과를 기다리고 있습니다.";
+      const mode=result.affectsAlerts ? "이상 알림 사용" : result.eventPolicy?.mode==="events" && result.inferenceEnabled ? "이상 기록 · 알림 꺼짐" : "비교 관찰 · 알림 꺼짐";
+      card.append(title,verdict,note,facts([["최근 측정",latest ? formatLocalTime(latest.window.timestamp) : "수신 대기"],["측정 수신",!latest ? "대기" : fresh ? "최신 측정 수신" : "측정 지연·시각 확인 필요"],["운영 상태",mode]]));
+      const key=JSON.stringify([result.siteId,result.assetId,result.deviceId,model?.scope?.sensorId]);
+      const readings=snapshotDetails(key+":operating-values"),readingsTitle=document.createElement("summary");readingsTitle.textContent="측정값·예측 보기";readings.appendChild(readingsTitle);
+      // Reuse the existing validated renderers so forecast rejection and provenance rules stay identical.
+      const original=renderSnapshotCard(result),technical=snapshotDetails(key+":operating-evidence"),technicalTitle=document.createElement("summary");technicalTitle.textContent="수신 이력·판정 근거";technical.appendChild(technicalTitle);
+      if(isDualModel(model)) {
+        for(const child of [...original.children]) {
+          if(child.className==="live-feature-table") readings.appendChild(child);
+          else if(child.className==="live-models") {
+            for(const module of [...child.children]) {if(module.className==="live-module forecast") readings.appendChild(module);else technical.appendChild(module);}
+          } else technical.appendChild(child);
+        }
+      } else {readings.appendChild(original);}
+      readings.appendChild(technical);card.appendChild(readings);return card;
+    }
+    $("csvToggle").addEventListener("click",()=>{if(!canExportMeasurements()) return;$("csvPanel").hidden=!$("csvPanel").hidden;$("csvToggle").setAttribute("aria-expanded",String(!$("csvPanel").hidden));});
+    $("csvClose").addEventListener("click",closeMeasurementExport);
+    $("csvDownload").addEventListener("click",downloadMeasurements);
+    for(const id of ["csvAsset","csvPeriod"]) $(id).addEventListener("change",()=>{exportGeneration++;$("csvStatus").textContent="";});
+    $("openHistory").addEventListener("click",()=>setView("events"));
     function can(permission) { return permissions.includes("*") || permissions.includes(permission); }
     const WORKSPACE_VIEWS = {
-      overview:{button:"navOverview",title:"운영 현황",panels:["snapshotPanel","notificationsPanel","healthPanel"]},
-      events:{button:"navEvents",title:"이벤트 검수",panels:["exportPanel","chartPanel","eventListPanel","eventReviewPanel"]},
+      overview:{button:"navOverview",title:"설비 현황",panels:["snapshotPanel","overviewIssuesPanel"]},
+      events:{button:"navEvents",title:"이상·조치 이력",panels:["eventListPanel","eventReviewPanel"]},
       management:{button:"navManagement",title:"운영 관리",panels:["managementPanel"]},
       models:{button:"navModels",title:"이전 분석·이력",panels:["siteKpis","sitesPanel","rf66Panel","modelPanel","modelReviewPanel"]},
       deviceOps:{button:"navDeviceOps",title:"장치 운영",panels:["deviceOpsPanel"]},
     };
-    function hasManagementAccess() {return can("audit-log:read") || Object.values(MANAGEMENT).some(config => can(config.permission + ":read"));}
+    function hasAdminAccess() {return ["audit-log:read","site:write","asset:write","device:write","user:write","model:review"].some(can);}
+    function hasManagementAccess() {return hasAdminAccess();}
     function setView(view) {
       if (!Object.hasOwn(WORKSPACE_VIEWS, view) || (view === "management" && !hasManagementAccess())) return;
+      if (["models","deviceOps"].includes(view) && !hasAdminAccess()) return;
       if (view === "models" && !can("model:read")) return;
       if (view === "deviceOps" && !can("device:read")) return;
       const enteringModels = view === "models" && currentView !== "models";
@@ -379,10 +555,13 @@ def render_page() -> str:
         for (const id of config.panels) $(id).hidden = name !== view;
       }
       $("navManagement").hidden = !hasManagementAccess();
-      $("navModels").hidden = !can("model:read");
-      $("navDeviceOps").hidden = !can("device:read");
+      $("navModels").hidden = !hasAdminAccess() || !can("model:read");
+      $("navDeviceOps").hidden = !hasAdminAccess() || !can("device:read");
+      $("adminMenu").hidden = !hasAdminAccess();
+      $("csvToggle").hidden = !canExportMeasurements();
+      if (!canExportMeasurements()) closeMeasurementExport();
       $("telemetryPeriodField").hidden = view !== "events";
-      $("viewHeading").textContent = WORKSPACE_VIEWS[view].title;
+      updateOperatingHeading();
       if (view === "events") redrawChart();
       if (enteringModels) act(() => Promise.all([loadLegacyOverview(selectionQuery()), modelReviewRow ? null : loadModelQueue(true)]));
       if (enteringDevices && !opsDirty && !opsSaving) act(loadDeviceOperations);
@@ -437,31 +616,48 @@ def render_page() -> str:
       if (requestGeneration !== assetGeneration || siteId !== selectedSite().id) return false;
       setOptions($("assetSelect"), assets, item => item.id, item => item.name);
       $("assetSelect").disabled = !assets.length;
+      assetCatalog = assets; renderAssetList();
+      setOptions($("csvAsset"), assets, item => item.id, item => item.name);
+      $("csvAsset").value = $("assetSelect").value;
       return true;
     }
 
     async function loadLiveOverview(query) {
-      if (!query) {clearSnapshots("조회 가능한 사이트 또는 설비가 없습니다."); return;}
+      updateOperatingHeading(); renderAssetList();
+      if (!query) {clearSnapshots("조회 가능한 설비가 없습니다."); $("overviewIssues").textContent="조회 가능한 설비가 없습니다."; return;}
       const generation=++renderGeneration, session=token;
       const current=()=>generation===renderGeneration && token===session && currentView==="overview"
         && $("siteSelect").value===query.siteId && $("assetSelect").value===query.assetId;
       await Promise.all([loadSnapshots(query), (async()=>{
+        if (!can("event:read")) {$("overviewIssues").textContent="이상 이력 조회 권한이 없습니다.";return;}
         try {
-          const devices=can("device:read") ? await snapshotApi(`/api/sites/${encodeURIComponent(query.siteId)}/devices`) : [];
-          if (!Array.isArray(devices)) throw new Error("장치 목록 형식 확인 필요");
-          const selected=devices.filter(d=>d.siteId===query.siteId && d.assetId===query.assetId);
-          const health=await Promise.all(selected.map(d=>snapshotApi(`/api/devices/${encodeURIComponent(d.id || d.deviceId)}/health`)));
-          const dependencies=can("service-health:read") ? await snapshotApi("/api/health/dependencies").catch(error=>({error:error.message})) : null;
-          if (current()) renderHealth(health,dependencies);
-        } catch(error) {if(current()) {$("deviceHealth").textContent="장치 상태 조회 실패 · "+error.message; $("serviceHealth").replaceChildren();}}
-      })(), (async()=>{
-        if (!can("alert:read")) {if(current()) $("notifications").textContent="알림 조회 권한이 없습니다.";return;}
-        try {
-          const reply=await snapshotApi(`/api/alerts?siteId=${encodeURIComponent(query.siteId)}&channel=web&status=sent&size=10`);
-          if (!Array.isArray(reply.items)) throw new Error("알림 응답 형식 확인 필요");
-          if(current()) renderNotifications(reply.items);
-        } catch(error) {if(current()) $("notifications").textContent="알림 조회 실패 · "+error.message;}
+          const reply=await snapshotApi(`/api/events?${scopeParams({siteId:query.siteId,assetId:query.assetId,status:"open",sort:"occurredAt_desc",page:1,size:200})}`);
+          if (!current()) return;
+          if (!Array.isArray(reply.items)) throw new Error("이상 이력 응답을 확인할 수 없습니다.");
+          // Filter again for compatibility with servers predating status filtering.
+          const open=reply.items.filter(row=>row.status==="open" && row.siteId===query.siteId && row.assetId===query.assetId);
+          const list=$("overviewIssues"); list.replaceChildren();
+          if (!open.length) {list.textContent=reply.total>reply.items.length ? "최근 이력에 진행 중인 이상이 없습니다. 전체 이력도 확인하세요." : "현재 진행 중인 이상 이력이 없습니다."; return;}
+          for (const event of open.slice(0,5)) {
+            const button=document.createElement("button");button.className="event";
+            const title=document.createElement("b");title.textContent=event.title || "이상 확인 필요";
+            const time=document.createElement("span");time.textContent=formatLocalTime(event.occurredAt)+" · 상세 보기 →";
+            button.append(title,time);button.addEventListener("click",()=>{setView("events");if(currentView==="events") act(()=>selectEvent(event.id));});list.appendChild(button);
+          }
+          if (open.length>5 || reply.total>reply.items.length) {const more=document.createElement("p");more.textContent="나머지 기록은 전체 이력에서 확인하세요.";list.appendChild(more);}
+        } catch(error) {if(current()) $("overviewIssues").textContent="이상 이력 조회 실패 · "+error.message;}
       })()]);
+    }
+    async function loadOperatingHistory(query) {
+      updateOperatingHeading(); renderAssetList();
+      const generation=++renderGeneration,session=token;
+      if (!query || !can("event:read")) {events=[];eventTotal=0;renderEvents();renderPager("events",1,0);$("events").textContent=query ? "이상 이력 조회 권한이 없습니다." : "설비를 선택하세요.";return;}
+      const reply=await api(`/api/events?${scopeParams(query)}&${eventFilterParams()}`);
+      if(generation!==renderGeneration || session!==token || currentView!=="events" || $("siteSelect").value!==query.siteId || $("assetSelect").value!==query.assetId) return;
+      if(!Array.isArray(reply.items) || !Number.isInteger(reply.total)) throw new Error("이상 이력 응답 형식을 확인하세요.");
+      const lastPage=Math.max(1,Math.ceil(reply.total/PAGE_SIZE));
+      if(eventPageNumber>lastPage) {eventPageNumber=lastPage;return loadOperatingHistory(query);}
+      events=reply.items;eventTotal=reply.total;renderEvents();renderPager("events",eventPageNumber,eventTotal);
     }
     async function loadLegacyOverview(query) {
       if(!query || currentView!=="models") return;
@@ -481,6 +677,8 @@ def render_page() -> str:
       await loadRF66(devices,query);
     }
     async function render() {
+      if (currentView === "events") return loadOperatingHistory(selectionQuery());
+      if (currentView === "management") return;
       if (currentView === "overview") return loadLiveOverview(selectionQuery());
       clearRF66("새로고침 후 RF66 결과를 확인합니다.");
       if (currentView === "models") return Promise.all([loadModelQueue(true),loadLegacyOverview(selectionQuery())]);
@@ -974,7 +1172,7 @@ def render_page() -> str:
       const key = JSON.stringify([token,query.siteId,query.assetId]);
       // A slow poll must finish, not be invalidated every five seconds.
       if (snapshotBusy?.key === key) return;
-      clearSnapshots("단건 수신 조회 중 · 조회 기간 필터와 별개인 최근 측정 최대 20건입니다.");
+      clearSnapshots("최근 측정과 판정을 확인하고 있습니다.");
       const generation = snapshotGeneration, session = token;
       snapshotBusy = {key,generation};
       const current = () => generation === snapshotGeneration && session === token && currentView === "overview"
@@ -1005,7 +1203,7 @@ def render_page() -> str:
               throw new Error("장치·설비 매핑 또는 결과 형식 불일치");
             if (result.configuredModel !== null && !snapshotModelValid(result.configuredModel,scope))
               throw new Error("단건 모델 설정 응답 확인 필요");
-            return renderSnapshotCard(result);
+            return renderOperatingSnapshotCard(result);
           } catch (error) {
             if (!current()) return null;
             errors++;
@@ -1017,7 +1215,7 @@ def render_page() -> str:
         if (!current()) return;
         $("snapshotRows").replaceChildren(...cards.filter(Boolean));
         $("snapshotStatus").textContent = (errors ? `${errors}개 장치 조회 실패 · ` : "조회 완료 · ")
-          + "운영 현황에서 5초마다 갱신 · 조회 기간과 별개 · 시각은 브라우저 현지 시각입니다.";
+          + "5초마다 갱신 · 시각은 브라우저 현지 시각입니다.";
       } catch (error) {
         if (current()) {$("snapshotRows").replaceChildren(); $("snapshotStatus").textContent = "단건 조회 실패: " + error.message;}
       } finally {
@@ -1194,7 +1392,7 @@ def render_page() -> str:
       return Object.hasOwn(labels,value) ? labels[value] : displayValue(value);
     }
     function reviewLabel(value) {
-      const labels = {needs_review:"검수 필요",normal_false_positive:"정상 / 오탐",confirmed_anomaly:"이상 확인",sensor_issue:"센서 문제",repair_completed:"조치 완료"};
+      const labels = {needs_review:"확인 필요",normal_false_positive:"이상 없음·오탐",confirmed_anomaly:"이상 확인",sensor_issue:"센서 점검 필요",repair_completed:"조치 완료"};
       return Object.hasOwn(labels,value) ? labels[value] : displayValue(value);
     }
     function facts(entries) {
@@ -1303,12 +1501,12 @@ def render_page() -> str:
         button.className = event.id === selectedEventId ? "event selected" : "event";
         button.dataset.id = event.id;
         const title = document.createElement("b");
-        title.textContent = `${event.id} - ${event.title}`;
+        title.textContent = event.title;
         const meta = document.createElement("div");
         const pill = document.createElement("span");
         pill.className = `pill ${["warning", "critical", "device"].includes(event.severity) ? event.severity : ""}`;
-        pill.textContent = event.label;
-        meta.append(pill, ` ${formatLocalTime(event.occurredAt)} - ` + eventModelSummary(event));
+        pill.textContent = reviewLabel(event.label);
+        meta.append(pill, ` ${formatLocalTime(event.occurredAt)} · ` + (event.status === "open" ? "진행 중" : event.status === "closed" ? "종료" : "상태 미확인"));
         button.append(title, document.createElement("br"), meta);
         return button;
       }));
@@ -1560,27 +1758,29 @@ def render_page() -> str:
       detail.replaceChildren();
       const title = document.createElement("b");
       title.textContent = event.title;
-      detail.append(title, document.createElement("br"), `${formatLocalTime(event.occurredAt)} · ${event.duration ?? "-"} · ` + eventModelSummary(event), document.createElement("br"), event.note || "");
+      detail.append(title, document.createElement("br"), `${formatLocalTime(event.occurredAt)} · ` + (event.status==="open" ? "진행 중" : event.status==="closed" ? "종료" : "상태 미확인"), document.createElement("br"), event.note || "");
       const missing = document.createElement("p");
-      detail.appendChild(rf66ResolutionControls(event, () => generation === detailGeneration && selectedEventId === eventId));
+      const resolution=document.createElement("details"),resolutionTitle=document.createElement("summary");resolutionTitle.textContent="사건 해제 상태·수동 해제";
+      resolution.append(resolutionTitle,rf66ResolutionControls(event, () => generation === detailGeneration && selectedEventId === eventId));detail.appendChild(resolution);
       missing.className = "notice";
       missing.textContent = event.source === "snapshot" ? "서버 모델 사건입니다. 발생·최근·해제 판정의 식별자, 무결성 해시와 모델 조건을 보존합니다. 이력 모델은 과거 24개 기록의 근거도 포함합니다. RF66 3구간 정책과 별개입니다."
         : response.context.rawDataMissing ? "요약 시계열 없음: 보관기간 만료 또는 미수신. 보존된 특징·버전만 표시합니다." : `전후 요약 시계열 ${response.context.points.length}건 · 출처 ${response.context.source} (원시 파형은 별도 분석 기록에서 확인)`;
-      detail.appendChild(missing);
+      const technical=document.createElement("details"), technicalTitle=document.createElement("summary");technicalTitle.textContent="판정·설치 상세";technical.append(technicalTitle,missing);detail.appendChild(technical);
+      const modelSummary=document.createElement("p");modelSummary.textContent=eventModelSummary(event);technical.appendChild(modelSummary);
       if (response.analysis) {
         const analysis = document.createElement("section");
-        detail.appendChild(analysis);
+        technical.appendChild(analysis);
         renderAnalysisRows(analysis,response.analysis,()=>detailGeneration===generation && selectedEventId===eventId);
       }
       const installation = response.installationSnapshot;
       if (installation?.status === "recorded") {
-        detail.appendChild(facts([["설치 정보 기준 시각",formatLocalTime(installation.effectiveAt)]]));
-        for (const point of installation.points || []) detail.appendChild(facts([
+        technical.appendChild(facts([["설치 정보 기준 시각",formatLocalTime(installation.effectiveAt)]]));
+        for (const point of installation.points || []) technical.appendChild(facts([
           ["설치점",point.id],["위치",point.position],["방향",point.orientation],
           ["고정 방식",point.mountingMethod],["음향 방향",point.acousticDirection],
           ["사진 참조",(point.photoRefs || []).join(" · ")],["설치 버전 시각",formatLocalTime(point.versionAt)]
         ]));
-      } else detail.appendChild(facts([["발생 당시 설치 정보","미확인 — 기록된 과거 설치 정보 없음"]]));
+      } else technical.appendChild(facts([["발생 당시 설치 정보","미확인 — 기록된 과거 설치 정보 없음"]]));
       $("eventEvidence").textContent = JSON.stringify({context:{from:response.context.from, to:response.context.to, source:response.context.source}, featureSnapshot:response.featureSnapshot, appliedRule:response.appliedRule, modelVersion:response.modelVersion, deviceSnapshot:response.deviceSnapshot,
         ...(event.source === "snapshot" ? {lastEvidence:event.snapshotLastEvidence,recoveryEvidence:event.snapshotRecoveryEvidence,resolution:event.snapshotResolution,observationReason:event.snapshotObservationReason} : {})}, null, 2);
       const rule = response.appliedRule || {};
@@ -2328,6 +2528,11 @@ def render_page() -> str:
       }
     }
     function invalidateScope(resetWindow = false) {
+      exportGeneration++;
+      $("csvStatus").textContent="";
+      $("csvAsset").value=$("assetSelect").value;
+      $("overviewIssues").replaceChildren();
+      renderAssetList();
       clearSnapshots();
       clearRF66();
       invalidateDeviceOperations();
@@ -2376,6 +2581,7 @@ def render_page() -> str:
       if (!allowSelectionChange()) return;
       invalidateScope(true);
       $("assetSelect").replaceChildren(); $("assetSelect").disabled = true;
+      assetCatalog=[];renderAssetList();$("csvAsset").replaceChildren();
       const assetRequestGeneration = ++assetGeneration;
       renderGeneration += 1;
       await act(async () => {
@@ -2422,18 +2628,19 @@ def render_page() -> str:
     $("saveReview").addEventListener("click", () => act(async () => {
       if (!selectedEventId || !selectedDetail || !can("event:review") || reviewSaving) return;
       if (memoDirty) throw new Error("먼저 편집 중인 개별 메모를 저장하거나 취소하세요.");
-      const eventId = selectedEventId, generation = detailGeneration, reason = $("reviewReason").value.trim();
-      if (!reason) throw new Error("검수 변경 사유를 입력하세요.");
+      const eventId = selectedEventId, generation = detailGeneration, reasonInput = $("reviewReason").value.trim();
+      const reason = reasonInput || $("noteInput").value.trim();
+      if (!reason) throw new Error("조치 메모 또는 변경 사유를 입력하세요.");
       const payload = {label:$("labelSelect").value,note:$("noteInput").value,reason};
       reviewSaving = true;
       $("saveReview").disabled = true;
       try {
         await api(`/api/events/${encodeURIComponent(eventId)}/review`, jsonOptions("POST", payload));
         if (generation !== detailGeneration) return;
-        if (memoDirty || noteSaving || $("labelSelect").value !== payload.label || $("noteInput").value !== payload.note || $("reviewReason").value.trim() !== reason) {
+        if (memoDirty || noteSaving || $("labelSelect").value !== payload.label || $("noteInput").value !== payload.note || $("reviewReason").value.trim() !== reasonInput) {
           statusMessage("이전 검수 입력을 저장했습니다. 이어서 편집한 내용은 아직 저장되지 않았습니다."); return;
         }
-        reviewDirty = false; await selectEvent(eventId, true); await render(); statusMessage("검수 내용을 저장했습니다.");
+        reviewDirty = false; await selectEvent(eventId, true); await render(); statusMessage("조치 기록을 저장했습니다.");
       } finally {reviewSaving = false; $("saveReview").disabled = !selectedDetail || !can("event:review");}
     }));
     $("saveNote").addEventListener("click", () => act(async () => {
@@ -2476,7 +2683,7 @@ def render_page() -> str:
     $("exportBtn").addEventListener("click", () => act(async () => {
       if (!can("export:read")) return;
       const query = exportQuery();
-      const response = await fetch(`/api/datasets/export?${scopeParams(query)}`, {headers:{authorization:`Bearer ${token}`}});
+      const response = await backendFetch(`/api/datasets/export?${scopeParams(query)}`, {headers:{authorization:`Bearer ${token}`}});
       if (!response.ok) {
         const error = await response.json(); throw new Error(error.error?.message || `Export failed: ${response.status}`);
       }
@@ -2525,6 +2732,25 @@ def render_page() -> str:
       const acousticLabel = latestUnits.acousticRmsRaw ? "acoustic raw RMS" : "demo acoustic (dB)";
       $("chartHint").textContent = `${point.timestamp} · ${vibrationLabel}: ${vibration ?? "-"} · ${acousticLabel}: ${acoustic ?? "-"} · ${rpmDescription(point)} · score: ${score ?? "unavailable"} (${point.anomalyStatus ?? "-"})`;
     });
+    // Optional read-only agent access uses the same visible scope, never credentials.
+    if (document.modelContext?.registerTool) {
+      const lifetime = new AbortController();
+      document.addEventListener("pagehide", () => lifetime.abort(), {once:true});
+      try {
+        Promise.resolve(document.modelContext.registerTool({
+          name:"get_operating_view",
+          title:"현재 운영 화면 확인",
+          description:"로그인된 운영 화면의 선택 범위와 표시 중인 실측 데이터 건수를 읽습니다. 장치 연결이나 모델 검증을 보증하지 않으며 API 쓰기를 수행하지 않습니다.",
+          inputSchema:{type:"object", properties:{}, additionalProperties:false},
+          annotations:{readOnlyHint:true, untrustedContentHint:true},
+          execute(input) {
+            if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length) throw new Error("입력은 빈 객체여야 합니다.");
+            if (!token) throw new Error("운영 계정 로그인이 필요합니다.");
+            return {view:currentView, siteId:$("siteSelect").value || null, assetId:$("assetSelect").value || null, displayedPointCount:latestPoints.length, fieldIntegrationVerified:false};
+          }
+        }, {signal:lifetime.signal})).catch(() => {});
+      } catch (_) { /* Normal browser operation does not depend on optional tools. */ }
+    }
     setInterval(() => {
       // Evidence and an unsaved decision must not be replaced by telemetry polling.
       if (["models","deviceOps"].includes(currentView) || !token || !selectedSite() || !$("assetSelect").value) return;

@@ -47,6 +47,8 @@ class SnapshotInference:
             self.store.stop.wait(.5)
 
     def _claim(self):
+        from .periodic_snapshots import LIVE_PRIORITY_SECONDS
+
         with self.store.lock:
             if self.store.stop.is_set():
                 return None
@@ -56,7 +58,9 @@ class SnapshotInference:
                     FROM snapshot_inference_jobs j JOIN periodic_snapshots w USING(ordinal)
                     WHERE j.binding=? AND w.status='queued_inference'
                     AND (j.status='queued' OR (j.status='running' AND j.lease_until<=?))
-                    ORDER BY j.ordinal LIMIT 1""", (self.model.binding_id, time.time())).fetchone()
+                    ORDER BY CASE WHEN w.captured>=? AND w.captured<=? THEN 0 ELSE 1 END,
+                    j.ordinal LIMIT 1""", (self.model.binding_id, time.time(),
+                                          time.time() - LIVE_PRIORITY_SECONDS, time.time() + 5)).fetchone()
                 if row is None:
                     return None
                 token, now = uuid.uuid4().hex, time.time()

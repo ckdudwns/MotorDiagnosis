@@ -33,12 +33,16 @@ MAX_ROWS = 100000
 MAX_STREAMS = 10000
 LIST_LIMIT = 20
 EXPORT_LIMIT = 100000
+EXPORT_BATCH_SIZE = 64
 EXPORT_RANGE_SECONDS = 31 * 24 * 60 * 60
 MEASUREMENT_CSV_FIELDS = (
     "site_id", "asset_id", "device_id", "sensor_id", "measured_at", "received_at",
     "profile_id", "quality", "reason", *feature_snapshots.FEATURES,
+    "vibration_rms_g", "dominant_frequency_hz", "rms_status", "frequency_status",
 )
 CLOCK_TOLERANCE_SECONDS = 1
+# Match the 25-second feature cadence plus the existing 60-second report grace.
+LIVE_PRIORITY_SECONDS = 85
 LOGGER = logging.getLogger(__name__)
 
 
@@ -56,10 +60,11 @@ def canonical(payload):
     return body
 
 
-def normalize_window(window, *, check_time_bounds=True):
+def normalize_window(window, *, check_time_bounds=True, allow_expired_features=False):
     """Verify wire bytes, not an RF66 feature vector or a JSON-file checksum."""
     if window.get("profileId") in feature_snapshots.PROFILE_IDS:
-        return feature_snapshots.normalize(window, check_time_bounds=check_time_bounds)
+        return feature_snapshots.normalize(window, check_time_bounds=check_time_bounds,
+                                           allow_expired=allow_expired_features)
     if window.get("profileId") == SUMMARY_PROFILE:
         from .pump_summary import normalize
         return normalize(window, check_time_bounds=check_time_bounds)
@@ -157,6 +162,12 @@ class PeriodicSnapshotStore:
             add_sensor_identity(self.db)
             self.db.execute("""CREATE INDEX IF NOT EXISTS snapshot_periodic_slot
                 ON periodic_snapshots(device,sensor,boot,json_extract(body,'$.window.periodicSlotEpoch'))""")
+            self.db.execute("""CREATE INDEX IF NOT EXISTS snapshot_history_sequence
+                ON periodic_snapshots(device,sensor,boot,json_extract(body,'$.window.historySequence'))""")
+            # The implicit rowid is ordinal, so export authorization can select
+            # its sort keys without reading the original spectra from the table.
+            self.db.execute("""CREATE INDEX IF NOT EXISTS snapshot_export_profile_time
+                ON periodic_snapshots(device,site,asset,json_extract(body,'$.window.profileId'),captured)""")
         except Exception:
             self.db.close()
             raise
@@ -236,7 +247,13 @@ class PeriodicSnapshotStore:
                     if row["digest"] != digest:
                         reject("Same snapshot identity has different content", 409, "SNAPSHOT_CONFLICT")
                 else:
-                    captured = normalize_window(window)
+                    # A durable ACK lets an offline board advance past an expired
+                    # spool head. Preserve its measurement time; never relabel it
+                    # as live or spend model/alert work on this archived receipt.
+                    captured = normalize_window(window, allow_expired_features=True)
+                    received = time.time()
+                    expired_feature = (window.get("profileId") in feature_snapshots.PROFILE_IDS
+                                       and captured < received - feature_snapshots.RETENTION)
                     if window.get("profileId") in feature_snapshots.PROFILE_IDS and window["periodicSlotEpoch"] is not None:
                         conflict = self.db.execute("""SELECT 1 FROM periodic_snapshots
                             WHERE device=? AND sensor=? AND boot=?
@@ -266,6 +283,13 @@ class PeriodicSnapshotStore:
                         "status": "unavailable", "reason": window.get("reason") or quality,
                         "verdict": None, "affectsAlerts": False,
                     })
+                    if expired_feature:
+                        status = "unavailable"
+                        result = json.dumps({
+                            "status": status, "reason": "MEASUREMENT_EXPIRED",
+                            "score": None, "verdict": None, "inferenceEnabled": False,
+                            "affectsAlerts": False, "historicalOnly": True,
+                        })
                     if window.get("profileId") in feature_snapshots.PROFILE_IDS:
                         # Pin the receipt-time compatibility decision. A restart
                         # or later model assignment cannot silently rebind history.
@@ -277,12 +301,13 @@ class PeriodicSnapshotStore:
                         (device,site,asset,boot,idx,uptime,captured,received,digest,body,late,quality,status,result,sensor)
                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (device_id, window["siteId"], window["assetId"], boot, index,
-                         window["startUptimeUs"], captured, time.time(), digest, body,
+                         window["startUptimeUs"], captured, received, digest, body,
                          int(late), quality, status, result, sensor))
                     row = self.db.execute("SELECT * FROM periodic_snapshots WHERE ordinal=?",
                                           (inserted.lastrowid,)).fetchone()
-                    self.inference.enqueue(inserted.lastrowid, window)
-                    self.events.enqueue(inserted.lastrowid, window)
+                    if not expired_feature:
+                        self.inference.enqueue(inserted.lastrowid, window)
+                        self.events.enqueue(inserted.lastrowid, window)
                     accepted = 1
             # The context manager COMMIT above must succeed before an ACK exists.
         except sqlite3.Error as exc:
@@ -293,6 +318,12 @@ class PeriodicSnapshotStore:
         if window.get("profileId") in feature_snapshots.PROFILE_IDS:
             feature_ack = {"eventType": transmission["eventType"], "durablyStored": True,
                            "featureDigest": window["integrity"]["digest"]}
+            rms, spectrum = window.get("rms"), window.get("spectrum")
+            rms_ready = feature_snapshots.validate_rms(rms, window["quality"])
+            if rms_ready:
+                feature_ack["rmsDigest"] = rms["integrity"]["digest"]
+            if feature_snapshots.validate_spectrum(spectrum, rms if rms_ready else None, window["quality"]):
+                feature_ack["spectrumDigest"] = spectrum["integrity"]["digest"]
         return {
             "deviceId": device_id, "policyId": transmission["policyId"], "accepted": accepted,
             "acknowledged": [{"bootId": row["boot"], "windowIndex": row["idx"],
@@ -341,7 +372,9 @@ class PeriodicSnapshotStore:
         # stranded, count a row twice, or overwrite a final result.
         with self.lock, self.db:
             self.db.execute("BEGIN IMMEDIATE")
-            row = self.db.execute("SELECT * FROM periodic_snapshots WHERE status='queued' ORDER BY ordinal LIMIT 1").fetchone()
+            row = self.db.execute("""SELECT * FROM periodic_snapshots WHERE status='queued'
+                ORDER BY CASE WHEN captured>=? AND captured<=? THEN 0 ELSE 1 END, ordinal LIMIT 1""",
+                (time.time() - LIVE_PRIORITY_SECONDS, time.time() + 5)).fetchone()
             if row is None:
                 return False
             result = {"status": "waiting_model", "reason": "MODEL_NOT_CONFIGURED",
@@ -385,7 +418,6 @@ class PeriodicSnapshotStore:
                             (result["status"], json.dumps(result, allow_nan=False), row["ordinal"]))
         return True
 
-    @device_lifecycle.serialized
     def export_measurements(self, user, site_id, asset_id, from_timestamp, to_timestamp):
         """Export original feature measurements, independent of inference or its display limit."""
         for permission in ("export:read", "telemetry:read", "device:read"):
@@ -396,6 +428,22 @@ class PeriodicSnapshotStore:
             raise data.ApiError(400, "INVALID_TIME_RANGE", "from must be earlier than or equal to to.")
         if (end - start).total_seconds() > EXPORT_RANGE_SECONDS:
             raise data.ApiError(400, "SNAPSHOT_EXPORT_RANGE_TOO_LARGE", "Export at most 31 days at a time.")
+        ordinals = self._export_ordinals(user, site_id, asset_id, start.timestamp(), end.timestamp())
+        rows = []
+        for offset in range(0, len(ordinals), EXPORT_BATCH_SIZE):
+            batch = ordinals[offset:offset + EXPORT_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            with self.lock:
+                originals = self.db.execute(
+                    f"SELECT received,body FROM periodic_snapshots WHERE ordinal IN ({placeholders}) "
+                    "ORDER BY captured,ordinal", batch).fetchall()
+            rows.extend(self._measurement_export_row(item) for item in originals)
+        return {"rows": rows, "from": start, "to": end}
+
+    @device_lifecycle.serialized
+    def _export_ordinals(self, user, site_id, asset_id, start, end):
+        # Freeze the authorized set of immutable originals. Later arrivals and
+        # remapping cannot introduce records while spectrum processing runs.
         with data.STORE_LOCK:
             data.get_site(site_id)
             data.require_site_access(user, site_id)
@@ -403,35 +451,42 @@ class PeriodicSnapshotStore:
             device_ids = [device["id"] for device in data.DEVICES
                           if device["siteId"] == site_id and device["assetId"] == asset_id]
         # The lifecycle gate keeps device assignments stable while STORE_LOCK is released.
-        # Query each current device using snapshot_latest, without an unbounded SQL IN list.
-        stored = []
+        # Filter each current device without an unbounded SQL IN list.
+        keys = []
         profiles = ",".join("?" for _ in feature_snapshots.PROFILE_IDS)
         with self.lock:
             for device_id in device_ids:
-                stored.extend(self.db.execute(
-                    "SELECT ordinal,captured,received,body FROM periodic_snapshots "
+                keys.extend((row["captured"], row["ordinal"]) for row in self.db.execute(
+                    "SELECT captured,ordinal FROM periodic_snapshots "
                     "WHERE device=? AND site=? AND asset=? AND captured>=? AND captured<=? "
                     f"AND json_extract(body,'$.window.profileId') IN ({profiles}) "
-                    "ORDER BY captured,ordinal LIMIT ?",
-                    (device_id, site_id, asset_id, start.timestamp(), end.timestamp(),
-                     *feature_snapshots.PROFILE_IDS, EXPORT_LIMIT - len(stored) + 1)).fetchall())
-                if len(stored) > EXPORT_LIMIT:
+                    "LIMIT ?",
+                    (device_id, site_id, asset_id, start, end,
+                     *feature_snapshots.PROFILE_IDS, EXPORT_LIMIT - len(keys) + 1)))
+                if len(keys) > EXPORT_LIMIT:
                     raise data.ApiError(413, "SNAPSHOT_EXPORT_TOO_LARGE",
                                         "Export exceeds 100000 measurements; choose a shorter period.")
-        rows = []
-        for item in sorted(stored, key=lambda row: (row["captured"], row["ordinal"])):
-            window = json.loads(item["body"])["window"]
-            values = window["features"] if window["quality"] == "valid" else None
-            rows.append({
-                "site_id": window["siteId"], "asset_id": window["assetId"],
-                "device_id": window["deviceId"], "sensor_id": window["sensorId"],
-                "measured_at": window["timestamp"], "received_at": iso(item["received"]),
-                "profile_id": window["profileId"], "quality": window["quality"],
-                "reason": window["reason"],
-                **{feature: values[feature] if values is not None else None
-                   for feature in feature_snapshots.FEATURES},
-            })
-        return {"rows": rows, "from": start, "to": end}
+        keys.sort()
+        return [ordinal for _, ordinal in keys]
+
+    @staticmethod
+    def _measurement_export_row(item):
+        window = json.loads(item["body"])["window"]
+        values = window["features"] if window["quality"] == "valid" else None
+        measurements = feature_snapshots.measured_vibration(window)
+        return {
+            "site_id": window["siteId"], "asset_id": window["assetId"],
+            "device_id": window["deviceId"], "sensor_id": window["sensorId"],
+            "measured_at": window["timestamp"], "received_at": iso(item["received"]),
+            "profile_id": window["profileId"], "quality": window["quality"],
+            "reason": window["reason"],
+            **{feature: values[feature] if values is not None else None
+               for feature in feature_snapshots.FEATURES},
+            "vibration_rms_g": measurements["vibrationRmsG"],
+            "dominant_frequency_hz": measurements["dominantFrequencyHz"],
+            "rms_status": measurements["rmsStatus"],
+            "frequency_status": measurements["frequencyStatus"],
+        }
 
     @device_lifecycle.serialized
     def list_device(self, user, device_id):
@@ -454,12 +509,13 @@ class PeriodicSnapshotStore:
             event_jobs = {r["ordinal"]: dict(r) for r in self.db.execute("""SELECT j.* FROM snapshot_event_jobs j
                 JOIN periodic_snapshots w USING(ordinal) WHERE w.device=? AND w.site=? AND w.asset=?
                 ORDER BY w.captured DESC,w.late ASC,w.ordinal DESC LIMIT ?""", (*scope, LIST_LIMIT))}
-        latest_transmission = json.loads(rows[0]["body"])["transmission"] if rows else None
+        bodies = [json.loads(row["body"]) for row in rows]
+        latest_transmission = bodies[0]["transmission"] if bodies else None
         model = self.inference.model
         current_scope = {"deviceId": device_id, "siteId": device["siteId"], "assetId": device["assetId"]}
         configured = model.metadata() if model is not None and all(
             model.metadata()["scope"].get(k) == v for k, v in current_scope.items()) else None
-        latest_window = json.loads(rows[0]["body"])["window"] if rows else None
+        latest_window = bodies[0]["window"] if bodies else None
         compatibility = self._feature_compatibility(latest_window) if latest_window and latest_window.get(
             "profileId") in feature_snapshots.PROFILE_IDS else None
         usable = configured is not None and (compatibility is None or compatibility["status"] == "ready")
@@ -483,7 +539,8 @@ class PeriodicSnapshotStore:
             "affectsAlerts": usable and self.events.mode == "alerts", "historyReprocessingEnabled": False,
             "eventPolicy": self.events.metadata(),
             "statuses": statuses, "supportedProfileIds": [*feature_snapshots.PROFILE_IDS, RAW_PROFILE, SUMMARY_PROFILE],
-            "items": [{**json.loads(row["body"]), "ordinal": row["ordinal"],
+            "items": [{**body, "ordinal": row["ordinal"],
+                       "measurements": feature_snapshots.measured_vibration(body["window"]),
                        "digest": row["digest"], "receivedAt": iso(row["received"]),
                        "lateArrival": bool(row["late"]),
                        "eventProcessing": ({"status": event_jobs[row["ordinal"]]["status"],
@@ -495,7 +552,7 @@ class PeriodicSnapshotStore:
                        "analysis": {"status": row["status"], **json.loads(row["result"])} if row["result"] else {
                            "status": "queued", "reason": "INFERENCE_NOT_ENABLED",
                            "verdict": None, "affectsAlerts": False,
-                       }} for row in rows],
+                       }} for row, body in zip(rows, bodies)],
         }
 
     def close(self):
